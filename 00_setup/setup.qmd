@@ -1,0 +1,699 @@
+---
+title: "Tesis — Data Lake Starter (GCS + Parquet) · V2"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: false
+---
+
+# Introducción
+
+Este notebook inicializa el entorno para trabajar **100% desde Google Cloud Storage (GCS)** sin duplicar datos en local. Incluye:
+
+- instalación de paquetes,
+- autenticación con Google (cross-platform),
+- utilidades para **listar** y **leer** CSV/Parquet desde `gs://`,
+- conversión **CSV → Parquet particionado (iso_year/iso_week)** con políticas de escritura,
+- lectura *lazy* con **Polars** para EDA rápida,
+- utilidades para validar conteos y limpiar ramas “no Hive”.
+
+> **Requisitos previos:** haber corrido al menos una vez `gcloud auth application-default login` en este equipo **o** definir `GOOGLE_APPLICATION_CREDENTIALS` apuntando a una Service Account JSON.  
+> **Paquetes:** `polars`, `pyarrow`, `gcsfs`, `fsspec`.
+
+---
+
+## 0) Paquetes
+
+```{python}
+# Si falta algo, descomenta y ejecuta:
+# !pip install -U polars pyarrow gcsfs fsspec
+
+import sys, os, io, textwrap, re, pathlib
+import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+import pyarrow.fs as pafs
+import gcsfs
+import fsspec  # FIX: para fallback de lectura CSV desde gs://
+
+print("versions -> polars:", pl.__version__, "| pyarrow:", pa.__version__)
+```
+
+## Autenticación con Google (cross-platform)
+
+* **Opción A (recomendada):** `gcloud auth application-default login`
+* **Opción B:** `GOOGLE_APPLICATION_CREDENTIALS=/ruta/tu-service-account.json`
+
+El helper de abajo asegura que el kernel vea las credenciales en cualquier SO.
+
+```{python}
+def enable_adc_crossplatform():
+    """
+    Si GOOGLE_APPLICATION_CREDENTIALS no está definido, intenta localizar el
+    application_default_credentials.json de gcloud y setear la variable.
+    """
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+    if sys.platform.startswith("win"):
+        adc = pathlib.Path(os.environ["APPDATA"]) / "gcloud" / "application_default_credentials.json"
+    else:
+        adc = pathlib.Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+    if not adc.exists():
+        raise FileNotFoundError(f"No encuentro ADC en {adc}. Ejecuta: gcloud auth application-default login")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(adc)
+    return str(adc)
+
+print("ADC =>", enable_adc_crossplatform())
+
+```
+
+## Configuración
+
+Edita aquí el **bucket** y prefijos. Si tu CSV usa coma en vez de punto y coma, cambia `CSV_SEP`.
+
+```{python}
+# === EDITAR ESTAS VARIABLES ===
+BUCKET = "tesis-vonetto-datalake"              # nombre del bucket (sin gs://)
+RAW_PREFIX = "raw"                              # carpeta con CSV originales
+BRONZE_PREFIX = "lake/bronze/trips"             # destino Parquet particionado
+CSV_FILENAME = "tabla_viajes_abril21_27.csv"    # archivo a convertir (en raw/)
+CSV_SEP = ";"                                   # separador del CSV (',' o ';')
+TS_COL = "tiempo_inicio"                        # timestamp ancla (o 'tiempo_fin')
+
+# Políticas de escritura (elige una): "upsert" | "write_missing" | "skip_if_exists" | "replace_all"
+WRITE_MODE = "write_missing"                           # FIX: políticas configurables
+
+# Derivados
+GCS_CSV = f"gs://{BUCKET}/{RAW_PREFIX}/{CSV_FILENAME}"
+BRONZE_BASE = f"gs://{BUCKET}/{BRONZE_PREFIX}"
+
+# Opciones de acceso (gcsfs/fsspec)
+OPTS = {"token": "google_default"}
+fs = gcsfs.GCSFileSystem(token="google_default")
+
+print("CSV:", GCS_CSV)
+print("Bronze base:", BRONZE_BASE)
+
+```
+
+## Utilidades GCS
+
+```{python}
+def gcs_ls(prefix: str):
+    """Lista objetos bajo 'bucket/prefix' o 'gs://bucket/prefix'."""
+    path = prefix.replace("gs://", "", 1)
+    try:
+        return fs.ls(path)
+    except Exception as e:
+        print("ls error:", e)
+
+def count_csv_lines_gcs(gcs_path: str) -> int:
+    """Conteo de filas del CSV en streaming (resta 1 por header)."""
+    path = gcs_path.replace("gs://", "", 1)
+    n = 0
+    with fs.open(path, "rb") as f:
+        for _ in io.TextIOWrapper(f, encoding="utf-8", newline=""):
+            n += 1
+    return max(0, n - 1)
+
+print("Objetos en raw/:")
+print("\n".join(gcs_ls(f"gs://{BUCKET}/{RAW_PREFIX}") or []))
+
+```
+
+# Parte 1 — Leer CSV desde GCS (Polars)
+
+```{python}
+# FIX: fallback fsspec si polars no respeta storage_options en gs://
+try:
+    df_csv = pl.read_csv(GCS_CSV, separator=CSV_SEP, try_parse_dates=True, storage_options=OPTS)
+except Exception as e:
+    print("read_csv directo falló; usando fsspec:", e)
+    with fsspec.open(GCS_CSV, mode="rb", **OPTS) as f:
+        df_csv = pl.read_csv(f, separator=CSV_SEP, try_parse_dates=True)
+
+print(df_csv.shape)
+df_csv.head(3)
+
+```
+
+```{python}
+# FIX: Verificación estricta de TS_COL y fallback controlado
+if TS_COL not in df_csv.columns:
+    for cand in ("tiempo_fin", "te0", "egreso"):
+        if cand in df_csv.columns:
+            TS_COL = cand
+            break
+if TS_COL not in df_csv.columns:
+    raise ValueError(f"No encuentro columna temporal. Revisa TS_COL (actual: {TS_COL}) y candidatos.")
+print("Usando columna temporal:", TS_COL)
+
+
+```
+
+# Parte 2 — CSV → Parquet particionado (iso\_year/iso\_week)
+
+Esta celda agrega `iso_year`/`iso_week` desde `TS_COL` y escribe un **dataset Parquet** particionado directamente en GCS con la política WRITE_MODE.
+
+```{python}
+# 1) Asegura datetime en TS_COL si viniera como string/numérico
+dtype = df_csv.schema[TS_COL]
+if dtype in (pl.Utf8, pl.String):
+    df_csv = df_csv.with_columns(pl.col(TS_COL).str.strptime(pl.Datetime, strict=False))
+elif dtype in (pl.Int64, pl.Int32, pl.Float64, pl.Float32):
+    mn, mx = df_csv.select(pl.col(TS_COL).min(), pl.col(TS_COL).max()).row(0)
+    mx = mx or 0
+    unit = "us" if mx > 1e14 else ("ms" if mx > 1e11 else "s")
+    df_csv = df_csv.with_columns(pl.from_epoch(pl.col(TS_COL), unit=unit).alias(TS_COL))
+
+# 2) FIX: Localizar a America/Santiago antes de derivar ISO week (evita desfases)
+df_csv = df_csv.with_columns(
+    pl.col(TS_COL).dt.replace_time_zone("America/Santiago")  # interpreta el timestamp como hora local
+    # .dt.convert_time_zone("America/Santiago")  # úsalo si necesitas conversión adicional
+)
+
+# 3) Agrega columnas de partición ISO
+df_csv = df_csv.with_columns([
+    pl.col(TS_COL).dt.cast_time_unit("us"),
+    pl.col(TS_COL).dt.strftime("%G").cast(pl.Int32).alias("iso_year"),
+    pl.col(TS_COL).dt.strftime("%V").cast(pl.Int32).alias("iso_week"),
+])
+
+# 4) (Opcional) compacta tipos para ahorrar tamaño — excluye columnas sensibles si fuese necesario
+downs = []
+SENSITIVE = {"lat", "lon", "latitud", "longitud", "monto"}  # ejemplo
+for name, dt in df_csv.schema.items():
+    if name in SENSITIVE:
+        continue
+    if dt == pl.Int64:
+        downs.append(pl.col(name).cast(pl.Int32, strict=False))
+    elif dt == pl.Float64:
+        downs.append(pl.col(name).cast(pl.Float32, strict=False))
+if downs:
+    df_csv = df_csv.with_columns(downs)
+
+# 5) Preparar filesystem y helpers
+gfs = gcsfs.GCSFileSystem(token="google_default")
+fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
+base_dir = f"{BUCKET}/{BRONZE_PREFIX}".lstrip("/")  # sin 'gs://'
+
+# ---- NEW: detectar layout actual del dataset en GCS ----
+def detect_layout(base_dir: str) -> str:
+    # ¿Hive?
+    if gfs.glob(f"{base_dir}/iso_year=*/iso_week=*/*.parquet"):
+        return "hive"
+    # ¿Directory (YYYY/WW)?
+    if gfs.glob(f"{base_dir}/*/*/*.parquet"):
+        return "directory"
+    return "empty"
+
+layout = detect_layout(base_dir)
+print(f"Layout detectado en bronze/trips: {layout}")
+
+def part_prefix(y: int, w: int) -> str:
+    if layout == "hive":
+        return f"{base_dir}/iso_year={int(y)}/iso_week={int(w)}"
+    else:  # directory o empty (escribiremos consistente con lo que haya)
+        return f"{base_dir}/{int(y)}/{int(w)}"
+
+# 6) Detectar particiones target presentes en el CSV
+targets = [(int(y), int(w)) for (y, w) in df_csv.select(["iso_year","iso_week"]).unique().iter_rows()]
+exists = { (y,w): bool(gfs.glob(part_prefix(y,w) + "/*.parquet")) for (y,w) in targets }
+
+print("Targets detectados:", targets[:5])
+print("Particiones existentes:", [k for k,v in exists.items() if v][:5])
+
+
+# 7) Elegir particiones a escribir según WRITE_MODE
+to_write = targets[:]  # default (upsert)
+if WRITE_MODE == "skip_if_exists":
+    if all(exists.values()):
+        print("⏭️  Todas las particiones ya existen. No se escribe.")
+        to_write = []
+    else:
+        print("⚠️  Existen algunas particiones; con 'skip_if_exists' NO se escriben las ya existentes.")
+        to_write = [t for t in targets if not exists[t]]
+elif WRITE_MODE == "write_missing":
+    to_write = [t for t in targets if not exists[t]]
+    if not to_write:
+        print("⏭️  No hay particiones faltantes. Nada que escribir.")
+elif WRITE_MODE == "upsert":
+    print("♻️  UPSERT por partición (re-escribe las que vienen en el CSV).")
+elif WRITE_MODE == "replace_all":
+    print("🧹 REPLACE ALL: borrando rama completa y re-escribiendo…")
+    if gfs.exists(base_dir):
+        gfs.rm(base_dir, recursive=True)
+    # Después de limpiar, escribiremos todo (to_write = targets)
+else:
+    raise ValueError("WRITE_MODE no reconocido. Usa: upsert | write_missing | skip_if_exists | replace_all")
+
+print("A escribir (to_write):", to_write[:5], "total:", len(to_write))
+
+# 8) Si no hay nada que escribir, termina acá
+if not to_write:
+    pass  # no-op (idempotente)
+else:
+    # 9) Filtra el DF a las particiones a escribir (semi-join en vez de is_in)
+    parts_df = pl.DataFrame(
+        to_write,
+        schema={"iso_year": pl.Int32, "iso_week": pl.Int32}  # tipado explícito = evita mismatch
+    )
+    df_out = df_csv.join(parts_df, on=["iso_year","iso_week"], how="semi")
+    # (df_out contiene SOLO filas cuyas particiones están en 'to_write')
+
+    # 10) Config de escritura y layout consistente (lo que ya tienes)
+    fmt = ds.ParquetFileFormat()
+    try:
+        file_opts = fmt.make_write_options(compression="zstd")
+    except Exception:
+        file_opts = None
+
+    if layout == "hive" or layout == "empty":
+        part_spec = ds.HivePartitioning.discover(schema=pa.schema([
+            pa.field("iso_year", pa.int32()), pa.field("iso_week", pa.int32())
+        ]))
+        # --- REEMPLAZA el bloque Hive por este ---
+        ds.write_dataset(
+            data=df_out.to_arrow(),
+            base_dir=base_dir,
+            filesystem=fs_arrow,
+            format="parquet",
+            partitioning=["iso_year", "iso_week"],   # nombres de columnas
+            partitioning_flavor="hive",              # 👈 HIVE al escribir
+            existing_data_behavior=("delete_matching" if WRITE_MODE=="upsert" else "overwrite_or_ignore"),
+            file_options=file_opts,
+            basename_template="part-{i}.parquet",
+        )
+
+    else:
+        ds.write_dataset(
+            data=df_out.to_arrow(),
+            base_dir=base_dir,
+            filesystem=fs_arrow,
+            format="parquet",
+            partitioning=["iso_year","iso_week"],   # directory YYYY/WW
+            existing_data_behavior=("delete_matching" if WRITE_MODE=="upsert" else "overwrite_or_ignore"),
+            file_options=file_opts,
+            basename_template="part-{i}.parquet",
+        )
+    print("✅ Escritura completada en gs://" + base_dir)
+
+
+
+```
+
+# Parte 3 — Leer Parquet (lazy) desde GCS — **método portable**
+
+Algunas combinaciones de SO/versión no expanden bien globs; este helper funciona en Windows/macOS/Linux y con distintas versiones de PyArrow.
+
+```{python}
+# -- Pega esto sustituyendo tu función scan_parquet_portable actual --
+
+import re
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.fs as pafs
+import gcsfs
+import polars as pl
+
+part_schema = pa.schema([pa.field("iso_year", pa.int32()),
+                         pa.field("iso_week", pa.int32())])
+
+def _has_hive_dirs(fs, base_no_scheme: str) -> bool:
+    """¿Existen carpetas estilo Hive (iso_year=...)?"""
+    try:
+        for p in fs.ls(base_no_scheme):
+            if "/iso_year=" in p:
+                return True
+    except Exception:
+        pass
+    return False
+
+def scan_parquet_portable(base_or_glob: str, token: str = "google_default") -> pl.LazyFrame:
+    """
+    Lectura portable en GCS:
+    - Detecta si el layout es Hive (iso_year=/iso_week=) o Directory (YYYY/WW).
+    - Usa HivePartitioning o DirectoryPartitioning según corresponda.
+    """
+    gfs = gcsfs.GCSFileSystem(token=token)
+    fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
+
+    is_glob = any(ch in base_or_glob for ch in "*?[")
+    if is_glob:
+        pattern = re.sub(r"^gs://", "", base_or_glob).rstrip("/")
+        paths = gfs.glob(pattern)
+        if not paths:
+            raise FileNotFoundError(f"No se encontraron objetos para: {base_or_glob}")
+        # Heurística: ¿alguna ruta contiene 'iso_year='?
+        is_hive = any("iso_year=" in p for p in paths)
+        if is_hive:
+            part = ds.HivePartitioning.discover(schema=part_schema)
+            dset = ds.dataset(paths, filesystem=fs_arrow, format="parquet",
+                              partitioning=part)
+        else:
+            # Directory: nombres tipo .../<iso_year>/<iso_week>/...
+            part = ds.DirectoryPartitioning.discover(field_names=["iso_year","iso_week"])
+            dset = ds.dataset(paths, filesystem=fs_arrow, format="parquet",
+                              partitioning=part)
+        return pl.scan_pyarrow_dataset(dset)
+
+    # Prefijo sin glob
+    base_no_scheme = re.sub(r"^gs://", "", base_or_glob).rstrip("/")
+    is_hive = _has_hive_dirs(gfs, base_no_scheme)
+    if is_hive:
+        part = ds.HivePartitioning.discover(schema=part_schema)
+    else:
+        part = ds.DirectoryPartitioning.discover(field_names=["iso_year","iso_week"])
+    dset = ds.dataset(base_no_scheme, filesystem=fs_arrow, format="parquet",
+                      partitioning=part)
+    return pl.scan_pyarrow_dataset(dset)
+
+```
+
+```{python}
+lf = scan_parquet_portable(BRONZE_BASE)  # detecta que es "directory"
+# (por si quedaron strings en meta antigua)
+lf = lf.with_columns([
+    pl.col("iso_year").cast(pl.Int32, strict=False),
+    pl.col("iso_week").cast(pl.Int32, strict=False),
+])
+print(lf.collect_schema())
+print(lf.select(pl.len().alias("n_filas")).collect())
+
+
+```
+
+
+### Ejemplos de uso
+
+
+```{python}
+# Top-10 paraderos (INICIO)
+top_ini = (
+    lf.filter((pl.col("iso_year") == 2025) & (pl.col("iso_week") == 17))
+      .group_by("paradero_inicio")
+      .agg(pl.len().alias("n"))
+      .sort("n", descending=True)
+      .limit(10)
+).collect(engine="in-memory")   # <<< FIX
+
+# Top-10 paraderos (FIN)
+top_fin = (
+    lf.filter((pl.col("iso_year") == 2025) & (pl.col("iso_week") == 17))
+      .group_by("paradero_fin")
+      .agg(pl.len().alias("n"))
+      .sort("n", descending=True)
+      .limit(10)
+).collect(engine="in-memory")   # <<< FIX
+
+
+print("Top paraderos de SUBIDA:"); print(top_ini)
+print("\nTop paraderos de BAJADA:"); print(top_fin)
+
+```
+
+## Conteos y validación rápida
+
+```{python}
+# Filas en CSV (en GCS)
+n_csv = count_csv_lines_gcs(GCS_CSV)
+
+# Filas en Parquet (solo rama Hive si filtraste por iso_year/iso_week)
+n_parq = (lf.filter((pl.col("iso_year")==2025) & (pl.col("iso_week")==17))
+            .select(pl.len()).collect().item())
+print(f"Filas — CSV: {n_csv:,} | Parquet (Hive, semana 2025-17): {n_parq:,}")
+
+```
+
+## Validación
+
+### Igualdad de filas (total y por partición)
+```{python}
+# Total de filas en el CSV ya cargado
+n_csv_df = df_csv.height
+
+# Total de filas en el Parquet (lee con tu helper)
+lf_all = scan_parquet_portable(BRONZE_BASE)
+n_parq = lf_all.select(pl.len()).collect(engine="in-memory").item()
+
+print(f"[TOTAL] CSV(df): {n_csv_df:,}  vs  Parquet: {n_parq:,}")
+
+# Por partición (iso_year/iso_week)
+cnt_csv = (df_csv.group_by(["iso_year","iso_week"])
+                 .agg(pl.len().alias("n_csv"))
+                 .sort(["iso_year","iso_week"]))
+
+cnt_parq = (lf_all.group_by(["iso_year","iso_week"])
+                  .agg(pl.len().alias("n_parq"))
+                  .sort(["iso_year","iso_week"])
+                  .collect(engine="in-memory"))
+
+cmp_counts = (cnt_csv.join(cnt_parq, on=["iso_year","iso_week"], how="outer")
+                    .fill_null(0)
+                    .with_columns((pl.col("n_csv") - pl.col("n_parq")).alias("diff")))
+print(cmp_counts)
+assert (cmp_counts["diff"] == 0).all(), "Hay diferencias de conteo por partición."
+```
+
+### Columnas presentes y tipos razonables
+
+```{python}
+cols_csv = set(df_csv.columns)
+schema_parq = lf_all.collect_schema()  # schema lazy de Parquet
+cols_parq = set(schema_parq.names())
+
+faltan_en_parquet = cols_csv - cols_parq
+sobran_en_parquet = cols_parq - cols_csv
+print("Faltan en Parquet:", faltan_en_parquet)
+print("Sobran en Parquet:", sobran_en_parquet)
+
+```
+
+### Nulos por columna (¿cambió el “missingness”?)
+
+```{python}
+def nulls_df(df: pl.DataFrame, tag: str):
+    exprs = [pl.count().alias("n_total")] + [pl.col(c).null_count().alias(c) for c in df.columns]
+    out = df.select(exprs).melt(id_vars=["n_total"], variable_name="col", value_name=f"na_{tag}")
+    return out
+
+# CSV ya cargado (después de parseos)
+na_csv = nulls_df(df_csv, "csv")
+
+# Parquet (colecta prudente para evitar traer todo: opción A = columnas de interés)
+# Si quieres todas, quita 'cols_interes'
+cols_interes = df_csv.columns  # o una lista reducida si prefieres
+df_parq = lf_all.select([pl.col(c) for c in cols_interes]).collect(engine="in-memory")
+na_parq = nulls_df(df_parq, "parq")
+
+na_cmp = (na_csv.join(na_parq, on=["col","n_total"], how="left")
+                .with_columns((pl.col("na_csv") - pl.col("na_parq")).alias("diff_na"))
+                .sort("diff_na", descending=True))
+print(na_cmp.head(20))
+```
+
+### Rango de valores clave (min/max)
+
+```{python}
+# elige columnas clave (timestampts y numéricas)
+cols_ts = [c for c,t in df_csv.schema.items() if t == pl.Datetime]
+cols_num = [c for c,t in df_csv.schema.items() if t in (pl.Int32, pl.Int64, pl.Float32, pl.Float64)]
+
+def minmax(df: pl.DataFrame, cols):
+    return df.select([pl.col(c).min().alias(c+"__min") for c in cols] +
+                     [pl.col(c).max().alias(c+"__max") for c in cols])
+
+mm_csv  = minmax(df_csv, cols_ts + cols_num)
+mm_parq = minmax(df_parq, cols_ts + cols_num)
+
+print("CSV min/max:\n", mm_csv)
+print("\nParquet min/max:\n", mm_parq)
+
+```
+
+# Parte 4 — Caracterizacion.csv
+
+
+```{python}
+# ==============================
+# CONFIG
+# ==============================
+CHAR_CSV_FILENAME  = "Caracterizacion.csv"        # en raw/
+CHAR_BRONZE_PREFIX = "lake/bronze/caracterizacion"
+WRITE_MODE_CHAR    = "write_missing"              # "write_missing" | "upsert" | "skip_if_exists" | "replace_all"
+
+GCS_CHAR_CSV = f"gs://{BUCKET}/{RAW_PREFIX}/{CHAR_CSV_FILENAME}"
+BRONZE_CHAR  = f"{BUCKET}/{CHAR_BRONZE_PREFIX}".lstrip("/")   # sin 'gs://'
+
+print("Caracterización CSV:", GCS_CHAR_CSV)
+print("Bronze (caracterización): gs://" + BRONZE_CHAR)
+
+```
+
+```{python}
+# ==============================
+# LECTURA ROBUSTA (auto-separador , / ;)
+# ==============================
+import fsspec
+
+def _detect_sep(gcs_path: str, opts: dict) -> str:
+    with fsspec.open(gcs_path, "rb", **opts) as fh:
+        head = fh.readline().decode("utf-8", errors="ignore")
+    return "," if head.count(",") >= head.count(";") else ";"
+
+try:
+    sep_char = _detect_sep(GCS_CHAR_CSV, OPTS)
+    char_df = pl.read_csv(GCS_CHAR_CSV, separator=sep_char, try_parse_dates=True, storage_options=OPTS)
+except Exception as e:
+    print("read_csv directo falló; usando fsspec:", e)
+    with fsspec.open(GCS_CHAR_CSV, mode="rb", **OPTS) as f:
+        sep_char = _detect_sep(GCS_CHAR_CSV, OPTS)
+        char_df = pl.read_csv(f, separator=sep_char, try_parse_dates=True)
+
+print(f"Separador detectado: {sep_char!r}")
+print("shape CSV caracterización:", char_df.shape)
+char_df.head(3)
+
+```
+
+```{python}
+# ==============================
+# LIMPIEZA SUAVE / NORMALIZACIÓN (FIX)
+# ==============================
+import re, datetime as dt
+
+# Copia de seguridad ANTES de normalizar (por si necesitas recuperar valores crudos)
+char_raw = char_df.clone()
+
+def to_snake(name: str) -> str:
+    name = name.strip()
+    name = re.sub(r"[^\w\s]", "_", name, flags=re.UNICODE)
+    name = re.sub(r"\s+", "_", name)
+    name = re.sub(r"_+", "_", name)
+    return name.lower().strip("_")
+
+# 1) renombra columnas a snake_case
+char_df = char_df.rename({c: to_snake(c) for c in char_df.columns})
+
+# 2) trims y ""->NULL en columnas string
+str_cols = [c for c,t in char_df.schema.items() if t == pl.Utf8]
+if str_cols:
+    char_df = char_df.with_columns([
+        pl.when(pl.col(c).str.len_bytes()==0).then(None).otherwise(pl.col(c).str.strip_chars()).alias(c)
+        for c in str_cols
+    ])
+
+# 3) DETECCIÓN ESTRICTA de columnas sí/no (regex anclado + umbral)
+#    - Requiere que ≥95% de las celdas no nulas sean una de estas: si/sí/s/no/n/yes/true/false/0/1
+#    - Cardinalidad reducida (≤3 valores distintos) en muestra
+BOOL_PATTERN = r'^(si|sí|s|no|n|yes|true|false|0|1)$'
+YN_BLACKLIST = {"comuna_declarada", "comuna", "comuna_residencia", "region", "nacionalidad"}  # <- nunca binarizar
+YN_CANDIDATES = []
+
+for c in str_cols:
+    if c in YN_BLACKLIST:
+        continue
+    # muestra hasta 1000 no nulos, normalizados
+    sample = (char_df.select(pl.col(c))
+                    .drop_nulls()
+                    .select(pl.col(c).cast(pl.Utf8).str.strip_chars().str.to_lowercase().alias(c))
+                    .limit(1000))[c]
+    if sample.len() == 0:
+        continue
+    # proporción que matchea el patrón
+    ratio = sample.str.contains(BOOL_PATTERN).cast(pl.UInt8).mean()
+    # cardinalidad de valores distintos en la muestra
+    uniq = set(sample.unique().to_list())
+    if float(ratio or 0) >= 0.95 and len(uniq) <= 3:
+        YN_CANDIDATES.append(c)
+
+# 4) convierte SOLO las columnas detectadas
+for c in YN_CANDIDATES:
+    char_df = char_df.with_columns(
+        pl.when(pl.col(c).is_null()).then(None)
+         .when(pl.col(c).cast(pl.Utf8).str.strip_chars().str.to_lowercase().is_in(["si","sí","s","yes","true","1"]))
+         .then(True)
+         .when(pl.col(c).cast(pl.Utf8).str.strip_chars().str.to_lowercase().is_in(["no","n","false","0"]))
+         .then(False)
+         .otherwise(None)
+         .alias(c)
+    )
+
+# 5) agrega snapshot_date (partición Hive)
+snapshot_date = dt.date.today().isoformat()
+char_df = char_df.with_columns(pl.lit(snapshot_date).alias("snapshot_date"))
+
+print("YN_CANDIDATES (detectadas como booleanas):", YN_CANDIDATES)
+print("Columnas caracterización:", char_df.columns[:15], "…")
+char_df.head(5)
+
+
+```
+
+```{python}
+# ==============================
+# ESCRITURA PARQUET (Hive por snapshot_date · idempotente)
+# ==============================
+gfs      = gcsfs.GCSFileSystem(token="google_default")
+fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
+
+part_path = f"{BRONZE_CHAR}/snapshot_date={snapshot_date}"
+exists_part = bool(gfs.glob(part_path.rstrip("/") + "/*.parquet"))
+print(f"Partición destino: gs://{part_path} | existe={exists_part}")
+
+if WRITE_MODE_CHAR == "skip_if_exists" and exists_part:
+    print("⏭️  snapshot ya existe; no se escribe.")
+elif WRITE_MODE_CHAR == "write_missing" and exists_part:
+    print("⏭️  snapshot ya existe; nada que escribir.")
+else:
+    if WRITE_MODE_CHAR in ("upsert","replace_all") and exists_part:
+        gfs.rm(part_path, recursive=True)
+        print("🗑️  Borrada partición existente:", "gs://" + part_path)
+
+    fmt = ds.ParquetFileFormat()
+    try:
+        file_opts = fmt.make_write_options(compression="zstd")
+    except Exception:
+        file_opts = None
+
+    ds.write_dataset(
+        data=char_df.to_arrow(),
+        base_dir=BRONZE_CHAR,
+        filesystem=fs_arrow,
+        format="parquet",
+        partitioning=["snapshot_date"],
+        partitioning_flavor="hive",   # 👈 importante para Hive
+        existing_data_behavior="overwrite_or_ignore",
+        file_options=file_opts,
+        basename_template="part-{i}.parquet",
+    )
+    print("✅ Escrito snapshot en:", "gs://" + part_path)
+
+```
+
+
+```{python}
+# ==============================
+# LECTURA Y VALIDACIÓN RÁPIDA
+# ==============================
+lf_char = pl.scan_pyarrow_dataset(
+    ds.dataset(
+        BRONZE_CHAR,
+        filesystem=fs_arrow,
+        format="parquet",
+        partitioning=ds.HivePartitioning.discover(schema=pa.schema([pa.field("snapshot_date", pa.string())])),
+    )
+)
+
+n_csv_char  = char_df.height
+n_parq_char = (lf_char.filter(pl.col("snapshot_date")==snapshot_date)
+                      .select(pl.len())
+                      .collect(engine="in-memory").item())
+
+print(f"[Caracterización] Filas CSV: {n_csv_char:,}  vs  Parquet (snapshot {snapshot_date}): {n_parq_char:,}")
+print("Schema bronze/caracterización:", lf_char.collect_schema())
+```

@@ -1,0 +1,9 @@
+project:
+  type: website        
+execute:
+  freeze: auto        
+format:
+  html:
+    toc: true
+    code-fold: true
+    smooth-scroll: true

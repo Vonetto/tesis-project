@@ -1,0 +1,131 @@
+---
+title: "EDA — Trips Overview"
+freeze: auto
+params:
+  year: 2025
+  iso_week: 17
+  save_gold: false
+output-file: "eda_trips_{{params.year}}_{{params.iso_week}}"
+---
+
+```{python}
+# --- Parámetros robustos: funcionan con Quarto y con "Run Cell" ---
+import os
+
+try:
+    params  # si Quarto ya la inyectó, úsala
+except NameError:
+    params = {
+        "year": int(os.getenv("EDA_YEAR", 2025)),
+        "iso_week": int(os.getenv("EDA_WEEK", 17)),
+        "save_gold": os.getenv("EDA_SAVE_GOLD", "false").lower() in ("1","true","yes")
+    }
+
+year = int(params["year"])
+week = int(params["iso_week"])
+save_gold = bool(params["save_gold"])
+
+```
+
+## Setup & Carga
+
+```{python}
+import os, sys, pathlib
+
+# Ensure the project root (which contains `lib/`) is on sys.path
+project_dir = pathlib.Path(os.environ.get("QUARTO_PROJECT_DIR", pathlib.Path.cwd())).resolve()
+if not (project_dir / "lib").exists():
+    project_dir = project_dir.parent
+sys.path.insert(0, str(project_dir))
+
+from lib.datalake import enable_adc, scan_parquet_portable
+import polars as pl
+import pyarrow.dataset as ds
+import pyarrow.fs as pafs
+import gcsfs
+import matplotlib.pyplot as plt
+import numpy as np
+
+enable_adc()
+
+BRONZE_BASE = "gs://tesis-vonetto-datalake/lake/bronze/trips"
+lf = scan_parquet_portable(BRONZE_BASE)
+
+year  = params["year"]
+week  = params["iso_week"]
+
+lfw = lf.filter((pl.col("iso_year")==year) & (pl.col("iso_week")==week))
+
+print(f"Filtrando iso_year={year}, iso_week={week}")
+print(lfw.collect_schema())
+```
+
+
+## KPIs básicos
+```{python}
+# Duración “mejor esfuerzo”: usa tviaje2 si existe; si no, calcula con timestamps
+has_tviaje2 = "tviaje2" in lfw.collect_schema().names()
+
+if has_tviaje2:
+    lfk = lfw.with_columns(pl.col("tviaje2").alias("dur_s"))
+else:
+    # Calcula desde timestamps (maneja zonas horarias distintas y nulos)
+    lfk = lfw.with_columns([
+        (pl.col("tiempo_fin").cast(pl.Datetime).dt.cast_time_unit("us") 
+         - pl.col("tiempo_inicio").cast(pl.Datetime).dt.cast_time_unit("us")).dt.seconds()
+        .alias("dur_s")
+    ])
+
+# Extra: hora y día de la semana desde tiempo_inicio (si no está, lo intenta con tiemposubida_1)
+time_source = "tiempo_inicio" if "tiempo_inicio" in lfk.collect_schema().names() else None
+if time_source is None and "tiemposubida_1" in lfk.collect_schema().names():
+    time_source = "tiemposubida_1"
+
+if time_source:
+    lfk = lfk.with_columns([
+        pl.col(time_source).dt.replace_time_zone("America/Santiago"),
+        pl.col(time_source).dt.weekday().alias("wday"),   # 0=Lunes
+        pl.col(time_source).dt.hour().alias("hour"),
+        pl.col(time_source).dt.date().alias("travel_date"),
+    ])
+
+kpi = (lfk
+    .select([
+        pl.len().alias("n_viajes"),
+        pl.col("dur_s").median().alias("p50_dur_s"),
+        pl.col("dur_s").quantile(0.9, interpolation="nearest").alias("p90_dur_s"),
+        pl.col("dur_s").max().alias("max_dur_s"),
+        (pl.col("dur_s") < 0).sum().alias("neg_dur_cnt"),
+        (pl.col("dur_s") > 4*3600).sum().alias("gt4h_cnt"),
+        pl.col("id_tarjeta").n_unique().alias("n_tarjetas") if "id_tarjeta" in lfk.collect_schema().names() else pl.lit(None).alias("n_tarjetas"),
+        pl.col("paradero_inicio").n_unique().alias("n_paraderos_ini") if "paradero_inicio" in lfk.collect_schema().names() else pl.lit(None).alias("n_paraderos_ini"),
+        pl.col("paradero_fin").n_unique().alias("n_paraderos_fin") if "paradero_fin" in lfk.collect_schema().names() else pl.lit(None).alias("n_paraderos_fin"),
+        pl.col("netapa").mean().alias("mean_netapas") if "netapa" in lfk.collect_schema().names() else pl.lit(None).alias("mean_netapas")
+    ])
+).collect(engine="in-memory")
+
+# Traducción legible
+k = kpi.to_dicts()[0]
+mins = lambda s: None if s is None else round(s/60,1)
+
+summary_rows = [
+    ("Viajes (semana)", f"{k['n_viajes']:,}"),
+    ("Tarjetas únicas", "—" if k['n_tarjetas'] is None else f"{k['n_tarjetas']:,}"),
+    ("Duración p50 (min)", "—" if k['p50_dur_s'] is None else mins(k['p50_dur_s'])),
+    ("Duración p90 (min)", "—" if k['p90_dur_s'] is None else mins(k['p90_dur_s'])),
+    ("Duración máx (min)", "—" if k['max_dur_s'] is None else mins(k['max_dur_s'])),
+    ("Duraciones negativas", f"{k['neg_dur_cnt']:,}"),
+    (">4h (anómalos)", f"{k['gt4h_cnt']:,}"),
+    ("Paraderos (subida)", "—" if k['n_paraderos_ini'] is None else f"{k['n_paraderos_ini']:,}"),
+    ("Paraderos (bajada)", "—" if k['n_paraderos_fin'] is None else f"{k['n_paraderos_fin']:,}"),
+    ("Etapas promedio", "—" if k['mean_netapas'] is None else round(k['mean_netapas'],3)),
+]
+for a,b in summary_rows:
+    print(f"{a:>22}: {b}")
+
+```
+
+## Distribución de duración (histograma)
+```{python}
+
+```

@@ -1,0 +1,52 @@
+# .gitignore
+
+```gitignore
+# --- Python / venv
+venv/
+.env
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# --- OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Quarto outputs/caches
+_site/
+_freeze/
+**/_freeze/
+**/execute-results/
+.quarto/_freeze/
+.quarto/project-cache/
+.quarto/preview/
+.quarto/idx/
+site_libs/
+**/site_libs/
+
+# --- Notebooks / checkpoints
+.ipynb_checkpoints/
+
+# --- Datos locales (si existiera)
+Datos/
+data/
+*.parquet
+*.feather
+*.arrow
+*.orc
+*.csv
+
+# --- Credenciales / llaves (¡nunca al repo!)
+*.key
+*.pem
+*.p12
+*.crt
+*.der
+*service-account*.json
+*credentials*.json
+secrets*/ 
