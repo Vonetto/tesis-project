@@ -8,7 +8,7 @@ El proyecto trabaja **100% contra Google Cloud Storage (GCS)**: los CSV viven en
 
 ```
 
-project/
+tesis-project/
 ├─ 00\_setup/
 │  └─ setup.qmd                # Ingesta a GCS (CSV→Parquet), validaciones
 ├─ 02\_eda/

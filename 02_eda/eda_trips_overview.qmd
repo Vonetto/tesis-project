@@ -1,131 +1,672 @@
 ---
-title: "EDA — Trips Overview"
+title: "EDA — Viajes (bronze nuevo)"
 freeze: auto
 params:
   year: 2025
   iso_week: 17
-  save_gold: false
-output-file: "eda_trips_{{params.year}}_{{params.iso_week}}"
+  gcs_bucket: "tesis-vonetto-datalake"
+  bronze_prefix: "lake/bronze"
+  dataset: "viajes"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
 ---
 
-```{python}
-# --- Parámetros robustos: funcionan con Quarto y con "Run Cell" ---
-import os
+```{python} 
+# --- Parámetros robustos: funcionan con Quarto y con "Run Cell" --- 
+import os 
 
-try:
-    params  # si Quarto ya la inyectó, úsala
-except NameError:
-    params = {
-        "year": int(os.getenv("EDA_YEAR", 2025)),
-        "iso_week": int(os.getenv("EDA_WEEK", 17)),
-        "save_gold": os.getenv("EDA_SAVE_GOLD", "false").lower() in ("1","true","yes")
-    }
+try: 
+    params # si Quarto ya la inyectó, úsala 
 
-year = int(params["year"])
-week = int(params["iso_week"])
-save_gold = bool(params["save_gold"])
-
+except NameError: 
+    params = { 
+        "year": int(os.getenv("EDA_YEAR", 2025)), 
+        "iso_week": int(os.getenv("EDA_WEEK", 17)), 
+        "gcs_bucket": os.getenv("GCS_BUCKET", "tesis-vonetto-datalake"),
+        "bronze_prefix": os.getenv("BRONZE_PREFIX", "lake/bronze"),
+        "dataset": os.getenv("DATASET", "viajes")
+    
+    } 
+year = int(params["year"]) 
+week = int(params["iso_week"]) 
+gcs_bucket = params["gcs_bucket"]
+bronze_prefix = params["bronze_prefix"]
+dataset = params["dataset"]
 ```
 
-## Setup & Carga
 
 ```{python}
-import os, sys, pathlib
-
-# Ensure the project root (which contains `lib/`) is on sys.path
-project_dir = pathlib.Path(os.environ.get("QUARTO_PROJECT_DIR", pathlib.Path.cwd())).resolve()
-if not (project_dir / "lib").exists():
-    project_dir = project_dir.parent
-sys.path.insert(0, str(project_dir))
-
-from lib.datalake import enable_adc, scan_parquet_portable
+# =======================
+# Parámetros y dependencias
+# =======================
+import os, re
 import polars as pl
-import pyarrow.dataset as ds
-import pyarrow.fs as pafs
 import gcsfs
+import pyarrow.fs as pafs
+import pyarrow.dataset as ds
 import matplotlib.pyplot as plt
 import numpy as np
 
-enable_adc()
+year       = int(params["year"])
+iso_week   = int(params["iso_week"])
+GCS_BUCKET = params["gcs_bucket"]
+BRONZE     = params["bronze_prefix"]
+DATASET    = params["dataset"]
 
-BRONZE_BASE = "gs://tesis-vonetto-datalake/lake/bronze/trips"
-lf = scan_parquet_portable(BRONZE_BASE)
+TZ = "America/Santiago"
+SEM_LABEL = f"{year}-W{iso_week:02d}"
 
-year  = params["year"]
-week  = params["iso_week"]
+print("Semana analizada:", SEM_LABEL)
 
-lfw = lf.filter((pl.col("iso_year")==year) & (pl.col("iso_week")==week))
+# FS para GCS (scan_parquet soporta gs:// via gcsfs)
+gfs = gcsfs.GCSFileSystem(token="google_default")
 
-print(f"Filtrando iso_year={year}, iso_week={week}")
-print(lfw.collect_schema())
+def gsjoin(*parts):
+    return "gs://" + "/".join(s.strip("/").replace("gs://","") for s in parts)
 ```
 
+## Carga: semana ISO específica
 
-## KPIs básicos
 ```{python}
-# Duración “mejor esfuerzo”: usa tviaje2 si existe; si no, calcula con timestamps
-has_tviaje2 = "tviaje2" in lfw.collect_schema().names()
+def scan_bronze_week(dataset: str, semana_iso: str) -> pl.LazyFrame:
+    base = gsjoin(GCS_BUCKET, BRONZE, dataset)
+    # Layout correcto
+    path_norm  = f"{base}/semana_iso={semana_iso}/*.parquet"
+    # Layout histórico incorrecto (por si aparece en otros runs)
+    path_tuple = f"{base}/semana_iso=('"+semana_iso+"',)/*.parquet"
+    try:
+        return pl.scan_parquet(path_norm)
+    except Exception:
+        try:
+            return pl.scan_parquet(path_tuple)
+        except Exception as e:
+            # Ayuda rápida
+            try:
+                print("Particiones disponibles:", gfs.ls(f"{GCS_BUCKET}/{BRONZE}/{dataset}")[:20])
+            except Exception:
+                pass
+            raise e
+
+lf_v = scan_bronze_week(DATASET, SEM_LABEL)
+print("Schema base:", lf_v.collect_schema())
+print("Filas estimadas (lazy):", lf_v.select(pl.len()).collect().item())
+```
+
+## Derivados estándar para análisis
+
+```{python}
+# Helpers
+def _as_dt(expr: pl.Expr) -> pl.Expr:
+    # Por seguridad, si llegaran como string
+    return expr.cast(pl.Datetime, strict=False)
+
+def _num_from_str(expr: pl.Expr) -> pl.Expr:
+    """
+    Limpia numéricos que podrían venir como texto con separadores locales:
+    - quita '.' (miles) y cambia ',' por '.' (decimales).
+    - castea a float; los que no se pueden, quedan en null.
+    """
+    s = expr.cast(pl.Utf8, strict=False)
+    s = s.str.replace_all(r"\.", "").str.replace_all(",", ".")
+    return s.cast(pl.Float64, strict=False)
+
+schema_names = set(lf_v.collect_schema().names())
+
+# 1) Fuente temporal (inicio del viaje si existe; si no, subida_1)
+time_start = "tiempo_inicio_viaje" if "tiempo_inicio_viaje" in schema_names \
+         else ("tiempo_subida_1" if "tiempo_subida_1" in schema_names else None)
+time_end   = "tiempo_fin_viaje" if "tiempo_fin_viaje" in schema_names \
+         else ("tiempo_bajada_1" if "tiempo_bajada_1" in schema_names else None)
+
+# 2) Duración robusta (segundos):
+#    - si existe 'tviaje2', úsala
+#    - si no, usa (fin - inicio) si ambos existen
+#    - si solo hay subida_1 y bajada_1, úsala
+has_tviaje2 = "tviaje2" in schema_names
+
+lfk = lf_v
 
 if has_tviaje2:
-    lfk = lfw.with_columns(pl.col("tviaje2").alias("dur_s"))
+    lfk = lfk.with_columns(pl.col("tviaje2").cast(pl.Float64, strict=False).alias("dur_s"))
 else:
-    # Calcula desde timestamps (maneja zonas horarias distintas y nulos)
-    lfk = lfw.with_columns([
-        (pl.col("tiempo_fin").cast(pl.Datetime).dt.cast_time_unit("us") 
-         - pl.col("tiempo_inicio").cast(pl.Datetime).dt.cast_time_unit("us")).dt.seconds()
-        .alias("dur_s")
-    ])
+    if time_start and time_end:
+        lfk = lfk.with_columns(
+            (_as_dt(pl.col(time_end)) - _as_dt(pl.col(time_start))).dt.total_seconds().alias("dur_s")
+        )
+    elif {"tiempo_subida_1","tiempo_bajada_1"} <= schema_names:
+        lfk = lfk.with_columns(
+            (_as_dt(pl.col("tiempo_bajada_1")) - _as_dt(pl.col("tiempo_subida_1"))).dt.total_seconds().alias("dur_s")
+        )
+    else:
+        lfk = lfk.with_columns(pl.lit(None).alias("dur_s"))
 
-# Extra: hora y día de la semana desde tiempo_inicio (si no está, lo intenta con tiemposubida_1)
-time_source = "tiempo_inicio" if "tiempo_inicio" in lfk.collect_schema().names() else None
-if time_source is None and "tiemposubida_1" in lfk.collect_schema().names():
-    time_source = "tiemposubida_1"
-
-if time_source:
+# 3) Campos temporales derivados (solo si tenemos time_start)
+if time_start:
     lfk = lfk.with_columns([
-        pl.col(time_source).dt.replace_time_zone("America/Santiago"),
-        pl.col(time_source).dt.weekday().alias("wday"),   # 0=Lunes
-        pl.col(time_source).dt.hour().alias("hour"),
-        pl.col(time_source).dt.date().alias("travel_date"),
+        _as_dt(pl.col(time_start)).dt.replace_time_zone(TZ).alias("_ts"),
+        _as_dt(pl.col(time_start)).dt.date().alias("travel_date"),
+        _as_dt(pl.col(time_start)).dt.weekday().alias("wday"),  # 0=Lunes
+        _as_dt(pl.col(time_start)).dt.hour().alias("hour"),
     ])
 
-kpi = (lfk
-    .select([
-        pl.len().alias("n_viajes"),
-        pl.col("dur_s").median().alias("p50_dur_s"),
-        pl.col("dur_s").quantile(0.9, interpolation="nearest").alias("p90_dur_s"),
-        pl.col("dur_s").max().alias("max_dur_s"),
-        (pl.col("dur_s") < 0).sum().alias("neg_dur_cnt"),
-        (pl.col("dur_s") > 4*3600).sum().alias("gt4h_cnt"),
-        pl.col("id_tarjeta").n_unique().alias("n_tarjetas") if "id_tarjeta" in lfk.collect_schema().names() else pl.lit(None).alias("n_tarjetas"),
-        pl.col("paradero_inicio").n_unique().alias("n_paraderos_ini") if "paradero_inicio" in lfk.collect_schema().names() else pl.lit(None).alias("n_paraderos_ini"),
-        pl.col("paradero_fin").n_unique().alias("n_paraderos_fin") if "paradero_fin" in lfk.collect_schema().names() else pl.lit(None).alias("n_paraderos_fin"),
-        pl.col("netapa").mean().alias("mean_netapas") if "netapa" in lfk.collect_schema().names() else pl.lit(None).alias("mean_netapas")
+# 4) Distancias y “circuity” si están disponibles
+has_dist_cols = {"distancia_ruta","distancia_eucl"} <= schema_names
+if has_dist_cols:
+    # Nota: unidades pueden ser metros; dejamos ambas interpretaciones visibles.
+    lfk = lfk.with_columns([
+        _num_from_str(pl.col("distancia_ruta")).alias("_dist_ruta_raw"),
+        _num_from_str(pl.col("distancia_eucl")).alias("_dist_eucl_raw"),
+    ]).with_columns([
+        (pl.col("_dist_ruta_raw")/1000.0).alias("dist_km_guess_m"),   # si la unidad original era metros
+        (pl.col("_dist_eucl_raw")/1000.0).alias("eucl_km_guess_m"),
+        (pl.col("_dist_ruta_raw") / pl.when(pl.col("_dist_eucl_raw")<=0).then(None).otherwise(pl.col("_dist_eucl_raw"))).alias("circuity_raw")
     ])
-).collect(engine="in-memory")
 
-# Traducción legible
-k = kpi.to_dicts()[0]
-mins = lambda s: None if s is None else round(s/60,1)
+# 4) Etapas (la columna ya se llama 'n_etapas' en la fuente)
+# El código para renombrar 'netapa' fue eliminado ya que no es necesario y causaba errores.
 
-summary_rows = [
-    ("Viajes (semana)", f"{k['n_viajes']:,}"),
-    ("Tarjetas únicas", "—" if k['n_tarjetas'] is None else f"{k['n_tarjetas']:,}"),
-    ("Duración p50 (min)", "—" if k['p50_dur_s'] is None else mins(k['p50_dur_s'])),
-    ("Duración p90 (min)", "—" if k['p90_dur_s'] is None else mins(k['p90_dur_s'])),
-    ("Duración máx (min)", "—" if k['max_dur_s'] is None else mins(k['max_dur_s'])),
-    ("Duraciones negativas", f"{k['neg_dur_cnt']:,}"),
-    (">4h (anómalos)", f"{k['gt4h_cnt']:,}"),
-    ("Paraderos (subida)", "—" if k['n_paraderos_ini'] is None else f"{k['n_paraderos_ini']:,}"),
-    ("Paraderos (bajada)", "—" if k['n_paraderos_fin'] is None else f"{k['n_paraderos_fin']:,}"),
-    ("Etapas promedio", "—" if k['mean_netapas'] is None else round(k['mean_netapas'],3)),
-]
-for a,b in summary_rows:
-    print(f"{a:>22}: {b}")
+# 5) Velocidad (si hay distancia y duración)
+if has_dist_cols and "dur_s" in lfk.collect_schema().names():
+    lfk = lfk.with_columns(
+        (pl.col("dist_km_guess_m") / pl.when(pl.col("dur_s") > 0).then(pl.col("dur_s")).otherwise(None) * 3600).alias("kmh_guess_m")
+    )
 
+# 6) Patrones de modo (arma una firma combinando id_tipotransporte_1..4 ignorando nulos/””)
+mode_cols = [c for c in ["id_tipotransporte_1","id_tipotransporte_2","id_tipotransporte_3","id_tipotransporte_4"] if c in lfk.collect_schema().names()]
+if mode_cols:
+    lfk = lfk.with_columns([
+        pl.concat_str([pl.col(c).cast(pl.Utf8, strict=False).fill_null("").str.strip_chars() for c in mode_cols],
+                      separator="|").alias("_mraw")
+    ]).with_columns([
+        pl.col("_mraw").str.split("|")
+                       .list.eval(pl.element().filter(pl.element() != ""))
+                       .list.join("-").alias("modo_patron")
+    ]).drop("_mraw")
+
+print("Columnas derivadas presentes:", [c for c in ["dur_s","travel_date","wday","hour","dist_km_guess_m","eucl_km_guess_m","circuity_raw","modo_patron"] if c in lfk.collect_schema().names()])
 ```
 
-## Distribución de duración (histograma)
+## KPIs principales
+
 ```{python}
+kpi_exprs = [
+    pl.len().alias("n_viajes"),
+    pl.col("dur_s").median().alias("p50_dur_s"),
+    pl.col("dur_s").quantile(0.9).alias("p90_dur_s"),
+    pl.col("dur_s").max().alias("max_dur_s"),
+    (pl.col("dur_s") < 0).sum().alias("neg_dur_cnt"),
+    (pl.col("dur_s") > 4*3600).sum().alias("gt4h_cnt"),
+]
+
+if "id_tarjeta" in lfk.collect_schema().names():
+    kpi_exprs.append(pl.col("id_tarjeta").n_unique().alias("n_tarjetas"))
+if "n_etapas" in lfk.collect_schema().names():
+    kpi_exprs.append(pl.col("n_etapas").mean().alias("mean_etapas"))
+if {"dist_km_guess_m","circuity_raw"} <= set(lfk.collect_schema().names()):
+    kpi_exprs.extend([
+        pl.col("dist_km_guess_m").median().alias("p50_dist_km_guess_m"),
+        pl.col("circuity_raw").median().alias("p50_circuity"),
+    ])
+
+kpi = lfk.select(kpi_exprs).collect(engine="in-memory").to_dicts()[0]
+
+mins = lambda s: None if s is None else round(float(s)/60,1)
+def fmt(v, none="—"):
+    return none if v is None else (f"{v:,}" if isinstance(v, (int,np.integer)) else v)
+
+rows = [
+    ("Viajes (semana)", fmt(kpi.get("n_viajes"))),
+    ("Tarjetas únicas", fmt(kpi.get("n_tarjetas"))),
+    ("Duración p50 (min)", "—" if kpi.get("p50_dur_s") is None else mins(kpi.get("p50_dur_s"))),
+    ("Duración p90 (min)", "—" if kpi.get("p90_dur_s") is None else mins(kpi.get("p90_dur_s"))),
+    ("Duraciones negativas", fmt(kpi.get("neg_dur_cnt", 0))),
+    (">4h (anómalos)", fmt(kpi.get("gt4h_cnt", 0))),
+    ("Etapas promedio", "—" if kpi.get("mean_etapas") is None else round(float(kpi["mean_etapas"]),2)),
+    ("Distancia p50 (km, asumiendo m)", "—" if kpi.get("p50_dist_km_guess_m") is None else round(float(kpi["p50_dist_km_guess_m"]),2)),
+    ("Circuito p50 (ruta/eucl.)", "—" if kpi.get("p50_circuity") is None else round(float(kpi["p50_circuity"]),2)),
+]
+for a,b in rows:
+    print(f"{a:>30}: {b}")
+```
+
+## Top paraderos y OD simple
+
+```{python}
+start_col = "paradero_inicio_viaje" if "paradero_inicio_viaje" in schema_names else None
+end_col   = "paradero_fin_viaje"     if "paradero_fin_viaje"     in schema_names else None
+
+if start_col and end_col:
+    top_start = (lfk.group_by(start_col).agg(pl.len().alias("n"))
+                   .sort("n", descending=True).limit(20)
+                   .collect(engine="in-memory"))
+    top_end   = (lfk.group_by(end_col).agg(pl.len().alias("n"))
+                   .sort("n", descending=True).limit(20)
+                   .collect(engine="in-memory"))
+    print("Top 20 paraderos SUBIDA:\n", top_start)
+    print("\nTop 20 paraderos BAJADA:\n", top_end)
+
+    top_od = (lfk.group_by([start_col,end_col])
+                .agg([pl.len().alias("n"),
+                      pl.col("dur_s").median().alias("p50_dur_s")])
+                .sort("n", descending=True).limit(20)
+                .collect(engine="in-memory"))
+    print("\nTop 20 pares OD:\n", top_od)
+else:
+    print("No hay columnas de paradero_inicio/paradero_fin.")
+
 
 ```
+
+## Eficiencia y Rendimiento de la Red
+
+### Velocidad Promedio por Hora
+
+Este análisis nos ayuda a cuantificar el impacto de la congestión. Se espera que la velocidad promedio de los viajes disminuya significativamente durante las horas punta de la mañana y la tarde.
+
+```{python}
+#| fig-width: 10
+#| fig-height: 5
+
+if "kmh" in lfk.collect_schema().names() and "hour" in lfk.collect_schema().names():
+    # Calcula la velocidad promedio por hora, excluyendo valores extremos o inválidos
+    speed_by_hour = (
+        lfk.filter(pl.col("kmh").is_between(1, 100)) # Filtro de velocidades razonables
+           .group_by("hour")
+           .agg(pl.col("kmh").median().alias("p50_kmh"))
+           .sort("hour")
+           .collect(engine="in-memory")
+    )
+
+    # Gráfico
+    plt.figure(figsize=(10, 5))
+    plt.plot(speed_by_hour["hour"], speed_by_hour["p50_kmh"], marker='o', linestyle='-')
+    plt.title(f"Velocidad Mediana de Viajes por Hora del Día (Semana {year}-W{week})")
+    plt.xlabel("Hora del Día")
+    plt.ylabel("Velocidad Mediana (km/h)")
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.xticks(range(0, 24))
+    plt.xlim(0, 23)
+    plt.show()
+    
+    print("Velocidad Mediana por Hora:")
+    print(speed_by_hour)
+else:
+    print("No se encontraron las columnas 'kmh' o 'hour' para el análisis de velocidad.")
+
+```
+
+## Etapas y patrones de modo
+
+```{python}
+if "n_etapas" in lfk.collect_schema().names():
+    dist_etapas = (lfk.group_by("n_etapas").agg(pl.len().alias("n"))
+                      .sort("n_etapas")
+                      .collect(engine="in-memory"))
+    plt.figure(figsize=(6,4))
+    plt.bar(dist_etapas["n_etapas"].to_numpy(), dist_etapas["n"].to_numpy())
+    plt.xlabel("Número de etapas"); plt.ylabel("Viajes")
+    plt.title(f"Distribución de etapas — {SEM_LABEL}"); plt.grid(True, linewidth=0.3); plt.show()
+    print(dist_etapas)
+
+if "modo_patron" in lfk.collect_schema().names():
+    modo_top = (lfk.group_by("modo_patron").agg(pl.len().alias("n"))
+                   .sort("n", descending=True).limit(15)
+                   .collect(engine="in-memory"))
+    print("Top patrones de modo:\n", modo_top)
+```
+
+## Perfil horario por #etapas
+
+```{python}
+if time_start and "n_etapas" in lfk.collect_schema().names():
+    grid = (lfk.group_by(["wday","hour","n_etapas"]).agg(pl.len().alias("n"))
+               .collect(engine="in-memory"))
+    plt.figure(figsize=(8,4))
+    for e in sorted(grid["n_etapas"].unique().to_list()):
+        sub=(grid.filter(pl.col("n_etapas")==e)
+               .group_by(["wday","hour"]).agg(pl.col("n").sum().alias("n"))
+               .sort(["wday","hour"]))
+        plt.plot(sub["hour"].to_numpy(), sub["n"].to_numpy(), label=f"{e} etapas")
+    plt.xlabel("Hora"); plt.ylabel("Viajes"); plt.title(f"Perfil horario — {SEM_LABEL}")
+    plt.legend(); plt.grid(True, linewidth=0.3); plt.show()
+```
+
+## Tarjetas: actividad y concentración
+
+```{python}
+if "id_tarjeta" in lfk.collect_schema().names():
+    by_card = (lfk.group_by("id_tarjeta").agg(pl.len().alias("n"))
+                  .collect(engine="in-memory"))
+    p50 = np.percentile(by_card["n"].to_numpy(), 50)
+    p90 = np.percentile(by_card["n"].to_numpy(), 90)
+    print(f"Tarjetas — viajes/semana p50={p50:.0f}, p90={p90:.0f}")
+
+    plt.figure(figsize=(6,4))
+    plt.hist(by_card["n"].to_numpy(), bins=50)
+    plt.xlabel("Viajes por tarjeta (semana)"); plt.ylabel("Tarjetas")
+    plt.title(f"Distribución de viajes por tarjeta — {SEM_LABEL}")
+    plt.grid(True, linewidth=0.3); plt.show()
+```
+
+## Chequeos de calidad rápidos
+
+```{python}
+checks = []
+
+neg_cnt = lfk.filter(pl.col("dur_s") < 0).select(pl.len()).collect().item()
+gt4h    = lfk.filter(pl.col("dur_s") > 4*3600).select(pl.len()).collect().item()
+checks += [("duración_negativa", neg_cnt), (">4h", gt4h)]
+
+if start_col and end_col:
+    miss_ini = lfk.filter(pl.col(start_col).is_null() | (pl.col(start_col)=="")).select(pl.len()).collect().item()
+    miss_fin = lfk.filter(pl.col(end_col).is_null()   | (pl.col(end_col)=="")).select(pl.len()).collect().item()
+    checks += [("sin_paradero_inicio", miss_ini), ("sin_paradero_fin", miss_fin)]
+
+if {"dist_km_guess_m","dur_s"} <= set(lfk.collect_schema().names()):
+    spd = (lfk
+           .filter((pl.col("dur_s")>0) & (pl.col("dist_km_guess_m")>0))
+           .with_columns((pl.col("dist_km_guess_m")/(pl.col("dur_s")/3600)).alias("kmh_guess_m"))
+           .select([
+               (pl.col("kmh_guess_m")>120).sum().alias("v>120_kmh"),
+               (pl.col("kmh_guess_m")>200).sum().alias("v>200_kmh")
+           ])
+           .collect(engine="in-memory")
+           .to_dicts()[0])
+    checks += list(spd.items())
+
+print("Chequeos de calidad (conteos):")
+for k,v in checks:
+    print(f" - {k:>22}: {v:,}")
+
+```
+
+## Comportamiento del Usuario
+
+### Actividad por tarjeta (días activos y viajes/semana)
+
+```{python}
+if "id_tarjeta" in lfk.collect_schema().names():
+    by_card = (
+        lfk.group_by("id_tarjeta")
+           .agg([
+               pl.len().alias("trips"),
+               pl.col("travel_date").n_unique().alias("days_active"),
+               pl.when("n_etapas" in lfk.collect_schema().names())
+                 .then(pl.col("n_etapas").mean())
+                 .otherwise(pl.lit(None)).alias("mean_etapas")
+           ])
+           .collect(engine="in-memory")
+    )
+
+    # Distribución de días activos
+    activity_dist = (
+        by_card.group_by("days_active")
+               .agg(pl.len().alias("n_cards"))
+               .sort("days_active")
+    )
+    print("Días activos por tarjeta (conteo):\n", activity_dist)
+
+    # Percentiles y distribución de viajes por tarjeta
+    trips_np = by_card["trips"].to_numpy()
+    p50, p90, p99 = np.percentile(trips_np, [50,90,99])
+    print(f"Viajes por tarjeta — p50={p50:.0f}, p90={p90:.0f}, p99={p99:.0f}")
+
+    # Histograma viajes por tarjeta
+    plt.figure(figsize=(7,4))
+    plt.hist(trips_np, bins=50, range=(0, np.percentile(trips_np, 99)), edgecolor="none")
+    plt.xlabel("Viajes por tarjeta (semana)"); plt.ylabel("Tarjetas")
+    plt.title("Distribución de viajes por tarjeta (recortado al p99)")
+    plt.grid(True, linewidth=0.3)
+    plt.show()
+else:
+    print("No existe 'id_tarjeta' en el esquema para análisis de comportamiento.")
+```
+
+### Etapas promedio por tarjeta
+
+```{python}
+if {"id_tarjeta","n_etapas"} <= set(lfk.collect_schema().names()):
+    mean_etapas = (
+        lfk.group_by("id_tarjeta")
+           .agg(pl.col("n_etapas").mean().alias("mean_etapas"))
+           .collect(engine="in-memory")
+    )
+    plt.figure(figsize=(7,4))
+    plt.hist(mean_etapas["mean_etapas"].to_numpy(), bins=20, edgecolor="none")
+    plt.xlabel("Etapas promedio por tarjeta"); plt.ylabel("Tarjetas")
+    plt.title("Distribución de etapas promedio por tarjeta")
+    plt.grid(True, linewidth=0.3)
+    plt.show()
+    print(mean_etapas.describe())
+else:
+    print("No hay columnas 'id_tarjeta' y 'n_etapas' para calcular etapas promedio.")
+```
+
+### Diversidad de paraderos por tarjeta
+
+```{python}
+needed = {"id_tarjeta","paradero_inicio_viaje","paradero_fin_viaje"}
+if needed <= set(lfk.collect_schema().names()):
+    diversity = (
+        lfk.group_by("id_tarjeta")
+           .agg([
+               pl.col("paradero_inicio_viaje").n_unique().alias("n_paraderos_ini"),
+               pl.col("paradero_fin_viaje").n_unique().alias("n_paraderos_fin"),
+           ])
+           .collect(engine="in-memory")
+    )
+    print("Diversidad de paraderos por tarjeta (sample):\n", diversity.head(10))
+    plt.figure(figsize=(7,4))
+    plt.hist(diversity["n_paraderos_ini"].to_numpy(), bins=30, alpha=0.6, label="subida", edgecolor="none")
+    plt.hist(diversity["n_paraderos_fin"].to_numpy(), bins=30, alpha=0.6, label="bajada", edgecolor="none")
+    plt.xlabel("Paraderos distintos en la semana"); plt.ylabel("Tarjetas")
+    plt.title("Diversidad de paraderos por tarjeta (subida vs bajada)")
+    plt.legend(); plt.grid(True, linewidth=0.3); plt.show()
+else:
+    print("Faltan columnas de paradero para medir diversidad por tarjeta.")
+```
+
+### Perfiles horarios por segmentos de uso
+
+```{python}
+if "id_tarjeta" in lfk.collect_schema().names() and "hour" in lfk.collect_schema().names():
+    by_card = (
+        lfk.group_by("id_tarjeta")
+           .agg(pl.len().alias("trips"))
+           .collect(engine="in-memory")
+    )
+    # Segmentos por intensidad de uso
+    def seg(n):
+        n = int(n)
+        if n <= 5: return "1-5"
+        if n <= 15: return "6-15"
+        if n <= 30: return "16-30"
+        return "31+"
+    by_card = by_card.with_columns(pl.col("trips").map_elements(seg).alias("seg_trips"))
+
+    # Join con viajes para perfiles horarios
+    lfk_seg = lfk.join(by_card.lazy(), on="id_tarjeta", how="inner")
+    grid = (
+        lfk_seg.group_by(["hour","seg_trips"]).agg(pl.len().alias("n"))
+               .collect(engine="in-memory")
+    )
+
+    plt.figure(figsize=(9,5))
+    for s in ["1-5","6-15","16-30","31+"]:
+        sub = grid.filter(pl.col("seg_trips") == s).sort("hour")
+        if sub.height:
+            plt.plot(sub["hour"].to_numpy(), sub["n"].to_numpy(), label=s)
+    plt.xlabel("Hora del día"); plt.ylabel("Viajes")
+    plt.title("Perfiles horarios por intensidad de uso (viajes/semana por tarjeta)")
+    plt.xticks(range(0,24)); plt.grid(True, linewidth=0.3); plt.legend(); plt.show()
+else:
+    print("Faltan 'id_tarjeta' u 'hour' para perfiles por segmento de uso.")
+
+```
+
+## Análisis de transbordos (1 etapa vs 2+)
+
+```{python}
+if "n_etapas" in lfk.collect_schema().names():
+    has_dist = "dist_km_guess_m" in lfk.collect_schema().names()
+    base = lfk.filter(pl.col("dur_s").is_not_null())
+    base = base.with_columns(
+        pl.when(pl.col("n_etapas") <= 1).then(pl.lit("Directo (1)")).otherwise(pl.lit("Transbordo (2+)"))
+          .alias("tipo_viaje")
+    )
+
+    aggs = [
+        pl.len().alias("n_viajes"),
+        (pl.col("dur_s")/60).mean().alias("mean_dur_min"),
+        (pl.col("dur_s")/60).median().alias("p50_dur_min"),
+    ]
+    if has_dist:
+        aggs += [
+            pl.col("dist_km_guess_m").mean().alias("mean_dist_km"),
+            pl.col("dist_km_guess_m").median().alias("p50_dist_km"),
+        ]
+
+    transbordo_tbl = (base.group_by("tipo_viaje").agg(aggs)
+                           .sort("tipo_viaje")
+                           .collect(engine="in-memory"))
+    print("Comparativa directos vs. transbordos:\n", transbordo_tbl)
+
+    # Penalización estimada
+    try:
+        m = {r["tipo_viaje"]: r for r in transbordo_tbl.to_dicts()}
+        pen_min = float(m["Transbordo (2+)"]["mean_dur_min"]) - float(m["Directo (1)"]["mean_dur_min"])
+        pen_pct = 100.0 * pen_min / float(m["Directo (1)"]["mean_dur_min"]) if m["Directo (1)"]["mean_dur_min"] else None
+        txt = f"Penalización en duración ≈ +{pen_min:.1f} min" + (f" ({pen_pct:.0f}%)" if pen_pct is not None else "")
+        if has_dist:
+            pen_km = float(m["Transbordo (2+)"]["mean_dist_km"]) - float(m["Directo (1)"]["mean_dist_km"])
+            txt += f" | Distancia ≈ +{pen_km:.2f} km"
+        print(txt)
+    except Exception:
+        pass
+
+    # Gráfico de barras (duración media)
+    try:
+        plot_df = transbordo_tbl.select(["tipo_viaje","mean_dur_min"]).to_pandas()
+        plt.figure(figsize=(5,4))
+        plt.bar(plot_df["tipo_viaje"], plot_df["mean_dur_min"])            
+        plt.ylabel("Duración media (min)"); plt.title("Directo vs. Transbordo — duración media")
+        plt.grid(True, axis="y", linewidth=0.3); plt.show()
+    except Exception:
+        pass
+else:
+    print("No existe 'n_etapas' para diferenciar directos/transbordos.")
+```
+
+## Análisis geoespacial — Zonas 777 y paraderos
+
+```{python}
+# Esta sección usa DIC_777.csv y el shapefile de Zonas 777 desde RAW en GCS.
+# Requiere geopandas/pyogrio opcionalmente para visualizar.
+
+import tempfile
+from pathlib import Path
+
+try:
+    import geopandas as gpd
+    import shapely  # noqa: F401
+    HAS_GEO = True
+except Exception:
+    HAS_GEO = False
+    print("Geopandas no disponible. Se limitará a cargas tabulares.")
+
+# Helpers mínimos
+def _detect_sep_gcs(path_no_scheme: str, default=";"):
+    with gfs.open(path_no_scheme, "rb") as fh:
+        head = fh.readline().decode("utf-8", errors="ignore")
+    return ";" if head.count(";") >= head.count(",") else ","
+
+# 1) Cargar diccionario DIC_777.csv
+try:
+    dic_path = f"{GCS_BUCKET}/raw/DIC_777.csv"
+    sep_dic = _detect_sep_gcs(dic_path)
+    with gfs.open(dic_path, "rb") as fh:
+        df_dic = pl.read_csv(
+            fh,
+            separator=sep_dic,
+            infer_schema_length=20000,
+            null_values=["", "-", "NA", "N/A", "null", "NULL"],
+            schema_overrides={"diseno_777": pl.Utf8},
+            ignore_errors=True,
+        )
+    # Renombres comunes si existen
+    ren = {"parada/est.metro": "parada", "Subidas día laboral por parada": "subidas_dia_lab",
+           "Bajadas día Laboral por parada": "bajadas_dia_lab"}
+    present = {k:v for k,v in ren.items() if k in df_dic.columns}
+    if present:
+        df_dic = df_dic.rename(present)
+    print("DIC_777 columnas:", df_dic.columns[:8], "…")
+except Exception as e:
+    df_dic = None
+    print("No se pudo cargar DIC_777:", e)
+
+# 2) Cargar shapefile Zonas777 (opcional para mapa)
+gdf_zonas = None
+if HAS_GEO:
+    try:
+        folder = f"{GCS_BUCKET}/raw/Zonas777-2014/Shape"
+        paths = gfs.ls(folder)
+        shp_remote = next(p for p in paths if p.lower().endswith(".shp"))
+        base = Path(shp_remote).stem.lower()
+        need = [".shp", ".shx", ".dbf", ".prj"]
+        tmp = Path(tempfile.mkdtemp(prefix="zonas777_"))
+        for p in paths:
+            if Path(p).suffix.lower() in need and Path(p).stem.lower() == base:
+                with gfs.open(p, "rb") as r, open(tmp / f"zonas777{Path(p).suffix.lower()}", "wb") as w:
+                    w.write(r.read())
+        local_shp = str(tmp / "zonas777.shp")
+        try:
+            import pyogrio
+            gdf_zonas = pyogrio.read_dataframe(local_shp)
+        except Exception:
+            gdf_zonas = gpd.read_file(local_shp)
+        if getattr(gdf_zonas, "crs", None) is None:
+            gdf_zonas = gdf_zonas.set_crs(4326, allow_override=True)
+        print("Zonas777:", gdf_zonas.shape)
+    except Exception as e:
+        print("No se pudo cargar shapefile Zonas777:", e)
+
+# 3) Construir puntos de paraderos (si hay x,y en DIC)
+gdf_par = None
+if HAS_GEO and df_dic is not None and {"x","y"} <= set(df_dic.columns):
+    df_cast = df_dic.with_columns([
+        pl.col("x").cast(pl.Float64, strict=False),
+        pl.col("y").cast(pl.Float64, strict=False),
+    ])
+    df_pd = df_cast.to_pandas()
+    gdf_par_utm = gpd.GeoDataFrame(df_pd, geometry=gpd.points_from_xy(df_pd["x"], df_pd["y"]), crs=32719)
+    gdf_par = gdf_par_utm.to_crs(4326)
+    if "parada" not in gdf_par.columns:
+        # intenta alguna columna equivalente
+        if "paradero" in gdf_par.columns:
+            gdf_par = gdf_par.rename(columns={"paradero":"parada"})
+    print("Paraderos (geom):", gdf_par.shape)
+
+# 4) Top paraderos de subida y mapa
+if HAS_GEO and gdf_par is not None and "paradero_inicio_viaje" in lfk.collect_schema().names():
+    top_sub = (lfk.filter(pl.col("paradero_inicio_viaje").is_not_null())
+                 .group_by("paradero_inicio_viaje").agg(pl.len().alias("n"))
+                 .sort("n", descending=True).limit(500)
+                 .collect(engine="in-memory").to_pandas())
+    # Join con puntos
+    gdf_top = gdf_par.merge(top_sub, left_on="parada", right_on="paradero_inicio_viaje", how="inner")
+    s = (gdf_top["n"] / gdf_top["n"].max()) * 100
+    fig, ax = plt.subplots(1,1, figsize=(7,7))
+    if gdf_zonas is not None:
+        gdf_zonas.boundary.plot(ax=ax, linewidth=0.3, color="gray")
+    gdf_top.plot(ax=ax, markersize=s, alpha=0.6, color="tab:red")
+    ax.set_title("Top paraderos de subida (tamaño ∝ viajes)")
+    ax.set_axis_off()
+    plt.show()
+else:
+    print("No se generó mapa (falta geopandas, DIC_777 con x/y o 'paradero_inicio_viaje').")
+
+```
+
