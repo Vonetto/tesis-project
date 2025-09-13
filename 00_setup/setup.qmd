@@ -340,6 +340,12 @@ def _ingest_viajes_files(file_paths: list[str]):
 
         dfw = pl.concat(dfs_aligned, how="vertical_relaxed").rechunk()
         dfw, sem_norm = _sanitize_before_write(dfw, sem)
+        # Derivar is_qr si hay columna de contrato en el DF
+        if "id_contrato" in dfw.columns or "contrato" in dfw.columns:
+            colc = "id_contrato" if "id_contrato" in dfw.columns else "contrato"
+            dfw = dfw.with_columns(
+                pl.col(colc).cast(pl.Utf8, strict=False).str.strip_chars().is_in(["171","102"]).alias("is_qr")
+            )
         target_dir = f"{out_base}/semana_iso={sem_norm}"
         if _partition_exists(out_base, sem_norm):
             print(f"⏭️  VIAJES {sem_norm} ya existe → omito")
@@ -435,6 +441,12 @@ def _ingest_etapas_files(file_paths: list[str]):
 
         dfw = pl.concat(dfs_aligned, how="vertical_relaxed").rechunk()
         dfw, sem_norm = _sanitize_before_write(dfw, sem)
+        # Derivar is_qr si etapas aportan contrato (poco común); protegido
+        if "id_contrato" in dfw.columns or "contrato" in dfw.columns:
+            colc = "id_contrato" if "id_contrato" in dfw.columns else "contrato"
+            dfw = dfw.with_columns(
+                pl.col(colc).cast(pl.Utf8, strict=False).str.strip_chars().is_in(["171","102"]).alias("is_qr")
+            )
         target_dir = f"{out_base}/semana_iso={sem_norm}"
         if _partition_exists(out_base, sem_norm):
             print(f"⏭️  ETAPAS {sem_norm} ya existe → omito")

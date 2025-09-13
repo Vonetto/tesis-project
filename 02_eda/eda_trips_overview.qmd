@@ -670,3 +670,28 @@ else:
 
 ```
 
+
+## Validación QR (contrato 171/102) vs CSV legacy
+
+```{python}
+# A partir de ahora usamos is_qr desde parquet (o lo derivamos localmente si falta)
+if "is_qr" not in lfk.collect_schema().names():
+    colc = "id_contrato" if "id_contrato" in lfk.collect_schema().names() else ("contrato" if "contrato" in lfk.collect_schema().names() else None)
+    if colc:
+        lfk = lfk.with_columns(pl.col(colc).cast(pl.Utf8).str.strip_chars().is_in(["171","102"]).alias("is_qr"))
+    else:
+        lfk = lfk.with_columns(pl.lit(None).alias("is_qr"))
+
+print("QR flag disponible:", "is_qr" in lfk.collect_schema().names())
+
+# Resumen QR vs no-QR
+if "is_qr" in lfk.collect_schema().names():
+    qr_sum = (lfk.group_by("is_qr").agg([
+        pl.len().alias("n"),
+        pl.col("dur_s").median().alias("p50_dur_s"),
+        pl.when("dist_km_guess_m" in lfk.collect_schema().names()).then(pl.col("dist_km_guess_m").median()).otherwise(pl.lit(None)).alias("p50_km"),
+        pl.when("n_etapas" in lfk.collect_schema().names()).then(pl.col("n_etapas").mean()).otherwise(pl.lit(None)).alias("mean_etapas"),
+    ]).collect(engine="in-memory"))
+    print("Resumen QR vs no-QR:\n", qr_sum)
+
+```
