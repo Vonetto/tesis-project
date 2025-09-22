@@ -4,5 +4,8 @@
   },
   "02_eda/eda_trips_overview.qmd": {
     "eda_trips_{{params.year}}_{{params.iso_week}}.html": "feea0186"
+  },
+  "01_eda/join_validation.qmd": {
+    "join_validation.html": "e8812ed1"
   }
 }

@@ -537,16 +537,16 @@ lf_e = scan_bronze("etapas")
 #lf_e = scan_bronze("etapas")
 print("viajes total:", lf_v.select(pl.len()).collect().item())
 print("etapas total:",  lf_e.select(pl.len()).collect().item())
-
-# 3) Conteo por semana
-cnt_v = (lf_v.group_by("semana_iso").agg(pl.len().alias("n")).sort("semana_iso")).collect()
-cnt_e = (lf_e.group_by("semana_iso").agg(pl.len().alias("n")).sort("semana_iso")).collect()
-print(cnt_v.tail(5)); print(cnt_e.tail(5))
-
-# 4) Lectura de semana específica (acepta ambos layouts)
-lf_v_w17 = scan_bronze("viajes", "2025-W17")
-lf_e_w17 = scan_bronze("etapas", "2025-W17")
-print(lf_v_w17.select(pl.len()).collect().item(), lf_e_w17.select(pl.len()).collect().item())
+#
+## 3) Conteo por semana
+#cnt_v = (lf_v.group_by("semana_iso").agg(pl.len().alias("n")).sort#("semana_iso")).collect()
+#cnt_e = (lf_e.group_by("semana_iso").agg(pl.len().alias("n")).sort#("semana_iso")).collect()
+#print(cnt_v.tail(5)); print(cnt_e.tail(5))
+#
+## 4) Lectura de semana específica (acepta ambos layouts)
+#lf_v_w17 = scan_bronze("viajes", "2025-W17")
+#lf_e_w17 = scan_bronze("etapas", "2025-W17")
+#print(lf_v_w17.select(pl.len()).collect().item(), lf_e_w17.select(pl.len()).#collect().item())
 ```
 
 ## 8) Checker de llaves candidatas (viajes/etapas)
@@ -642,65 +642,65 @@ def _evaluate_key_list(lf: pl.LazyFrame, combos: list[list[str]], extras: dict[s
 ```
 
 
-```{python}
+```{python }
 # Trabajamos sobre la semana que ya tenemos (2025-W17). Si luego agregas más, puedes quitar el 2º argumento.
-lf_v = scan_bronze("viajes", "2025-W17")
+#lf_v = scan_bronze("viajes", "2025-W17")
 
 # Elegimos columna temporal preferente disponible
-v_time_pref = [c for c in ["tiempo_inicio_viaje","tiempo_subida_1","mediahora_inicio_viaje"] if c in _schema_cols(lf_v)]
-v_time_col = v_time_pref[0] if v_time_pref else None
+#v_time_pref = [c for c in ["tiempo_inicio_viaje","tiempo_subida_1","mediahora_inicio_viaje"] if c in _schema_cols(lf_v)]
+#v_time_col = v_time_pref[0] if v_time_pref else None
 
 # Columnas comunes de contexto (si existen, se usarán en combos “fuertes”)
-ctx_v = [c for c in ["paradero_inicio_viaje","paradero_fin_viaje","n_etapas","srv_1","modos"] if c in _schema_cols(lf_v)]
+#ctx_v = [c for c in ["paradero_inicio_viaje","paradero_fin_viaje","n_etapas","srv_1","modos"] if c in _schema_cols(lf_v)]
 
 # Extras calculados (timestamp a minuto)
-extras_v = {"_ts_min": _ts_min(pl.col(v_time_col))} if v_time_col else {}
+#extras_v = {"_ts_min": _ts_min(pl.col(v_time_col))} if v_time_col else {}
 
 # Combos base y “fuertes”
-combos_v = [
-    ["id_tarjeta","id_viaje"],
-    ["id_tarjeta","id_viaje","fecha"],
-]
-if v_time_col:
-    combos_v += [
-        ["id_tarjeta","id_viaje","_ts_min"],
-    ]
+#combos_v = [
+#    ["id_tarjeta","id_viaje"],
+#    ["id_tarjeta","id_viaje","fecha"],
+#]
+#if v_time_col:
+#    combos_v += [
+#        ["id_tarjeta","id_viaje","_ts_min"],
+#    ]
     # versión “fuerte” agregando contexto si lo tenemos
-    strong = ["id_tarjeta","id_viaje","_ts_min"] + [c for c in ctx_v]
-    combos_v += [strong]
+#    strong = ["id_tarjeta","id_viaje","_ts_min"] + [c for c in ctx_v]
+#    combos_v += [strong]
 
-print("⏱️ Evaluando llaves en VIAJES… (esto puede demorar)")
-summary_v = _evaluate_key_list(lf_v, combos_v, extras=extras_v)
-summary_v
+#print("⏱️ Evaluando llaves en VIAJES… (esto puede demorar)")
+#summary_v = _evaluate_key_list(lf_v, combos_v, extras=extras_v)
+#summary_v
 
 ```
 
 ```{python}
-lf_e = scan_bronze("etapas", "2025-W17")
+#lf_e = scan_bronze("etapas", "2025-W17")
 
 # Extras: timestamps normalizados a minuto (si existen)
-extras_e = {}
-if "tiempo_subida" in _schema_cols(lf_e):
-    extras_e["_ts_sub_min"] = _ts_min(pl.col("tiempo_subida"))
-if "tiempo_bajada" in _schema_cols(lf_e):
-    extras_e["_ts_baj_min"] = _ts_min(pl.col("tiempo_bajada"))
+#extras_e = {}
+#if "tiempo_subida" in _schema_cols(lf_e):
+#    extras_e["_ts_sub_min"] = _ts_min(pl.col("tiempo_subida"))
+#if "tiempo_bajada" in _schema_cols(lf_e):
+#    extras_e["_ts_baj_min"] = _ts_min(pl.col("tiempo_bajada"))
 
 # Columnas de contexto (si existen)
-ctx_e = [c for c in ["parada_subida","parada_bajada","servicio_subida","servicio_bajada","tipo_transporte"] if c in _schema_cols(lf_e)]
+#ctx_e = [c for c in ["parada_subida","parada_bajada","servicio_subida","servicio_bajada","tipo_transporte"] if c in _schema_cols(lf_e)]
 
 # Combos a evaluar
-combos_e = [
-    ["id_tarjeta","id_viaje","n_etapa"],
-    ["id_tarjeta","id_viaje","n_etapa","fecha"],
-]
-if "_ts_sub_min" in extras_e:
-    combos_e += [["id_tarjeta","id_viaje","n_etapa","_ts_sub_min"]]
-    strong_e = ["id_tarjeta","id_viaje","n_etapa","_ts_sub_min"] + [c for c in ctx_e]
-    combos_e += [strong_e]
+#combos_e = [
+#    ["id_tarjeta","id_viaje","n_etapa"],
+#      ["id_tarjeta","id_viaje","n_etapa","fecha"],
+#]
+#if "_ts_sub_min" in extras_e:
+#    combos_e += [["id_tarjeta","id_viaje","n_etapa","_ts_sub_min"]]
+#    strong_e = ["id_tarjeta","id_viaje","n_etapa","_ts_sub_min"] + [c for c in ctx_e]
+#    combos_e += [strong_e]
 
-print("⏱️ Evaluando llaves en ETAPAS… (esto puede demorar)")
-summary_e = _evaluate_key_list(lf_e, combos_e, extras=extras_e)
-summary_e
+#print("⏱️ Evaluando llaves en ETAPAS… (esto puede demorar)")
+#summary_e = _evaluate_key_list(lf_e, combos_e, extras=extras_e)
+#summary_e
 
 ```
 
@@ -867,4 +867,12 @@ if all(c in df_zonas_777.columns for c in ["x","y"]):
     print(gdf_par_4326.head(2))
 else:
     print("Columnas 'x' y 'y' no presentes; se omite creación de GeoDataFrame de puntos.")
+```
+
+```{python}
+print(lf_v.columns)
+print(lf_e.columns)
+print(df_zonas_777.columns)
+print(gdf_zonas777.columns)
+print(gdf_par_4326.columns)
 ```

@@ -670,8 +670,9 @@ else:
 
 ```
 
+## Análisis QR
 
-## Validación QR (contrato 171/102) vs CSV legacy
+### Validación QR (contrato 171/102) vs CSV legacy
 
 ```{python}
 # A partir de ahora usamos is_qr desde parquet (o lo derivamos localmente si falta)
@@ -692,6 +693,352 @@ if "is_qr" in lfk.collect_schema().names():
         pl.when("dist_km_guess_m" in lfk.collect_schema().names()).then(pl.col("dist_km_guess_m").median()).otherwise(pl.lit(None)).alias("p50_km"),
         pl.when("n_etapas" in lfk.collect_schema().names()).then(pl.col("n_etapas").mean()).otherwise(pl.lit(None)).alias("mean_etapas"),
     ]).collect(engine="in-memory"))
+    qr_sum = qr_sum.with_columns((pl.col("n") / pl.col("n").sum()).alias("pct_qr"))
     print("Resumen QR vs no-QR:\n", qr_sum)
 
 ```
+
+### Perfil del Usuario QR
+
+```{python}
+#| fig-width: 10
+#| fig-height: 8
+#| subfigs-layout: [
+#|   [ "A", "B" ],
+#|   [ "C", "C" ]
+#| ]
+
+import polars as pl
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- 1) Perfil por tarjeta ---
+# Calculamos viajes totales, viajes QR y % de adopción QR para cada tarjeta
+if {"id_tarjeta", "is_qr"} <= set(lfk.collect_schema().names()):
+    by_card = (
+        lfk.group_by("id_tarjeta")
+           .agg([
+               pl.len().alias("n_trips"),
+               (pl.col("is_qr") == True).sum().alias("n_qr_trips")
+           ])
+           .with_columns(
+               (pl.col("n_qr_trips") / pl.col("n_trips") * 100).alias("qr_share_pct")
+           )
+           .collect(engine="in-memory")
+    )
+    print("Perfil base por tarjeta (muestra):")
+    print(by_card.head())
+
+    # --- 2) Análisis de intensidad de uso (distribución de n_trips) ---
+    n_trips_np = by_card["n_trips"].to_numpy()
+    quantiles = np.percentile(n_trips_np, [25, 50, 75, 90, 95, 99])
+    print("\nDistribución de viajes por tarjeta (semana):")
+    print(f"p25={quantiles[0]:.0f}, p50={quantiles[1]:.0f}, p75={quantiles[2]:.0f}, p90={quantiles[3]:.0f}, p95={quantiles[4]:.0f}, p99={quantiles[5]:.0f}")
+
+    fig = plt.figure(figsize=(10, 8))
+    
+    # Subfig A: Histograma de n_trips
+    ax_a = fig.add_subplot(2, 2, 1)
+    ax_a.hist(n_trips_np, bins=100, range=(0, quantiles[5]), edgecolor="none")
+    ax_a.set_title("A: Distribución de Viajes por Tarjeta (hasta p99)")
+    ax_a.set_xlabel("Viajes por semana")
+    ax_a.set_ylabel("Nº de Tarjetas")
+    ax_a.grid(True, linewidth=0.3)
+
+    # --- 3) Nivel de adopción por tarjeta (% QR) ---
+    # Subfig B: Histograma de qr_share_pct
+    ax_b = fig.add_subplot(2, 2, 2)
+    ax_b.hist(by_card["qr_share_pct"].to_numpy(), bins=50, range=(0, 100), edgecolor="none")
+    ax_b.set_title("B: Nivel de Adopción QR por Tarjeta")
+    ax_b.set_xlabel("% de Viajes con QR")
+    ax_b.set_ylabel("Nº de Tarjetas")
+    ax_b.grid(True, linewidth=0.3)
+
+    # --- 4) Relación entre intensidad y adopción ---
+    # Creamos segmentos basados en la distribución observada
+    def assign_segment(n):
+        if n <= 5: return "1. Ocasional (1-5)"
+        if n <= 15: return "2. Regular (6-15)"
+        if n <= 30: return "3. Frecuente (16-30)"
+        return "4. Intensivo (31+)"
+
+    by_card_seg = by_card.with_columns(
+        pl.col("n_trips").map_elements(assign_segment, return_dtype=pl.String).alias("segmento_uso")
+    )
+    
+    # Subfig C: Gráfico de barras apiladas 100%
+    ax_c = fig.add_subplot(2, 1, 2)
+    
+    # Preparamos los datos para el gráfico de barras apiladas
+    plot_data = (
+        by_card_seg.with_columns(
+            pl.when(pl.col("qr_share_pct") > 0).then(pl.lit("Adoptante (>0% QR)"))
+              .otherwise(pl.lit("No Adoptante (0% QR)")).alias("tipo_adopcion")
+        )
+        .group_by(["segmento_uso", "tipo_adopcion"])
+        .agg(pl.len().alias("n_tarjetas"))
+        .pivot(values="n_tarjetas", index="segmento_uso", columns="tipo_adopcion")
+        .fill_null(0)
+    )
+
+    # Calculamos porcentajes
+    total = plot_data.select(pl.sum_horizontal(pl.all().exclude("segmento_uso"))).to_series()
+    plot_data_pct = plot_data.with_columns(
+        (pl.col(c) / total * 100).alias(f"{c}_pct")
+        for c in plot_data.columns if c != "segmento_uso"
+    ).sort("segmento_uso")
+
+    # Graficamos
+    bottom = np.zeros(plot_data_pct.height)
+    # Aseguramos el orden para que "No Adoptante" vaya primero
+    adopt_cols = sorted([c for c in plot_data_pct.columns if c.endswith("_pct")], reverse=True)
+    
+    for col in adopt_cols:
+        ax_c.bar(
+            plot_data_pct["segmento_uso"],
+            plot_data_pct[col],
+            bottom=bottom,
+            label=col.replace("_pct", "")
+        )
+        bottom += plot_data_pct[col].to_numpy()
+
+    ax_c.set_title("C: Proporción de Adoptantes de QR por Intensidad de Uso")
+    ax_c.set_xlabel("Segmento de Uso (viajes/semana)")
+    ax_c.set_ylabel("Porcentaje de Tarjetas (%)")
+    ax_c.legend(title="Tipo de Adopción")
+    ax_c.set_ylim(0, 100)
+    ax_c.grid(True, axis='y', linewidth=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Tabla resumen
+    summary_by_segment = (
+        by_card_seg.group_by("segmento_uso")
+                   .agg([
+                       pl.len().alias("n_tarjetas"),
+                       pl.col("qr_share_pct").mean().alias("mean_qr_share"),
+                       pl.col("qr_share_pct").median().alias("median_qr_share")
+                   ])
+                   .with_columns(
+                       (pl.col("n_tarjetas") / pl.col("n_tarjetas").sum()).alias("pct_tarjetas")
+                   )
+                   .sort("segmento_uso")
+                   .select(
+                       "segmento_uso",
+                       "n_tarjetas",
+                       "pct_tarjetas",
+                       "mean_qr_share",
+                       "median_qr_share",
+                   )
+    )
+    print("\nResumen de adopción por segmento:")
+    print(summary_by_segment)
+
+else:
+    print("Faltan 'id_tarjeta' o 'is_qr' para realizar el perfil de usuario.")
+
+```
+
+#### Análisis del Perfil de Usuario
+
+El análisis del perfil de usuario revela tres hallazgos principales:
+
+1.  **Distribución de Uso:** La actividad semanal por tarjeta está fuertemente concentrada en usuarios de baja frecuencia. La mediana es de solo **4 viajes por semana**, y el 95% de los usuarios realiza 13 viajes o menos. Esto justifica la segmentación en **Ocasionales (1-5)**, **Regulares (6-15)**, **Frecuentes (16-30)** e **Intensivos (31+)**, que captura eficazmente la estructura de la población.
+
+2.  **Adopción Bimodal:** El uso de QR es un comportamiento polarizado. Los usuarios tienden a usar **casi exclusivamente un método de pago** durante la semana: o 100% tarjeta física (0% QR) o 100% QR. El uso mixto es prácticamente inexistente, lo que sugiere que la adopción tecnológica es un "switch" de comportamiento más que un proceso gradual.
+
+3.  **Adopción por Segmento:** La inercia hacia la tarjeta física es la norma en todos los segmentos (mediana de adopción QR = 0%). Sin embargo, la proporción de usuarios que han adoptado el QR **crece con la intensidad de uso**. El segmento **"Intensivo" (31+)** es el que tiene la mayor proporción de adoptantes, indicando que los usuarios que más dependen del sistema son los que lideran la migración al pago digital.
+
+
+#### Análisis Adicional de Segmentación
+
+```{python}
+#| label: extra-clustering
+#| fig-width: 12
+#| fig-height: 5
+
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import seaborn as sns
+
+# Usamos el DF 'by_card' que ya tiene n_trips y qr_share_pct
+features = by_card.select(["n_trips", "qr_share_pct"]).to_pandas()
+
+# Escalar las características es crucial para K-Means
+scaler = StandardScaler()
+features_scaled = scaler.fit_transform(features)
+
+# --- Determinar K óptimo con el método del codo ---
+inertia = []
+K = range(1, 11)
+for k in K:
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+    kmeans.fit(features_scaled)
+    inertia.append(kmeans.inertia_)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# Gráfico del codo
+axes[0].plot(K, inertia, 'bx-')
+axes[0].set_xlabel('Número de Clusters (k)')
+axes[0].set_ylabel('Inercia')
+axes[0].set_title('Método del Codo para K Óptimo')
+axes[0].grid(True, linewidth=0.3)
+
+# --- Aplicar K-Means y visualizar ---
+# Basado en el codo, un k=3 parece razonable para separar no-adoptantes, adoptantes, y distinguir por intensidad.
+optimal_k = 3
+kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init='auto')
+by_card = by_card.with_columns(
+    pl.Series("cluster", kmeans.fit_predict(features_scaled))
+)
+
+# Gráfico de clusters
+sns.scatterplot(
+    data=by_card.to_pandas(),
+    x="n_trips",
+    y="qr_share_pct",
+    hue="cluster",
+    palette="viridis",
+    ax=axes[1],
+    alpha=0.6,
+    s=10 # Puntos más pequeños para visualizar mejor la densidad
+)
+axes[1].set_title(f'Clusters de Usuarios (k={optimal_k})')
+axes[1].set_xlabel('Nº de Viajes por Semana')
+axes[1].set_ylabel('% de Viajes con QR')
+axes[1].set_xlim(0, by_card["n_trips"].quantile(0.99)) # Limitar para mejor visualización
+axes[1].grid(True, linewidth=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# --- Analizar los clusters ---
+cluster_summary = (
+    by_card.group_by("cluster")
+           .agg([
+               pl.len().alias("n_tarjetas"),
+               pl.col("n_trips").mean().alias("mean_n_trips"),
+               pl.col("qr_share_pct").mean().alias("mean_qr_share_pct")
+           ])
+           .sort("cluster")
+)
+
+print("Resumen de los Clusters:")
+print(cluster_summary)
+```
+
+
+El K-Means ha validado nuestra segmentación manual, pero desde un ángulo diferente. Nos dice que la población se divide naturalmente en tres grandes grupos:
+1.  **Mayoría Ocasional No Adoptante (Cluster 2):** Viajan poco, usan tarjeta.
+2.  **Minoría Regular No Adoptante (Cluster 0):** Viajan mucho, usan tarjeta. Son el grupo clave para entender la inercia en usuarios frecuentes.
+3.  **Grupo de Adoptantes Totales (Cluster 1):** Han migrado 100% a QR, y su frecuencia de uso es variada, pero tiende a ser media-baja.
+
+
+
+```{python}
+#| label: extra-behavioral-segmentation
+
+# Definir horas punta
+AM_PEAK = {7, 8, 9}
+PM_PEAK = {17, 18, 19}
+
+# Calcular métricas de comportamiento por tarjeta
+if {"id_tarjeta", "wday", "hour"} <= set(lfk.collect_schema().names()):
+    # 1. Calcular viajes por día y hora para cada tarjeta
+    daily_patterns = (
+        lfk.group_by(["id_tarjeta", "travel_date"])
+           .agg([
+               (pl.col("hour").is_in(list(AM_PEAK))).any().alias("has_am_peak"),
+               (pl.col("hour").is_in(list(PM_PEAK))).any().alias("has_pm_peak"),
+               pl.col("wday").first().alias("wday") # Tomar el día de la semana
+           ])
+    )
+    
+    # 2. Agregar métricas a nivel de tarjeta
+    behavior_metrics = (
+        daily_patterns.group_by("id_tarjeta")
+            .agg([
+                pl.len().alias("days_active"),
+                # "Puntualidad Commuter": % de días activos con viaje AM y PM
+                (pl.col("has_am_peak") & pl.col("has_pm_peak")).mean().alias("commuter_consistency"),
+                # % de viajes en días de semana (L-V)
+                (pl.col("wday") <= 5).mean().alias("pct_weekday")
+            ])
+    )
+
+    # 3. Definir reglas de clasificación más robustas
+    def classify_behavior_v2(days_active, commuter_consistency, pct_weekday):
+        if days_active >= 3 and commuter_consistency >= 0.6:
+            return "Usuario de Alta Rutina"
+        elif pct_weekday <= 0.2:
+            return "Usuario de Fin de Semana"
+        else:
+            return "Esporádico / Otro"
+    
+    # Aplicar clasificación
+    behavioral_segments = behavior_metrics.with_columns(
+        pl.struct(["days_active", "commuter_consistency", "pct_weekday"])
+          .map_elements(
+              lambda x: classify_behavior_v2(x["days_active"], x["commuter_consistency"], x["pct_weekday"]),
+              return_dtype=pl.String
+          )
+          .alias("comportamiento")
+    ).collect()
+    
+    # Unir con datos de adopción
+    by_card_behavior = by_card.join(
+        behavioral_segments.select(["id_tarjeta", "comportamiento"]),
+        on="id_tarjeta",
+        how="inner"
+    )
+    
+    # Analizar resultados
+    segment_counts = by_card_behavior.group_by("comportamiento").agg(pl.len().alias("n_tarjetas"))
+    print("Conteo de usuarios por segmento de comportamiento:")
+    print(segment_counts)
+    
+    adoption_by_behavior = (
+        by_card_behavior.group_by("comportamiento")
+                        .agg([
+                            pl.col("qr_share_pct").mean().alias("mean_qr_share"),
+                            pl.col("qr_share_pct").median().alias("median_qr_share")
+                        ])
+    )
+    print("\nAdopción de QR por segmento de comportamiento:")
+    print(adoption_by_behavior)
+    
+    # Visualización
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+    sns.barplot(
+        data=adoption_by_behavior.to_pandas().sort_values("mean_qr_share", ascending=False),
+        x="comportamiento",
+        y="mean_qr_share",
+        ax=ax
+    )
+    ax.set_title("Adopción Media de QR por Patrón de Comportamiento (v2)")
+    ax.set_xlabel("Patrón de Comportamiento")
+    ax.set_ylabel("Adopción Media de QR (%)")
+    ax.grid(True, axis='y', linewidth=0.3)
+    plt.show()
+
+else:
+    print("Faltan columnas 'wday' o 'hour' para la segmentación por comportamiento.")
+
+```
+
+#### Análisis de la Segmentación por Comportamiento
+
+La segmentación basada en patrones de viaje (rutina y horario) revela una conexión clara entre el tipo de uso del sistema y la adopción de tecnología QR:
+
+1.  **Composición de Segmentos:** La mayoría de los usuarios (~2.8M) exhibe un patrón de viaje **"Esporádico / Otro"**. Sin embargo, la metodología logra aislar con éxito a dos grupos clave con comportamientos definidos: los **"Usuarios de Alta Rutina"** (~455k), que viajan frecuentemente siguiendo un patrón de horas punta, y los **"Usuarios de Fin de Semana"** (~290k), que concentran su actividad en Sábado y Domingo.
+
+2.  **Adopción y Rutina:** El hallazgo más significativo es la relación inversa entre la rutina y la adopción de QR.
+    *   Los **"Usuarios de Fin de Semana"** muestran la **mayor adopción media de QR (25.2%)**. Esto sugiere que los viajes menos estructurados, probablemente ligados al ocio o actividades no laborales, fomentan el uso de herramientas digitales más flexibles.
+    *   Por el contrario, los **"Usuarios de Alta Rutina"** presentan la **menor adopción media (20.0%)**. Este grupo, a pesar de su alta dependencia del sistema, muestra la mayor inercia, prefiriendo el método de pago tradicional (tarjeta física) para sus trayectos predecibles.
+
+**Conclusión para la Tesis:** Estos resultados proporcionan una evidencia cuantitativa robusta de que **la inercia en la elección de tecnología de pago está fuertemente correlacionada con la regularidad del patrón de viaje**. La rutina fomenta el hábito y la resistencia al cambio, mientras que los contextos de viaje más variados (fin de semana) se asocian con una mayor apertura a la adopción tecnológica.
+
+

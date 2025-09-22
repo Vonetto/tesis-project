@@ -11,7 +11,7 @@ El proyecto trabaja **100% contra Google Cloud Storage (GCS)**: los CSV viven en
 tesis-project/
 ├─ 00\_setup/
 │  └─ setup.qmd                # Ingesta a GCS (CSV→Parquet), validaciones
-├─ 02\_eda/
+├─ 01\_eda/
 │  └─ eda\_trips\_overview\.qmd   # EDA parametrizado por año/semana
 ├─ lib/
 │  └─ datalake.py              # Helpers (enable\_adc, scan\_parquet\_portable, etc.)
@@ -81,12 +81,12 @@ quarto render project/00_setup/setup.qmd
 3. Correr el **EDA** para una semana:
 
 ```bash
-quarto render project/02_eda/eda_trips_overview.qmd -P year:2025 -P iso_week:17
+quarto render project/01_eda/eda_trips_overview.qmd -P year:2025 -P iso_week:17
 # Salida HTML queda bajo _site/
 ```
 
 > También puedes setear env vars y “Run Cell”:
-> `EDA_YEAR=2025 EDA_WEEK=17 quarto preview project/02_eda/eda_trips_overview.qmd`
+> `EDA_YEAR=2025 EDA_WEEK=17 quarto preview project/01_eda/eda_trips_overview.qmd`
 
 ## Parámetros y variables de entorno
 
