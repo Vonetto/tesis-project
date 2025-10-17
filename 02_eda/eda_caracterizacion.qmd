@@ -1,0 +1,210 @@
+---
+title: "Análisis del Perfil Demográfico de Usuarios QR"
+freeze: auto
+params:
+  gcs_bucket: "tesis-vonetto-datalake"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+---
+
+En este notebook, analizamos el dataset de caracterización, que corresponde a los usuarios que han adoptado el pago con QR. El objetivo es construir un perfil demográfico detallado de estos usuarios para entender quiénes son los "early adopters" de esta tecnología en el sistema de transporte.
+
+## 1. Carga y Limpieza de Datos
+
+Cargamos, limpiamos y preparamos el dataset de usuarios QR. Los pasos clave son:
+- Cargar los datos desde el Data Lake en formato Parquet.
+- Calcular la edad de los usuarios a partir de su fecha de nacimiento.
+- Resolver duplicados en `id_tarjeta` para asegurar una clave primaria única por usuario.
+
+```{python}
+#| label: setup-and-load
+
+import os
+import polars as pl
+import gcsfs
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import date
+import tempfile
+from pathlib import Path
+
+# --- Parámetros y Filesystem ---
+GCS_BUCKET = os.getenv("GCS_BUCKET", "tesis-vonetto-datalake")
+RAW_PREFIX = "raw" # Necesario para cargar geodatos
+gfs = gcsfs.GCSFileSystem(token="google_default")
+print(f"Buscando datos en: gs://{GCS_BUCKET}/")
+
+# --- Carga de Geodatos (gdf_zonas) ---
+# Replicamos la lógica de carga de 01_eda/eda_trips_overview.qmd para que esté disponible
+gdf_zonas = None
+try:
+    import geopandas as gpd
+    folder = f"{GCS_BUCKET}/{RAW_PREFIX}/Zonas777-2014/Shape"
+    paths = gfs.ls(folder)
+    shp_remote = next(p for p in paths if p.lower().endswith(".shp"))
+    base = Path(shp_remote).stem.lower()
+    need = [".shp", ".shx", ".dbf", ".prj"]
+    tmp = Path(tempfile.mkdtemp(prefix="zonas777_"))
+    for p in paths:
+        if Path(p).suffix.lower() in need and Path(p).stem.lower() == base:
+            with gfs.open(p, "rb") as r, open(tmp / f"zonas777{Path(p).suffix.lower()}", "wb") as w:
+                w.write(r.read())
+    local_shp = str(tmp / "zonas777.shp")
+    try:
+        import pyogrio
+        gdf_zonas = pyogrio.read_dataframe(local_shp)
+    except Exception:
+        gdf_zonas = gpd.read_file(local_shp)
+    if getattr(gdf_zonas, "crs", None) is None:
+        gdf_zonas = gdf_zonas.set_crs(4326, allow_override=True)
+    print(f"GeoDataFrame 'gdf_zonas' cargado exitosamente ({len(gdf_zonas)} zonas).")
+except Exception as e:
+    print(f"No se pudo cargar el shapefile de Zonas777: {e}")
+    print("Los mapas geográficos no estarán disponibles.")
+
+
+# --- Carga de Datos ---
+path_caracterizacion_parquet = f"gs://{GCS_BUCKET}/lake/bronze/caracterizacion/snapshot_date=2025-09-05/part-0.parquet"
+try:
+    with gfs.open(path_caracterizacion_parquet, "rb") as f:
+        df_caracterizacion = pl.read_parquet(f)
+    print(f"Datos de caracterización cargados ({df_caracterizacion.height:,} filas).")
+except Exception as e:
+    print(f"Error al cargar datos: {e}")
+    df_caracterizacion = None
+
+# --- Limpieza y Preparación ---
+if df_caracterizacion is not None:
+    # 1. Calcular Edad y Limpiar
+    df_cleaned = df_caracterizacion.with_columns(
+        (pl.lit(date.today()) - pl.col("fecha_nacimiento")).dt.total_days().truediv(365.25).cast(pl.Int32).alias("edad")
+    ).drop("fecha_defuncion", "fecha_nacimiento") # Quitamos columnas ya no necesarias
+
+    # 2. Resolver Duplicados
+    df_qr_users = (
+        df_cleaned.group_by("id_tarjeta")
+                  .agg([
+                      pl.first(col).alias(col) for col in df_cleaned.columns if col != "id_tarjeta"
+                  ])
+    )
+    print(f"DataFrame limpio con {df_qr_users.height:,} usuarios QR únicos.")
+    
+    # 3. Limpiar y Mapear Sexo
+    sexo_map = {"F": "Femenino", "M": "Masculino"}
+    df_qr_users = df_qr_users.with_columns(
+        pl.col("sexo").replace(sexo_map, default="No Informado").alias("sexo")
+    )
+```
+
+## 2. Análisis Demográfico de Usuarios QR
+
+Ahora que tenemos un dataset limpio, exploramos las características demográficas de los usuarios que han adoptado el pago con QR.
+
+### a) Distribución por Edad
+
+```{python}
+#| label: eda-edad
+#| fig-width: 10
+#| fig-height: 6
+
+if 'df_qr_users' in globals():
+    # Crear segmentos de edad
+    df_qr_users = df_qr_users.with_columns(
+        pl.when(pl.col("edad") <= 17).then(pl.lit("Menor de 18"))
+          .when(pl.col("edad").is_between(18, 29)).then(pl.lit("18-29 (Joven)"))
+          .when(pl.col("edad").is_between(30, 44)).then(pl.lit("30-44 (Adulto Joven)"))
+          .when(pl.col("edad").is_between(45, 59)).then(pl.lit("45-59 (Adulto)"))
+          .when(pl.col("edad") >= 60).then(pl.lit("60+ (Adulto Mayor)"))
+          .otherwise(pl.lit("Sin Edad"))
+          .alias("segmento_edad")
+    )
+
+    # Calcular distribución (conteo y porcentaje)
+    age_segment_dist = (
+        df_qr_users['segmento_edad']
+        .value_counts()
+        .sort("segmento_edad")
+        .with_columns(
+            (pl.col("count") / pl.col("count").sum() * 100).round(1).alias("pct")
+        )
+    )
+    
+    print("--- Distribución de Usuarios QR por Segmento de Edad (con %) ---")
+    print(age_segment_dist)
+    
+    # Visualización en porcentaje
+    import matplotlib.ticker as mtick
+    pdf = age_segment_dist.to_pandas()
+    plt.figure(figsize=(10, 6))
+    ax = sns.barplot(
+        data=pdf,
+        x="segmento_edad",
+        y="pct",
+        palette="viridis"
+    )
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter())
+    
+    # Etiquetas con porcentaje encima de cada barra
+    for patch, value in zip(ax.patches, pdf["pct" ].tolist()):
+        ax.annotate(
+            f"{value:.1f}%",
+            (patch.get_x() + patch.get_width() / 2, patch.get_height()),
+            ha="center",
+            va="bottom",
+            xytext=(0, 3),
+            textcoords="offset points",
+            fontsize=10
+        )
+    
+    plt.title("Distribución de Usuarios QR por Segmento de Edad", fontsize=16)
+    plt.xlabel("Segmento de Edad", fontsize=12)
+    plt.ylabel("Porcentaje de Usuarios", fontsize=12)
+    plt.grid(axis='y', linestyle='--', linewidth=0.7)
+    plt.tight_layout()
+    plt.show()
+else:
+    print("DataFrame 'df_qr_users' no disponible.")
+```
+
+### b) Distribución por Sexo
+
+```{python}
+#| label: eda-sexo
+#| fig-width: 7
+#| fig-height: 5
+
+if 'df_qr_users' in globals():
+    sexo_dist = df_qr_users['sexo'].value_counts()
+    
+    print("--- Distribución de Usuarios QR por Sexo ---")
+    print(sexo_dist)
+    
+    # Visualización
+    plt.figure(figsize=(7, 5))
+    sexo_dist.to_pandas().set_index('sexo').plot(
+        kind='pie', y='count', autopct='%1.1f%%',
+        startangle=90, colors=['skyblue', 'lightcoral', 'lightgray'],
+        title='Distribución de Usuarios QR por Sexo',
+        ylabel=''
+    )
+    plt.show()
+else:
+    print("DataFrame 'df_qr_users' no disponible.")
+```
+
+## 3. Conclusiones del Perfil Demográfico
+
+El análisis del dataset de caracterización, que hemos confirmado corresponde a los usuarios de QR, revela un perfil demográfico claro y definido del "early adopter" de esta tecnología en el sistema de transporte público de Santiago.
+
+1.  **La Adopción es un Fenómeno Generacional:** El factor más determinante es la **edad**. La gran mayoría de los usuarios de QR se concentra en los segmentos más jóvenes de la población:
+    *   **Adultos Jóvenes (30-44 años)** y **Jóvenes (18-29 años)** constituyen el núcleo masivo de adoptantes, sumando más de 400,000 de los casi 500,000 usuarios caracterizados.
+    *   A partir de los 45 años, la representación de usuarios QR disminuye drásticamente, siendo mínima en el segmento de Adultos Mayores (60+).
+    *   **Implicancia:** Esto sugiere que la adhesión a los métodos de pago tradicionales está fuertemente correlacionada con la edad. Es importante acotar que la baja adopción en los segmentos "Menor de 18" y "18-29" puede estar influenciada por el uso de la Tarjeta Nacional Estudiantil (TNE), que ofrece una tarifa altamente subsidiada y representa un fuerte incentivo para no migrar al pago digital.
+
+2.  **Ligero Sesgo de Género:** Existe una **mayoría femenina (53.3%)** entre los adoptantes de QR. Aunque la diferencia no es abrumadora, indica una leve mayor propensión de las mujeres a utilizar esta tecnología de pago en el transporte público.
+
+
+En resumen, el perfil del adoptante de QR es predominantemente un **adulto joven (menor de 45 años), con una ligera mayoría femenina.**

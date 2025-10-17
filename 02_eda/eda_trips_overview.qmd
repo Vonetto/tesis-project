@@ -1,0 +1,2547 @@
+---
+title: "EDA — Viajes (bronze nuevo)"   
+freeze: auto
+params:
+  year: 2025
+  iso_week: 17
+  gcs_bucket: "tesis-vonetto-datalake"
+  bronze_prefix: "lake/bronze"
+  dataset: "viajes"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+---
+
+```{python} 
+# --- Parámetros robustos: funcionan con Quarto y con "Run Cell" --- 
+#| echo: false
+import os 
+
+try: 
+    params # si Quarto ya la inyectó, úsala 
+
+except NameError: 
+    params = { 
+        "year": int(os.getenv("EDA_YEAR", 2025)), 
+        "iso_week": int(os.getenv("EDA_WEEK", 17)), 
+        "gcs_bucket": os.getenv("GCS_BUCKET", "tesis-vonetto-datalake"),
+        "bronze_prefix": os.getenv("BRONZE_PREFIX", "lake/bronze"),
+        "dataset": os.getenv("DATASET", "viajes")
+    
+    } 
+year = int(params["year"]) 
+week = int(params["iso_week"]) 
+gcs_bucket = params["gcs_bucket"]
+bronze_prefix = params["bronze_prefix"]
+dataset = params["dataset"]
+```
+
+
+```{python}
+# =======================
+# Parámetros y dependencias
+# =======================
+import os, re
+import polars as pl
+import gcsfs
+import pyarrow.fs as pafs
+import pyarrow.dataset as ds
+import matplotlib.pyplot as plt
+import numpy as np
+
+year       = int(params["year"])
+iso_week   = int(params["iso_week"])
+GCS_BUCKET = params["gcs_bucket"]
+BRONZE     = params["bronze_prefix"]
+DATASET    = params["dataset"]
+
+TZ = "America/Santiago"
+SEM_LABEL = f"{year}-W{iso_week:02d}"
+
+print("Semana analizada:", SEM_LABEL)
+
+# FS para GCS (scan_parquet soporta gs:// via gcsfs)
+gfs = gcsfs.GCSFileSystem(token="google_default")
+
+def gsjoin(*parts):
+    return "gs://" + "/".join(s.strip("/").replace("gs://","") for s in parts)
+```
+
+## Carga: semana ISO específica
+
+```{python}
+def scan_bronze_week(dataset: str, semana_iso: str) -> pl.LazyFrame:
+    base = gsjoin(GCS_BUCKET, BRONZE, dataset)
+    # Layout correcto
+    path_norm  = f"{base}/semana_iso={semana_iso}/*.parquet"
+    # Layout histórico incorrecto (por si aparece en otros runs)
+    path_tuple = f"{base}/semana_iso=('"+semana_iso+"',)/*.parquet"
+    try:
+        return pl.scan_parquet(path_norm)
+    except Exception:
+        try:
+            return pl.scan_parquet(path_tuple)
+        except Exception as e:
+            # Ayuda rápida
+            try:
+                print("Particiones disponibles:", gfs.ls(f"{GCS_BUCKET}/{BRONZE}/{dataset}")[:20])
+            except Exception:
+                pass
+            raise e
+
+lf_v = scan_bronze_week(DATASET, SEM_LABEL)
+print("Schema base:", lf_v.collect_schema())
+print("Filas estimadas (lazy):", lf_v.select(pl.len()).collect().item())
+```
+
+## Derivados estándar para análisis {.visually-hidden}
+
+
+```{python}
+#| include: false
+
+# Helpers
+def _as_dt(expr: pl.Expr) -> pl.Expr:
+    # Por seguridad, si llegaran como string
+    return expr.cast(pl.Datetime, strict=False)
+
+def _num_from_str(expr: pl.Expr) -> pl.Expr:
+    """
+    Limpia numéricos que podrían venir como texto con separadores locales:
+    - quita '.' (miles) y cambia ',' por '.' (decimales).
+    - castea a float; los que no se pueden, quedan en null.
+    """
+    s = expr.cast(pl.Utf8, strict=False)
+    s = s.str.replace_all(r"\.", "").str.replace_all(",", ".")
+    return s.cast(pl.Float64, strict=False)
+
+schema_names = set(lf_v.collect_schema().names())
+
+# 1) Fuente temporal (inicio del viaje si existe; si no, subida_1)
+time_start = "tiempo_inicio_viaje" if "tiempo_inicio_viaje" in schema_names \
+         else ("tiempo_subida_1" if "tiempo_subida_1" in schema_names else None)
+time_end   = "tiempo_fin_viaje" if "tiempo_fin_viaje" in schema_names \
+         else ("tiempo_bajada_1" if "tiempo_bajada_1" in schema_names else None)
+
+# 2) Duración robusta (segundos):
+#    - si existe 'tviaje2', úsala
+#    - si no, usa (fin - inicio) si ambos existen
+#    - si solo hay subida_1 y bajada_1, úsala
+has_tviaje2 = "tviaje2" in schema_names
+
+lfk = lf_v
+
+if has_tviaje2:
+    lfk = lfk.with_columns(pl.col("tviaje2").cast(pl.Float64, strict=False).alias("dur_s"))
+else:
+    if time_start and time_end:
+        lfk = lfk.with_columns(
+            (_as_dt(pl.col(time_end)) - _as_dt(pl.col(time_start))).dt.total_seconds().alias("dur_s")
+        )
+    elif {"tiempo_subida_1","tiempo_bajada_1"} <= schema_names:
+        lfk = lfk.with_columns(
+            (_as_dt(pl.col("tiempo_bajada_1")) - _as_dt(pl.col("tiempo_subida_1"))).dt.total_seconds().alias("dur_s")
+        )
+    else:
+        lfk = lfk.with_columns(pl.lit(None).alias("dur_s"))
+
+# 3) Campos temporales derivados (solo si tenemos time_start)
+if time_start:
+    lfk = lfk.with_columns([
+        _as_dt(pl.col(time_start)).dt.replace_time_zone(TZ).alias("_ts"),
+        _as_dt(pl.col(time_start)).dt.date().alias("travel_date"),
+        _as_dt(pl.col(time_start)).dt.weekday().alias("wday"),  # 0=Lunes
+        _as_dt(pl.col(time_start)).dt.hour().alias("hour"),
+    ])
+
+# 4) Distancias y "circuity" si están disponibles
+has_dist_cols = {"distancia_ruta","distancia_eucl"} <= schema_names
+if has_dist_cols:
+    # Nota: unidades pueden ser metros; dejamos ambas interpretaciones visibles.
+    lfk = lfk.with_columns([
+        _num_from_str(pl.col("distancia_ruta")).alias("_dist_ruta_raw"),
+        _num_from_str(pl.col("distancia_eucl")).alias("_dist_eucl_raw"),
+    ]).with_columns([
+        (pl.col("_dist_ruta_raw")/1000.0).alias("dist_km_guess_m"),   # si la unidad original era metros
+        (pl.col("_dist_eucl_raw")/1000.0).alias("eucl_km_guess_m"),
+        (pl.col("_dist_ruta_raw") / pl.when(pl.col("_dist_eucl_raw")<=0).then(None).otherwise(pl.col("_dist_eucl_raw"))).alias("circuity_raw")
+    ])
+
+# 4) Etapas (la columna ya se llama 'n_etapas' en la fuente)
+# El código para renombrar 'netapa' fue eliminado ya que no es necesario y causaba errores.
+
+# 5) Velocidad (si hay distancia y duración)
+if has_dist_cols and "dur_s" in lfk.collect_schema().names():
+    lfk = lfk.with_columns(
+        (pl.col("dist_km_guess_m") / pl.when(pl.col("dur_s") > 0).then(pl.col("dur_s")).otherwise(None) * 3600).alias("kmh_guess_m")
+    )
+
+# 6) Patrones de modo (arma una firma combinando id_tipotransporte_1..4 ignorando nulos/"")
+mode_cols = [c for c in ["id_tipotransporte_1","id_tipotransporte_2","id_tipotransporte_3","id_tipotransporte_4"] if c in lfk.collect_schema().names()]
+if mode_cols:
+    lfk = lfk.with_columns([
+        pl.concat_str([pl.col(c).cast(pl.Utf8, strict=False).fill_null("").str.strip_chars() for c in mode_cols],
+                      separator="|").alias("_mraw")
+    ]).with_columns([
+        pl.col("_mraw").str.split("|")
+                       .list.eval(pl.element().filter(pl.element() != ""))
+                       .list.join("-").alias("modo_patron")
+    ]).drop("_mraw")
+
+print("Columnas derivadas presentes:", [c for c in ["dur_s","travel_date","wday","hour","dist_km_guess_m","eucl_km_guess_m","circuity_raw","modo_patron"] if c in lfk.collect_schema().names()])
+```
+
+## KPIs principales
+
+```{python}
+kpi_exprs = [
+    pl.len().alias("n_viajes"),
+    pl.col("dur_s").median().alias("p50_dur_s"),
+    pl.col("dur_s").quantile(0.9).alias("p90_dur_s"),
+    pl.col("dur_s").max().alias("max_dur_s"),
+    pl.col("dur_s").min().alias("min_dur_s"),
+    (pl.col("dur_s") < 1*60).sum().alias("lt1m_cnt"),
+    (pl.col("dur_s") < 0).sum().alias("neg_dur_cnt"),
+    (pl.col("dur_s") > 4*3600).sum().alias("gt4h_cnt"),
+]
+
+if "id_tarjeta" in lfk.collect_schema().names():
+    kpi_exprs.append(pl.col("id_tarjeta").n_unique().alias("n_tarjetas"))
+if "n_etapas" in lfk.collect_schema().names():
+    kpi_exprs.append(pl.col("n_etapas").mean().alias("mean_etapas"))
+if {"dist_km_guess_m","circuity_raw"} <= set(lfk.collect_schema().names()):
+    kpi_exprs.extend([
+        pl.col("dist_km_guess_m").median().alias("p50_dist_km_guess_m"),
+        pl.col("circuity_raw").median().alias("p50_circuity"),
+    ])
+
+kpi = lfk.select(kpi_exprs).collect(engine="in-memory").to_dicts()[0]
+
+mins = lambda s: None if s is None else round(float(s)/60,1)
+def fmt(v, none="—"):
+    return none if v is None else (f"{v:,}" if isinstance(v, (int,np.integer)) else v)
+
+rows = [
+    ("Viajes (semana)", fmt(kpi.get("n_viajes"))),
+    ("Tarjetas únicas", fmt(kpi.get("n_tarjetas"))),
+    ("Duración p50 (min)", "—" if kpi.get("p50_dur_s") is None else mins(kpi.get("p50_dur_s"))),
+    ("Duración p90 (min)", "—" if kpi.get("p90_dur_s") is None else mins(kpi.get("p90_dur_s"))),
+    ("Duración mínima (min)", "—" if kpi.get("min_dur_s") is None else mins(kpi.get("min_dur_s"))),
+    ("Viajes con duración menor a 1 minuto", fmt(kpi.get("lt1m_cnt", 0))),
+    ("Duraciones negativas", fmt(kpi.get("neg_dur_cnt", 0))),
+    (">4h (anómalos)", fmt(kpi.get("gt4h_cnt", 0))),
+    ("Etapas promedio", "—" if kpi.get("mean_etapas") is None else round(float(kpi["mean_etapas"]),2)),
+    ("Distancia p50 (km, asumiendo m)", "—" if kpi.get("p50_dist_km_guess_m") is None else round(float(kpi["p50_dist_km_guess_m"]),2)),
+    ("Circuito p50 (ruta/eucl.)", "—" if kpi.get("p50_circuity") is None else round(float(kpi["p50_circuity"]),2)),
+]
+for a,b in rows:
+    print(f"{a:>30}: {b}")
+```
+
+### Lectura de KPIs principales
+
+-   **Escala y cobertura**: Se observan 18.7M de viajes y 3.39M de tarjetas únicas en la semana analizada. Esto implica un uso agregado alto del sistema y, en promedio grueso, ≈5.5 viajes por tarjeta en la semana (18.7M/3.39M), consistente con una mezcla de usuarios ocasionales y frecuentes.
+-   **Duración de viaje**: Mediana 24.6 min y p90 55.0 min. La mayoría de los viajes se concentra entre 25 y 55 minutos, con cola moderada. Sin embargo, se detectan viajes con duración menor a 1 minuto que sugieren registros "irreales" o errores de medición que requerirán limpieza.
+-   **Estructura de etapas**: 1.33 etapas promedio indica predominio de viajes directos (1 etapa) con una fracción relevante de transbordos.
+-   **Necesidad de filtrado**: Los datos muestran patrones que requieren limpieza cuidadosa (viajes <1 min, posibles outliers), siguiendo metodologías establecidas como las propuestas en "CÁLCULO DE INDICADORES DE CALIDAD DE SERVICIO PARA EL
+SISTEMA DE TRANSPORTE PÚBLICO DE SANTIAGO A PARTIR DE
+DATOS PASIVOS" de Núñez (2015) para el cálculo de indicadores de calidad.
+
+## Top paraderos y OD simple
+
+```{python}
+start_col = "paradero_inicio_viaje" if "paradero_inicio_viaje" in schema_names else None
+end_col   = "paradero_fin_viaje"     if "paradero_fin_viaje"     in schema_names else None
+
+if start_col and end_col:
+    top_start = (lfk.group_by(start_col).agg(pl.len().alias("n"))
+                   .sort("n", descending=True).limit(20)
+                   .collect(engine="in-memory"))
+    top_end   = (lfk.group_by(end_col).agg(pl.len().alias("n"))
+                   .sort("n", descending=True).limit(20)
+                   .collect(engine="in-memory"))
+    print("Top 20 paraderos SUBIDA:\n", top_start)
+    print("\nTop 20 paraderos BAJADA:\n", top_end)
+
+    top_od = (lfk.group_by([start_col,end_col])
+                .agg([pl.len().alias("n"),
+                      pl.col("dur_s").median().alias("p50_dur_s")])
+                .sort("n", descending=True).limit(20)
+                .collect(engine="in-memory"))
+    print("\nTop 20 pares OD:\n", top_od)
+else:
+    print("No hay columnas de paradero_inicio/paradero_fin.")
+```
+
+#### Nota sobre paraderos de bajada nulos
+
+-   Se observa una cantidad elevada de valores nulos en `paradero_fin_viaje` (por ejemplo, `null` aparece con ≈5.36M registros en el Top 20). Esto sugiere que una fracción importante de viajes no registra correctamente el paradero final o no aplica en ciertos casos.
+-   Implicancias: afecta conteos de bajada y el análisis OD; las métricas basadas en destino podrían estar sesgadas hacia el origen.
+
+
+
+## Etapas
+
+### Distribución de número de etapas (con bucket de outliers)
+
+```{python}
+
+if "n_etapas" in lfk.collect_schema().names():
+    # Distribución base
+    dist_etapas = (lfk.group_by("n_etapas").agg(pl.len().alias("n"))
+                      .sort("n_etapas")
+                      .collect(engine="in-memory"))
+
+    total_viajes = int(dist_etapas["n"].sum())
+    dist_etapas = dist_etapas.with_columns([
+        (pl.col("n") / pl.lit(total_viajes) * 100).alias("pct"),
+        (pl.col("n").cum_sum() / pl.lit(total_viajes) * 100).alias("cum_pct"),
+    ])
+
+    # Umbral X por regla práctica: 95% acumulado de cobertura
+    THRESH_CUM = 99.0
+    try:
+        # Tomar el menor n_etapas cuyo acumulado alcanza/supera el umbral
+        X_series = dist_etapas.filter(pl.col("cum_pct") >= THRESH_CUM)["n_etapas"]
+        X = int(X_series.min()) if X_series.len() > 0 else int(dist_etapas["n_etapas"].max())
+    except Exception:
+        X = int(dist_etapas["n_etapas"].max())
+
+    # Bucketizar: <= X como su valor; > X como "Más de X"
+    bucketed = (dist_etapas
+        .with_columns(
+            pl.when(pl.col("n_etapas") <= pl.lit(X))
+              .then(pl.col("n_etapas").cast(pl.Utf8))
+              .otherwise(pl.lit(f"Más de {X}")).alias("bucket")
+        )
+        .group_by("bucket")
+        .agg(pl.col("n").sum().alias("n"))
+        .with_columns((pl.col("n") / pl.lit(total_viajes) * 100).alias("pct"))
+    )
+
+    # Orden: numérico ascendente y "Más de X" al final (sin fallar por casteo)
+    bucketed = (bucketed
+        .with_columns(
+            pl.coalesce([
+                pl.col("bucket").cast(pl.Int32, strict=False),  # valores numéricos → número; fallas → null
+                pl.lit(10_000)                                    # null ("Más de X") → 10000
+            ]).alias("_ord")
+        )
+        .sort(["_ord"]).drop("_ord")
+    )
+
+    # Plot en porcentaje
+    plt.figure(figsize=(7,4))
+    plt.bar(bucketed["bucket"].to_numpy(), bucketed["pct"].to_numpy())
+    plt.xlabel("Número de etapas")
+    plt.ylabel("Porcentaje de viajes (%)")
+    plt.title(f"Distribución de etapas (3 etapas: percentil 99) — {SEM_LABEL}")
+    plt.grid(True, linewidth=0.3, axis="y")
+    plt.show()
+
+    print("Distribución porcentual de etapas (con bucket de outliers):\n", bucketed)
+else:
+    print("No hay columna 'n_etapas' en el esquema.")
+```
+Notamos que el **99% de los viajes tienen 3 etapas o menos**. Por lo que consideraremos que las etapas más de 3 son outliers.
+
+## Modos{.visually-hidden}
+
+### Top patrones de modo{.visually-hidden}
+
+```{python}
+#| eval: false
+if "modos" in lfk.collect_schema().names():
+    modo_cnt = (lfk.group_by("modos").agg(pl.len().alias("n"))
+                   .sort("n", descending=True)
+                   .collect(engine="in-memory"))
+    total = int(modo_cnt["n"].sum())
+    modo_cnt = modo_cnt.with_columns((pl.col("n")/pl.lit(total)*100).alias("pct"))
+    modo_top = modo_cnt.head(15)
+
+    # Plot porcentual top 15
+    plt.figure(figsize=(8,4))
+    plt.bar(modo_top["modos"].to_list(), modo_top["pct"].to_numpy())
+    plt.xticks(rotation=45, ha="right")
+    plt.ylabel("Porcentaje de viajes (%)")
+    plt.title(f"Patrones de modo — {SEM_LABEL}")
+    plt.grid(True, linewidth=0.3, axis="y")
+    plt.tight_layout()
+    plt.show()
+
+    print("Top patrones de modo (con porcentaje):\n", modo_top)
+else:
+    print("No hay columna 'modos' en el esquema.")
+```
+
+## Comportamiento del Usuario
+
+### Actividad por tarjeta (días activos y viajes/semana)
+
+```{python}
+if "id_tarjeta" in lfk.collect_schema().names():
+    by_card = (
+        lfk.group_by("id_tarjeta")
+           .agg([
+               pl.len().alias("trips"),
+               pl.col("travel_date").n_unique().alias("days_active"),
+               pl.when("n_etapas" in lfk.collect_schema().names())
+                 .then(pl.col("n_etapas").mean())
+                 .otherwise(pl.lit(None)).alias("mean_etapas")
+           ])
+           .collect(engine="in-memory")
+    )
+
+    # Distribución de días activos
+    total_cards = int(by_card.height)
+    activity_dist = (
+        by_card.group_by("days_active")
+               .agg(pl.len().alias("n_cards"))
+               .with_columns((pl.col("n_cards")/pl.lit(total_cards)*100).round(2).alias("pct"))
+               .sort("days_active")
+    )
+    print("Días activos por tarjeta (conteo y % sobre tarjetas):\n", activity_dist)
+
+    # Percentiles y distribución de viajes por tarjeta
+    trips_np = by_card["trips"].to_numpy()
+    p50, p90, p99 = np.percentile(trips_np, [50,90,99])
+    print(f"Viajes por tarjeta — p50={p50:.0f}, p90={p90:.0f}, p99={p99:.0f}")
+
+    # Histograma viajes por tarjeta
+    plt.figure(figsize=(7,4))
+    plt.hist(trips_np, bins=50, range=(0, np.percentile(trips_np, 99)), edgecolor="none")
+    plt.xlabel("Viajes por tarjeta (semana)"); plt.ylabel("Tarjetas")
+    plt.title("Distribución de viajes por tarjeta (recortado al p99)")
+    plt.grid(True, linewidth=0.3)
+    plt.show()
+else:
+    print("No existe 'id_tarjeta' en el esquema para análisis de comportamiento.")
+```
+
+
+
+
+### Diversidad de paraderos por tarjeta
+
+```{python}
+needed = {"id_tarjeta","paradero_inicio_viaje","paradero_fin_viaje"}
+if needed <= set(lfk.collect_schema().names()):
+    diversity = (
+        lfk.group_by("id_tarjeta")
+           .agg([
+               pl.col("paradero_inicio_viaje").n_unique().alias("n_paraderos_ini"),
+               pl.col("paradero_fin_viaje").n_unique().alias("n_paraderos_fin"),
+           ])
+           .collect(engine="in-memory")
+    )
+    print("Diversidad de paraderos por tarjeta (sample):\n", diversity.head(10))
+    plt.figure(figsize=(7,4))
+    plt.hist(diversity["n_paraderos_ini"].to_numpy(), bins=30, alpha=0.6, label="subida", edgecolor="none")
+    plt.hist(diversity["n_paraderos_fin"].to_numpy(), bins=30, alpha=0.6, label="bajada", edgecolor="none")
+    plt.xlabel("Paraderos distintos en la semana"); plt.ylabel("Tarjetas")
+    plt.title("Diversidad de paraderos por tarjeta (subida vs bajada)")
+    plt.legend(); plt.grid(True, linewidth=0.3); plt.show()
+else:
+    print("Faltan columnas de paradero para medir diversidad por tarjeta.")
+```
+
+#### Lectura — Diversidad de paraderos por tarjeta
+
+-   **Concentración baja de lugares por semana**: Para la mayoría de las tarjetas, el número de paraderos distintos en la semana es reducido (picos en 1–3). Esto sugiere patrones de origen/destino relativamente estables, coherentes con viajes recurrentes.
+-   **Subida vs. bajada**: Las distribuciones de `n_paraderos_ini` y `n_paraderos_fin` son similares; pequeñas diferencias pueden reflejar asimetrías de la red (transferencias, caminatas al origen/destino) o los nulos en bajada.
+-   **Advertencia por nulos de bajada**: El alto volumen de `paradero_fin_viaje = null` detectado previamente puede subestimar la diversidad de bajada. Interpretar con cautela y priorizar una estrategia de imputación/corrección antes de conclusiones finas.
+
+### Perfiles horarios por segmentos de uso
+
+```{python}
+if "id_tarjeta" in lfk.collect_schema().names() and "hour" in lfk.collect_schema().names():
+    by_card = (
+        lfk.group_by("id_tarjeta")
+           .agg(pl.len().alias("trips"))
+           .collect(engine="in-memory")
+    )
+
+    # Umbrales dinámicos por percentiles
+    trips_np = by_card["trips"].to_numpy()
+    p50, p90, p99 = np.percentile(trips_np, [50, 90, 99])
+    p50, p90, p99 = int(np.floor(p50)), int(np.floor(p90)), int(np.floor(p99))
+    # Asegura orden estricto por si hay empates
+    if p90 < p50: p90 = p50
+    if p99 < p90: p99 = p90
+
+    low_label = f"≤{p50}"
+    mid_label = f"{p50+1}–{p90}" if p90 >= p50+1 else None
+    high_label = f"{p90+1}–{p99}" if p99 >= p90+1 else None
+    top_label = f"{p99+1}+"
+
+    def seg(n: int) -> str:
+        n = int(n)
+        if n <= p50:
+            return low_label
+        if n <= p90 and mid_label is not None:
+            return mid_label
+        if n <= p99 and high_label is not None:
+            return high_label
+        return top_label
+
+    by_card = by_card.with_columns(pl.col("trips").map_elements(seg).alias("seg_trips"))
+
+    # Join con viajes para perfiles horarios
+    lfk_seg = lfk.join(by_card.lazy(), on="id_tarjeta", how="inner")
+    grid = (
+        lfk_seg.group_by(["hour","seg_trips"]).agg(pl.len().alias("n"))
+               .collect(engine="in-memory")
+    )
+
+    # Orden de segmentos a graficar
+    seg_order = [low_label]
+    if mid_label: seg_order.append(mid_label)
+    if high_label: seg_order.append(high_label)
+    seg_order.append(top_label)
+
+    plt.figure(figsize=(9,5))
+    for s in seg_order:
+        sub = grid.filter(pl.col("seg_trips") == s).sort("hour")
+        if sub.height:
+            plt.plot(sub["hour"].to_numpy(), sub["n"].to_numpy(), label=s)
+    plt.xlabel("Hora del día"); plt.ylabel("Viajes")
+    plt.title("Perfiles horarios por intensidad (segmentos basados en percentiles)")
+    plt.xticks(range(0,24)); plt.grid(True, linewidth=0.3); plt.legend(title="Viajes/semana"); plt.show()
+else:
+    print("Faltan 'id_tarjeta' u 'hour' para perfiles por segmento de uso.")
+
+```
+
+#### Lectura — Perfiles horarios por intensidad (segmentos por percentiles)
+
+-   **≤4 viajes/semana (p50 y menos)**: Comportamiento distintivo. Perfil más plano y desplazado hacia el mediodía/tarde, con menor ajuste a las horas punta AM/PM. Sugiere uso más discrecional/ocasional.
+
+-   **5–11 (p50+1 a p90)**: Domina los picos. Presenta máximos muy marcados en AM (~7–8h) y PM (~18–19h), patrón clásico de commuting regular; concentra la mayor parte del volumen.
+
+-   **12–18 (p90+1 a p99)**: Mantiene doble punta pero con mesetas más sostenidas entre 10–16h, indicando múltiples desplazamientos diarios (recados intermedios/transbordos/itinerarios más complejos).
+
+-   **19+ (>p99)**: Grupo pequeño pero persistente durante el día; actividad también fuera de puntas. Posibles superusuarios (operaciones, logística, repartos).
+ 
+
+## Análisis de transbordos (1 etapa vs 2+)
+
+```{python}
+if "n_etapas" in lfk.collect_schema().names():
+    has_dist = "dist_km_guess_m" in lfk.collect_schema().names()
+    base = lfk.filter(pl.col("dur_s").is_not_null())
+    base = base.with_columns(
+        pl.when(pl.col("n_etapas") <= 1).then(pl.lit("Directo (1)")).otherwise(pl.lit("Transbordo (2+)"))
+          .alias("tipo_viaje")
+    )
+
+    aggs = [
+        pl.len().alias("n_viajes"),
+        (pl.col("dur_s")/60).mean().alias("mean_dur_min"),
+        (pl.col("dur_s")/60).median().alias("p50_dur_min"),
+    ]
+    if has_dist:
+        aggs += [
+            pl.col("dist_km_guess_m").mean().alias("mean_dist_km"),
+            pl.col("dist_km_guess_m").median().alias("p50_dist_km"),
+        ]
+
+    transbordo_tbl = (base.group_by("tipo_viaje").agg(aggs)
+                           .sort("tipo_viaje")
+                           .collect(engine="in-memory"))
+    print("Comparativa directos vs. transbordos:\n", transbordo_tbl)
+
+    # Penalización estimada
+    try:
+        m = {r["tipo_viaje"]: r for r in transbordo_tbl.to_dicts()}
+        pen_min = float(m["Transbordo (2+)"]["mean_dur_min"]) - float(m["Directo (1)"]["mean_dur_min"])
+        pen_pct = 100.0 * pen_min / float(m["Directo (1)"]["mean_dur_min"]) if m["Directo (1)"]["mean_dur_min"] else None
+        txt = f"Penalización en duración ≈ +{pen_min:.1f} min" + (f" ({pen_pct:.0f}%)" if pen_pct is not None else "")
+        if has_dist:
+            pen_km = float(m["Transbordo (2+)"]["mean_dist_km"]) - float(m["Directo (1)"]["mean_dist_km"])
+            txt += f" | Distancia ≈ +{pen_km:.2f} km"
+        print(txt)
+    except Exception:
+        pass
+
+    # Gráfico de barras: cantidad de viajes y % sobre el total
+    try:
+        plot_df = transbordo_tbl.select(["tipo_viaje","n_viajes"]).to_pandas()
+        total = float(plot_df["n_viajes"].sum()) or 1.0
+        plot_df["pct"] = (plot_df["n_viajes"] / total * 100).round(1)
+
+        plt.figure(figsize=(5.5,4))
+        bars = plt.bar(plot_df["tipo_viaje"], plot_df["n_viajes"]) 
+        plt.ylabel("Viajes"); plt.title("Directo vs. Transbordo — cantidad y % del total")
+        plt.grid(True, axis="y", linewidth=0.3)
+
+        # Etiquetas de % sobre cada barra
+        for bar, p in zip(bars, plot_df["pct"].tolist()):
+            x = bar.get_x() + bar.get_width()/2
+            y = bar.get_height()
+            plt.text(x, y, f"{p:.1f}%", ha="center", va="bottom")
+
+        plt.show()
+    except Exception:
+        pass
+else:
+    print("No existe 'n_etapas' para diferenciar directos/transbordos.")
+```
+
+#### Lectura — Directo vs. Transbordo
+
+-   **Penalización de tiempo clara**: Los viajes con transbordo presentan una duración media ≈46.4 min vs. 22.4 min en directos; la diferencia (\~+23.9 min, ≈+107%) y la mediana (44.3 vs. 19.8) confirman un costo temporal sustantivo asociado a transbordar.
+-   **Aumento de longitud aparente**: Las columnas de distancia reportan valores muy altos (p50 ≈ 64.3/151.9 “km” y medias ≈ 4,580/9,097), señal de problemas de unidades/escala o de cómputo en las variables de distancia. Hasta corregirlas, interpretar estos números con cautela.
+
+## Análisis geoespacial — Zonas 777 y paraderos{.visually-hidden}
+
+```{python}
+#| include: false
+# Esta sección usa DIC_777.csv y el shapefile de Zonas 777 desde RAW en GCS.
+# Requiere geopandas/pyogrio opcionalmente para visualizar.
+
+import tempfile
+from pathlib import Path
+
+try:
+    import geopandas as gpd
+    import shapely  # noqa: F401
+    HAS_GEO = True
+except Exception:
+    HAS_GEO = False
+    print("Geopandas no disponible. Se limitará a cargas tabulares.")
+
+# Helpers mínimos
+def _detect_sep_gcs(path_no_scheme: str, default=";"):
+    with gfs.open(path_no_scheme, "rb") as fh:
+        head = fh.readline().decode("utf-8", errors="ignore")
+    return ";" if head.count(";") >= head.count(",") else ","
+
+# 1) Cargar diccionario DIC_777.csv
+try:
+    dic_path = f"{GCS_BUCKET}/raw/DIC_777.csv"
+    sep_dic = _detect_sep_gcs(dic_path)
+    with gfs.open(dic_path, "rb") as fh:
+        df_dic = pl.read_csv(
+            fh,
+            separator=sep_dic,
+            infer_schema_length=20000,
+            null_values=["", "-", "NA", "N/A", "null", "NULL"],
+            schema_overrides={"diseno_777": pl.Utf8},
+            ignore_errors=True,
+        )
+    # Renombres comunes si existen
+    ren = {"parada/est.metro": "parada", "Subidas día laboral por parada": "subidas_dia_lab",
+           "Bajadas día Laboral por parada": "bajadas_dia_lab"}
+    present = {k:v for k,v in ren.items() if k in df_dic.columns}
+    if present:
+        df_dic = df_dic.rename(present)
+    print("DIC_777 columnas:", df_dic.columns[:8], "…")
+except Exception as e:
+    df_dic = None
+    print("No se pudo cargar DIC_777:", e)
+
+# 2) Cargar shapefile Zonas777 (opcional para mapa)
+gdf_zonas = None
+if HAS_GEO:
+    try:
+        folder = f"{GCS_BUCKET}/raw/Zonas777-2014/Shape"
+        paths = gfs.ls(folder)
+        shp_remote = next(p for p in paths if p.lower().endswith(".shp"))
+        base = Path(shp_remote).stem.lower()
+        need = [".shp", ".shx", ".dbf", ".prj"]
+        tmp = Path(tempfile.mkdtemp(prefix="zonas777_"))
+        for p in paths:
+            if Path(p).suffix.lower() in need and Path(p).stem.lower() == base:
+                with gfs.open(p, "rb") as r, open(tmp / f"zonas777{Path(p).suffix.lower()}", "wb") as w:
+                    w.write(r.read())
+        local_shp = str(tmp / "zonas777.shp")
+        try:
+            import pyogrio
+            gdf_zonas = pyogrio.read_dataframe(local_shp)
+        except Exception:
+            gdf_zonas = gpd.read_file(local_shp)
+        if getattr(gdf_zonas, "crs", None) is None:
+            gdf_zonas = gdf_zonas.set_crs(4326, allow_override=True)
+        print("Zonas777:", gdf_zonas.shape)
+    except Exception as e:
+        print("No se pudo cargar shapefile Zonas777:", e)
+
+# 3) Construir puntos de paraderos (si hay x,y en DIC)
+gdf_par = None
+if HAS_GEO and df_dic is not None and {"x","y"} <= set(df_dic.columns):
+    df_cast = df_dic.with_columns([
+        pl.col("x").cast(pl.Float64, strict=False),
+        pl.col("y").cast(pl.Float64, strict=False),
+    ])
+    df_pd = df_cast.to_pandas()
+    gdf_par_utm = gpd.GeoDataFrame(df_pd, geometry=gpd.points_from_xy(df_pd["x"], df_pd["y"]), crs=32719)
+    gdf_par = gdf_par_utm.to_crs(4326)
+    if "parada" not in gdf_par.columns:
+        # intenta alguna columna equivalente
+        if "paradero" in gdf_par.columns:
+            gdf_par = gdf_par.rename(columns={"paradero":"parada"})
+    print("Paraderos (geom):", gdf_par.shape)
+
+# 4) Top paraderos de subida y mapa
+if HAS_GEO and gdf_par is not None and "paradero_inicio_viaje" in lfk.collect_schema().names():
+    top_sub = (lfk.filter(pl.col("paradero_inicio_viaje").is_not_null())
+                 .group_by("paradero_inicio_viaje").agg(pl.len().alias("n"))
+                 .sort("n", descending=True).limit(500)
+                 .collect(engine="in-memory").to_pandas())
+    # Join con puntos
+    gdf_top = gdf_par.merge(top_sub, left_on="parada", right_on="paradero_inicio_viaje", how="inner")
+    s = (gdf_top["n"] / gdf_top["n"].max()) * 100
+    fig, ax = plt.subplots(1,1, figsize=(7,7))
+    if gdf_zonas is not None:
+        gdf_zonas.boundary.plot(ax=ax, linewidth=0.3, color="gray")
+    gdf_top.plot(ax=ax, markersize=s, alpha=0.6, color="tab:red")
+    ax.set_title("Top paraderos de subida (tamaño ∝ viajes)")
+    ax.set_axis_off()
+    plt.show()
+else:
+    print("No se generó mapa (falta geopandas, DIC_777 con x/y o 'paradero_inicio_viaje').")
+
+```
+
+## Análisis QR
+
+### Validación QR (contrato 171/102) vs CSV legacy
+
+```{python}
+# A partir de ahora usamos is_qr desde parquet (o lo derivamos localmente si falta)
+if "is_qr" not in lfk.collect_schema().names():
+    colc = "id_contrato" if "id_contrato" in lfk.collect_schema().names() else ("contrato" if "contrato" in lfk.collect_schema().names() else None)
+    if colc:
+        lfk = lfk.with_columns(pl.col(colc).cast(pl.Utf8).str.strip_chars().is_in(["171","102"]).alias("is_qr"))
+    else:
+        lfk = lfk.with_columns(pl.lit(None).alias("is_qr"))
+
+print("QR flag disponible:", "is_qr" in lfk.collect_schema().names())
+
+# Resumen QR vs no-QR
+if "is_qr" in lfk.collect_schema().names():
+    qr_sum = (lfk.group_by("is_qr").agg([
+        pl.len().alias("n"),
+        pl.col("dur_s").median().alias("p50_dur_s"),
+        pl.when("dist_km_guess_m" in lfk.collect_schema().names()).then(pl.col("dist_km_guess_m").median()).otherwise(pl.lit(None)).alias("p50_km"),
+        pl.when("n_etapas" in lfk.collect_schema().names()).then(pl.col("n_etapas").mean()).otherwise(pl.lit(None)).alias("mean_etapas"),
+    ]).collect(engine="in-memory"))
+    qr_sum = qr_sum.with_columns((pl.col("n") / pl.col("n").sum()).alias("pct"))
+    # Reordenar columnas: is_qr, n, pct, ...
+    keep_order = [c for c in ["is_qr","n","pct","p50_dur_s","p50_km","mean_etapas"] if c in qr_sum.columns]
+    qr_sum = qr_sum.select(keep_order)
+    print("Resumen QR vs no-QR:\n", qr_sum)
+
+```
+
+#### Lectura — Resumen QR vs. no-QR y supuestos
+
+-   **Adopción semanal**: `pct` indica que ≈17.6% de los viajes están marcados como QR; ≈82.4% usan tarjeta física. Las duraciones p50 son levemente menores en QR y el número promedio de etapas también, lo que sugiere un uso algo más directo del sistema.
+-   **Supuesto operativo del flag**: La columna is_qr la derivamos usando el contrato (`id_contrato`/`contrato`) y asumimos que los contratos 171/102 corresponden a viajes con QR.
+
+### Perfil del Usuario QR
+
+#### *WARNING*
+
+En la reunión del 23/09 con Jacqueline se me comentó que cada id_tarjeta puede ser o bien Bip o bien QR, pero no ambas cosas. No tiene sentido analizar el porcentaje o adopción de QR para cada id_tarjeta, por ende todo gráfico a continuación en donde se analice el porcentaje de QR por tarjeta, no tiene sentido, se marcará como deprecado y quedará fuera de un futuro análisis.
+```{python}
+#| fig-width: 10
+#| fig-height: 8
+#| subfigs-layout: [
+#|   [ "A", "B" ],
+#|   [ "C", "C" ]
+#| ]
+
+import polars as pl
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- 1) Perfil por tarjeta ---
+# Calculamos viajes totales, viajes QR y % de adopción QR para cada tarjeta
+if {"id_tarjeta", "is_qr"} <= set(lfk.collect_schema().names()):
+    by_card = (
+        lfk.group_by("id_tarjeta")
+           .agg([
+               pl.len().alias("n_trips"),
+               (pl.col("is_qr") == True).sum().alias("n_qr_trips")
+           ])
+           .with_columns(
+               (pl.col("n_qr_trips") / pl.col("n_trips") * 100).alias("qr_share_pct")
+           )
+           .collect(engine="in-memory")
+    )
+    print("Analicemos algunos casos aleatorios:")
+    print(by_card.head())
+
+    # --- 2) Análisis de intensidad de uso (distribución de n_trips) ---
+    n_trips_np = by_card["n_trips"].to_numpy()
+    quantiles = np.percentile(n_trips_np, [25, 50, 75, 90, 95, 99])
+    print("\nDistribución de viajes por tarjeta (semana):")
+    print(f"p25={quantiles[0]:.0f}, p50={quantiles[1]:.0f}, p75={quantiles[2]:.0f}, p90={quantiles[3]:.0f}, p95={quantiles[4]:.0f}, p99={quantiles[5]:.0f}")
+
+    fig = plt.figure(figsize=(10, 8))
+    
+    # Subfig A: Histograma de n_trips
+    ax_a = fig.add_subplot(2, 2, 1)
+    ax_a.hist(n_trips_np, bins=100, range=(0, quantiles[5]), edgecolor="none")
+    ax_a.set_title("A: Distribución de Viajes por Tarjeta (hasta p99)")
+    ax_a.set_xlabel("Viajes por semana")
+    ax_a.set_ylabel("Nº de Tarjetas")
+    ax_a.grid(True, linewidth=0.3)
+
+    # --- 3) Nivel de adopción por tarjeta (% QR) ---
+    # Subfig B: Histograma de qr_share_pct
+    ax_b = fig.add_subplot(2, 2, 2)
+    ax_b.hist(by_card["qr_share_pct"].to_numpy(), bins=50, range=(0, 100), edgecolor="none")
+    ax_b.set_title("-DEPRECADO- B: Nivel de Adopción QR por Tarjeta")
+    ax_b.set_xlabel("% de Viajes con QR")
+    ax_b.set_ylabel("Nº de Tarjetas")
+    ax_b.grid(True, linewidth=0.3)
+
+    # --- 4) Relación entre intensidad y adopción ---
+    # Segmentación dinámica por percentiles (consistente con el resto del análisis)
+    p50 = int(np.floor(quantiles[1])); p90 = int(np.floor(quantiles[3])); p99 = int(np.floor(quantiles[5]))
+    if p90 < p50: p90 = p50
+    if p99 < p90: p99 = p90
+
+    low_label  = f"≤{p50}"
+    mid_label  = f"{p50+1}–{p90}" if p90 >= p50+1 else None
+    high_label = f"{p90+1}–{p99}" if p99 >= p90+1 else None
+    top_label  = f"{p99+1}+"
+
+    def seg_dyn(n: int) -> str:
+        n = int(n)
+        if n <= p50:
+            return low_label
+        if n <= p90 and mid_label is not None:
+            return mid_label
+        if n <= p99 and high_label is not None:
+            return high_label
+        return top_label
+
+    by_card_seg = by_card.with_columns(
+        pl.col("n_trips").map_elements(seg_dyn, return_dtype=pl.String).alias("segmento_uso")
+    )
+    
+    # Subfig C: Gráfico de barras apiladas 100%
+    ax_c = fig.add_subplot(2, 1, 2)
+    
+    # Preparamos los datos para el gráfico de barras apiladas
+    plot_data = (
+        by_card_seg.with_columns(
+            pl.when(pl.col("qr_share_pct") > 0).then(pl.lit("Adoptante"))
+              .otherwise(pl.lit("No Adoptante")).alias("tipo_adopcion")
+        )
+        .group_by(["segmento_uso", "tipo_adopcion"])
+        .agg(pl.len().alias("n_tarjetas"))
+        .pivot(values="n_tarjetas", index="segmento_uso", columns="tipo_adopcion")
+        .fill_null(0)
+    )
+
+    # Calculamos porcentajes
+    total = plot_data.select(pl.sum_horizontal(pl.all().exclude("segmento_uso"))).to_series()
+    plot_data_pct = plot_data.with_columns(
+        (pl.col(c) / total * 100).alias(f"{c}_pct")
+        for c in plot_data.columns if c != "segmento_uso"
+    )
+
+    # Orden deseado de segmentos: ≤p50, (p50+1–p90], (p90+1–p99], >p99
+    seg_order = [low_label]
+    if mid_label: seg_order.append(mid_label)
+    if high_label: seg_order.append(high_label)
+    seg_order.append(top_label)
+    order_expr = (
+        pl.when(pl.col("segmento_uso") == seg_order[0]).then(1)
+         .when((len(seg_order) > 1) & (pl.col("segmento_uso") == seg_order[1])).then(2)
+         .when((len(seg_order) > 2) & (pl.col("segmento_uso") == seg_order[2])).then(3)
+         .when((len(seg_order) > 3) & (pl.col("segmento_uso") == seg_order[3])).then(4)
+         .otherwise(99)
+         .alias("_ord")
+    )
+    plot_data_pct = plot_data_pct.with_columns(order_expr).sort("_ord").drop("_ord")
+
+    # Graficamos
+    bottom = np.zeros(plot_data_pct.height)
+    # Aseguramos el orden para que "No Adoptante" vaya primero
+    adopt_cols = sorted([c for c in plot_data_pct.columns if c.endswith("_pct")], reverse=True)
+    
+    for col in adopt_cols:
+        ax_c.bar(
+            plot_data_pct["segmento_uso"],
+            plot_data_pct[col],
+            bottom=bottom,
+            label=col.replace("_pct", "")
+        )
+        bottom += plot_data_pct[col].to_numpy()
+
+    ax_c.set_title("C: Proporción de Adoptantes de QR por Intensidad de Uso")
+    ax_c.set_xlabel("Segmento de Uso (viajes/semana)")
+    ax_c.set_ylabel("Porcentaje de Tarjetas (%)")
+    ax_c.legend(title="Tipo de Adopción")
+    ax_c.set_ylim(0, 100)
+    ax_c.grid(True, axis='y', linewidth=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Tabla resumen
+    summary_by_segment = (
+        by_card_seg.group_by("segmento_uso")
+                   .agg([
+                       pl.len().alias("n_tarjetas"),
+                       pl.col("qr_share_pct").mean().alias("mean_qr_share"),
+                       pl.col("qr_share_pct").median().alias("median_qr_share")
+                   ])
+                   .with_columns(
+                       (pl.col("n_tarjetas") / pl.col("n_tarjetas").sum()).alias("pct_tarjetas")
+                   )
+                   .sort("segmento_uso")
+                   .select(
+                       "segmento_uso",
+                       "n_tarjetas",
+                       "pct_tarjetas",
+                       "mean_qr_share",
+                       "median_qr_share",
+                   )
+    )
+    print("\nResumen de adopción por segmento:")
+    print(summary_by_segment)
+
+else:
+    print("Faltan 'id_tarjeta' o 'is_qr' para realizar el perfil de usuario.")
+
+```
+
+#### Análisis del Perfil de Usuario
+
+El análisis del perfil de usuario revela tres hallazgos principales basados en percentiles y la nueva segmentación:
+
+1.  **Distribución de uso (percentiles):** p25=2, p50=4, p75=8, p90=11, p95=13, p99=18 viajes/semana. Esto respalda los segmentos dinámicos usados en el documento: **≤4**, **5–11**, **12–18** y **19+**.
+
+2.  **Composición por segmento:** Las tarjetas se distribuyen como: **≤4 (51.2%)**, **5–11 (39.1%)**, **12–18 (8.9%)** y **19+ (0.72%)**. La población está fuertemente concentrada en los usuarios de baja frecuencia (≤4), seguidos por regulares (5–11).
+
+3.  **Adopción por segmento (media de %QR por tarjeta):** aunque la mediana de adopción por tarjeta es 0% en todos los segmentos, la media crece con la intensidad: **≤4 → 24.3%**, **5–11 → 17.5%**, **12–18 → 14.0%**, **19+ → 18.1%**. Dado el carácter bimodal (0% o 100% por tarjeta), esta media aproxima la proporción de tarjetas “adoptantes” en cada segmento; destaca que incluso en ≤4 existe una fracción no menor que usa QR.
+
+ Que el segmento de menor frecuencia (≤4) presente la mayor media de %QR sugiere que la adopción de QR está asociada a usos más casuales/discrecionales (p. ej., viajes esporádicos, visitantes, usuarios que prueban el sistema o que no cargan saldo físico). 
+
+#### Análisis Adicional de Segmentación{.visually-hidden}
+
+```{python}
+#| eval: false
+#| label: extra-clustering
+#| fig-width: 12
+#| fig-height: 5
+
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import seaborn as sns
+
+# Usamos el DF 'by_card' que ya tiene n_trips y qr_share_pct
+features = by_card.select(["n_trips", "qr_share_pct"]).to_pandas()
+
+# Escalar las características es crucial para K-Means
+scaler = StandardScaler()
+features_scaled = scaler.fit_transform(features)
+
+# --- Determinar K óptimo con el método del codo ---
+inertia = []
+K = range(1, 11)
+for k in K:
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+    kmeans.fit(features_scaled)
+    inertia.append(kmeans.inertia_)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# Gráfico del codo
+axes[0].plot(K, inertia, 'bx-')
+axes[0].set_xlabel('Número de Clusters (k)')
+axes[0].set_ylabel('Inercia')
+axes[0].set_title('Método del Codo para K Óptimo')
+axes[0].grid(True, linewidth=0.3)
+
+# --- Aplicar K-Means y visualizar ---
+# Basado en el codo, un k=3 parece razonable para separar no-adoptantes, adoptantes, y distinguir por intensidad.
+optimal_k = 3
+kmeans = KMeans(n_clusters=optimal_k, random_state=42, n_init='auto')
+by_card = by_card.with_columns(
+    pl.Series("cluster", kmeans.fit_predict(features_scaled))
+)
+
+# Gráfico de clusters
+sns.scatterplot(
+    data=by_card.to_pandas(),
+    x="n_trips",
+    y="qr_share_pct",
+    hue="cluster",
+    palette="viridis",
+    ax=axes[1],
+    alpha=0.6,
+    s=10 # Puntos más pequeños para visualizar mejor la densidad
+)
+axes[1].set_title(f'Clusters de Usuarios (k={optimal_k})')
+axes[1].set_xlabel('Nº de Viajes por Semana')
+axes[1].set_ylabel('% de Viajes con QR')
+axes[1].set_xlim(0, by_card["n_trips"].quantile(0.99)) # Limitar para mejor visualización
+axes[1].grid(True, linewidth=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# --- Analizar los clusters ---
+cluster_summary = (
+    by_card.group_by("cluster")
+           .agg([
+               pl.len().alias("n_tarjetas"),
+               pl.col("n_trips").mean().alias("mean_n_trips"),
+               pl.col("qr_share_pct").mean().alias("mean_qr_share_pct")
+           ])
+           .sort("cluster")
+)
+
+print("Resumen de los Clusters:")
+print(cluster_summary)
+```
+
+```{python}
+#| label: extra-behavioral-segmentation
+#| eval: false
+
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import seaborn as sns
+
+# Definir horas punta
+AM_PEAK = {7, 8, 9}
+PM_PEAK = {17, 18, 19}
+
+# Calcular métricas de comportamiento por tarjeta
+if {"id_tarjeta", "wday", "hour"} <= set(lfk.collect_schema().names()):
+    # 1. Calcular viajes por día y hora para cada tarjeta
+    daily_patterns = (
+        lfk.group_by(["id_tarjeta", "travel_date"])
+           .agg([
+               (pl.col("hour").is_in(list(AM_PEAK))).any().alias("has_am_peak"),
+               (pl.col("hour").is_in(list(PM_PEAK))).any().alias("has_pm_peak"),
+               pl.col("wday").first().alias("wday") # Tomar el día de la semana
+           ])
+    )
+    
+    # 2. Agregar métricas a nivel de tarjeta
+    behavior_metrics = (
+        daily_patterns.group_by("id_tarjeta")
+            .agg([
+                pl.len().alias("days_active"),
+                # "Puntualidad Commuter": % de días activos con viaje AM y PM
+                (pl.col("has_am_peak") & pl.col("has_pm_peak")).mean().alias("commuter_consistency"),
+                # % de viajes en días de semana (L-V)
+                (pl.col("wday") <= 5).mean().alias("pct_weekday")
+            ])
+    )
+
+    # 3. Definir reglas de clasificación más robustas
+    def classify_behavior_v2(days_active, commuter_consistency, pct_weekday):
+        if days_active >= 3 and commuter_consistency >= 0.6:
+            return "Usuario de Alta Rutina"
+        elif pct_weekday <= 0.2:
+            return "Usuario de Fin de Semana"
+        else:
+            return "Esporádico / Otro"
+    
+    # Aplicar clasificación
+    behavioral_segments = behavior_metrics.with_columns(
+        pl.struct(["days_active", "commuter_consistency", "pct_weekday"])
+          .map_elements(
+              lambda x: classify_behavior_v2(x["days_active"], x["commuter_consistency"], x["pct_weekday"]),
+              return_dtype=pl.String
+          )
+          .alias("comportamiento")
+    ).collect()
+    
+    # Unir con datos de adopción
+    by_card_behavior = by_card.join(
+        behavioral_segments.select(["id_tarjeta", "comportamiento"]),
+        on="id_tarjeta",
+        how="inner"
+    )
+    
+    # Analizar resultados
+    segment_counts = by_card_behavior.group_by("comportamiento").agg(pl.len().alias("n_tarjetas"))
+    print("Conteo de usuarios por segmento de comportamiento:")
+    print(segment_counts)
+    
+    adoption_by_behavior = (
+        by_card_behavior.group_by("comportamiento")
+                        .agg([
+                            pl.col("qr_share_pct").mean().alias("mean_qr_share"),
+                            pl.col("qr_share_pct").median().alias("median_qr_share")
+                        ])
+    )
+    print("\nAdopción de QR por segmento de comportamiento:")
+    print(adoption_by_behavior)
+    
+    # Visualización
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+    sns.barplot(
+        data=adoption_by_behavior.to_pandas().sort_values("mean_qr_share", ascending=False),
+        x="comportamiento",
+        y="mean_qr_share",
+        ax=ax
+    )
+    ax.set_title("Adopción Media de QR por Patrón de Comportamiento (v2)")
+    ax.set_xlabel("Patrón de Comportamiento")
+    ax.set_ylabel("Adopción Media de QR (%)")
+    ax.grid(True, axis='y', linewidth=0.3)
+    plt.show()
+```
+
+
+### Geografía de la Adopción de QR
+
+```{python}
+#| label: qr-geography-services
+
+import polars as pl
+import unicodedata
+
+def normalize_comuna(s: str) -> str:
+    """Elimina tildes, convierte a mayúsculas y limpia espacios para un join robusto."""
+    if not isinstance(s, str):
+        return str(s)
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', s)
+        if unicodedata.category(c) != 'Mn'
+    ).upper().strip()
+
+# Aseguramos que las columnas necesarias existen
+if {"srv_1", "is_qr"} <= set(lfk.collect_schema().names()):
+    
+    # Definimos un umbral de viajes para considerar un servicio robusto
+    MIN_TRIPS_PER_SERVICE = 1000
+
+    # Calculamos la adopción de QR por servicio
+    by_service = (
+        lfk.filter(pl.col("srv_1").is_not_null() & (pl.col("srv_1") != ""))
+           .group_by("srv_1")
+           .agg([
+               pl.len().alias("n_trips"),
+               (pl.col("is_qr") == True).sum().alias("n_qr_trips")
+           ])
+                 .with_columns(
+               (pl.col("n_qr_trips") / pl.col("n_trips") * 100).alias("qr_share_pct")
+           )
+           .filter(pl.col("n_trips") >= MIN_TRIPS_PER_SERVICE)
+           .collect(engine="in-memory")
+    )
+    
+    # Top 20 servicios con MAYOR adopción de QR
+    top_adopters = by_service.sort("qr_share_pct", descending=True).head(20)
+    
+    # Top 20 servicios con MENOR adopción de QR
+    lowest_adopters = by_service.sort("qr_share_pct", descending=False).head(20)
+    
+    print(f"--- Análisis de Adopción de QR por Servicio (rutas con >= {MIN_TRIPS_PER_SERVICE} viajes) ---")
+    
+    print("\n Top 20 Servicios con Mayor Adopción de QR:")
+    print(top_adopters)
+    
+    print("\n Top 20 Servicios con Menor Adopción de QR:")
+    print(lowest_adopters)
+
+
+```
+
+**TO-DO**: Mapear los servicios y paraderos con sus nombres "reales" asignados por el DTPM.
+
+#### Mapa de calor de la Adopción de QR
+
+
+```{python}
+#| label: qr-heatmap-zonas777
+#| fig-width: 8
+#| fig-height: 8
+
+# --- 1. Usar Datos Geoespaciales de Zonas 777 ---
+if 'gdf_zonas' in globals() and gdf_zonas is not None:
+    zonas_geo = gdf_zonas.copy()
+    print("Geometrías de Zonas 777 preparadas.")
+
+    # --- 2. Calcular Adopción de QR por Zona de Inicio ---
+    if {"zona_inicio_viaje", "is_qr"} <= set(lfk.collect_schema().names()):
+        # La columna zona_inicio_viaje parece ser un código numérico. Lo casteamos.
+        qr_by_zona = (
+            lfk.with_columns(
+                pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777")
+            )
+            .filter(pl.col("ZONA777").is_not_null())
+            .group_by("ZONA777")
+            .agg(
+                (pl.col("is_qr") == True).sum().alias("n_qr"),
+                pl.len().alias("n_total")
+            )
+            .with_columns(
+                (pl.col("n_qr") / pl.col("n_total") * 100).alias("qr_share_pct")
+            )
+            .filter(pl.col("n_total") > 100)  # Umbral para robustez
+            .collect(engine="in-memory")
+        )
+        print("Adopción de QR por Zona 777 calculada (Top 5 con mayor adopción):")
+        print(qr_by_zona.sort("qr_share_pct", descending=True).head())
+
+        print("Adopción de QR por Zona 777 calculada (Top 5 con menor adopción):")
+        print(qr_by_zona.sort("qr_share_pct", descending=False).head())
+
+        # --- 3. Unir Datos Geoespaciales y de Adopción ---
+        # El join se hace por la columna 'ZONA777', que es el código numérico.
+        zonas_map_data = zonas_geo.merge(
+            qr_by_zona.to_pandas(),
+            on='ZONA777',
+            how='left'
+        )
+        zonas_map_data['qr_share_pct'] = zonas_map_data['qr_share_pct'].fillna(0)
+
+        # --- 4. Generar los Mapas Coropléticos por Zona (absoluto y relativo) ---
+        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+        # Paleta blanco→rojo y normalización al máximo real
+        from matplotlib.colors import LinearSegmentedColormap
+        white_red = LinearSegmentedColormap.from_list(
+            'white_red', ['#ffffff', '#fee0d2', '#fc9272', '#de2d26', '#a50f15'], N=256
+        )
+        
+        # Mapa izquierdo: escala absoluta (0-100%)
+        zonas_map_data.plot(
+            column='qr_share_pct',
+            cmap=white_red,
+            vmin=0, vmax=100,
+            linewidth=0.5, # Líneas más delgadas para no saturar
+            ax=axes[0],
+            edgecolor='0.8',
+            legend=True,
+            legend_kwds={'label': "Adopción de QR (%)", 'orientation': "horizontal"}
+        )
+        axes[0].set_title('Escala Absoluta (0-100%)', fontdict={'fontsize': '14', 'fontweight': 'bold'})
+        axes[0].set_axis_off()
+        
+        # Mapa derecho: escala relativa (0-máximo observado)
+        vmax_val = float(qr_by_zona["qr_share_pct"].max()) if qr_by_zona.height else 100.0
+        if vmax_val <= 0:
+            vmax_val = 1.0
+        zonas_map_data.plot(
+            column='qr_share_pct',
+            cmap=white_red,
+            vmin=0, vmax=vmax_val,
+            linewidth=0.5, # Líneas más delgadas para no saturar
+            ax=axes[1],
+            edgecolor='0.8',
+            legend=True,
+            legend_kwds={'label': "Adopción de QR (%)", 'orientation': "horizontal"}
+        )
+        axes[1].set_title(f'Escala Relativa (0-{vmax_val:.1f}%)', fontdict={'fontsize': '14', 'fontweight': 'bold'})
+        axes[1].set_axis_off()
+        
+        fig.suptitle('Mapa de Calor de Adopción de QR por Zona 777 de Inicio de Viaje', fontsize=16, fontweight='bold')
+        plt.show()
+
+
+
+```
+
+#### Mapa de Adopción por Paradero
+
+```{python}
+#| label: qr-scatterplot-paraderos
+#| fig-width: 10
+#| fig-height: 10
+
+import unicodedata
+
+def normalize_paradero(s: str) -> str:
+    """Normaliza nombres de paraderos para joins robustos."""
+    if not isinstance(s, str):
+        return s
+    # Elimina tildes, convierte a mayúsculas, quita espacios extra
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', s)
+        if unicodedata.category(c) != 'Mn'
+    ).upper().strip()
+
+# --- 1. Calcular Adopción por Paradero de Inicio (con normalización) ---
+if {"paradero_inicio_viaje", "is_qr"} <= set(lfk.collect_schema().names()):
+    MIN_TRIPS_PER_STOP = 200 # Umbral para paraderos con suficiente actividad
+
+    lfk_paradero_norm = lfk.with_columns(
+        pl.col("paradero_inicio_viaje").map_elements(normalize_paradero, return_dtype=pl.String).alias("paradero_inicio_norm")
+    )
+
+    qr_by_paradero = (
+        lfk_paradero_norm.filter(pl.col("paradero_inicio_norm").is_not_null() & (pl.col("paradero_inicio_norm") != ""))
+           .group_by("paradero_inicio_norm")
+           .agg(
+               (pl.col("is_qr") == True).sum().alias("n_qr"),
+               pl.len().alias("n_total")
+           )
+           .with_columns(
+               (pl.col("n_qr") / pl.col("n_total") * 100).alias("qr_share_pct")
+           )
+           .filter(pl.col("n_total") >= MIN_TRIPS_PER_STOP)
+           .collect(engine="in-memory")
+    )
+    print("Adopción de QR por paradero calculada.")
+
+    # --- 2. Unir con Datos Geoespaciales de Paraderos (con normalización y deduplicación) ---
+    if 'gdf_par' in globals() and gdf_par is not None:
+        gdf_par_clean = gdf_par.copy()
+        # Normalizamos la columna de unión en el GeoDataFrame
+        gdf_par_clean['parada_norm'] = gdf_par_clean['parada'].apply(normalize_paradero)
+        # Eliminamos duplicados basados en el nombre normalizado, manteniendo la primera geometría
+        gdf_par_clean = gdf_par_clean.drop_duplicates(subset=['parada_norm'], keep='first')
+
+        # Hacemos el merge usando las columnas normalizadas
+        paraderos_map_data = gdf_par_clean.merge(
+            qr_by_paradero.to_pandas(),
+            left_on='parada_norm',
+            right_on='paradero_inicio_norm',
+            how='inner' # Inner join para quedarnos solo con paraderos con datos y geometría
+        )
+        print(f"Se mapearon {len(paraderos_map_data)} paraderos únicos con datos de adopción y ubicación.")
+
+        # --- 3. Generar los Mapas de Dispersión Geográfico (absoluto y relativo) ---
+        fig, axes = plt.subplots(1, 2, figsize=(20, 10))
+        
+        # Dibujamos el fondo con los límites de las comunas para dar contexto
+        if 'comunas_geo' in globals():
+            comunas_geo.boundary.plot(ax=axes[0], linewidth=0.4, color="gray")
+            comunas_geo.boundary.plot(ax=axes[1], linewidth=0.4, color="gray")
+
+        # Dibujamos los paraderos como puntos coloreados por %QR (usando el plot nativo de GeoPandas)
+        from matplotlib.colors import LinearSegmentedColormap
+        white_red = LinearSegmentedColormap.from_list(
+            'white_red', ['#ffffff', '#fee0d2', '#fc9272', '#de2d26', '#a50f15'], N=256
+        )
+        
+        # Mapa izquierdo: escala absoluta (0-100%)
+        paraderos_map_data.plot(
+            ax=axes[0],
+            column='qr_share_pct',
+            cmap=white_red,
+            vmin=0, vmax=100,
+            markersize=20,  # Tamaño fijo para todos los puntos
+            alpha=0.7,
+            legend=True,
+            legend_kwds={'label': "Adopción de QR (%)", 'orientation': "horizontal"}
+        )
+        axes[0].set_title('Escala Absoluta (0-100%)', fontdict={'fontsize': '14', 'fontweight': 'bold'})
+        axes[0].set_axis_off()
+        
+        # Mapa derecho: escala relativa (0-máximo observado)
+        vmax_val = float(qr_by_paradero["qr_share_pct"].max()) if qr_by_paradero.height else 100.0
+        if vmax_val <= 0:
+            vmax_val = 1.0
+        paraderos_map_data.plot(
+            ax=axes[1],
+            column='qr_share_pct',
+            cmap=white_red,
+            vmin=0, vmax=vmax_val,
+            markersize=20,  # Tamaño fijo para todos los puntos
+            alpha=0.7,
+            legend=True,
+            legend_kwds={'label': "Adopción de QR (%)", 'orientation': "horizontal"}
+        )
+        axes[1].set_title(f'Escala Relativa (0-{vmax_val:.1f}%)', fontdict={'fontsize': '14', 'fontweight': 'bold'})
+        axes[1].set_axis_off()
+        
+        fig.suptitle('Adopción de QR por Paradero de Inicio de Viaje', fontsize=16, fontweight='bold')
+        plt.show()
+
+
+```
+
+```{python}
+#| label: top-20-paraderos-qr
+
+# Imprimir el top 20 de paraderos con mayor adopción de QR
+if 'qr_by_paradero' in globals():
+    top_20_qr_paraderos = qr_by_paradero.sort("qr_share_pct", descending=True).head(20)
+    
+    print("--- Top 20 Paraderos con Mayor Adopción de QR ---")
+    print("(Basado en paraderos con al menos 200 viajes semanales)")
+    print(top_20_qr_paraderos.rename({"paradero_inicio_norm": "paradero"}))
+else:
+    print("El DataFrame 'qr_by_paradero' no ha sido calculado. Ejecuta la celda anterior primero.")
+
+```
+
+#### Mapa Interactivo de Adopción por Paradero
+
+```{python}
+#| label: qr-interactive-map
+#| echo: true
+
+import folium
+from folium.plugins import FastMarkerCluster
+from branca.colormap import LinearColormap
+from sklearn.preprocessing import MinMaxScaler
+import numpy as np
+
+# --- 1. Preparar Datos para el Mapa Interactivo ---
+if 'paraderos_map_data' in globals():
+    # Asegurarse de que el GeoDataFrame está en el CRS correcto para Folium (WGS84)
+    if paraderos_map_data.crs.to_epsg() != 4326:
+        paraderos_map_data = paraderos_map_data.to_crs(epsg=4326)
+
+    # --- 2. Radio fijo para todos los círculos ---
+    # Todos los paraderos tendrán el mismo tamaño
+    paraderos_map_data['radius'] = 8  # Radio fijo para todos los puntos
+
+    # --- 3. Crear Mapa Base ---
+    # Centramos el mapa en una ubicación aproximada de Santiago
+    map_center = [-33.45, -70.6]
+    interactive_map = folium.Map(location=map_center, zoom_start=11, tiles="CartoDB positron")
+
+    # --- 4. Crear una Escala de Colores Blanco-Rojo (igual a la previa) ---
+    # Gradiente de blanco a rojo consistente con los mapas estáticos
+    min_adopt = paraderos_map_data['qr_share_pct'].min()
+    max_adopt = paraderos_map_data['qr_share_pct'].max()
+    # Usamos una paleta válida y la invertimos para mantener el gradiente esperado
+    # Escala blanca→rojo previa
+    colormap = LinearColormap(
+        colors=['#ffffff', '#fee0d2', '#fc9272', '#de2d26', '#a50f15'],
+        vmin=min_adopt,
+        vmax=max_adopt
+    )
+    colormap.caption = 'Adopción de QR (%)'
+
+    # --- 5. Añadir Círculos al Mapa ---
+    for idx, row in paraderos_map_data.iterrows():
+        # Tooltip (información que aparece al pasar el ratón)
+        tooltip_html = f"""
+        <b>Paradero:</b> {row['paradero_inicio_norm']}<br>
+        <b>Adopción QR:</b> {row['qr_share_pct']:.1f}%<br>
+        <b>Viajes Totales:</b> {row['n_total']:,}
+        """
+        
+        folium.CircleMarker(
+            location=[row.geometry.y, row.geometry.x],
+            radius=row['radius'], # Radio fijo para todos los puntos
+            tooltip=tooltip_html,
+            color=colormap(row['qr_share_pct']),
+            fill=True,
+            fill_color=colormap(row['qr_share_pct']),
+            fill_opacity=0.7,
+            weight=1
+        ).add_to(interactive_map)
+    
+    # Añadir la leyenda de color al mapa
+    interactive_map.add_child(colormap)
+
+    # --- 6. Mostrar el Mapa ---
+    # El mapa se mostrará en la salida de la celda
+    display(interactive_map)
+
+
+
+```
+
+### Geografía de la Adopción de QR (por Destino)
+
+Replicamos el análisis geográfico utilizando el destino final del viaje para capturar dónde efectivamente terminan los desplazamientos.
+
+
+#### Mapa de calor por Zona 777 de Destino (Robusto)
+
+```{python}
+#| label: qr-heatmap-zonas777-destino-robusto
+#| fig-width: 8
+#| fig-height: 8
+
+import polars as pl
+import matplotlib.pyplot as plt
+
+# Asegurar flag de QR si no existe
+if "is_qr" not in lfk.collect_schema().names():
+    colc = "id_contrato" if "id_contrato" in lfk.collect_schema().names() else ("contrato" if "contrato" in lfk.collect_schema().names() else None)
+    if colc:
+        lfk = lfk.with_columns(pl.col(colc).cast(pl.Utf8).str.strip_chars().is_in(["171","102"]).alias("is_qr"))
+    else:
+        lfk = lfk.with_columns(pl.lit(None).alias("is_qr"))
+
+if 'gdf_zonas' not in globals() or gdf_zonas is None:
+    print("GeoDataFrame 'gdf_zonas' no encontrado. Ejecuta la carga de Zonas 777.")
+else:
+    zonas_geo = gdf_zonas.copy()
+    print("Geometrías de Zonas 777 disponibles.")
+
+    # Columnas de zona de destino robustas (última bajada disponible)
+    zona_bajada_cols = [
+        c for c in ["zona_bajada_4","zona_bajada_3","zona_bajada_2","zona_bajada_1","zona_fin_viaje"]
+        if c in lfk.collect_schema().names()
+    ]
+    if not zona_bajada_cols:
+        print("No se encontraron columnas de zona de bajada/fin para destino.")
+    else:
+        lfk_with_zona_dest = lfk.with_columns(
+            pl.coalesce([pl.col(c) for c in zona_bajada_cols]).alias("zona_destino_robust")
+        )
+
+        qr_by_zona_dest = (
+            lfk_with_zona_dest
+            .with_columns(pl.col("zona_destino_robust").cast(pl.Int64, strict=False).alias("ZONA777"))
+            .filter(pl.col("ZONA777").is_not_null())
+            .group_by("ZONA777")
+            .agg([
+                (pl.col("is_qr") == True).sum().alias("n_qr"),
+                pl.len().alias("n_total")
+            ])
+            .with_columns((pl.col("n_qr") / pl.col("n_total") * 100).alias("qr_share_pct"))
+            .filter(pl.col("n_total") > 100)
+            .collect(engine="in-memory")
+        )
+
+        print("Adopción de QR por Zona 777 de destino (Top 5):")
+        print(qr_by_zona_dest.sort("qr_share_pct", descending=True).head())
+
+        zonas_map_data_fin = zonas_geo.merge(
+            qr_by_zona_dest.to_pandas(),
+            on='ZONA777',
+            how='left'
+        )
+        zonas_map_data_fin['qr_share_pct'] = zonas_map_data_fin['qr_share_pct'].fillna(0)
+
+        # --- 4. Generar los Mapas Coropléticos por Zona de Destino (absoluto y relativo) ---
+        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+        # Paleta blanco→rojo y normalización al máximo real
+        from matplotlib.colors import LinearSegmentedColormap
+        white_red = LinearSegmentedColormap.from_list(
+            'white_red', ['#ffffff', '#fee0d2', '#fc9272', '#de2d26', '#a50f15'], N=256
+        )
+        
+        # Mapa izquierdo: escala absoluta (0-100%)
+        zonas_map_data_fin.plot(
+            column='qr_share_pct',
+            cmap=white_red,
+            vmin=0, vmax=100,
+            linewidth=0.5, # Líneas más delgadas para no saturar
+            ax=axes[0],
+            edgecolor='0.8',
+            legend=True,
+            legend_kwds={'label': "Adopción de QR (%)", 'orientation': "horizontal"}
+        )
+        axes[0].set_title('Escala Absoluta (0-100%)', fontdict={'fontsize': '14', 'fontweight': 'bold'})
+        axes[0].set_axis_off()
+        
+        # Mapa derecho: escala relativa (0-máximo observado)
+        vmax_val = float(qr_by_zona_dest["qr_share_pct"].max()) if qr_by_zona_dest.height else 100.0
+        if vmax_val <= 0:
+            vmax_val = 1.0
+        zonas_map_data_fin.plot(
+            column='qr_share_pct',
+            cmap=white_red,
+            vmin=0, vmax=vmax_val,
+            linewidth=0.5, # Líneas más delgadas para no saturar
+            ax=axes[1],
+            edgecolor='0.8',
+            legend=True,
+            legend_kwds={'label': "Adopción de QR (%)", 'orientation': "horizontal"}
+        )
+        axes[1].set_title(f'Escala Relativa (0-{vmax_val:.1f}%)', fontdict={'fontsize': '14', 'fontweight': 'bold'})
+        axes[1].set_axis_off()
+        
+        fig.suptitle('Mapa de Calor de Adopción de QR por Zona 777 de Destino Final', fontsize=16, fontweight='bold')
+        plt.show()
+
+```
+
+
+#### Mapa Comparativo: Zonas 777 de Destino — PEAK AM vs PEAK PM
+
+```{python}
+#| label: qr-geotemporal-peak-am-vs-pm-zonas-destino
+#| fig-width: 14
+#| fig-height: 7
+
+import polars as pl
+import matplotlib.pyplot as plt
+
+AM_PEAK = {7,8,9}
+PM_PEAK = {17,18,19}
+
+# Asegurar 'lfk', 'hour' e 'is_qr' si la celda se ejecuta antes
+try:
+    lfk
+except NameError:
+    lfk = lf_v
+cols = set(lfk.collect_schema().names())
+if "hour" not in cols:
+    ts_col = "tiempo_inicio_viaje" if "tiempo_inicio_viaje" in cols else ("tiempo_subida_1" if "tiempo_subida_1" in cols else None)
+    if ts_col:
+        lfk = lfk.with_columns(
+            pl.col(ts_col).cast(pl.Datetime, strict=False).dt.replace_time_zone("America/Santiago").dt.hour().alias("hour")
+        )
+if "is_qr" not in lfk.collect_schema().names():
+    c = "id_contrato" if "id_contrato" in lfk.collect_schema().names() else ("contrato" if "contrato" in lfk.collect_schema().names() else None)
+    if c:
+        lfk = lfk.with_columns(pl.col(c).cast(pl.Utf8).str.strip_chars().is_in(["171","102"]).alias("is_qr"))
+
+dest_cols = [c for c in ["zona_bajada_4","zona_bajada_3","zona_bajada_2","zona_bajada_1","zona_fin_viaje"] if c in lfk.collect_schema().names()]
+if {"hour","is_qr"} <= set(lfk.collect_schema().names()) and dest_cols and 'gdf_zonas' in globals():
+    def agg_zona(hours_set):
+        return (
+            lfk.with_columns(pl.coalesce([pl.col(c) for c in dest_cols]).alias("_zona_dest"))
+               .with_columns(pl.col("_zona_dest").cast(pl.Int64, strict=False).alias("ZONA777"))
+               .filter(pl.col("ZONA777").is_not_null() & pl.col("hour").is_in(list(hours_set)))
+               .group_by("ZONA777").agg([
+                   (pl.col("is_qr") == True).sum().alias("n_qr"),
+                   pl.len().alias("n_total")
+               ])
+               .with_columns((pl.col("n_qr")/pl.col("n_total")*100).alias("qr_share_pct"))
+               .filter(pl.col("n_total") > 50)
+               .collect(engine="in-memory")
+        )
+
+    am = agg_zona(AM_PEAK)
+    pm = agg_zona(PM_PEAK)
+
+    zonas_geo = gdf_zonas.copy()
+    map_am = zonas_geo.merge(am.to_pandas(), on='ZONA777', how='left').fillna({'qr_share_pct':0})
+    map_pm = zonas_geo.merge(pm.to_pandas(), on='ZONA777', how='left').fillna({'qr_share_pct':0})
+
+    vmin = min(map_am['qr_share_pct'].min(), map_pm['qr_share_pct'].min())
+    vmax = max(map_am['qr_share_pct'].max(), map_pm['qr_share_pct'].max())
+    from matplotlib.colors import LinearSegmentedColormap
+    white_red = LinearSegmentedColormap.from_list('white_red', ['#ffffff','#fee0d2','#fc9272','#de2d26','#a50f15'], N=256)
+
+    fig, axes = plt.subplots(1,2, figsize=(15,8), sharex=True, sharey=True)
+    fig.suptitle('Adopción de QR por Zona de Destino — PEAK AM vs PEAK PM', fontsize=18, y=0.95)
+    map_am.plot(column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, linewidth=0.5, edgecolor='0.8', ax=axes[0])
+    axes[0].set_title('PEAK AM (7–9h)'); axes[0].set_axis_off()
+    map_pm.plot(column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, linewidth=0.5, edgecolor='0.8', ax=axes[1])
+    axes[1].set_title('PEAK PM (17–19h)'); axes[1].set_axis_off()
+
+    fig.subplots_adjust(bottom=0.1)
+    cbar_ax = fig.add_axes([0.3, 0.05, 0.4, 0.03])
+    sm = plt.cm.ScalarMappable(cmap=white_red, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Adopción de QR (%)', fontsize=12)
+    plt.show()
+else:
+    print("Faltan columnas o geometría para mapa de zonas PEAK AM vs PM (destino).")
+```
+
+#### Mapa Comparativo: Zonas 777 de Destino — PEAK (AM+PM) vs Valle
+
+```{python}
+#| label: qr-geotemporal-peak-vs-valle-zonas-destino
+#| fig-width: 14
+#| fig-height: 7
+
+import polars as pl
+import matplotlib.pyplot as plt
+
+AM_PEAK = {7,8,9}
+PM_PEAK = {17,18,19}
+PEAK = AM_PEAK | PM_PEAK
+
+dest_cols = [c for c in ["zona_bajada_4","zona_bajada_3","zona_bajada_2","zona_bajada_1","zona_fin_viaje"] if c in lfk.collect_schema().names()]
+if {"hour","is_qr"} <= set(lfk.collect_schema().names()) and dest_cols and 'gdf_zonas' in globals():
+    def agg_zona(mask_expr):
+        return (
+            lfk.with_columns(pl.coalesce([pl.col(c) for c in dest_cols]).alias("_zona_dest"))
+               .with_columns(pl.col("_zona_dest").cast(pl.Int64, strict=False).alias("ZONA777"))
+               .filter(pl.col("ZONA777").is_not_null() & mask_expr)
+               .group_by("ZONA777").agg([
+                   (pl.col("is_qr") == True).sum().alias("n_qr"),
+                   pl.len().alias("n_total")
+               ])
+               .with_columns((pl.col("n_qr")/pl.col("n_total")*100).alias("qr_share_pct"))
+               .filter(pl.col("n_total") > 50)
+               .collect(engine="in-memory")
+        )
+
+    peak = agg_zona(pl.col("hour").is_in(list(PEAK)))
+    valle = agg_zona(~pl.col("hour").is_in(list(PEAK)))
+
+    zonas_geo = gdf_zonas.copy()
+    map_peak = zonas_geo.merge(peak.to_pandas(), on='ZONA777', how='left').fillna({'qr_share_pct':0})
+    map_valle = zonas_geo.merge(valle.to_pandas(), on='ZONA777', how='left').fillna({'qr_share_pct':0})
+
+    vmin = min(map_peak['qr_share_pct'].min(), map_valle['qr_share_pct'].min())
+    vmax = max(map_peak['qr_share_pct'].max(), map_valle['qr_share_pct'].max())
+    from matplotlib.colors import LinearSegmentedColormap
+    white_red = LinearSegmentedColormap.from_list('white_red', ['#ffffff','#fee0d2','#fc9272','#de2d26','#a50f15'], N=256)
+
+    fig, axes = plt.subplots(1,2, figsize=(15,8), sharex=True, sharey=True)
+    fig.suptitle('Adopción de QR por Zona de Destino — PEAK (AM+PM) vs Valle', fontsize=18, y=0.95)
+    map_peak.plot(column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, linewidth=0.5, edgecolor='0.8', ax=axes[0])
+    axes[0].set_title('PEAK (AM+PM)'); axes[0].set_axis_off()
+    map_valle.plot(column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, linewidth=0.5, edgecolor='0.8', ax=axes[1])
+    axes[1].set_title('Valle'); axes[1].set_axis_off()
+
+    fig.subplots_adjust(bottom=0.1)
+    cbar_ax = fig.add_axes([0.3, 0.05, 0.4, 0.03])
+    sm = plt.cm.ScalarMappable(cmap=white_red, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Adopción de QR (%)', fontsize=12)
+    plt.show()
+else:
+    print("Faltan columnas o geometría para mapa de zonas PEAK vs Valle (destino).")
+```
+
+
+#### Geo-Temporal: Destino por Paradero — PEAK AM vs PEAK PM
+
+```{python}
+#| label: qr-geotemporal-peak-am-vs-pm-paradero-destino
+#| fig-width: 20
+#| fig-height: 10
+
+import polars as pl
+import matplotlib.pyplot as plt
+
+AM_PEAK = {7,8,9}
+PM_PEAK = {17,18,19}
+
+dest_cols = [c for c in ["paradero_bajada_4","paradero_bajada_3","paradero_bajada_2","paradero_bajada_1","paradero_fin_viaje"] if c in lfk.collect_schema().names()]
+
+if {"hour","is_qr"} <= set(lfk.collect_schema().names()) and dest_cols and 'gdf_par' in globals() and gdf_par is not None:
+    try:
+        normalize_paradero
+    except NameError:
+        import unicodedata
+        def normalize_paradero(s: str) -> str:
+            if not isinstance(s, str):
+                return s
+            return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn').upper().strip()
+
+    lfk_dest = (
+        lfk.with_columns(pl.coalesce([pl.col(c) for c in dest_cols]).alias("paradero_destino_robust"))
+           .with_columns(pl.col("paradero_destino_robust").map_elements(normalize_paradero, return_dtype=pl.String).alias("paradero_destino_norm"))
+    )
+
+    def agg_by(hours_set, label):
+        return (
+            lfk_dest.filter(pl.col("hour").is_in(list(hours_set)))
+                    .group_by("paradero_destino_norm")
+                    .agg([
+                        (pl.col("is_qr") == True).sum().alias("n_qr"),
+                        pl.len().alias("n_total")
+                    ])
+                    .with_columns((pl.col("n_qr")/pl.col("n_total")*100).alias("qr_share_pct"))
+                    .filter(pl.col("n_total") >= 200)
+                    .with_columns(pl.lit(label).alias("periodo"))
+                    .collect(engine="in-memory")
+        )
+
+    am = agg_by(AM_PEAK, "PEAK AM")
+    pm = agg_by(PM_PEAK, "PEAK PM")
+
+    from matplotlib.colors import LinearSegmentedColormap
+    white_red = LinearSegmentedColormap.from_list('white_red', ['#ffffff','#fee0d2','#fc9272','#de2d26','#a50f15'], N=256)
+
+    gdf_clean = gdf_par.copy()
+    gdf_clean['parada_norm'] = gdf_clean['parada'].apply(normalize_paradero)
+    gdf_clean = gdf_clean.drop_duplicates(subset=['parada_norm'], keep='first')
+
+    def plot_map(df_polars, ax, title, vmin, vmax):
+        gdf_plot = gdf_clean.merge(df_polars.to_pandas(), left_on='parada_norm', right_on='paradero_destino_norm', how='inner')
+        if 'comunas_geo' in globals():
+            comunas_geo.boundary.plot(ax=ax, linewidth=0.4, color="gray")
+        gdf_plot.plot(ax=ax, column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, markersize=20, alpha=0.7, legend=False)
+        ax.set_title(title, fontsize=14)
+        ax.set_axis_off()
+
+    vmin = float(min(am['qr_share_pct'].min(), pm['qr_share_pct'].min())) if am.height and pm.height else 0.0
+    vmax = float(max(am['qr_share_pct'].max(), pm['qr_share_pct'].max())) if am.height and pm.height else 100.0
+    if vmax <= 0:
+        vmax = 1.0
+
+    fig, axes = plt.subplots(1, 2, figsize=(20,10), sharex=True, sharey=True)
+    fig.suptitle('Adopción de QR por Paradero de Destino — PEAK AM vs PEAK PM', fontsize=18, y=0.95)
+    plot_map(am, axes[0], 'PEAK AM (7–9h)', vmin, vmax)
+    plot_map(pm, axes[1], 'PEAK PM (17–19h)', vmin, vmax)
+
+    fig.subplots_adjust(bottom=0.1)
+    cbar_ax = fig.add_axes([0.3, 0.05, 0.4, 0.03])
+    sm = plt.cm.ScalarMappable(cmap=white_red, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Adopción de QR (%)', fontsize=12)
+    plt.show()
+else:
+    print("Faltan columnas/geometría para el análisis por paradero de destino (PEAK AM vs PM).")
+```
+
+
+### Patrones Temporales de Adopción de QR
+
+```{python}
+#| label: qr-temporal-day-of-week
+#| fig-width: 10
+#| fig-height: 6
+
+import polars as pl
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Asegurar que las columnas 'wday' y 'is_qr' existen
+if {"wday", "is_qr"} <= set(lfk.collect_schema().names()):
+
+    # 1. Calcular n_viajes y n_qr_trips por día de la semana
+    qr_by_day = (
+        lfk.group_by("wday")
+           .agg([
+               pl.len().alias("n_total"),
+               (pl.col("is_qr") == True).sum().alias("n_qr")
+           ])
+           .with_columns(
+               (pl.col("n_qr") / pl.col("n_total") * 100).alias("qr_share_pct")
+           )
+           .sort("wday")
+           .collect(engine="in-memory")
+    )
+
+    # Mapear wday a nombres de días para el gráfico
+    day_map = {1: 'Lunes', 2: 'Martes', 3: 'Miércoles', 4: 'Jueves', 5: 'Viernes', 6: 'Sábado', 7: 'Domingo'}
+    qr_by_day = qr_by_day.with_columns(
+        pl.col("wday").map_elements(lambda d: day_map.get(d), return_dtype=pl.String).alias("day_name")
+    )
+
+    print("Adopción de QR por día de la semana:")
+    print(qr_by_day)
+
+    # 2. Visualizar
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Ordenar los días de la semana correctamente para el gráfico
+    day_order = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
+    
+    sns.barplot(
+        data=qr_by_day.to_pandas().set_index('day_name').loc[day_order].reset_index(),
+        x="day_name",
+        y="qr_share_pct",
+        ax=ax,
+        color='skyblue'
+    )
+    
+    ax.set_title(f'Adopción de QR por Día de la Semana (Semana {SEM_LABEL})', fontsize=16)
+    ax.set_xlabel('Día de la Semana', fontsize=12)
+    ax.set_ylabel('Porcentaje de Viajes con QR (%)', fontsize=12)
+    ax.set_ylim(0, max(qr_by_day["qr_share_pct"]) * 1.15) # Un poco de espacio arriba
+    
+    # Añadir etiquetas de porcentaje
+    for p in ax.patches:
+        ax.annotate(f'{p.get_height():.1f}%', 
+                    (p.get_x() + p.get_width() / 2., p.get_height()), 
+                    ha='center', va='center', 
+                    xytext=(0, 9), 
+                    textcoords='offset points')
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+```
+
+```{python}
+#| label: qr-temporal-hour-of-day
+#| fig-width: 12
+#| fig-height: 6
+
+import polars as pl
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Asegurar que las columnas 'hour' y 'is_qr' existen
+if {"hour", "is_qr"} <= set(lfk.collect_schema().names()):
+
+    # 1. Calcular adopción por hora del día
+    qr_by_hour = (
+        lfk.group_by("hour")
+           .agg([
+               pl.len().alias("n_total"),
+               (pl.col("is_qr") == True).sum().alias("n_qr")
+           ])
+           .with_columns(
+               (pl.col("n_qr") / pl.col("n_total") * 100).alias("qr_share_pct")
+           )
+           .sort("hour")
+           .collect(engine="in-memory")
+    )
+
+    print("Adopción de QR por hora del día:")
+    print(qr_by_hour)
+    
+    # --- Visualización ---
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+
+    # Gráfico de barras para el % de adopción
+    sns.barplot(
+        data=qr_by_hour.to_pandas(),
+        x="hour",
+        y="qr_share_pct",
+        color="lightcoral",
+        ax=ax1,
+        label="Adopción QR (%)"
+    )
+    ax1.set_xlabel('Hora del Día', fontsize=12)
+    ax1.set_ylabel('Porcentaje de Viajes con QR (%)', color='lightcoral', fontsize=12)
+    ax1.tick_params(axis='y', labelcolor='lightcoral')
+    ax1.set_ylim(0, max(qr_by_hour["qr_share_pct"]) * 1.2)
+    
+    # Gráfico de líneas para el volumen total de viajes en un segundo eje Y
+    ax2 = ax1.twinx()
+    sns.lineplot(
+        data=qr_by_hour.to_pandas(),
+        x="hour",
+        y="n_total",
+        color="steelblue",
+        ax=ax2,
+        marker='o',
+        label="Volumen Total de Viajes"
+    )
+    ax2.set_ylabel('Volumen Total de Viajes', color='steelblue', fontsize=12)
+    ax2.tick_params(axis='y', labelcolor='steelblue')
+    
+    # Título y leyenda
+    fig.suptitle(f'Adopción de QR y Volumen de Viajes por Hora del Día (Semana {SEM_LABEL})', fontsize=16)
+    fig.tight_layout(rect=[0, 0, 1, 0.96]) # Ajustar para el suptitle
+    
+    # Unir leyendas
+    lines, labels = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax2.legend(lines + lines2, labels + labels2, loc='upper left')
+    
+    plt.xticks(range(0, 24))
+    ax1.grid(True, axis='y', linestyle='--', linewidth=0.6)
+    plt.show()
+
+```
+
+#### Perfil Horario Comparativo: QR vs. Tarjeta
+
+```{python}
+#| label: qr-temporal-combined-profile
+#| fig-width: 12
+#| fig-height: 7
+
+import polars as pl
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Asegurar que las columnas 'wday', 'hour', 'is_qr' existen
+if {"wday", "hour", "is_qr"} <= set(lfk.collect_schema().names()):
+
+    # 1. Crear 'tipo_dia' (L-V vs S-D) y 'tipo_pago' (QR vs Tarjeta)
+    lfk_temp_profile = lfk.with_columns([
+        pl.when(pl.col("wday") <= 5).then(pl.lit("Lunes a Viernes")).otherwise(pl.lit("Sábado y Domingo")).alias("tipo_dia"),
+        pl.when(pl.col("is_qr")).then(pl.lit("Pago QR")).otherwise(pl.lit("Tarjeta Bip!")).alias("tipo_pago")
+    ])
+
+    # 2. Agrupar para obtener el perfil horario
+    hourly_profile = (
+        lfk_temp_profile.group_by(["tipo_dia", "tipo_pago", "hour"])
+                        .agg(pl.len().alias("n_viajes"))
+                        .sort(["tipo_dia", "tipo_pago", "hour"])
+                        .collect(engine="in-memory")
+    )
+
+    # 3. Visualizar con FacetGrid de Seaborn
+    g = sns.FacetGrid(
+        data=hourly_profile.to_pandas(),
+        row="tipo_dia",
+        hue="tipo_pago",
+        height=3.5,
+        aspect=3,
+        sharex=True,
+        sharey=False, # Perfiles pueden tener escalas muy distintas
+        palette={"Pago QR": "orangered", "Tarjeta Bip!": "royalblue"},
+        row_order=["Lunes a Viernes", "Sábado y Domingo"] # Asegurar orden
+    )
+    
+    g.map(sns.lineplot, "hour", "n_viajes", marker='o', markersize=4)
+    g.map(plt.fill_between, "hour", "n_viajes", alpha=0.1)
+
+    g.add_legend(title="Tipo de Pago")
+    g.set_axis_labels("Hora del Día", "Número de Viajes")
+    g.set_titles(row_template="{row_name}")
+    g.fig.suptitle(f'Perfil Horario de Viajes por Tipo de Día y Método de Pago (Semana {SEM_LABEL})', y=1.03)
+    
+    for ax in g.axes.flatten():
+        ax.grid(True, linestyle='--', linewidth=0.6)
+    
+    plt.xticks(range(0, 24))
+    g.tight_layout()
+    plt.show()
+
+
+
+```
+
+#### Análisis de Patrones Temporales
+
+El análisis temporal del uso del QR revela tres hallazgos clave que se alinean con la hipótesis de la inercia conductual:
+
+1.  **Efecto Fin de Semana:** La adopción del pago QR es consistentemente más alta durante los sábados y domingos (19.0% - 19.4%) en comparación con los días laborales (16.7% - 17.5%). Esta diferencia de \~2 puntos porcentuales sugiere que los viajes de fin de semana, a menudo menos estructurados y no ligados a la rutina laboral, presentan una barrera de entrada más baja para la adopción de nuevas tecnologías.
+
+2.  **Patrón Horario en "U" (Inverso a la Congestión):** El porcentaje de uso de QR es máximo durante las horas valle (madrugada y noche) y alcanza su punto más bajo durante la hora punta de la mañana (6-8 AM), justo cuando el volumen de viajes es mayor. Este patrón contraintuitivo es una fuerte evidencia de inercia: en los momentos de mayor presión y rutina, los usuarios recurren al método más familiar y habitual (la tarjeta física), mientras que en viajes menos apremiantes (horas valle) están más dispuestos a utilizar el pago digital.
+
+3.  **Perfiles de Uso Diferenciados:** La comparación de perfiles horarios muestra que, si bien ambos métodos de pago siguen el pulso de la ciudad, los picos de la "Tarjeta Bip!" durante los días de semana son mucho más pronunciados y agudos, característicos del *commuting* masivo. El perfil del QR, en cambio, es más suave. Esto indica que, aunque el QR se utiliza a todas horas, su relevancia es proporcionalmente mayor fuera de los momentos de máxima rigidez horaria, reforzando la idea de que la rutina solidifica el uso de la tecnología tradicional.
+
+### Análisis Geo-Temporal: El "Efecto Fin de Semana"
+
+#### Mapa Comparativo: Adopción en Zonas 777 (Días Laborales vs. Fin de Semana)
+
+```{python}
+#| label: qr-geotemporal-weekend-effect-zonas
+#| fig-width: 14
+#| fig-height: 7
+
+import polars as pl
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
+# 1. Asegurar que tenemos los datos necesarios
+if {"wday", "is_qr", "zona_inicio_viaje"} <= set(lfk.collect_schema().names()) and 'gdf_zonas' in globals():
+    
+    # 2. Calcular adopción de QR por Zona 777 y tipo de día
+    lfk_geotemp = lfk.with_columns(
+        pl.when(pl.col("wday") <= 5).then(pl.lit("Lunes a Viernes")).otherwise(pl.lit("Sábado y Domingo")).alias("tipo_dia")
+    )
+
+    qr_by_zona_daytype = (
+        lfk_geotemp
+        .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .filter(pl.col("ZONA777").is_not_null())
+        .group_by(["ZONA777", "tipo_dia"])
+        .agg([
+            (pl.col("is_qr") == True).sum().alias("n_qr"),
+            pl.len().alias("n_total")
+        ])
+        .with_columns((pl.col("n_qr") / pl.col("n_total") * 100).alias("qr_share_pct"))
+        .filter(pl.col("n_total") > 50) # Umbral un poco más bajo para capturar datos de finde
+        .collect(engine="in-memory")
+    )
+
+    # 3. Pivotar la tabla para tener columnas separadas para cada tipo de día
+    qr_pivot = qr_by_zona_daytype.pivot(
+        values="qr_share_pct",
+        index="ZONA777",
+        columns="tipo_dia"
+    ).rename({
+        "Lunes a Viernes": "qr_pct_laboral",
+        "Sábado y Domingo": "qr_pct_finde"
+    })
+
+    # 4. Unir con los datos geoespaciales
+    zonas_geo = gdf_zonas.copy()
+    zonas_map_geotemp = zonas_geo.merge(
+        qr_pivot.to_pandas(),
+        on='ZONA777',
+        how='left'
+    )
+    # Rellenar con 0 para zonas sin suficientes datos o sin cambio
+    zonas_map_geotemp['qr_pct_laboral'] = zonas_map_geotemp['qr_pct_laboral'].fillna(0)
+    zonas_map_geotemp['qr_pct_finde'] = zonas_map_geotemp['qr_pct_finde'].fillna(0)
+
+    # 5. Crear la visualización comparativa
+    fig, axes = plt.subplots(1, 2, figsize=(15, 8), sharex=True, sharey=True)
+    fig.suptitle('Adopción de QR por Zona de Origen: Días Laborales vs. Fin de Semana', fontsize=18, y=0.95)
+
+    # Definir una escala de color común para ambos mapas
+    vmin = min(zonas_map_geotemp['qr_pct_laboral'].min(), zonas_map_geotemp['qr_pct_finde'].min())
+    vmax = max(zonas_map_geotemp['qr_pct_laboral'].max(), zonas_map_geotemp['qr_pct_finde'].max())
+
+    # Crear paleta blanco-rojo
+    from matplotlib.colors import LinearSegmentedColormap
+    white_red = LinearSegmentedColormap.from_list(
+        'white_red', ['#ffffff', '#fee0d2', '#fc9272', '#de2d26', '#a50f15'], N=256
+    )
+
+    # Mapa de Días Laborales
+    zonas_map_geotemp.plot(
+        column='qr_pct_laboral', cmap=white_red, linewidth=0.5, ax=axes[0], edgecolor='0.8',
+        vmin=vmin, vmax=vmax
+    )
+    axes[0].set_title('Lunes a Viernes', fontsize=14)
+    axes[0].set_axis_off()
+
+    # Mapa de Fin de Semana (sin leyenda aquí para mantener el tamaño)
+    zonas_map_geotemp.plot(
+        column='qr_pct_finde', cmap=white_red, linewidth=0.5, ax=axes[1], edgecolor='0.8',
+        vmin=vmin, vmax=vmax
+    )
+    axes[1].set_title('Sábado y Domingo', fontsize=14)
+    axes[1].set_axis_off()
+    
+    # 6. Añadir una barra de color compartida y bien posicionada
+    # Ajustar el layout principal para dejar espacio en la parte inferior
+    fig.subplots_adjust(bottom=0.1)
+    
+    # Crear un nuevo eje para la barra de color: [left, bottom, width, height]
+    cbar_ax = fig.add_axes([0.3, 0.05, 0.4, 0.03])
+    
+    # Crear un objeto ScalarMappable que la barra de color pueda usar
+    sm = plt.cm.ScalarMappable(cmap=white_red, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    
+    # Dibujar la barra de color en el eje que creamos
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Adopción de QR (%)', fontsize=12)
+    
+    plt.show()
+
+
+```
+
+#### Mapa Comparativo: Origen Zonas 777 — PEAK AM vs PEAK PM
+
+```{python}
+#| label: qr-geotemporal-peak-am-vs-pm-zonas
+#| fig-width: 14
+#| fig-height: 7
+
+import polars as pl
+import matplotlib.pyplot as plt
+
+AM_PEAK = {7,8,9}
+PM_PEAK = {17,18,19}
+
+if {"hour","is_qr","zona_inicio_viaje"} <= set(lfk.collect_schema().names()) and 'gdf_zonas' in globals():
+    def agg_zona(hours_set):
+        return (
+            lfk.with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+               .filter(pl.col("ZONA777").is_not_null() & pl.col("hour").is_in(list(hours_set)))
+               .group_by("ZONA777").agg([
+                   (pl.col("is_qr") == True).sum().alias("n_qr"),
+                   pl.len().alias("n_total")
+               ])
+               .with_columns((pl.col("n_qr")/pl.col("n_total")*100).alias("qr_share_pct"))
+               .filter(pl.col("n_total") > 50)
+               .collect(engine="in-memory")
+        )
+
+    am = agg_zona(AM_PEAK)
+    pm = agg_zona(PM_PEAK)
+
+    zonas_geo = gdf_zonas.copy()
+    map_am = zonas_geo.merge(am.to_pandas(), on='ZONA777', how='left').fillna({'qr_share_pct':0})
+    map_pm = zonas_geo.merge(pm.to_pandas(), on='ZONA777', how='left').fillna({'qr_share_pct':0})
+
+    vmin = min(map_am['qr_share_pct'].min(), map_pm['qr_share_pct'].min())
+    vmax = max(map_am['qr_share_pct'].max(), map_pm['qr_share_pct'].max())
+    from matplotlib.colors import LinearSegmentedColormap
+    white_red = LinearSegmentedColormap.from_list('white_red', ['#ffffff','#fee0d2','#fc9272','#de2d26','#a50f15'], N=256)
+
+    fig, axes = plt.subplots(1,2, figsize=(15,8), sharex=True, sharey=True)
+    fig.suptitle('Adopción de QR por Zona de Origen — PEAK AM vs PEAK PM', fontsize=18, y=0.95)
+    map_am.plot(column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, linewidth=0.5, edgecolor='0.8', ax=axes[0])
+    axes[0].set_title('PEAK AM (7–9h)'); axes[0].set_axis_off()
+    map_pm.plot(column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, linewidth=0.5, edgecolor='0.8', ax=axes[1])
+    axes[1].set_title('PEAK PM (17–19h)'); axes[1].set_axis_off()
+
+    fig.subplots_adjust(bottom=0.1)
+    cbar_ax = fig.add_axes([0.3, 0.05, 0.4, 0.03])
+    sm = plt.cm.ScalarMappable(cmap=white_red, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Adopción de QR (%)', fontsize=12)
+    plt.show()
+else:
+    print("Faltan columnas o geometría para mapa de zonas PEAK AM vs PM (origen).")
+```
+
+#### Mapa Comparativo: Origen Zonas 777 — PEAK (AM+PM) vs Valle
+
+```{python}
+#| label: qr-geotemporal-peak-vs-valle-zonas
+#| fig-width: 14
+#| fig-height: 7
+
+import polars as pl
+import matplotlib.pyplot as plt
+
+AM_PEAK = {7,8,9}
+PM_PEAK = {17,18,19}
+PEAK = AM_PEAK | PM_PEAK
+
+if {"hour","is_qr","zona_inicio_viaje"} <= set(lfk.collect_schema().names()) and 'gdf_zonas' in globals():
+    def agg_zona(mask_expr):
+        return (
+            lfk.with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+               .filter(pl.col("ZONA777").is_not_null() & mask_expr)
+               .group_by("ZONA777").agg([
+                   (pl.col("is_qr") == True).sum().alias("n_qr"),
+                   pl.len().alias("n_total")
+               ])
+               .with_columns((pl.col("n_qr")/pl.col("n_total")*100).alias("qr_share_pct"))
+               .filter(pl.col("n_total") > 50)
+               .collect(engine="in-memory")
+        )
+
+    peak = agg_zona(pl.col("hour").is_in(list(PEAK)))
+    valle = agg_zona(~pl.col("hour").is_in(list(PEAK)))
+
+    zonas_geo = gdf_zonas.copy()
+    map_peak = zonas_geo.merge(peak.to_pandas(), on='ZONA777', how='left').fillna({'qr_share_pct':0})
+    map_valle = zonas_geo.merge(valle.to_pandas(), on='ZONA777', how='left').fillna({'qr_share_pct':0})
+
+    vmin = min(map_peak['qr_share_pct'].min(), map_valle['qr_share_pct'].min())
+    vmax = max(map_peak['qr_share_pct'].max(), map_valle['qr_share_pct'].max())
+    from matplotlib.colors import LinearSegmentedColormap
+    white_red = LinearSegmentedColormap.from_list('white_red', ['#ffffff','#fee0d2','#fc9272','#de2d26','#a50f15'], N=256)
+
+    fig, axes = plt.subplots(1,2, figsize=(15,8), sharex=True, sharey=True)
+    fig.suptitle('Adopción de QR por Zona de Origen — PEAK (AM+PM) vs Valle', fontsize=18, y=0.95)
+    map_peak.plot(column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, linewidth=0.5, edgecolor='0.8', ax=axes[0])
+    axes[0].set_title('PEAK (AM+PM)'); axes[0].set_axis_off()
+    map_valle.plot(column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, linewidth=0.5, edgecolor='0.8', ax=axes[1])
+    axes[1].set_title('Valle'); axes[1].set_axis_off()
+
+    fig.subplots_adjust(bottom=0.1)
+    cbar_ax = fig.add_axes([0.3, 0.05, 0.4, 0.03])
+    sm = plt.cm.ScalarMappable(cmap=white_red, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Adopción de QR (%)', fontsize=12)
+    plt.show()
+else:
+    print("Faltan columnas o geometría para mapa de zonas PEAK vs Valle (origen).")
+```
+
+#### Mapa Comparativo: Adopción en Zonas 777 de Destino (Días Laborales vs. Fin de Semana)
+
+```{python}
+#| label: qr-geotemporal-weekend-effect-zonas-destino
+#| fig-width: 14
+#| fig-height: 7
+
+import polars as pl
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
+# 1. Asegurar que tenemos los datos necesarios
+zona_dest_cols = [c for c in ["zona_bajada_4","zona_bajada_3","zona_bajada_2","zona_bajada_1","zona_fin_viaje"] if c in lfk.collect_schema().names()]
+
+if {"wday", "is_qr"} <= set(lfk.collect_schema().names()) and zona_dest_cols and 'gdf_zonas' in globals():
+    
+    # 2. Calcular adopción de QR por Zona 777 de destino robusto y tipo de día
+    lfk_geotemp_dest = lfk.with_columns(
+        pl.when(pl.col("wday") <= 5).then(pl.lit("Lunes a Viernes")).otherwise(pl.lit("Sábado y Domingo")).alias("tipo_dia")
+    ).with_columns(
+        pl.coalesce([pl.col(c) for c in zona_dest_cols]).alias("zona_destino_robust")
+    )
+
+    qr_by_zona_daytype_dest = (
+        lfk_geotemp_dest
+        .with_columns(pl.col("zona_destino_robust").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .filter(pl.col("ZONA777").is_not_null())
+        .group_by(["ZONA777", "tipo_dia"])
+        .agg([
+            (pl.col("is_qr") == True).sum().alias("n_qr"),
+            pl.len().alias("n_total")
+        ])
+        .with_columns((pl.col("n_qr") / pl.col("n_total") * 100).alias("qr_share_pct"))
+        .filter(pl.col("n_total") > 50)
+        .collect(engine="in-memory")
+    )
+
+    # 3. Pivotar la tabla
+    qr_pivot_dest = qr_by_zona_daytype_dest.pivot(
+        values="qr_share_pct",
+        index="ZONA777",
+        columns="tipo_dia"
+    ).rename({
+        "Lunes a Viernes": "qr_pct_laboral",
+        "Sábado y Domingo": "qr_pct_finde"
+    })
+
+    # 4. Unir con los datos geoespaciales
+    zonas_geo_dest = gdf_zonas.copy()
+    zonas_map_geotemp_dest = zonas_geo_dest.merge(
+        qr_pivot_dest.to_pandas(),
+        on='ZONA777',
+        how='left'
+    )
+    zonas_map_geotemp_dest['qr_pct_laboral'] = zonas_map_geotemp_dest['qr_pct_laboral'].fillna(0)
+    zonas_map_geotemp_dest['qr_pct_finde'] = zonas_map_geotemp_dest['qr_pct_finde'].fillna(0)
+
+    # 5. Crear la visualización comparativa
+    fig, axes = plt.subplots(1, 2, figsize=(15, 8), sharex=True, sharey=True)
+    fig.suptitle('Adopción de QR por Zona de Destino: Días Laborales vs. Fin de Semana', fontsize=18, y=0.95)
+
+    vmin = min(zonas_map_geotemp_dest['qr_pct_laboral'].min(), zonas_map_geotemp_dest['qr_pct_finde'].min())
+    vmax = max(zonas_map_geotemp_dest['qr_pct_laboral'].max(), zonas_map_geotemp_dest['qr_pct_finde'].max())
+
+    # Crear paleta blanco-rojo
+    from matplotlib.colors import LinearSegmentedColormap
+    white_red = LinearSegmentedColormap.from_list(
+        'white_red', ['#ffffff', '#fee0d2', '#fc9272', '#de2d26', '#a50f15'], N=256
+    )
+
+    zonas_map_geotemp_dest.plot(
+        column='qr_pct_laboral', cmap=white_red, linewidth=0.5, ax=axes[0], edgecolor='0.8',
+        vmin=vmin, vmax=vmax
+    )
+    axes[0].set_title('Lunes a Viernes', fontsize=14)
+    axes[0].set_axis_off()
+
+    zonas_map_geotemp_dest.plot(
+        column='qr_pct_finde', cmap=white_red, linewidth=0.5, ax=axes[1], edgecolor='0.8',
+        vmin=vmin, vmax=vmax
+    )
+    axes[1].set_title('Sábado y Domingo', fontsize=14)
+    axes[1].set_axis_off()
+    
+    fig.subplots_adjust(bottom=0.1)
+    cbar_ax = fig.add_axes([0.3, 0.05, 0.4, 0.03])
+    sm = plt.cm.ScalarMappable(cmap=white_red, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Adopción de QR (%)', fontsize=12)
+    
+    plt.show()
+
+
+
+```
+
+#### Geo-Temporal: Origen por Paradero — PEAK AM vs PEAK PM
+
+```{python}
+#| label: qr-geotemporal-peak-am-vs-pm-paradero-origen
+#| fig-width: 20
+#| fig-height: 10
+
+import polars as pl
+import matplotlib.pyplot as plt
+
+AM_PEAK = {7,8,9}
+PM_PEAK = {17,18,19}
+
+if {"paradero_inicio_viaje","hour","is_qr"} <= set(lfk.collect_schema().names()) and 'gdf_par' in globals() and gdf_par is not None:
+    # Normalizar nombre de paradero para join
+    try:
+        normalize_paradero
+    except NameError:
+        import unicodedata
+        def normalize_paradero(s: str) -> str:
+            if not isinstance(s, str):
+                return s
+            return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn').upper().strip()
+
+    lfk_norm = lfk.with_columns(
+        pl.col("paradero_inicio_viaje").map_elements(normalize_paradero, return_dtype=pl.String).alias("paradero_inicio_norm")
+    )
+
+    # PEAK AM y PEAK PM
+    def agg_by(label, hours_set):
+        return (
+            lfk_norm.filter(pl.col("hour").is_in(list(hours_set)))
+                   .group_by("paradero_inicio_norm")
+            .agg([
+                       (pl.col("is_qr") == True).sum().alias("n_qr"),
+                       pl.len().alias("n_total")
+            ])
+                   .with_columns((pl.col("n_qr")/pl.col("n_total")*100).alias("qr_share_pct"))
+                   .filter(pl.col("n_total") >= 200)
+                   .with_columns(pl.lit(label).alias("periodo"))
+            .collect(engine="in-memory")
+    )
+
+    am = agg_by("PEAK AM", AM_PEAK)
+    pm = agg_by("PEAK PM", PM_PEAK)
+
+    from matplotlib.colors import LinearSegmentedColormap
+    white_red = LinearSegmentedColormap.from_list('white_red', ['#ffffff','#fee0d2','#fc9272','#de2d26','#a50f15'], N=256)
+
+    # Merge con geometría
+    gdf_clean = gdf_par.copy()
+    gdf_clean['parada_norm'] = gdf_clean['parada'].apply(normalize_paradero)
+    gdf_clean = gdf_clean.drop_duplicates(subset=['parada_norm'], keep='first')
+
+    def plot_map(df_polars, ax, title, vmin, vmax):
+        gdf_plot = gdf_clean.merge(df_polars.to_pandas(), left_on='parada_norm', right_on='paradero_inicio_norm', how='inner')
+        if 'comunas_geo' in globals():
+            comunas_geo.boundary.plot(ax=ax, linewidth=0.4, color="gray")
+        gdf_plot.plot(ax=ax, column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, markersize=20, alpha=0.7, legend=False)
+        ax.set_title(title, fontsize=14)
+        ax.set_axis_off()
+
+    # vmin/vmax compartidos
+    vmin = float(min(am['qr_share_pct'].min(), pm['qr_share_pct'].min())) if am.height and pm.height else 0.0
+    vmax = float(max(am['qr_share_pct'].max(), pm['qr_share_pct'].max())) if am.height and pm.height else 100.0
+    if vmax <= 0:
+        vmax = 1.0
+
+    fig, axes = plt.subplots(1, 2, figsize=(20,10), sharex=True, sharey=True)
+    fig.suptitle('Adopción de QR por Paradero de Origen — PEAK AM vs PEAK PM', fontsize=18, y=0.95)
+    plot_map(am, axes[0], 'PEAK AM (7–9h)', vmin, vmax)
+    plot_map(pm, axes[1], 'PEAK PM (17–19h)', vmin, vmax)
+
+    # Colorbar común
+    fig.subplots_adjust(bottom=0.1)
+    cbar_ax = fig.add_axes([0.3, 0.05, 0.4, 0.03])
+    sm = plt.cm.ScalarMappable(cmap=white_red, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Adopción de QR (%)', fontsize=12)
+    plt.show()
+else:
+    print("Faltan columnas/geometría para el análisis por paradero de origen (PEAK AM vs PM).")
+```
+
+#### Geo-Temporal: Origen por Paradero — PEAK (AM+PM) vs Valle
+
+```{python}
+#| label: qr-geotemporal-peak-vs-valle-paradero-origen
+#| fig-width: 20
+#| fig-height: 10
+
+AM_PEAK = {7,8,9}
+PM_PEAK = {17,18,19}
+
+if {"paradero_inicio_viaje","hour","is_qr"} <= set(lfk.collect_schema().names()) and 'gdf_par' in globals() and gdf_par is not None:
+    try:
+        normalize_paradero
+    except NameError:
+        import unicodedata
+        def normalize_paradero(s: str) -> str:
+            if not isinstance(s, str):
+                return s
+            return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn').upper().strip()
+
+    lfk_norm = lfk.with_columns(
+        pl.col("paradero_inicio_viaje").map_elements(normalize_paradero, return_dtype=pl.String).alias("paradero_inicio_norm")
+    )
+
+    PEAK = AM_PEAK | PM_PEAK
+    def agg_by(label, mask_expr):
+        return (
+            lfk_norm.filter(mask_expr)
+                   .group_by("paradero_inicio_norm")
+                   .agg([
+                       (pl.col("is_qr") == True).sum().alias("n_qr"),
+                       pl.len().alias("n_total")
+                   ])
+                   .with_columns((pl.col("n_qr")/pl.col("n_total")*100).alias("qr_share_pct"))
+                   .filter(pl.col("n_total") >= 200)
+                   .with_columns(pl.lit(label).alias("periodo"))
+            .collect(engine="in-memory")
+    )
+
+    peak = agg_by("PEAK (AM+PM)", pl.col("hour").is_in(list(PEAK)))
+    valle = agg_by("Valle", ~pl.col("hour").is_in(list(PEAK)))
+
+    from matplotlib.colors import LinearSegmentedColormap
+    white_red = LinearSegmentedColormap.from_list('white_red', ['#ffffff','#fee0d2','#fc9272','#de2d26','#a50f15'], N=256)
+
+    gdf_clean = gdf_par.copy()
+    gdf_clean['parada_norm'] = gdf_clean['parada'].apply(normalize_paradero)
+    gdf_clean = gdf_clean.drop_duplicates(subset=['parada_norm'], keep='first')
+
+    def plot_map(df_polars, ax, title, vmin, vmax):
+        gdf_plot = gdf_clean.merge(df_polars.to_pandas(), left_on='parada_norm', right_on='paradero_inicio_norm', how='inner')
+        if 'comunas_geo' in globals():
+            comunas_geo.boundary.plot(ax=ax, linewidth=0.4, color="gray")
+        gdf_plot.plot(ax=ax, column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, markersize=20, alpha=0.7, legend=False)
+        ax.set_title(title, fontsize=14)
+        ax.set_axis_off()
+
+    vmin = float(min(peak['qr_share_pct'].min(), valle['qr_share_pct'].min())) if peak.height and valle.height else 0.0
+    vmax = float(max(peak['qr_share_pct'].max(), valle['qr_share_pct'].max())) if peak.height and valle.height else 100.0
+    if vmax <= 0:
+        vmax = 1.0
+
+    fig, axes = plt.subplots(1, 2, figsize=(20,10), sharex=True, sharey=True)
+    fig.suptitle('Adopción de QR por Paradero de Origen — PEAK (AM+PM) vs Valle', fontsize=18, y=0.95)
+    plot_map(peak, axes[0], 'PEAK (AM+PM)', vmin, vmax)
+    plot_map(valle, axes[1], 'Valle', vmin, vmax)
+
+    fig.subplots_adjust(bottom=0.1)
+    cbar_ax = fig.add_axes([0.3, 0.05, 0.4, 0.03])
+    sm = plt.cm.ScalarMappable(cmap=white_red, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Adopción de QR (%)', fontsize=12)
+    plt.show()
+else:
+    print("Faltan columnas/geometría para el análisis PEAK vs Valle por paradero de origen.")
+```
+
+#### Geo-Temporal: Destino por Paradero — PEAK (AM+PM) vs Valle
+
+```{python}
+#| label: qr-geotemporal-peak-vs-valle-paradero-destino
+#| fig-width: 20
+#| fig-height: 10
+
+AM_PEAK = {7,8,9}
+PM_PEAK = {17,18,19}
+PEAK = AM_PEAK | PM_PEAK
+
+dest_cols = [c for c in ["paradero_bajada_4","paradero_bajada_3","paradero_bajada_2","paradero_bajada_1","paradero_fin_viaje"] if c in lfk.collect_schema().names()]
+if {"hour","is_qr"} <= set(lfk.collect_schema().names()) and dest_cols and 'gdf_par' in globals() and gdf_par is not None:
+    try:
+        normalize_paradero
+    except NameError:
+        import unicodedata
+        def normalize_paradero(s: str) -> str:
+            if not isinstance(s, str):
+                return s
+            return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn').upper().strip()
+
+    lfk_dest = (
+        lfk.with_columns(pl.coalesce([pl.col(c) for c in dest_cols]).alias("paradero_destino_robust"))
+           .with_columns(pl.col("paradero_destino_robust").map_elements(normalize_paradero, return_dtype=pl.String).alias("paradero_destino_norm"))
+    )
+
+    def agg_by(label, mask_expr):
+        return (
+            lfk_dest.filter(mask_expr)
+                    .group_by("paradero_destino_norm")
+                    .agg([
+                        (pl.col("is_qr") == True).sum().alias("n_qr"),
+                        pl.len().alias("n_total")
+                    ])
+                    .with_columns((pl.col("n_qr")/pl.col("n_total")*100).alias("qr_share_pct"))
+                    .filter(pl.col("n_total") >= 200)
+                    .with_columns(pl.lit(label).alias("periodo"))
+            .collect(engine="in-memory")
+    )
+
+    peak = agg_by("PEAK (AM+PM)", pl.col("hour").is_in(list(PEAK)))
+    valle = agg_by("Valle", ~pl.col("hour").is_in(list(PEAK)))
+
+    from matplotlib.colors import LinearSegmentedColormap
+    white_red = LinearSegmentedColormap.from_list('white_red', ['#ffffff','#fee0d2','#fc9272','#de2d26','#a50f15'], N=256)
+
+    gdf_clean = gdf_par.copy()
+    gdf_clean['parada_norm'] = gdf_clean['parada'].apply(normalize_paradero)
+    gdf_clean = gdf_clean.drop_duplicates(subset=['parada_norm'], keep='first')
+
+    def plot_map(df_polars, ax, title, vmin, vmax):
+        gdf_plot = gdf_clean.merge(df_polars.to_pandas(), left_on='parada_norm', right_on='paradero_destino_norm', how='inner')
+        if 'comunas_geo' in globals():
+            comunas_geo.boundary.plot(ax=ax, linewidth=0.4, color="gray")
+        gdf_plot.plot(ax=ax, column='qr_share_pct', cmap=white_red, vmin=vmin, vmax=vmax, markersize=20, alpha=0.7, legend=False)
+        ax.set_title(title, fontsize=14)
+        ax.set_axis_off()
+
+    vmin = float(min(peak['qr_share_pct'].min(), valle['qr_share_pct'].min())) if peak.height and valle.height else 0.0
+    vmax = float(max(peak['qr_share_pct'].max(), valle['qr_share_pct'].max())) if peak.height and valle.height else 100.0
+    if vmax <= 0:
+        vmax = 1.0
+
+    fig, axes = plt.subplots(1, 2, figsize=(20,10), sharex=True, sharey=True)
+    fig.suptitle('Adopción de QR por Paradero de Destino — PEAK (AM+PM) vs Valle', fontsize=18, y=0.95)
+    plot_map(peak, axes[0], 'PEAK (AM+PM)', vmin, vmax)
+    plot_map(valle, axes[1], 'Valle', vmin, vmax)
+
+    fig.subplots_adjust(bottom=0.1)
+    cbar_ax = fig.add_axes([0.3, 0.05, 0.4, 0.03])
+    sm = plt.cm.ScalarMappable(cmap=white_red, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Adopción de QR (%)', fontsize=12)
+    plt.show()
+else:
+    print("Faltan columnas/geometría para el análisis PEAK vs Valle por paradero de destino.")
+```
+
