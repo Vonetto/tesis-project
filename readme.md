@@ -7,19 +7,23 @@ El proyecto trabaja **100% contra Google Cloud Storage (GCS)**: los CSV viven en
 ## Arquitectura del proyecto
 
 ```
-
 tesis-project/
-├─ 00\_setup/
-│  └─ setup.qmd                # Ingesta a GCS (CSV→Parquet), validaciones
-├─ 01\_eda/
-│  └─ eda\_trips\_overview\.qmd   # EDA parametrizado por año/semana
+├─ 00_setup/
+│  └─ setup.qmd                # Validación de la capa Bronze
+├─ 01_processing/
+│  └─ 01_silver_processing.qmd # Procesamiento Bronze→Silver
+├─ 02_eda/
+│  ├─ eda_caracterizacion.qmd  # Perfil demográfico de usuarios QR
+│  ├─ eda_trips_overview.qmd   # Análisis de patrones de viaje
+│  └─ join_validation.qmd      # Validación de joins
 ├─ lib/
-│  └─ datalake.py              # Helpers (enable\_adc, scan\_parquet\_portable, etc.)
-├─ \_quarto.yml                 # Config del sitio Quarto
-├─ \_site/                      # (generado) HTML renderizados
+│  └─ datalake.py              # Helpers (enable_adc, scan_parquet_portable)
+├─ process_data.py             # Pipeline de ingesta RAW→Bronze
+├─ _quarto.yml                 # Config del sitio Quarto
+├─ GIT_WORKFLOW.md             # Guía de workflow de Git
+├─ _site/                      # (generado) HTML renderizados
 └─ .quarto/                    # (generado) cachés de Quarto
-
-````
+```
 
 > Las carpetas **`_site/`**, **`_freeze/`** y **`.quarto/`** son artefactos generados por Quarto y **no** deben versionarse.
 
@@ -29,9 +33,9 @@ tesis-project/
   CSV originales (solo lectura).
 
 - `gs://tesis-vonetto-datalake/lake/bronze/`  
-  **Bronze** = datos “aterrizados” en Parquet, con cambios mínimos (parseo de fechas y particiones).
-  - `bronze/trips/iso_year=YYYY/iso_week=WW/part-*.parquet`
-  - `bronze/caracterizacion/snapshot_date=YYYY-MM-DD/part-*.parquet`
+  **Bronze** = datos "aterrizados" en Parquet, con cambios mínimos (parseo de fechas y particiones).
+  - `bronze/viajes/semana_iso=YYYY-WNN/part-*.parquet` (particionado por semana ISO)
+  - `bronze/caracterizacion/snapshot_date=YYYY-MM-DD/part-*.parquet` (snapshot único)
 
 - `gs://tesis-vonetto-datalake/lake/silver/`  
   **Silver** = limpieza y enriquecimiento reutilizable (nombres normalizados, tipos, dedupe, features básicos).
@@ -46,11 +50,31 @@ Resumen:
 
 ## Requisitos
 
-- Python 3.10+ (se probó con Polars ≥ 1.33 y PyArrow ≥ 11).
-- Quarto ≥ 1.4 (`quarto --version`).
-- Google Cloud SDK (`gcloud`).
+- **Python 3.10+** (se probó con Python 3.13 y Polars ≥ 1.33, PyArrow ≥ 11)
+- **Quarto ≥ 1.4** (`quarto --version`)
+- **Google Cloud SDK** (`gcloud`) para autenticación
 
-Paquetes principales: `polars`, `pyarrow`, `gcsfs`, `fsspec`, `matplotlib`.
+### Paquetes Python
+
+**Core (obligatorios):**
+- `polars` - Procesamiento de datos rápido
+- `pyarrow` - Backend de Parquet
+- `gcsfs` - Acceso a Google Cloud Storage
+- `fsspec` - Sistema de archivos abstracto
+
+**Análisis y visualización:**
+- `matplotlib` - Gráficos
+- `seaborn` - Visualizaciones estadísticas
+- `geopandas` - Datos geoespaciales
+- `pyogrio` - Lectura eficiente de shapefiles
+
+**Utilidades:**
+- `tqdm` - Progress bars
+
+**Instalación completa:**
+```bash
+pip install polars pyarrow gcsfs fsspec matplotlib seaborn geopandas pyogrio tqdm
+```
 
 ## Autenticación (GCP)
 
@@ -64,29 +88,62 @@ Los notebooks usan un helper (`enable_adc`) que levanta automáticamente las cre
 
 ## Configuración rápida
 
-1. Crear venv e instalar deps:
+### 1. Crear entorno virtual e instalar dependencias
 
 ```bash
 python -m venv venv
-source venv/bin/activate  # (Windows: venv\Scripts\activate)
-pip install -U polars pyarrow gcsfs fsspec matplotlib quarto-cli
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install -U polars pyarrow gcsfs fsspec matplotlib seaborn geopandas pyogrio tqdm
 ```
 
-2. Renderizar el **setup** (ingesta CSV→Parquet en bronze):
+### 2. Autenticación con GCP
 
 ```bash
-quarto render project/00_setup/setup.qmd
+gcloud auth application-default login
 ```
 
-3. Correr el **EDA** para una semana:
+### 3. Pipeline de Datos (ejecutar en orden)
+
+#### a) Ingesta RAW → Bronze (primera vez o al agregar datos nuevos)
 
 ```bash
-quarto render project/01_eda/eda_trips_overview.qmd -P year:2025 -P iso_week:17
-# Salida HTML queda bajo _site/
+python process_data.py
 ```
 
-> También puedes setear env vars y “Run Cell”:
-> `EDA_YEAR=2025 EDA_WEEK=17 quarto preview project/01_eda/eda_trips_overview.qmd`
+Esto lee los CSVs de `gs://tesis-vonetto-datalake/raw/` y los escribe como Parquet particionado en `bronze/viajes/`.
+
+**⏱️ Tiempo:** Puede tomar varios minutos dependiendo del volumen de datos.
+
+#### b) Validación de Bronze (opcional pero recomendado)
+
+```bash
+quarto render 00_setup/setup.qmd
+```
+
+Valida que las particiones se escribieron correctamente y genera un reporte HTML.
+
+#### c) Procesamiento Silver (cuando necesites datos enriquecidos)
+
+```bash
+quarto render 01_processing/01_silver_processing.qmd
+```
+
+Aplica enriquecimiento geográfico y crea primary keys. **Nota:** El join geográfico está pendiente de completarse.
+
+#### d) Análisis Exploratorio (EDA)
+
+```bash
+# Análisis demográfico de usuarios QR
+quarto render 02_eda/eda_caracterizacion.qmd
+
+# Análisis de patrones de viaje (parametrizable)
+quarto render 02_eda/eda_trips_overview.qmd
+
+# O en modo preview interactivo:
+quarto preview 02_eda/eda_caracterizacion.qmd
+```
+
+Los HTMLs generados quedan en `_site/` y en las carpetas `*_files/`.
 
 ## Parámetros y variables de entorno
 
@@ -101,11 +158,19 @@ quarto render project/01_eda/eda_trips_overview.qmd -P year:2025 -P iso_week:17
 * **Silver/Gold** deberán incluir **checks** (conteos, nulos, rangos) y **metadatos** (fecha, versión de código).
 * **Privacidad**: todo está pseudonimizado; no subir credenciales ni datos sensibles locales al repo.
 
-## Roadmap breve
+## Workflow de Git
 
-* `silver/trips_clean`: normalización, `dur_s`, `wday`, `hour`, etc.
-* `gold/user_week_panel`: métricas de inercia (entropía/HHI, stickiness, RCS preliminar).
-* Integración con `caracterizacion` (snapshots) a nivel de zona/segmentos.
+Este proyecto usa una estrategia de ramas estructurada:
+- `main` - Código estable para hitos importantes
+- `develop` - Desarrollo activo y trabajo diario
+- `feature/*` - Funcionalidades nuevas
+- `docs/*` - Documentación y paper
+
+📖 **Ver guía completa en:** [`GIT_WORKFLOW.md`](GIT_WORKFLOW.md)
+
+## Contribuciones
+
+Este es un proyecto de tesis. Para dudas o colaboraciones, contactar a Juan Vicente Onetto Romero.
 
 ## Licencia
 
