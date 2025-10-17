@@ -1,13 +1,6 @@
 ---
-title: "Tesis — Data Lake Starter (GCS + Parquet) · Setup limpio"
+title: "Tesis — 00 | Validación del Data Lake (Bronze)"
 author: "Juan Vicente Onetto Romero"
-params:
-  # GCS
-  gcs_bucket: "tesis-vonetto-datalake"
-  raw_prefix: "raw"              # dónde subirás los CSV DTPM
-  bronze_prefix: "lake/bronze"   # base para escribir Parquet
-  # CSV (DTPM suele usar ';')
-  csv_sep_default: ";"           # si tus CSV vienen con coma, cámbialo a ","
 format:
   html:
     toc: true
@@ -16,863 +9,140 @@ jupyter: python3
 freeze: false
 ---
 
-# Objetivo
+# Objetivo y Flujo de Trabajo
 
-Setup mínimo y robusto para:
-- Autenticación (ADC).
-- Lectura **CSV → Parquet** en **GCS** con **Polars/PyArrow**.
-- Particionado por `semana_iso` correctamente calculada (ISO-8601).
-- **Sin** extras (no PKs, no migraciones automáticas, no dedupe complejo).
-- **Parche de lectura** que tolera carpetas antiguas mal nombradas.
+Este notebook valida la integridad de la capa **Bronze** de nuestro Data Lake en GCS.
+
+El flujo de trabajo es:
+
+1.  **Procesar Datos:** Para ingestar nuevos archivos, ejecuta `python process_data.py` en la terminal.
+2.  **Validar en este Notebook:** Ejecuta las celdas de este notebook para:
+    *   Ver un resumen de las particiones existentes.
+    *   Validar que el esquema (columnas) sea el correcto.
+    *   Verificar que el número total de filas en Bronze coincida con los CSV originales (esta parte es lenta).
 
 ---
 
-## 0) Paquetes
+## 1) Setup y Conexión
 
 ```{python}
-# Si falta algo, descomenta:
-# !pip install -U polars pyarrow gcsfs fsspec
-
-import os, sys, io, pathlib, csv, re
-from datetime import datetime
+import os
+import sys
 import polars as pl
-import pyarrow as pa
-import pyarrow.dataset as ds
-import pyarrow.fs as pafs
 import gcsfs
+from tqdm import tqdm
 
-print("versions -> polars:", pl.__version__, "| pyarrow:", pa.__version__)
-```
+# --- Parámetros ---
+GCS_BUCKET = "tesis-vonetto-datalake"
+BRONZE_VIAJES_PATH = f"gs://{GCS_BUCKET}/lake/bronze/viajes"
+RAW_PATH = f"gs://{GCS_BUCKET}/raw"
 
-## 1) Autenticación Google (ADC)
-
-```{python}
+# --- Conexión ---
 def enable_adc_crossplatform():
-    """Intenta localizar ADC si no está GOOGLE_APPLICATION_CREDENTIALS."""
     if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        return os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+        return
     if sys.platform.startswith("win"):
-        adc = pathlib.Path(os.environ["APPDATA"]) / "gcloud" / "application_default_credentials.json"
+        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
     else:
-        adc = pathlib.Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
-    if not adc.exists():
-        raise FileNotFoundError("No encuentro ADC. Ejecuta: gcloud auth application-default login")
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(adc)
-    return str(adc)
+        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+    if not os.path.exists(adc_path):
+        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
 
-print("ADC =>", enable_adc_crossplatform())
-```
-
-## 2) Parámetros & Filesystems
-
-```{python}
-# Parámetros (sirve con Quarto y con ejecución suelta)
 try:
-    params
-except NameError:
-    params = {
-        "gcs_bucket": os.getenv("GCS_BUCKET", "tesis-vonetto-datalake"),
-        "raw_prefix": os.getenv("RAW_PREFIX", "raw"),
-        "bronze_prefix": os.getenv("BRONZE_PREFIX", "lake/bronze"),
-        "csv_sep_default": os.getenv("CSV_SEP_DEFAULT", ";"),
-    }
+    enable_adc_crossplatform()
+    gfs = gcsfs.GCSFileSystem(token="google_default")
+    print("✅ Conexión con GCS establecida.")
+except FileNotFoundError as e:
+    print(f"❌ Error de autenticación: {e}")
 
-GCS_BUCKET     = params["gcs_bucket"]
-RAW_PREFIX     = params["raw_prefix"]
-BRONZE_PREFIX  = params["bronze_prefix"]
-CSV_SEP_DEF    = params["csv_sep_default"] or ";"
-
-# FS
-gfs = gcsfs.GCSFileSystem(token="google_default")
-fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
-
-def gsjoin(*parts: str) -> str:
-    return "gs://" + "/".join(s.strip("/").replace("gs://","") for s in parts)
-
-print("Bucket:", GCS_BUCKET)
-print("RAW:", gsjoin(GCS_BUCKET, RAW_PREFIX))
-print("BRONZE:", gsjoin(GCS_BUCKET, BRONZE_PREFIX))
 ```
 
-## 3) Utilidades (separador, esquema, fechas)
+## 2) Resumen de Particiones en Bronze
 
-> Meta: evitar que `21-04-25` se interprete como **año 21 d.C.**. Normalizamos **dd-mm-yy → 20yy-mm-dd** y soportamos `/` o `-`, con y sin hora.
+Primero, escaneamos la capa Bronze para ver qué particiones (`semana_iso`) existen y cuántos registros tiene cada una. Esto nos da una vista general rápida del estado del Data Lake.
 
 ```{python}
-TRUE_SET  = {"1","t","true","y","yes","sí","si","s"}
-FALSE_SET = {"0","f","false","n","no"}
-NULL_TOKENS = ["", "-", "NA", "N/A", "null", "NULL"]
-
-def _detect_sep_from_fullpath(gcs_path_no_scheme: str, default=";"):
-    with gfs.open(gcs_path_no_scheme, "rb") as fh:
-        head = fh.readline().decode("utf-8", errors="ignore")
-    candidates = [",", ";", "|", "\t"]
-    counts = {c: head.count(c) for c in candidates}
-    sep = max(counts, key=counts.get)
-    return sep if counts.get(sep, 0) > 0 else default
-
-def _get_header_cols(gcs_path_no_scheme: str, sep: str) -> list[str]:
-    with gfs.open(gcs_path_no_scheme, "rb") as fh:
-        head = fh.readline().decode("utf-8", errors="ignore")
-    cols = next(csv.reader([head], delimiter=sep))
-    return [c for c in cols if c != ""]
-
-def _schema_overrides_for_cols(cols: list[str]) -> dict[str, pl.datatypes.DataType]:
-    ov = {}
-    for c in cols:
-        lc = c.lower()
-        if (
-            "zona" in lc or "paradero" in lc or "srv" in lc or "servicio" in lc or
-            "periodo" in lc or "mediahora" in lc or "comuna" in lc or
-            lc in {"modos","tipodia","contrato"} or
-            lc.startswith("tipo_") or lc.startswith("op_") or
-            lc == "id_tarjeta"
-        ):
-            ov[c] = pl.Utf8
-        if lc.startswith("tiempo_"):
-            ov[c] = pl.Utf8
-    return ov
-
-def _glob_raw(patterns):
-    if isinstance(patterns, str):
-        patterns = [patterns]
-    base = f"{GCS_BUCKET}/{RAW_PREFIX}".strip("/")
-    hits = []
-    for pat in patterns:
-        hits += gfs.glob(f"{base}/{pat}")
-    hits = sorted(set(hits))
-    print(f"[GCS] {len(hits)} archivos para {patterns}")
-    for p in hits[:10]:
-        print("   - gs://" + p)
-    if not hits:
-        raise FileNotFoundError(f"No se encontraron CSV bajo gs://{base}")
-    return hits
-
-# ---------- Normalizador de fechas (string) ----------
-# Convierte "dd-mm-yy HH:MM" o "dd/mm/yy HH:MM" → "20yy-mm-dd HH:MM"
-# y "dd-mm-YYYY" → "YYYY-mm-dd". Luego parsea a Datetime.
-def _debug_date_parse(raw_str):
-    """Debug paso a paso del parseo de fechas."""
-    s = raw_str.strip()
-    print(f"Original: '{s}'")
-    
-    # Paso 1: dd-mm-yy -> 20yy-mm-dd (anclado al inicio)
-    s1 = re.sub(r"^(\d{2})[-/](\d{2})[-/](\d{2})", r"20\3-\2-\1", s)
-    print(f"Paso 1 (dd-mm-yy): '{s1}'")
-    
-    # Paso 2: dd-mm-YYYY -> YYYY-mm-dd (anclado al inicio)
-    s2 = re.sub(r"^(\d{2})[-/](\d{2})[-/](\d{4})", r"\3-\2-\1", s1)
-    print(f"Paso 2 (dd-mm-YYYY): '{s2}'")
-    
-    # Paso 3: espacios múltiples → 1
-    s3 = re.sub(r"\s+", " ", s2)
-    print(f"Paso 3 (espacios): '{s3}'")
-    
-    # Paso 4: intentos de parseo
-    formats = [
-        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
-        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d"
-    ]
-    
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(s3, fmt)
-            print(f"✅ Parseado con formato '{fmt}': {dt}")
-            return
-        except ValueError:
-            print(f"❌ Falla con formato '{fmt}'")
-    
-    print("❌ No se pudo parsear con ningún formato")
-def _fix_ddmmyy_to_iso(expr: pl.Expr) -> pl.Expr:
-    s = expr.cast(pl.Utf8).str.strip_chars()
-    # dd-mm-yy -> 20yy-mm-dd (anclado al inicio, usa $ para back-references)
-    s = s.str.replace_all(r"^(\d{2})[-/](\d{2})[-/](\d{2})", r"20$3-$2-$1")
-    # dd-mm-YYYY -> YYYY-mm-dd (anclado al inicio, usa $ para back-references)
-    s = s.str.replace_all(r"^(\d{2})[-/](\d{2})[-/](\d{4})", r"$3-$2-$1")
-    # espacios múltiples → 1
-    s = s.str.replace_all(r"\s+", " ")
-    
-    # Normalizar hora con 1 dígito a 2 dígitos (8:48 → 08:48)
-    s = s.str.replace_all(r"(\d{4}-\d{2}-\d{2}) (\d):(\d{2})", r"$1 0$2:$3")
-    
-    # Intentos de parseo explícitos
-    formats = [
-        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
-        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d"
-    ]
-    tries = [s.str.strptime(pl.Datetime, format=f, strict=False, exact=False) for f in formats]
-    return pl.coalesce(tries)
-
-def _week_from_path(gcs_path_no_scheme: str) -> str | None:
-    """Extrae YYYY-MM-DD del nombre de archivo y devuelve "YYYY-Www" ISO."""
-    m = re.search(r"(\d{4}-\d{2}-\d{2})", gcs_path_no_scheme)
-    if not m:
-        return None
+def scan_bronze_viajes() -> pl.LazyFrame:
+    """Escanea el directorio de viajes en la capa Bronze."""
     try:
-        d = datetime.strptime(m.group(1), "%Y-%m-%d").date()
-        iso_year, iso_week, _ = d.isocalendar()
-        return f"{iso_year}-W{iso_week:02d}"
-    except Exception:
-        return None
+        return pl.scan_parquet(f"{BRONZE_VIAJES_PATH}/**/*.parquet")
+    except Exception as e:
+        print(f"No se pudo escanear la ruta {BRONZE_VIAJES_PATH}. ¿Ejecutaste la ingesta?", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
+        return pl.LazyFrame([])
 
-def _add_fecha_y_semana_df(df: pl.DataFrame, time_col: str) -> pl.DataFrame:
-    # 1) normaliza el string (si viene dd-mm-yy) y parsea a Datetime
-    df = df.with_columns(_fix_ddmmyy_to_iso(pl.col(time_col)).alias(time_col))
-    # 2) deriva fecha/semana ISO (año ISO y semana ISO)
-    df = df.with_columns([
-        pl.col(time_col).dt.date().alias("fecha"),
-        pl.col(time_col).dt.iso_year().alias("iso_year"),
-        pl.col(time_col).dt.week().alias("iso_week"),
-    ])
-    df = df.with_columns(
-        (pl.col("iso_year").cast(pl.Utf8) + pl.lit("-W") +
-         pl.col("iso_week").cast(pl.Int32).cast(pl.Utf8).str.zfill(2)).alias("semana_iso")
+lf_viajes_bronze = scan_bronze_viajes()
+
+if lf_viajes_bronze.columns:
+    print("Escaneando registros por semana en la capa Bronze...")
+    conteo_semanal = (
+        lf_viajes_bronze
+        .group_by("semana_iso")
+        .agg(pl.len().alias("cantidad_registros"))
+        .sort("semana_iso")
+        .collect()
     )
-    return df
-
-def _read_csv_polars_gcs(gcs_path_no_scheme: str, sep: str, dtypes: dict | None = None) -> pl.DataFrame:
-    cols = _get_header_cols(gcs_path_no_scheme, sep)
-    overrides = _schema_overrides_for_cols(cols)
-    if dtypes:
-        overrides.update(dtypes)
-    decimal_comma_flag = (sep == ";")
-    with gfs.open(gcs_path_no_scheme, "rb") as fh:
-        return pl.read_csv(
-            fh,
-            separator=sep,
-            schema_overrides=overrides,
-            try_parse_dates=False,        # parseamos nosotros
-            infer_schema_length=10000,
-            null_values=NULL_TOKENS,
-            ignore_errors=False,
-            low_memory=True,
-            decimal_comma=decimal_comma_flag
-        )
-```
-
-## 4) Ingesta NUEVA → Parquet (viajes / etapas)
-
-> Es **idempotente por semana**: si ya existe la partición, no la reescribe.
-> No usa `partitioning=` de Arrow; escribe directamente en `.../semana_iso=AAAA-WW/`.
-
-```{python}
-def _sanitize_before_write(dfw: pl.DataFrame, sem_key) -> tuple[pl.DataFrame, str]:
-    # Normaliza llave de semana
-    sem = str(sem_key[0]) if isinstance(sem_key, (list, tuple)) else str(sem_key)
-    # Aplana columnas List → string (defensivo)
-    list_cols = [name for name, dt in dfw.schema.items() if str(dt).startswith("list[")]
-    if list_cols:
-        dfw = dfw.with_columns([
-            pl.when(pl.col(c).is_null()).then(None).otherwise(
-                pl.col(c).list.eval(pl.element().cast(pl.Utf8)).list.join(" | ")
-            ).alias(c)
-            for c in list_cols
-        ])
-    # Asegura 'semana_iso' textual
-    if "semana_iso" in dfw.columns:
-        dfw = dfw.drop("semana_iso")
-    dfw = dfw.with_columns(pl.lit(sem).cast(pl.Utf8).alias("semana_iso"))
-    return dfw, sem
-
-def _partition_exists(base_no_scheme: str, sem: str) -> bool:
-    normal = f"{base_no_scheme}/semana_iso={sem}".rstrip("/")
-    tuple_like = f"{base_no_scheme}/semana_iso=('"+sem+"',)"
-    try:
-        return gfs.exists(normal) or gfs.exists(tuple_like)
-    except Exception:
-        return False
-
-def _ingest_viajes_files(file_paths: list[str]):
-    dtypes = {
-        "id_tarjeta": pl.Utf8,
-        "id_viaje": pl.Int64,
-        "n_etapas": pl.Int32,
-        "factor_expansion": pl.Float64,
-        "tiempo_inicio_viaje": pl.Utf8,
-        "tiempo_fin_viaje": pl.Utf8,
-    }
-    buckets = {}  # semana_iso -> [DataFrame]
-    for p in file_paths:
-        sep = _detect_sep_from_fullpath(p, default=CSV_SEP_DEF)
-        df = _read_csv_polars_gcs(p, sep, dtypes=dtypes)
-
-        # Columna temporal preferente + fallbacks
-        time_col = next((c for c in ["tiempo_inicio_viaje","tiempo_subida_1","mediahora_inicio_viaje"] if c in df.columns), None)
-        if not time_col:
-            raise ValueError(f"[VIAJES] No encuentro columna temporal en {p}. Columns: {df.columns[:20]} ...")
-
-        df = _add_fecha_y_semana_df(df, time_col)
-        # fallback: si quedaron nulos en semana_iso, usar semana del nombre de archivo
-        fallback_week = _week_from_path(p)
-        if fallback_week:
-            df = df.with_columns(
-                pl.when(pl.col("semana_iso").is_null() | (pl.col("semana_iso")=="None"))
-                  .then(pl.lit(fallback_week))
-                  .otherwise(pl.col("semana_iso")).alias("semana_iso")
-            )
-
-        # Bucket por semana
-        for sem, dfi in df.partition_by("semana_iso", as_dict=True, maintain_order=True).items():
-            buckets.setdefault(sem, []).append(dfi)
-
-    # Escribe por semana (idempotente)
-    out_base = gsjoin(GCS_BUCKET, BRONZE_PREFIX, "viajes").replace("gs://", "")
-    wrote, skipped = [], []
-    for sem, dfs in buckets.items():
-        if sem is None or str(sem).lower()=="none" or str(sem).strip()=="":
-            print("⚠️  VIAJES: se detectó partición 'None' — se omite escritura")
-            continue
-        
-        # Unifica esquemas antes de concatenar para evitar "schema lengths differ"
-        all_cols = set()
-        for df_part in dfs: all_cols.update(df_part.columns)
-        
-        sorted_cols = sorted(list(all_cols))
-        dfs_aligned = []
-        for df_part in dfs:
-            missing = all_cols - set(df_part.columns)
-            if missing:
-                df_part = df_part.with_columns([pl.lit(None).alias(c) for c in sorted(list(missing))])
-            # Forzar el orden canónico de columnas
-            dfs_aligned.append(df_part.select(sorted_cols))
-
-        dfw = pl.concat(dfs_aligned, how="vertical_relaxed").rechunk()
-        dfw, sem_norm = _sanitize_before_write(dfw, sem)
-        # Derivar is_qr si hay columna de contrato en el DF
-        if "id_contrato" in dfw.columns or "contrato" in dfw.columns:
-            colc = "id_contrato" if "id_contrato" in dfw.columns else "contrato"
-            dfw = dfw.with_columns(
-                pl.col(colc).cast(pl.Utf8, strict=False).str.strip_chars().is_in(["171","102"]).alias("is_qr")
-            )
-        target_dir = f"{out_base}/semana_iso={sem_norm}"
-        if _partition_exists(out_base, sem_norm):
-            print(f"⏭️  VIAJES {sem_norm} ya existe → omito")
-            skipped.append(sem_norm); continue
-        if gfs.exists(target_dir): gfs.rm(target_dir, recursive=True)
-
-        fmt = ds.ParquetFileFormat()
-        try:
-            file_opts = fmt.make_write_options(compression="zstd")
-        except Exception:
-            file_opts = None
-
-        ds.write_dataset(
-            data=dfw.to_arrow(),
-            base_dir=target_dir,
-            filesystem=fs_arrow,
-            format="parquet",
-            existing_data_behavior="overwrite_or_ignore",
-            file_options=file_opts,
-            basename_template="part-{i}.parquet",
-        )
-        print(f"✅ VIAJES {sem_norm} → gs://{target_dir}")
-        wrote.append(sem_norm)
-    print(f"Resumen VIAJES → nuevas: {len(wrote)}, omitidas: {len(skipped)}")
-    return {"dataset":"viajes","written":sorted(set(wrote)),"skipped":sorted(set(skipped))}
-
-def _ingest_etapas_files(file_paths: list[str]):
-    dtypes = {
-        "id_etapa": pl.Utf8,                # → id_tarjeta
-        "correlativo_viajes": pl.Int64,     # → id_viaje
-        "correlativo_etapas": pl.Int32,     # → n_etapa
-        "tiempo_subida": pl.Utf8,
-        "tiempo_bajada": pl.Utf8,
-        "tiene_bajada": pl.Utf8,
-    }
-    buckets = {}
-    for p in file_paths:
-        sep = _detect_sep_from_fullpath(p, default=CSV_SEP_DEF)
-        df = _read_csv_polars_gcs(p, sep, dtypes=dtypes)
-
-        # Renombres canónicos (si existen)
-        ren = {}
-        if "id_etapa" in df.columns: ren["id_etapa"] = "id_tarjeta"
-        if "correlativo_viajes" in df.columns: ren["correlativo_viajes"] = "id_viaje"
-        if "correlativo_etapas" in df.columns: ren["correlativo_etapas"] = "n_etapa"
-        if ren: df = df.rename(ren)
-
-        # Booleana segura
-        if "tiene_bajada" in df.columns:
-            norm = pl.col("tiene_bajada").cast(pl.Utf8).str.strip_chars().str.to_lowercase()
-            df = df.with_columns(
-                pl.when(norm.is_in(list(TRUE_SET))).then(True)
-                 .when(norm.is_in(list(FALSE_SET))).then(False)
-                 .otherwise(None).alias("tiene_bajada")
-            )
-
-        # Columna temporal obligatoria
-        if "tiempo_subida" not in df.columns:
-            raise ValueError(f"[ETAPAS] Falta 'tiempo_subida' en {p}. Columns: {df.columns[:20]} ...")
-
-        df = _add_fecha_y_semana_df(df, "tiempo_subida")
-        # fallback semana desde el nombre si quedó nulo
-        fallback_week = _week_from_path(p)
-        if fallback_week:
-            df = df.with_columns(
-                pl.when(pl.col("semana_iso").is_null() | (pl.col("semana_iso")=="None"))
-                  .then(pl.lit(fallback_week))
-                  .otherwise(pl.col("semana_iso")).alias("semana_iso")
-            )
-
-        for sem, dfi in df.partition_by("semana_iso", as_dict=True, maintain_order=True).items():
-            buckets.setdefault(sem, []).append(dfi)
-
-    out_base = gsjoin(GCS_BUCKET, BRONZE_PREFIX, "etapas").replace("gs://", "")
-    wrote, skipped = [], []
-    for sem, dfs in buckets.items():
-        if sem is None or str(sem).lower()=="none" or str(sem).strip()=="":
-            print("⚠️  ETAPAS: se detectó partición 'None' — se omite escritura")
-            continue
-
-        # Unifica esquemas antes de concatenar
-        all_cols = set()
-        for df_part in dfs: all_cols.update(df_part.columns)
-
-        sorted_cols = sorted(list(all_cols))
-        dfs_aligned = []
-        for df_part in dfs:
-            missing = all_cols - set(df_part.columns)
-            if missing:
-                df_part = df_part.with_columns([pl.lit(None).alias(c) for c in sorted(list(missing))])
-            # Forzar el orden canónico de columnas
-            dfs_aligned.append(df_part.select(sorted_cols))
-
-        dfw = pl.concat(dfs_aligned, how="vertical_relaxed").rechunk()
-        dfw, sem_norm = _sanitize_before_write(dfw, sem)
-        # Derivar is_qr si etapas aportan contrato (poco común); protegido
-        if "id_contrato" in dfw.columns or "contrato" in dfw.columns:
-            colc = "id_contrato" if "id_contrato" in dfw.columns else "contrato"
-            dfw = dfw.with_columns(
-                pl.col(colc).cast(pl.Utf8, strict=False).str.strip_chars().is_in(["171","102"]).alias("is_qr")
-            )
-        target_dir = f"{out_base}/semana_iso={sem_norm}"
-        if _partition_exists(out_base, sem_norm):
-            print(f"⏭️  ETAPAS {sem_norm} ya existe → omito")
-            skipped.append(sem_norm); continue
-        if gfs.exists(target_dir): gfs.rm(target_dir, recursive=True)
-
-        fmt = ds.ParquetFileFormat()
-        try:
-            file_opts = fmt.make_write_options(compression="zstd")
-        except Exception:
-            file_opts = None
-
-        ds.write_dataset(
-            data=dfw.to_arrow(),
-            base_dir=target_dir,
-            filesystem=fs_arrow,
-            format="parquet",
-            existing_data_behavior="overwrite_or_ignore",
-            file_options=file_opts,
-            basename_template="part-{i}.parquet",
-        )
-        print(f"✅ ETAPAS {sem_norm} → gs://{target_dir}")
-        wrote.append(sem_norm)
-    print(f"Resumen ETAPAS → nuevas: {len(wrote)}, omitidas: {len(skipped)}")
-    return {"dataset":"etapas","written":sorted(set(wrote)),"skipped":sorted(set(skipped))}
-```
-
-## 5) Wrapper de ingesta
-
-```{python}
-def ingest_new_to_bronze(viajes_glob: str | None = None, etapas_glob: str | None = None):
-    """
-    Ingesta desde /raw. Por defecto toma archivos planos: *viajes.csv / *etapas.csv
-    """
-    viajes_glob = viajes_glob or "*viajes.csv"
-    etapas_glob = etapas_glob or "*etapas.csv"
-
-    print("⏳ Iniciando ingesta NUEVA → bronze")
-    files_v = _glob_raw(viajes_glob)
-    files_e = _glob_raw(etapas_glob)
-
-    sum_v = _ingest_viajes_files(files_v)
-    sum_e = _ingest_etapas_files(files_e)
-
-    print("🏁 Ingesta finalizada.")
-    return {"viajes": sum_v, "etapas": sum_e}
-```
-
-## 6) Lectura desde bronze (con parche de nombres)
-
-```{python}
-def scan_bronze(dataset: str, semana_iso: str | None = None) -> pl.LazyFrame:
-    base_gs = gsjoin(GCS_BUCKET, BRONZE_PREFIX, dataset).rstrip("/")
-    if semana_iso:
-        # layout correcto
-        part_norm  = f"{base_gs}/semana_iso={semana_iso}/*.parquet"
-        # layout histórico incorrecto (formato "tupla")
-        part_tuple = "{}/semana_iso=('{}',)/*.parquet".format(base_gs, semana_iso)
-        try:
-            return pl.scan_parquet(part_norm)
-        except Exception:
-            try:
-                return pl.scan_parquet(part_tuple)
-            except Exception as e:
-                try:
-                    print("Particiones disponibles:", gfs.ls(f"{GCS_BUCKET}/{BRONZE_PREFIX}/{dataset}")[:20])
-                except Exception:
-                    pass
-                raise e
-    else:
-        base_no_scheme = base_gs.replace("gs://", "", 1)
-        dset = ds.dataset(base_no_scheme, filesystem=fs_arrow, format="parquet")
-        return pl.scan_pyarrow_dataset(dset)
-```
-
-## 7) Prueba rápida (comentado)
-
-```{python}
-lf_v = scan_bronze("viajes")
-lf_e = scan_bronze("etapas")
-```
-```{python}
-# 1) Ejecuta ingesta cuando subas nuevos CSV
-#ingest_new_to_bronze()
-
-# 2) Lectura para EDA
-#lf_v = scan_bronze("viajes")
-#lf_e = scan_bronze("etapas")
-print("viajes total:", lf_v.select(pl.len()).collect().item())
-print("etapas total:",  lf_e.select(pl.len()).collect().item())
-#
-## 3) Conteo por semana
-#cnt_v = (lf_v.group_by("semana_iso").agg(pl.len().alias("n")).sort#("semana_iso")).collect()
-#cnt_e = (lf_e.group_by("semana_iso").agg(pl.len().alias("n")).sort#("semana_iso")).collect()
-#print(cnt_v.tail(5)); print(cnt_e.tail(5))
-#
-## 4) Lectura de semana específica (acepta ambos layouts)
-#lf_v_w17 = scan_bronze("viajes", "2025-W17")
-#lf_e_w17 = scan_bronze("etapas", "2025-W17")
-#print(lf_v_w17.select(pl.len()).collect().item(), lf_e_w17.select(pl.len()).#collect().item())
-```
-
-## 8) Checker de llaves candidatas (viajes/etapas)
-```{python}
-# ========= Helpers para evaluar llaves =========
-
-def _schema_cols(lf: pl.LazyFrame) -> set[str]:
-    return set(lf.collect_schema().names())
-
-def _ts_min(expr: pl.Expr) -> pl.Expr:
-    """
-    Normaliza un timestamp cualquiera a resolución de minuto 'YYYY-MM-DD HH:MM'.
-    Soporta columnas ya Datetime o string; tolera nulos.
-    """
-    dt = pl.coalesce([
-        expr.cast(pl.Datetime, strict=False),
-        expr.cast(pl.Utf8, strict=False).str.to_datetime(strict=False, exact=False),
-    ])
-    return dt.dt.strftime("%Y-%m-%d %H:%M")
-
-def _key_quality(lf: pl.LazyFrame, keys: list[str], extras: dict[str, pl.Expr] | None = None) -> dict:
-    """
-    Calcula métricas de unicidad para 'keys'.
-    - extras: dict de {nombre_columna_calculada: Expr} que se agregarán antes de evaluar.
-    Devuelve un dict resumido (apto para tabular).
-    """
-    # agrega columnas extra si se piden
-    if extras:
-        lf_eval = lf.with_columns([expr.alias(name) for name, expr in extras.items()])
-    else:
-        lf_eval = lf
-
-    present = _schema_cols(lf_eval)
-    if any(k not in present for k in keys):
-        return {
-            "keys": str(keys),
-            "usable": False,
-            "n_total": None,
-            "n_non_null": None,
-            "n_distinct": None,
-            "dup_groups": None,
-            "dup_rows": None,
-            "max_dupe_size": None,
-            "nonnull_coverage_pct": None,
-            "distinct_over_nonnull_pct": None,
-        }
-
-    # filas totales
-    n_total = lf_eval.select(pl.len()).collect().item()
-
-    # filtro filas con todas las llaves NO nulas
-    nn_filter = pl.all_horizontal([pl.col(k).is_not_null() for k in keys])
-    lf_nn = lf_eval.filter(nn_filter)
-    n_non_null = lf_nn.select(pl.len()).collect().item()
-
-    # conteo de grupos por llave
-    grp = (lf_nn.group_by(keys).agg(pl.len().alias("n")).collect())
-    n_distinct = int(grp.height)
-    # grupos con duplicados
-    grp_dup = grp.filter(pl.col("n") > 1)
-    dup_groups = int(grp_dup.height)
-    dup_rows = int((grp_dup["n"] - 1).sum()) if dup_groups > 0 else 0
-    max_dupe_size = int(grp_dup["n"].max()) if dup_groups > 0 else 1
-
-    return {
-        "keys": str(keys),
-        "usable": True,
-        "n_total": n_total,
-        "n_non_null": n_non_null,
-        "n_distinct": n_distinct,
-        "dup_groups": dup_groups,
-        "dup_rows": dup_rows,
-        "max_dupe_size": max_dupe_size,
-        "nonnull_coverage_pct": (100.0 * n_non_null / n_total) if n_total else None,
-        "distinct_over_nonnull_pct": (100.0 * n_distinct / n_non_null) if n_non_null else None,
-    }
-
-def _evaluate_key_list(lf: pl.LazyFrame, combos: list[list[str]], extras: dict[str, pl.Expr] | None = None) -> pl.DataFrame:
-    rows = [_key_quality(lf, keys, extras=extras) for keys in combos]
-    # orden útil: más cobertura y más unicidad primero
-    df = pl.DataFrame(rows)
-    if df.height:
-        df = df.sort(
-            by=[
-                pl.col("usable").cast(pl.Int8),
-                pl.col("distinct_over_nonnull_pct").fill_null(0),
-                pl.col("nonnull_coverage_pct").fill_null(0),
-            ],
-            descending=[True, True, True]
-        )
-    return df
-
-```
-
-
-```{python }
-# Trabajamos sobre la semana que ya tenemos (2025-W17). Si luego agregas más, puedes quitar el 2º argumento.
-#lf_v = scan_bronze("viajes", "2025-W17")
-
-# Elegimos columna temporal preferente disponible
-#v_time_pref = [c for c in ["tiempo_inicio_viaje","tiempo_subida_1","mediahora_inicio_viaje"] if c in _schema_cols(lf_v)]
-#v_time_col = v_time_pref[0] if v_time_pref else None
-
-# Columnas comunes de contexto (si existen, se usarán en combos “fuertes”)
-#ctx_v = [c for c in ["paradero_inicio_viaje","paradero_fin_viaje","n_etapas","srv_1","modos"] if c in _schema_cols(lf_v)]
-
-# Extras calculados (timestamp a minuto)
-#extras_v = {"_ts_min": _ts_min(pl.col(v_time_col))} if v_time_col else {}
-
-# Combos base y “fuertes”
-#combos_v = [
-#    ["id_tarjeta","id_viaje"],
-#    ["id_tarjeta","id_viaje","fecha"],
-#]
-#if v_time_col:
-#    combos_v += [
-#        ["id_tarjeta","id_viaje","_ts_min"],
-#    ]
-    # versión “fuerte” agregando contexto si lo tenemos
-#    strong = ["id_tarjeta","id_viaje","_ts_min"] + [c for c in ctx_v]
-#    combos_v += [strong]
-
-#print("⏱️ Evaluando llaves en VIAJES… (esto puede demorar)")
-#summary_v = _evaluate_key_list(lf_v, combos_v, extras=extras_v)
-#summary_v
-
-```
-
-```{python}
-#lf_e = scan_bronze("etapas", "2025-W17")
-
-# Extras: timestamps normalizados a minuto (si existen)
-#extras_e = {}
-#if "tiempo_subida" in _schema_cols(lf_e):
-#    extras_e["_ts_sub_min"] = _ts_min(pl.col("tiempo_subida"))
-#if "tiempo_bajada" in _schema_cols(lf_e):
-#    extras_e["_ts_baj_min"] = _ts_min(pl.col("tiempo_bajada"))
-
-# Columnas de contexto (si existen)
-#ctx_e = [c for c in ["parada_subida","parada_bajada","servicio_subida","servicio_bajada","tipo_transporte"] if c in _schema_cols(lf_e)]
-
-# Combos a evaluar
-#combos_e = [
-#    ["id_tarjeta","id_viaje","n_etapa"],
-#      ["id_tarjeta","id_viaje","n_etapa","fecha"],
-#]
-#if "_ts_sub_min" in extras_e:
-#    combos_e += [["id_tarjeta","id_viaje","n_etapa","_ts_sub_min"]]
-#    strong_e = ["id_tarjeta","id_viaje","n_etapa","_ts_sub_min"] + [c for c in ctx_e]
-#    combos_e += [strong_e]
-
-#print("⏱️ Evaluando llaves en ETAPAS… (esto puede demorar)")
-#summary_e = _evaluate_key_list(lf_e, combos_e, extras=extras_e)
-#summary_e
-
-```
-
-## 9) Añadir PKs sobre viajes y etapas
-
-```{python}
-
-def _norm_ts_min(expr: pl.Expr) -> pl.Expr:
-    # expr puede ser Datetime (ya parseado en bronze) o string (lo normalizamos).
-    # La expresión `expr.dtype` no es válida en el API de Polars.
-    # Se aplica la normalización directamente, ya que _fix_ddmmyy_to_iso
-    # es suficientemente robusta para manejar ambos casos.
-    dt = _fix_ddmmyy_to_iso(expr)
-    return dt.dt.strftime("%Y-%m-%d %H:%M")
-
-def add_pks_viajes(lf: pl.LazyFrame) -> pl.LazyFrame:
-    # Fallback: inicio → subida_1
-    ts_any = pl.coalesce([
-        pl.col("tiempo_inicio_viaje"),
-        pl.col("tiempo_subida_1"),
-    ])
-    ts_min = _norm_ts_min(ts_any).alias("ts_inicio_min")
-    return (lf.with_columns(ts_min)
-              .with_columns(pl.struct([
-                    pl.col("id_tarjeta").cast(pl.Utf8, strict=False),
-                    pl.col("id_viaje").cast(pl.Int64, strict=False),
-                    pl.col("ts_inicio_min")
-                ]).hash(seed=0).alias("pk_viaje")))
-
-def add_pks_etapas(lf: pl.LazyFrame) -> pl.LazyFrame:
-    # Fallback: subida → bajada
-    ts_any = pl.coalesce([
-        pl.col("tiempo_subida"),
-        pl.col("tiempo_bajada"),
-    ])
-    ts_min = _norm_ts_min(ts_any).alias("ts_subida_min")
-    return (lf.with_columns(ts_min)
-              .with_columns(pl.struct([
-                    pl.col("id_tarjeta").cast(pl.Utf8, strict=False),
-                    pl.col("id_viaje").cast(pl.Int64, strict=False),
-                    pl.col("n_etapa").cast(pl.Int16, strict=False),
-                    pl.col("ts_subida_min")
-                ]).hash(seed=0).alias("pk_etapa")))
-
-```
-
-
-```{python}
-# VIAJES
-lf_v = add_pks_viajes(scan_bronze("viajes", "2025-W17"))
-dups_v = (lf_v.group_by(["pk_viaje"]).len()
-              .filter(pl.col("len")>1).select(pl.len().alias("dup_groups"))
-              .collect(engine="in-memory").item())
-print("viajes dup_groups by pk_viaje:", dups_v)
-
-# ETAPAS
-lf_e = add_pks_etapas(scan_bronze("etapas", "2025-W17"))
-dups_e = (lf_e.group_by(["pk_etapa"]).len()
-              .filter(pl.col("len")>1).select(pl.len().alias("dup_groups"))
-              .collect(engine="in-memory").item())
-print("etapas dup_groups by pk_etapa:", dups_e)
-
-```
-
-## 10) Diccionario zonas_777 (DIC_777.csv)
-
-```{python}
-# Carga del diccionario de zonas y paraderos desde RAW (DIC_777.csv)
-path_dic_no_scheme = f"{GCS_BUCKET}/{RAW_PREFIX}/DIC_777.csv"
-print("Leyendo:", "gs://" + path_dic_no_scheme)
-sep_dic = _detect_sep_from_fullpath(path_dic_no_scheme, default=CSV_SEP_DEF)
-df_zonas_777 = _read_csv_polars_gcs(path_dic_no_scheme, sep_dic)
-print("df_zonas_777 shape:", df_zonas_777.shape)
-print(df_zonas_777.head(5))
-print(df_zonas_777.schema)
-```
-
-## 11) Zonas 777 (shapefile → GeoDataFrame)
-
-```{python}
-# Dependencias opcionales para lectura geoespacial (descomenta si faltan):
-# !pip install -q geopandas pyogrio shapely
-
-import tempfile
-from pathlib import Path
-
-# Ruta base en GCS
-shape_folder = f"{GCS_BUCKET}/{RAW_PREFIX}/Zonas777-2014/Shape"
-paths = gfs.ls(shape_folder)
-
-# Detectar el .shp (insensible a mayúsculas/minúsculas)
-shp_remote = next(p for p in paths if p.lower().endswith(".shp"))
-base_stem = Path(shp_remote).stem.lower()
-
-# Descargar componentes mínimos (.shp/.shx/.dbf) y .prj si existe
-need_exts = [".shp", ".shx", ".dbf", ".prj"]
-remote_by_ext = {}
-for p in paths:
-    ext = Path(p).suffix.lower()
-    if ext in need_exts and Path(p).stem.lower() == base_stem:
-        remote_by_ext[ext] = p
-
-tmpdir = Path(tempfile.mkdtemp(prefix="zonas777_"))
-for ext in need_exts:
-    if ext in remote_by_ext:
-        with gfs.open(remote_by_ext[ext], "rb") as r, open(tmpdir / f"zonas777{ext}", "wb") as w:
-            w.write(r.read())
-
-local_shp = str(tmpdir / "zonas777.shp")
-
-# Leer con pyogrio si está disponible; si no, usar geopandas/ogr
-try:
-    import pyogrio
-    gdf_zonas777 = pyogrio.read_dataframe(local_shp)
-except Exception:
-    import geopandas as gpd
-    gdf_zonas777 = gpd.read_file(local_shp)
-
-# Asegurar CRS: si está ausente, asumir WGS84 lon/lat (EPSG:4326)
-if getattr(gdf_zonas777, "crs", None) is None:
-    gdf_zonas777 = gdf_zonas777.set_crs(4326, allow_override=True)
-
-print("gdf_zonas777:", gdf_zonas777.shape, gdf_zonas777.crs)
-print(gdf_zonas777.head(2))
-```
-
-## 12) Diccionario zonas_777 → normalización y puntos (GeoDataFrame)
-
-```{python}
-# Requiere geopandas para convertir a GeoDataFrame
-# !pip install -q geopandas shapely
-
-import geopandas as gpd
-
-# 1) Normaliza nombres de columnas (planos y snake_case básico donde aplica)
-ren_map = {
-    "parada/est.metro": "parada",
-    "Subidas día laboral por parada": "subidas_dia_lab",
-    "Bajadas día Laboral por parada": "bajadas_dia_lab",
-    "Referencia": "referencia",
-    "diseno_777": "diseno_777",
-    "comuna": "comuna",
-    "x": "x",
-    "y": "y",
-}
-present = [c for c in ren_map if c in df_zonas_777.columns]
-df_zonas_777 = df_zonas_777.rename({k: ren_map[k] for k in present})
-
-# 2) Construye puntos desde x,y en UTM 19S (EPSG:32719) y reproyecta a WGS84
-if all(c in df_zonas_777.columns for c in ["x","y"]):
-    # Asegura tipos numéricos
-    df_cast = df_zonas_777.with_columns([
-        pl.col("x").cast(pl.Float64, strict=False),
-        pl.col("y").cast(pl.Float64, strict=False),
-    ])
-    df_pd = df_cast.to_pandas()
-    gdf_par_utm = gpd.GeoDataFrame(
-        df_pd,
-        geometry=gpd.points_from_xy(df_pd["x"], df_pd["y"]),
-        crs=32719
-    )
-    gdf_par_4326 = gdf_par_utm.to_crs(4326)
-    print("gdf_par_4326:", gdf_par_4326.shape, gdf_par_4326.crs)
-    print(gdf_par_4326.head(2))
+    
+    print("Resumen de particiones en 'bronze/viajes':")
+    with pl.Config(tbl_rows=-1):
+        print(conteo_semanal)
 else:
-    print("Columnas 'x' y 'y' no presentes; se omite creación de GeoDataFrame de puntos.")
+    print("No se encontraron datos en la capa Bronze de viajes.")
+
 ```
 
+## 3) Validación de Integridad
+
+### 3.1) Validación de Conteo de Filas
+
+Esta es la validación más robusta. Compara el total de filas en la capa Bronze con el total de filas en los CSV originales. 
+
+**Advertencia:** Esta celda es lenta, ya que necesita escanear todos los archivos CSV originales desde la red.
+
 ```{python}
-print(lf_v.columns)
-print(lf_e.columns)
-print(df_zonas_777.columns)
-print(gdf_zonas777.columns)
-print(gdf_par_4326.columns)
+def get_csv_row_count(file_path: str, separator: str) -> int:
+    """Cuenta las filas de un CSV de forma eficiente en memoria."""
+    try:
+        # scan_csv es mucho más eficiente en memoria que read_csv
+        return pl.scan_csv(file_path, separator=separator, has_header=True).select(pl.len()).collect().item()
+    except Exception as e:
+        print(f"Error contando filas en {os.path.basename(file_path)}: {e}")
+        return 0
+
+if lf_viajes_bronze.columns:
+    print("--- Validación de Conteo de Filas ---")
+    
+    # 1. Contar filas en Parquet (rápido)
+    print("Contando filas en la capa Bronze (Parquet)... Esto es rápido.")
+    total_parquet_rows = lf_viajes_bronze.select(pl.len()).collect().item()
+    print(f"Total de filas en Parquet: {total_parquet_rows:,}")
+
+    # 2. Contar filas en CSVs (lento)
+    print("\nContando filas en los CSV originales... Esto puede tardar varios minutos.")
+    viajes_glob = "raw_csv/source=drive/ingest_date=2025-10-01/*viajes.csv"
+    try:
+        csv_files = gfs.glob(f"{RAW_PATH}/{viajes_glob}")
+        total_csv_rows = 0
+        for file in tqdm(csv_files, desc="Escaneando CSVs"):
+            # Asumimos el separador por defecto, se podría detectar si fuera necesario
+            total_csv_rows += get_csv_row_count(f"gs://{file}", separator=";")
+        
+        print(f"Total de filas en CSVs: {total_csv_rows:,}")
+
+        # 3. Comparar
+        print("\n--- Resultado ---")
+        if total_parquet_rows == total_csv_rows:
+            print(f"✅ ¡Éxito! El número de filas coincide ({total_parquet_rows:,}).")
+        else:
+            print(f"❌ ¡Falla! El número de filas no coincide.")
+            print(f"   - Filas en Parquet: {total_parquet_rows:,}")
+            print(f"   - Filas en CSV:     {total_csv_rows:,}")
+            print(f"   - Diferencia:       {abs(total_parquet_rows - total_csv_rows):,}")
+
+    except Exception as e:
+        print(f"Ocurrió un error al intentar listar los archivos CSV: {e}")
+else:
+    print("No hay datos para validar el conteo de filas.")
+
 ```
