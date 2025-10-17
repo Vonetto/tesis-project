@@ -1,0 +1,265 @@
+---
+title: "Tesis — 01 | Procesamiento Silver (Viajes Enriquecidos)"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Este notebook toma los datos de la capa **Bronze** (particionados y en formato Parquet) y les aplica un proceso de enriquecimiento y limpieza para generar una tabla en la capa **Silver**. 
+
+El proceso incluye:
+1.  Cargar los datos de viajes de la capa Bronze.
+2.  Cargar datasets de enriquecimiento (diccionario de zonas/paraderos y geometrías).
+3.  Generar llaves únicas (Primary Keys) para los viajes.
+4.  Unir los datos de viajes con la información geográfica.
+5.  Guardar (materializar) el resultado como un nuevo dataset Parquet en la capa Silver.
+
+---
+
+## 1) Setup y Conexión
+
+```{python}
+import os
+import sys
+import polars as pl
+import pyarrow.dataset as ds
+import gcsfs
+import geopandas as gpd
+import pyogrio
+import tempfile
+from pathlib import Path
+
+# --- Parámetros ---
+GCS_BUCKET = "tesis-vonetto-datalake"
+BRONZE_PATH = f"gs://{GCS_BUCKET}/lake/bronze"
+SILVER_PATH = f"gs://{GCS_BUCKET}/lake/silver"
+RAW_PATH = f"gs://{GCS_BUCKET}/raw"
+
+# --- Conexión ---
+def enable_adc_crossplatform():
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return
+    if sys.platform.startswith("win"):
+        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
+    else:
+        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+    if not os.path.exists(adc_path):
+        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
+
+try:
+    enable_adc_crossplatform()
+    gfs = gcsfs.GCSFileSystem(token="google_default")
+    print("✅ Conexión con GCS establecida.")
+except FileNotFoundError as e:
+    print(f"❌ Error de autenticación: {e}")
+
+```
+
+## 2) Carga de Datos
+
+### 2.1) Datos de Viajes (Bronze)
+
+Cargamos el dataset completo de viajes desde la capa Bronze. `scan_parquet` es perezoso (Lazy), por lo que no consume memoria hasta que se ejecuta una acción (`.collect()` o `.sink_parquet()`).
+
+```{python}
+def scan_bronze_dataset(dataset_name: str) -> pl.LazyFrame:
+    """Escanea un dataset completo en la capa Bronze."""
+    path = f"{BRONZE_PATH}/{dataset_name}"
+    try:
+        return pl.scan_parquet(f"{path}/**/*.parquet")
+    except Exception as e:
+        print(f"No se pudo escanear la ruta {path}.", file=sys.stderr)
+        raise e
+
+lf_viajes_bronze = scan_bronze_dataset("viajes")
+
+print(f"Schema de Viajes (Bronze):")
+print(lf_viajes_bronze.collect_schema().names())
+
+```
+
+### 2.2) Datos de Enriquecimiento (Zonas y Paraderos)
+
+Cargamos los diccionarios y shapefiles que usaremos para enriquecer los datos de viajes. Inmediatamente después, los materializamos en la capa Silver para su reutilización.
+
+```{python}
+# Carga del diccionario de zonas y paraderos (DIC_777.csv)
+def read_gcs_csv(path: str, sep=";") -> pl.DataFrame:
+    with gfs.open(path, "rb") as fh:
+        return pl.read_csv(fh, separator=sep, infer_schema_length=10000, ignore_errors=True)
+
+df_zonas_777 = read_gcs_csv(f"{RAW_PATH}/DIC_777.csv")
+print("Diccionario Zonas 777 (df_zonas_777):", df_zonas_777.shape)
+
+# --- Escritura a Silver ---
+SILVER_DICCIONARIO_ZONAS_PATH = f"{SILVER_PATH}/diccionario_zonas_777/data.parquet"
+df_zonas_777.write_parquet(SILVER_DICCIONARIO_ZONAS_PATH, pyarrow_options={"filesystem": gfs})
+print(f"✅ Diccionario de zonas guardado en: {SILVER_DICCIONARIO_ZONAS_PATH}")
+
+
+# Carga del shapefile de Zonas 777
+def read_gcs_shapefile(shape_folder_path: str) -> gpd.GeoDataFrame:
+    """Descarga un shapefile de GCS a un directorio temporal y lo lee con pyogrio."""
+    paths = gfs.ls(shape_folder_path)
+    shp_remote = next((p for p in paths if p.lower().endswith(".shp")), None)
+    if not shp_remote:
+        raise FileNotFoundError(f"No se encontró archivo .shp en {shape_folder_path}")
+    
+    base_stem = Path(shp_remote).stem
+    need_exts = [".shp", ".shx", ".dbf", ".prj", ".cpg"]
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for ext in need_exts:
+            remote_file = next((p for p in paths if Path(p).stem == base_stem and Path(p).suffix.lower() == ext), None)
+            if remote_file:
+                local_path = os.path.join(tmpdir, f"{base_stem}{ext}")
+                gfs.get(remote_file, local_path)
+        
+        gdf = pyogrio.read_dataframe(os.path.join(tmpdir, f"{base_stem}.shp"))
+        if gdf.crs is None:
+            gdf = gdf.set_crs(4326, allow_override=True)
+        return gdf
+
+gdf_zonas777_geo = read_gcs_shapefile(f"{RAW_PATH}/Zonas777-2014/Shape")
+print("GeoDataFrame Zonas 777 (gdf_zonas777_geo):", gdf_zonas777_geo.shape, gdf_zonas777_geo.crs)
+
+# --- Escritura a Silver (GeoParquet) ---
+SILVER_GEOMETRIA_ZONAS_PATH = f"gs://{GCS_BUCKET}/lake/silver/geometria_zonas_777/data.geoparquet"
+gdf_zonas777_geo.to_parquet(SILVER_GEOMETRIA_ZONAS_PATH)
+print(f"✅ Geometría de zonas guardada en: {SILVER_GEOMETRIA_ZONAS_PATH}")
+
+```
+
+## 3) Lógica de Enriquecimiento
+
+### 3.1) Creación de Llaves Únicas (PK)
+
+Definimos una función para crear una llave única para cada viaje, basada en la tarjeta, el ID del viaje y el timestamp de inicio.
+
+```{python}
+def _fix_ddmmyy_to_iso(expr: pl.Expr) -> pl.Expr:
+    s = expr.cast(pl.Utf8).str.strip_chars()
+    s = s.str.replace_all(r"^(\d{2})[-/](\d{2})[-/](\d{2})", r"20$3-$2-$1")
+    s = s.str.replace_all(r"^(\d{2})[-/](\d{2})[-/](\d{4})", r"$3-$2-$1")
+    s = s.str.replace_all(r"\s+", " ")
+    formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"]
+    tries = [s.str.strptime(pl.Datetime, format=f, strict=False, exact=False) for f in formats]
+    return pl.coalesce(tries)
+
+def _norm_ts_min(expr: pl.Expr) -> pl.Expr:
+    dt = _fix_ddmmyy_to_iso(expr)
+    return dt.dt.strftime("%Y-%m-%d %H:%M")
+
+def add_pk_viaje(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Añade una llave primaria (pk_viaje) a un LazyFrame de viajes."""
+    ts_any = pl.coalesce([
+        pl.col("tiempo_inicio_viaje"),
+        pl.col("tiempo_subida_1"),
+    ])
+    ts_min = _norm_ts_min(ts_any).alias("ts_inicio_min")
+    
+    # Primero añadimos la columna de timestamp
+    lf_with_ts = lf.with_columns(ts_min)
+    
+    # Luego, sobre ese nuevo LF, añadimos la PK usando la columna recién creada
+    return lf_with_ts.with_columns(
+        pl.struct([
+            pl.col("id_tarjeta").cast(pl.Utf8, strict=False),
+            pl.col("id_viaje").cast(pl.Int64, strict=False),
+            pl.col("ts_inicio_min")
+        ]).hash(seed=42).alias("pk_viaje")
+    )
+
+# Aplicamos la transformación al LazyFrame
+lf_viajes_con_pk = add_pk_viaje(lf_viajes_bronze)
+
+print("Schema de Viajes con PK:")
+print(lf_viajes_con_pk.collect_schema().names())
+
+```
+
+### 3.2) Enriquecimiento Geográfico (Ejemplo)
+
+Aquí iría la lógica para unir `lf_viajes_con_pk` con `df_zonas_777` o `gdf_zonas777_geo`. Por ejemplo, para agregar la comuna o zona de origen del viaje.
+
+```{python}
+# Esta celda es un placeholder para el enriquecimiento
+# Ejemplo: lf_viajes_enriquecido = lf_viajes_con_pk.join(..., on=..., how="left")
+
+lf_viajes_enriquecido = lf_viajes_con_pk # Por ahora, pasamos el mismo LF
+
+print("El enriquecimiento aún no se ha implementado. Pasando el LF con PK a la siguiente etapa.")
+```
+
+## 4) Escritura en Capa Silver (Particionamiento Manual)
+
+Usaremos una estrategia de particionamiento manual para evitar las incompatibilidades de API entre Polars y PyArrow, usando el método `.sink_parquet()` que es nativo de Polars y muy eficiente en memoria.
+
+```{python}
+from tqdm import tqdm
+import os
+
+# Definir la ruta base de salida en la capa Silver
+SILVER_VIAJES_PATH = f"{SILVER_PATH}/viajes_enriquecidos"
+print(f"Ruta de destino en la capa Silver: {SILVER_VIAJES_PATH}")
+
+# 1. Obtener las particiones únicas que necesitamos escribir
+print("Obteniendo lista de particiones a procesar...")
+partitions_df = lf_viajes_enriquecido.select(["iso_year", "iso_week"]).unique().collect()
+print(f"Se procesarán y escribirán {len(partitions_df)} particiones únicas.")
+
+# 2. Iterar sobre cada partición, filtrar y guardar (sink)
+for part in tqdm(partitions_df.iter_rows(named=True), total=len(partitions_df), desc="Escribiendo particiones a Silver"):
+    year = part['iso_year']
+    week = part['iso_week']
+
+    # Filtramos el LazyFrame principal para esta partición específica
+    lf_partition = lf_viajes_enriquecido.filter(
+        (pl.col("iso_year") == year) & (pl.col("iso_week") == week)
+    )
+
+    # Creamos el directorio de la partición en GCS
+    partition_dir = os.path.join(SILVER_VIAJES_PATH, f"iso_year={year}", f"iso_week={week}")
+    gfs.mkdirs(partition_dir, exist_ok=True)
+    
+    # Definimos el path final del archivo parquet
+    output_file_path = os.path.join(partition_dir, "data-0.parquet")
+
+    # Usamos sink_parquet para ejecutar la consulta y guardar el resultado de forma eficiente
+    lf_partition.sink_parquet(
+        path=output_file_path,
+        compression="zstd",
+        # El filesystem se maneja a través del path si gcsfs está instalado y configurado
+    )
+
+print(f"\n✅ Proceso completado. Se han escrito {len(partitions_df)} particiones en la capa Silver.")
+print(f"Puedes verificar los archivos en: {SILVER_VIAJES_PATH}")
+
+```
+
+## 5) Verificación (Opcional)
+
+Podemos hacer un `scan` rápido a la nueva tabla en la capa Silver para verificar que se escribió correctamente.
+
+```{python}
+try:
+    lf_silver_check = pl.scan_parquet(f"{SILVER_VIAJES_PATH}/**/*.parquet")
+    
+    print("Verificación de la capa Silver:")
+    print(f"Schema: {lf_silver_check.collect_schema().names()}")
+    
+    conteo_silver = lf_silver_check.group_by("semana_iso").len().sort("semana_iso").collect()
+    
+    with pl.Config(tbl_rows=-1):
+        print(conteo_silver)
+except Exception as e:
+    print(f"No se pudo leer la tabla Silver. Error: {e}")
+
+```
