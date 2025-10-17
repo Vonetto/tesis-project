@@ -1,8 +1,6 @@
-# .gitignore
-
-```gitignore
-# --- Python / venv
+# --- Python / venv ---
 venv/
+env/
 .env
 *.pyc
 __pycache__/
@@ -10,29 +8,36 @@ __pycache__/
 *.pyd
 .pytest_cache/
 *.egg-info/
+dist/
+build/
 
-# --- OS / IDE
+# --- OS / IDE ---
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# --- Quarto outputs/caches
+# --- Quarto outputs/caches ---
 _site/
 _freeze/
 **/_freeze/
 **/execute-results/
-.quarto/_freeze/
-.quarto/project-cache/
-.quarto/preview/
-.quarto/idx/
+.quarto/
+**/.quarto/
 site_libs/
 **/site_libs/
+**/*.html
+**/*_files/
+*.quarto_ipynb
 
-# --- Notebooks / checkpoints
+# --- Notebooks / checkpoints ---
 .ipynb_checkpoints/
+**/.ipynb_checkpoints/
 
-# --- Datos locales (si existiera)
+# --- Datos locales (NO subir datos al repo) ---
 Datos/
 data/
 *.parquet
@@ -40,8 +45,11 @@ data/
 *.arrow
 *.orc
 *.csv
+*.tsv
+*.xlsx
+*.xls
 
-# --- Credenciales / llaves (¡nunca al repo!)
+# --- Credenciales / llaves (¡NUNCA al repo!) ---
 *.key
 *.pem
 *.p12
@@ -50,6 +58,14 @@ data/
 *service-account*.json
 *credentials*.json
 secrets*/
+.gcloud/
+.config/gcloud/
 
-/.quarto/
-**/*.quarto_ipynb
+# --- Temporales ---
+tmp/
+temp/
+*.tmp
+*.log
+
+# --- Papers (comentar si quieres versionarlos) ---
+papers/
