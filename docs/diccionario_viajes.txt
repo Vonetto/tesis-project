@@ -1,0 +1,135 @@
+Campo	Formato	Descripción
+
+-- COLUMNAS ORIGINALES --
+
+tipodia	character varying(10)	Tipo de día (LABORAL/SABADO/DOMINGO)
+factor_expansion	double precision	Factor de expansión en base a matriz OD (zonas777)
+n_etapas	integer	Cantidad de etapas del viaje
+tviaje	double precision	[DEPRECADO] Tiempo de viaje original [seg]. Reemplazado por tviaje2 y luego por t_total_calculado_seg.
+distancia_eucl	double precision	Distancia euclidiana entre subida y bajada del viaje [m]
+distancia_ruta	double precision	Distancia en ruta, suma de la distancia en ruta de cada etapa [m]
+tiempo_inicio_viaje	timestamp without time zone	Tiempo en que se realiza la subida de la primera etapa
+tiempo_fin_viaje	timestamp without time zone	Tiempo en que se realiza la bajada de la última etapa
+mediahora_inicio_viaje	time without time zone	Media hora en que se produce el tiempo_subida
+mediahora_fin_viaje	time without time zone	Media hora en que se produce el tiempo_bajada
+periodo_inicio_viaje	character varying(100)	Periodo transantiago en que se produce el tiempo_subida
+periodo_fin_viaje	character varying(100)	Periodo transantiago en que se produce el tiempo_bajada
+tipo_transporte_1	character varying(50)	Tipo de transporte de etapa 1. 1:Bus, 2:Metro, 3:Zona Paga, 4:MetroTren.
+tipo_transporte_2	character varying(50)	Tipo de transporte de etapa 2. 1:Bus, 2:Metro, 3:Zona Paga, 4:MetroTren.
+tipo_transporte_3	character varying(50)	Tipo de transporte de etapa 3. 1:Bus, 2:Metro, 3:Zona Paga, 4:MetroTren.
+tipo_transporte_4	character varying(50)	Tipo de transporte de etapa 4. 1:Bus, 2:Metro, 3:Zona Paga, 4:MetroTren.
+srv_1	character varying(500)	Servicio de etapa 1
+srv_2	character varying(500)	Servicio de etapa 2
+srv_3	character varying(500)	Servicio de etapa 3
+srv_4	character varying(500)	Servicio de etapa 4
+paradero_inicio_viaje	character varying(50)	Paradero de la subida de la 1era etapa
+paradero_fin_viaje	character varying(50)	Paradero de bajada de la etapa final
+comuna_inicio_viaje	character varying(20)	Comuna del paradero de subida
+comuna_fin_viaje	character varying(20)	Comuna del paradero de bajada
+zona_inicio_viaje	character varying(20)	Zona 777 de paradero de subida
+zona_fin_viaje	character varying(20)	Zona 777 de paradero de bajada
+modos	character varying(20)	Codificación de los modos del viaje
+tiempo_subida_1	timestamp without time zone	Tiempo de subida de la etapa 1
+tiempo_subida_2	timestamp without time zone	Tiempo de subida de la etapa 2
+tiempo_subida_3	timestamp without time zone	Tiempo de subida de la etapa 3
+tiempo_subida_4	timestamp without time zone	Tiempo de subida de la etapa 4
+tiempo_bajada_1	timestamp without time zone	Tiempo de bajada de la etapa 1
+tiempo_bajada_2	timestamp without time zone	Tiempo de bajada de la etapa 2
+tiempo_bajada_3	timestamp without time zone	Tiempo de bajada de la etapa 3
+tiempo_bajada_4	timestamp without time zone	Tiempo de bajada de la etapa 4
+zona_subida_1	character varying(50)	Zona 777 de subida de etapa 1
+zona_subida_2	character varying(50)	Zona 777 de subida de etapa 2
+zona_subida_3	character varying(50)	Zona 777 de subida de etapa 3
+zona_subida_4	character varying(50)	Zona 777 de subida de etapa 4
+zona_bajada_1	character varying(50)	Zona 777 de bajada de etapa 1
+zona_bajada_2	character varying(50)	Zona 777 de bajada de etapa 2
+zona_bajada_3	character varying(50)	Zona 777 de bajada de etapa 3
+zona_bajada_4	character varying(50)	Zona 777 de bajada de etapa 4
+paradero_subida_1	character varying(50)	Paradero de subida de la etapa 1
+paradero_subida_2	character varying(50)	Paradero de subida de la etapa 2
+paradero_subida_3	character varying(50)	Paradero de subida de la etapa 3
+paradero_subida_4	character varying(50)	Paradero de subida de la etapa 4
+paradero_bajada_1	character varying(50)	Paradero de bajada de la etapa 1
+paradero_bajada_2	character varying(50)	Paradero de bajada de la etapa 2
+paradero_bajada_3	character varying(50)	Paradero de bajada de la etapa 3
+paradero_bajada_4	character varying(50)	Paradero de bajada de la etapa 4
+mediahora_bajada_1	time without time zone	Media hora de bajada de la etapa 1
+mediahora_bajada_2	time without time zone	Media hora de bajada de la etapa 2
+mediahora_bajada_3	time without time zone	Media hora de bajada de la etapa 3
+mediahora_bajada_4	time without time zone	Media hora de bajada de la etapa 4
+periodo_bajada_1	character varying(100)	Periodo de bajada de etapa 1
+periodo_bajada_2	character varying(100)	Periodo de bajada de etapa 2
+periodo_bajada_3	character varying(100)	Periodo de bajada de etapa 3
+periodo_bajada_4	character varying(100)	Periodo de bajada de etapa 4
+id_tarjeta	varying(20)	Id encriptado de la tarjeta bip!
+id_viaje	integer	Correlativo del viaje de la tarjeta bip!
+netapassinbajada	integer	Número de etapas sin bajada del viaje
+ultimaetapaconbajada	integer	1 si la última etapa tiene bajada estimada
+contrato	character varying(50)	Contrato de la transacción. Valores 171 y 102 identifican pagos con QR (viajes digitales).
+mediahora_inicio_viaje_hora	time without time zone	Media hora en que se produce el tiempo_subida
+mediahora_fin_viaje_hora	time without time zone	Media hora en que se produce el tiempo_bajada
+op_1era_etapa	character varying(10)	Operador de la primera etapa
+op_2da_etapa	character varying(10)	Operador de la segunda etapa
+op_3era_etapa	character varying(10)	Operador de la tercera etapa
+op_4ta_etapa	character varying(10)	Operador de la cuarta etapa
+dt1	double precision	Distancia de trasbordo (caminata) entre etapa1 y etapa2 [m]
+dveh_ruta1	double precision	Distancia recorrida en vehículo en ruta etapa1 [m]
+dveh_euc1	double precision	Distancia recorrida en vehículo euclidiana etapa1 [m]
+dt2	double precision	Distancia de trasbordo (caminata) entre etapa2 y etapa3 [m]
+dveh_ruta2	double precision	Distancia recorrida en vehículo en ruta etapa2 [m]
+dveh_euc2	double precision	Distancia recorrida en vehículo euclidiana etapa2 [m]
+dt3	double precision	Distancia de trasbordo (caminata) entre etapa3 y etapa4 [m]
+dveh_ruta3	double precision	Distancia recorrida en vehículo en ruta etapa 3 [m]
+dveh_euc3	double precision	Distancia recorrida en vehículo euclidiana etapa 3 [m]
+dveh_ruta4	double precision	Distancia recorrida en vehículo en ruta etapa 4 [m]
+dveh_euc4	double precision	Distancia recorrida en vehículo euclidiana etapa 4 [m]
+dtfinal	double precision	Suma de distancia de todos los trasbordos [m]
+dveh_rutafinal	double precision	Suma de distancias total recorrida en vehículo en ruta [m]
+dveh_eucfinal	double precision	Suma de distancia euclidiana total recorrida en vehículo [m]
+tipo_corte_etapa_viaje	character varying(50)	Tipo de corte etapa/viaje
+proposito	character varying(50)	Propósito del viaje
+entrada	double precision	Tiempo de entrada a estaciones de metro [seg]
+te0	double precision	Tiempo de espera en la etapa 1 [seg]
+tv1	double precision	Tiempo de viaje en vehículo en la etapa 1 [seg]
+tc1	double precision	Tiempo de caminata de la etapa 1 hacia subida etapa 2 [seg]
+te1	double precision	Tiempo de espera en la etapa 2 [seg]
+tv2	double precision	Tiempo de viaje en vehí­culo en la etapa 2 [seg]
+tc2	double precision	Tiempo de caminata de la etapa 2 hacia subida etapa 3 [seg]
+te2	double precision	Tiempo de espera en la etapa 3 [seg]
+tv3	double precision	Tiempo de viaje en vehículo en la etapa 3 [seg]
+tc3	double precision	Tiempo de caminata de la etapa 3 hacia subida etapa 4 [seg]
+te3	double precision	Tiempo de espera en la etapa 4 [seg]
+tv4	double precision	Tiempo de viaje en vehículo en la etapa 4 [seg]
+egreso	double precision	Tiempo de egreso de estaciones de metro [seg]
+tviaje2	double precision	Tiempo de viaje total, la suma de todos los tiempos anteriores [seg]
+
+-- COLUMNAS GENERADAS (process_data.py) --
+
+fecha	Date	[GENERADA] Fecha de la transacción, derivada de la columna de tiempo principal.
+iso_year	Int32	[GENERADA] Año ISO de la semana del viaje, para particionamiento.
+iso_week	Int32	[GENERADA] Semana ISO del viaje (1-53), para particionamiento.
+semana_iso	String	[GENERADA] Combinación de año y semana ISO (ej. "2024-W14").
+is_qr	Boolean	[GENERADA] True si el viaje fue pagado con QR (contrato 171 o 102).
+
+-- COLUMNAS GENERADAS (02_data_quality.qmd) --
+
+t_vehiculo_total_seg	double precision	[GENERADA] Suma de todos los tiempos en vehículo (tv1+tv2+tv3+tv4). Fuente de verdad para tiempo en vehículo.
+t_espera_total_seg	double precision	[GENERADA] Suma de todos los tiempos de espera (te0+te1+te2+te3).
+t_caminata_total_seg	double precision	[GENERADA] Suma de todos los tiempos de caminata (tc1+tc2+tc3).
+t_acceso_egreso_total_seg	double precision	[GENERADA] Suma de tiempos de acceso y egreso a Metro (entrada+egreso).
+t_total_calculado_seg	double precision	[GENERADA] Suma de todos los componentes de tiempo. Fuente de verdad para la duración total del viaje.
+d_vehiculo_ruta_total_m	double precision	[GENERADA] Suma de distancias en ruta por etapa (dveh_ruta1+...).
+d_caminata_total_m	double precision	[GENERADA] Suma de distancias de caminata en transbordos (dt1+...).
+d_vehiculo_eucl_total_m	double precision	[GENERADA] Suma de distancias euclidianas por etapa (dveh_euc1+...).
+
+-- COLUMNAS GENERADAS (03_feature_engineering.qmd) --
+
+tiempo_total_seg	double precision	[GENERADA] Alias de t_total_calculado_seg, casteado a Float64.
+tiempo_vehiculo_seg	double precision	[GENERADA] Alias de t_vehiculo_total_seg, casteado a Float64.
+distancia_ruta_m	double precision	[GENERADA] Alias de distancia_ruta, casteado a Float64.
+distancia_euc_OD_m	double precision	[GENERADA] Alias de distancia_eucl, casteado a Float64.
+dr_de	double precision	[GENERADA] Razón Distancia en Ruta / Distancia Euclidiana (O-D).
+velocidad_vehiculo_kmhr	double precision	[GENERADA] Velocidad promedio mientras el usuario está en un vehículo [km/h].
+velocidad_eucl_kmhr	double precision	[GENERADA] Velocidad promedio en línea recta (O-D) considerando solo el tiempo en vehículo [km/h].
+is_anomalo	boolean	[GENERADA] Flag booleano. True si el viaje cumple con al menos uno de los criterios de anomalía.
+anom_*	boolean	[GENERADA] Serie de columnas booleanas (ej. anom_c1_vr_baja), una por cada criterio de anomalía, para auditoría.
