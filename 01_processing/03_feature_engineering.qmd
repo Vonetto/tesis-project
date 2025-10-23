@@ -1,0 +1,521 @@
+---
+title: "Tesis — 03 | Feature Engineering y Filtrado de Viajes Anómalos"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Este notebook toma los datos **limpios** de la capa **Silver** (`viajes_limpios`) y les aplica filtros de anomalías comportamentales basados en el informe "Cálculo de indicadores de calidad de servicio" (C. Nuñez, 2015).
+
+**⚠️ PREREQUISITO:** Ejecutar primero `02_data_quality.qmd` para crear `viajes_limpios`.
+
+El proceso es el siguiente:
+1.  Leer los datos de `silver/viajes_limpios` (ya sin valores imposibles o nulos críticos).
+2.  Calcular indicadores de calidad (DR/DE, velocidades, etc.).
+3.  Aplicar filtros comportamentales (paraderos repetidos, velocidades anómalas, etc.).
+4.  Crear columna `is_anomalo` y columnas individuales por filtro (para auditoría).
+5.  Guardar **dos** nuevos datasets en la capa Silver:
+    *   `viajes_con_indicadores`: Tabla completa con flags de anomalías.
+    *   `viajes_filtrados`: Solo viajes que pasan todos los filtros (para análisis).
+
+---
+
+## 1) Setup y Conexión
+
+```{python}
+import os
+import sys
+import polars as pl
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.fs as pafs
+import pyarrow.parquet as pq
+import gcsfs
+from tqdm import tqdm
+
+# --- Autenticación GCS ---
+def enable_adc_crossplatform():
+    """Configura credenciales de Google Cloud para acceso a GCS"""
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return
+    if sys.platform.startswith("win"):
+        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
+    else:
+        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+    if not os.path.exists(adc_path):
+        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
+
+try:
+    enable_adc_crossplatform()
+    gfs = gcsfs.GCSFileSystem(token="google_default")
+    # Crear filesystem de PyArrow compatible con GCS
+    fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
+    print("✅ Conexión con GCS establecida.")
+except FileNotFoundError as e:
+    print(f"❌ Error de autenticación: {e}")
+
+# --- Parámetros ---
+GCS_BUCKET = "tesis-vonetto-datalake"
+SILVER_PATH = f"{GCS_BUCKET}/lake/silver"  # Sin gs:// para pyarrow
+
+# --- Rutas de Entrada y Salida ---
+INPUT_PATH = f"{SILVER_PATH}/viajes_limpios"  # Prerequisito: ejecutar 02_data_quality.qmd
+OUTPUT_INDICADORES_PATH = f"{SILVER_PATH}/viajes_con_indicadores"
+OUTPUT_FILTRADOS_PATH = f"{SILVER_PATH}/viajes_filtrados"
+
+print(f"Ruta de Entrada: {INPUT_PATH}")
+print(f"Ruta de Salida (con indicadores): {OUTPUT_INDICADORES_PATH}")
+print(f"Ruta de Salida (filtrados): {OUTPUT_FILTRADOS_PATH}")
+
+```
+
+## 2) Carga de Datos desde Silver
+
+Cargamos el dataset `viajes_limpios` (creado en 02_data_quality.qmd) que ya tiene:
+- Valores imposibles eliminados (distancias negativas, tiempos > 4 horas, etc.)
+- Nulos críticos eliminados (paradero_fin, tviaje2, etc.)
+- Columnas unificadas (dist_vehiculo_m, tiempo_vehiculo_seg, etc.)
+
+```{python}
+try:
+    # Buscar todos los archivos .parquet (enfoque lazy - no carga todo en memoria)
+    print("🔍 Buscando archivos .parquet en Silver...")
+    archivos_parquet = gfs.glob(f"{INPUT_PATH}/**/*.parquet")
+    print(f"   ✅ Encontrados {len(archivos_parquet)} archivos")
+    
+    if len(archivos_parquet) == 0:
+        raise FileNotFoundError(f"No se encontraron archivos .parquet en {INPUT_PATH}")
+    
+    # Crear dataset de PyArrow usando el filesystem autenticado
+    # partitioning=None evita problemas con tipos inconsistentes
+    print("📖 Configurando dataset con PyArrow...")
+    dataset = ds.dataset(
+        archivos_parquet,  # Lista de rutas sin gs://
+        filesystem=fs_arrow,  # Usa el filesystem autenticado
+        format="parquet",
+        partitioning=None  # No leer columnas de partición (evita conflictos de tipos)
+    )
+    
+    # Convertir a Polars LazyFrame
+    print("🔄 Convirtiendo a Polars LazyFrame...")
+    lf_viajes = pl.scan_pyarrow_dataset(dataset)
+    
+    print("✅ Lectura de `viajes_limpios` configurada (lazy).")
+    print(f"   Columnas: {len(lf_viajes.collect_schema().names())}")
+    print(f"   Primeras 10 columnas: {lf_viajes.collect_schema().names()[:10]}")
+    print(f"\n⚠️  NOTA: Los datos NO están en memoria aún (LazyFrame).")
+    print("   Se procesarán cuando ejecutes .collect() o .sink_parquet()")
+except Exception as e:
+    print(f"❌ No se pudo leer la tabla de entrada: {e}")
+    import traceback
+    traceback.print_exc()
+    lf_viajes = None
+```
+
+## 3) Cálculo de Indicadores de Anomalía
+
+Leemos los datos de `viajes_limpios` y calculamos directamente los indicadores necesarios para el filtrado de anomalías comportamentales. Las columnas de tiempo y distancia ya fueron limpiadas y consolidadas en el notebook anterior.
+
+```{python}
+if lf_viajes is not None:
+    lf_with_features = lf_viajes.with_columns([
+        # 1. Convertir columnas clave a Float para cálculos
+        pl.col("t_total_calculado_seg").cast(pl.Float64).alias("tiempo_total_seg"),
+        pl.col("t_vehiculo_total_seg").cast(pl.Float64).alias("tiempo_vehiculo_seg"),
+        pl.col("distancia_ruta").cast(pl.Float64).alias("distancia_ruta_m"),
+        pl.col("distancia_eucl").cast(pl.Float64).alias("distancia_euc_OD_m"),
+    ]).with_columns([
+        # ====================================================================
+        # INDICADORES CALCULADOS PARA FILTRADO
+        # ====================================================================
+        
+        # 1. Razón DR/DE - Mide qué tan indirecto es el viaje
+        (pl.col("distancia_ruta_m") / pl.col("distancia_euc_OD_m")).alias("dr_de"),
+        
+        # 2. Velocidad EN VEHÍCULO (VR) - para filtro de velocidad baja
+        # Usa la distancia en ruta y el tiempo solo dentro del vehículo
+        (pl.col("distancia_ruta_m") / 1000 / (pl.col("tiempo_vehiculo_seg") / 3600)).alias("velocidad_vehiculo_kmhr"),
+        
+        # 3. Velocidad EUCLIDIANA (VE) - para filtro de velocidad alta
+        # Usa la distancia euclidiana (línea recta) y el tiempo en vehículo
+        (pl.col("distancia_euc_OD_m") / 1000 / (pl.col("tiempo_vehiculo_seg") / 3600)).alias("velocidad_eucl_kmhr"),
+    ])
+    
+    print("✅ Indicadores para filtrado calculados.")
+    print(f"   Columnas de indicadores añadidas: ['dr_de', 'velocidad_vehiculo_kmhr', 'velocidad_eucl_kmhr']")
+    print(f"   Total de columnas ahora: {len(lf_with_features.collect_schema().names())}")
+
+    # Verificación rápida de los cálculos
+    print("\n🔍 Verificando cálculos con una muestra de 5 viajes...")
+    muestra = lf_with_features.select([
+        "tiempo_vehiculo_seg", 
+        "distancia_ruta_m", "distancia_euc_OD_m",
+        "velocidad_vehiculo_kmhr", "velocidad_eucl_kmhr",
+        "dr_de", "n_etapas"
+    ]).filter(
+        pl.col("tiempo_vehiculo_seg") > 0
+    ).limit(5).collect()
+    print(muestra)
+
+else:
+    lf_with_features = None
+
+```
+
+## 4.1) Verificación de Cálculos (Muestra)
+
+Antes de procesar todo, verificamos que los cálculos sean razonables con una muestra pequeña.
+
+```{python}
+if lf_with_features is not None:
+    print(" Verificando cálculos con una muestra de 5 viajes...")
+    
+    # Seleccionamos las columnas correctas y ya calculadas
+    muestra = lf_with_features.select([
+        "tiempo_vehiculo_seg",
+        "t_total_calculado_seg",
+        "distancia_ruta_m",
+        "distancia_euc_OD_m",
+        "velocidad_vehiculo_kmhr",
+        "dr_de",
+        "n_etapas"
+    ]).filter(
+        pl.col("tiempo_vehiculo_seg") > 0
+    ).limit(5).collect()
+    
+    print(muestra)
+    
+    print("\n🧮 Validación Manual (primer viaje):")
+    if len(muestra) > 0:
+        t_veh = muestra["tiempo_vehiculo_seg"][0]
+        t_total = muestra["t_total_calculado_seg"][0]
+        d_ruta = muestra["distancia_ruta_m"][0]
+        d_euc = muestra["distancia_euc_OD_m"][0]
+        v_veh = muestra["velocidad_vehiculo_kmhr"][0]
+        dr_de = muestra["dr_de"][0]
+        
+        print(f"   Tiempo en vehículo:      {t_veh:.0f} seg = {t_veh/60:.1f} min")
+        print(f"   Tiempo total:             {t_total:.0f} seg = {t_total/60:.1f} min")
+        print(f"   Distancia en ruta:         {d_ruta:.0f} m = {d_ruta/1000:.2f} km")
+        print(f"   Distancia euclidiana:      {d_euc:.0f} m = {d_euc/1000:.2f} km")
+        print(f"   Velocidad en vehículo:     {v_veh:.1f} km/h")
+        print(f"   Razón DR/DE:               {dr_de:.2f}")
+        print(f"\n   Cálculo manual: ({d_ruta:.0f} m / 1000) / ({t_veh:.0f} s / 3600) = { (d_ruta/1000) / (t_veh/3600) :.1f} km/h")
+        print(f"   {'✅ Coincide' if abs(v_veh - ((d_ruta/1000)/(t_veh/3600))) < 0.1 else '❌ NO COINCIDE'}")
+else:
+    print("⚠️  No hay datos para verificar.")
+```
+
+## 5) Aplicación de Filtros de Anomalías
+
+Implementamos los criterios del informe "Cálculo de indicadores de calidad de servicio" (C. Nuñez, 2015). Los filtros D y E quedan comentados para trabajo futuro.
+
+```{python}
+if lf_with_features is not None:
+    print("🔧 Aplicando criterios de filtrado de anomalías...")
+    print("   Creando columnas individuales por cada condición para auditoría...")
+    
+    # ========================================================================
+    # CREAR COLUMNAS BOOLEANAS INDIVIDUALES POR CADA FILTRO
+    # ========================================================================
+    lf_final = lf_with_features.with_columns([
+        # A. VALIDACIÓN ORIGEN/DESTINO
+        (pl.col("paradero_inicio_viaje").cast(pl.Utf8) == pl.col("paradero_fin_viaje").cast(pl.Utf8)).alias("anom_a1_od_viaje"),
+        (pl.col("paradero_subida_1") == pl.col("paradero_bajada_1")).alias("anom_a1_od_etapa1"),
+        (pl.col("paradero_subida_2") == pl.col("paradero_bajada_2")).alias("anom_a1_od_etapa2"),
+        (pl.col("paradero_subida_3") == pl.col("paradero_bajada_3")).alias("anom_a1_od_etapa3"),
+        (pl.col("paradero_subida_4") == pl.col("paradero_bajada_4")).alias("anom_a1_od_etapa4"),
+        
+        # B. DISTANCIA Y DURACIÓN
+        (pl.col("distancia_ruta_m") < 350).alias("anom_b1_dr_min"),
+        (pl.col("distancia_euc_OD_m") > 50000).alias("anom_b2_de_max"),
+        (pl.col("tiempo_total_seg") < 35).alias("anom_b3_dur_min"),  # Segundos
+        
+        # C. VELOCIDADES (usar velocidad EN VEHÍCULO, no la que incluye esperas)
+        (pl.col("velocidad_vehiculo_kmhr") < 4).alias("anom_c1_vr_baja"),
+        (pl.col("velocidad_eucl_kmhr") > 70).alias("anom_c2_ve_alta"),
+        ((pl.col("velocidad_vehiculo_kmhr") > 60) & (pl.col("distancia_ruta_m") < 5000)).alias("anom_c3_vr_alta_dr_corto"),
+        ((pl.col("velocidad_vehiculo_kmhr") > 70) & (pl.col("distancia_ruta_m") >= 5000)).alias("anom_c4_vr_alta_dr_largo"),
+    ]).with_columns([
+        # COMBINAR: Un viaje es anómalo si cumple CUALQUIERA de estas condiciones
+        (
+            pl.col("anom_a1_od_viaje") | pl.col("anom_a1_od_etapa1") | pl.col("anom_a1_od_etapa2") | 
+            pl.col("anom_a1_od_etapa3") | pl.col("anom_a1_od_etapa4") |
+            pl.col("anom_b1_dr_min") | pl.col("anom_b2_de_max") | pl.col("anom_b3_dur_min") |
+            pl.col("anom_c1_vr_baja") | pl.col("anom_c2_ve_alta") | pl.col("anom_c3_vr_alta_dr_corto") | 
+            pl.col("anom_c4_vr_alta_dr_largo")
+        ).alias("is_anomalo")
+    ])
+    
+    print("✅ Columnas de filtros individuales y 'is_anomalo' creadas (LazyFrame).")
+    print(f"   Total de columnas ahora: {len(lf_final.collect_schema().names())}")
+    
+    print("\n📊 Contando viajes anómalos PARTICIÓN POR PARTICIÓN...")
+    print("   (Procesando archivo por archivo para evitar problemas de memoria)")
+    
+    # Obtener lista de particiones únicas
+    particiones = lf_final.select(["iso_year", "iso_week"]).unique().collect()
+    print(f"   Total de particiones a procesar: {len(particiones)}\n")
+    
+    # Acumuladores para TODAS las estadísticas
+    total_viajes = 0
+    total_anomalos = 0
+    stats_acumulados = {
+        "count_a1_od_viaje": 0, "count_a1_od_etapa1": 0, "count_a1_od_etapa2": 0,
+        "count_a1_od_etapa3": 0, "count_a1_od_etapa4": 0, "count_b1_dr_min": 0,
+        "count_b2_de_max": 0, "count_b3_dur_min": 0, "count_c1_vr_baja": 0,
+        "count_c2_ve_alta": 0, "count_c3_vr_alta_dr_corto": 0, "count_c4_vr_alta_dr_largo": 0,
+    }
+    
+    # Procesar cada partición individualmente
+    for row in tqdm(particiones.iter_rows(named=True), total=len(particiones), desc="Procesando particiones", unit="part"):
+        year, week = row['iso_year'], row['iso_week']
+        
+        # Filtrar SOLO esta partición y calcular TODO en una query
+        stats_part = lf_final.filter(
+            (pl.col("iso_year") == year) & (pl.col("iso_week") == week)
+        ).select([
+            pl.len().alias("n_viajes"),
+            pl.col("is_anomalo").sum().alias("n_anomalos"),
+            # Contar cada filtro
+            pl.col("anom_a1_od_viaje").sum().alias("count_a1_od_viaje"),
+            pl.col("anom_a1_od_etapa1").sum().alias("count_a1_od_etapa1"),
+            pl.col("anom_a1_od_etapa2").sum().alias("count_a1_od_etapa2"),
+            pl.col("anom_a1_od_etapa3").sum().alias("count_a1_od_etapa3"),
+            pl.col("anom_a1_od_etapa4").sum().alias("count_a1_od_etapa4"),
+            pl.col("anom_b1_dr_min").sum().alias("count_b1_dr_min"),
+            pl.col("anom_b2_de_max").sum().alias("count_b2_de_max"),
+            pl.col("anom_b3_dur_min").sum().alias("count_b3_dur_min"),
+            pl.col("anom_c1_vr_baja").sum().alias("count_c1_vr_baja"),
+            pl.col("anom_c2_ve_alta").sum().alias("count_c2_ve_alta"),
+            pl.col("anom_c3_vr_alta_dr_corto").sum().alias("count_c3_vr_alta_dr_corto"),
+            pl.col("anom_c4_vr_alta_dr_largo").sum().alias("count_c4_vr_alta_dr_largo"),
+        ]).collect()
+        
+        # Acumular resultados
+        total_viajes += stats_part["n_viajes"][0]
+        total_anomalos += stats_part["n_anomalos"][0]
+        for key in stats_acumulados.keys():
+            stats_acumulados[key] += stats_part[key][0]
+    
+    validos = total_viajes - total_anomalos
+    pct_anomalos = (total_anomalos / total_viajes * 100) if total_viajes > 0 else 0
+    
+    print(f"\n📈 Resumen General:")
+    print(f"   Total de viajes:     {total_viajes:,}")
+    print(f"   Viajes válidos:      {validos:,} ({100-pct_anomalos:.1f}%)")
+    print(f"   Viajes anómalos:     {total_anomalos:,} ({pct_anomalos:.1f}%)")
+    
+    # Guardar variables globales para la siguiente celda
+    anomalos = total_anomalos
+    total = total_viajes
+    validos_globales = validos
+    
+    print("\n💡 Nota:")
+    print("   - Las columnas anom_* contienen flags individuales por cada filtro")
+    print("   - stats_acumulados contiene TODAS las estadísticas por filtro")
+    print("   - Ejecuta la siguiente celda para ver el desglose detallado (instantáneo)")
+else:
+    lf_final = None
+
+```
+
+## 5.1) Auditoría Detallada por Condición
+
+Esta celda permite ver cuántos viajes son marcados como anómalos por cada filtro específico.
+
+```{python}
+if lf_final is not None and 'stats_acumulados' in globals():
+    print("🔍 AUDITORÍA DETALLADA DE FILTROS")
+    print("="*80)
+    print("\n Usando estadísticas YA calculadas en Celda 5 (instantáneo)...\n")
+    
+    # Mapear resultados a diccionario con descripciones
+    columnas_info = [
+        ("count_a1_od_viaje", "A1: O/D iguales (viaje completo)"),
+        ("count_a1_od_etapa1", "A1: O/D iguales (etapa 1)"),
+        ("count_a1_od_etapa2", "A1: O/D iguales (etapa 2)"),
+        ("count_a1_od_etapa3", "A1: O/D iguales (etapa 3)"),
+        ("count_a1_od_etapa4", "A1: O/D iguales (etapa 4)"),
+        ("count_b1_dr_min", "B1: Distancia ruta < 350m"),
+        ("count_b2_de_max", "B2: Distancia eucl > 50km"),
+        ("count_b3_dur_min", "B3: Duración < 35 seg"),
+        ("count_c1_vr_baja", "C1: Velocidad ruta < 4 km/h"),
+        ("count_c2_ve_alta", "C2: Velocidad eucl > 70 km/h"),
+        ("count_c3_vr_alta_dr_corto", "C3: VR > 60 km/h (DR < 5km)"),
+        ("count_c4_vr_alta_dr_largo", "C4: VR > 70 km/h (DR ≥ 5km)"),
+    ]
+    
+    conteos = {}
+    for col_name, desc in columnas_info:
+        count = stats_acumulados[col_name]  # Leer del diccionario acumulado
+        conteos[col_name] = {"descripcion": desc, "count": count}
+    
+    # Usar variables ya calculadas en Celda 5
+    total_viajes = total
+    pct_anomalos_global = (anomalos / total * 100) if total > 0 else 0
+    
+    # Imprimir resultados ordenados por cantidad (mayor a menor)
+    print(" RESULTADOS (ordenados por impacto):")
+    print("-"*80)
+    print(f"{'Código':<25} {'Descripción':<40} {'Viajes':>12} {'%':>7}")
+    print("-"*80)
+    
+    # Ordenar por count descendente
+    for col, data in sorted(conteos.items(), key=lambda x: x[1]['count'], reverse=True):
+        desc = data['descripcion']
+        count = data['count']
+        pct = (count / total_viajes * 100) if total_viajes > 0 else 0
+        
+        # Usar código corto del filtro (remover "count_")
+        codigo = col.replace("count_", "")
+        print(f"{codigo:<25} {desc:<40} {count:>12,} {pct:>6.2f}%")
+    
+    print("-"*80)
+    print(f"{'TOTAL (al menos uno)':<25} {'Viajes marcados como anómalos':<40} {anomalos:>12,} {pct_anomalos_global:>6.2f}%")
+    print(f"{'VÁLIDOS':<25} {'Viajes que pasan todos los filtros':<40} {validos_globales:>12,} {100-pct_anomalos_global:>6.2f}%")
+    print("="*80)
+    
+    print("\n Interpretación:")
+    print("   - Los filtros mostrados arriba son independientes")
+    print("   - Un viaje puede cumplir MÚLTIPLES condiciones a la vez")
+    print("   - El TOTAL (al menos uno) no es la suma, sino la unión de todos")
+    
+else:
+    print("⚠️  Ejecuta primero la Celda 5 para calcular las estadísticas.")
+```
+
+## 5.2) Ejemplos Concretos de Viajes Anómalos por Categoría
+
+Esta celda muestra 5 casos reales de viajes descartados por cada filtro para validar los criterios.
+
+```{python}
+if lf_final is not None:
+    print("🔍 EJEMPLOS DE VIAJES ANÓMALOS POR CATEGORÍA")
+    print("="*80)
+    print("\n⏱️  Extrayendo ejemplos (procesando solo 1 partición para rapidez)...\n")
+    
+    # OPTIMIZACIÓN: Procesar SOLO una partición representativa (mucho más rápido)
+    # Usamos la partición 2024-W14 específicamente
+    year = 2024
+    week = 14
+    
+    print(f"📊 Usando partición: iso_year={year}, iso_week={week}")
+    print(f"   (Esto procesa 1 archivo en lugar de 15 → mucho más rápido)\n")
+    
+    # MEGA-OPTIMIZACIÓN: Extraer TODOS los ejemplos en UNA SOLA query
+    # Seleccionar columnas relevantes para todos los análisis
+    cols_ejemplos = [
+        "pk_viaje",
+        "n_etapas", "semana_iso", 
+        # O/D
+        "paradero_inicio_viaje", "paradero_fin_viaje",
+        # Distancias y tiempos (columnas finales)
+        "tiempo_total_seg", "tiempo_vehiculo_seg",
+        "distancia_ruta_m", "distancia_euc_OD_m",
+        # Indicadores calculados
+        "velocidad_vehiculo_kmhr", "velocidad_eucl_kmhr", "dr_de",
+        # Zonas
+        "zona_inicio_viaje", "zona_fin_viaje",
+        # Flags de anomalías
+        "anom_a1_od_viaje", "anom_b1_dr_min", "anom_b2_de_max", "anom_b3_dur_min",
+        "anom_c1_vr_baja", "anom_c2_ve_alta",
+    ]
+    
+    # Filtrar SOLO una partición y obtener TODOS los anómalos de una vez
+    print(f"⏱️  Extrayendo TODOS los ejemplos de la partición {year}-W{week}...")
+    df_anomalos_particion = lf_final.filter(
+        (pl.col("iso_year") == year) & (pl.col("iso_week") == week) &
+        (pl.col("is_anomalo") == True)  # Solo anómalos
+    ).select(cols_ejemplos).limit(1000).collect()  # Hasta 1000 ejemplos
+    
+    print(f"   ✅ Extraídos {len(df_anomalos_particion):,} viajes anómalos de esta partición\n")
+    
+    # Ahora mostrar 5 ejemplos de cada filtro (filtrado en memoria - instantáneo)
+    filtros_info = [
+        ("anom_a1_od_viaje", "A1: O/D iguales (viaje)"),
+        ("anom_b1_dr_min", "B1: Distancia ruta < 350m"),
+        ("anom_b2_de_max", "B2: Distancia eucl > 50km"),
+        ("anom_b3_dur_min", "B3: Duración < 35 seg"),
+        ("anom_c1_vr_baja", "C1: Velocidad vehículo ruta < 4 km/h"),
+        ("anom_c2_ve_alta", "C2: Velocidad vehículo en euclidiana > 70 km/h"),
+
+    ]
+    
+    # Configurar Polars para mostrar TODAS las columnas
+    with pl.Config(
+        tbl_cols=-1,           # Mostrar todas las columnas
+        tbl_rows=10,           # Mostrar hasta 10 filas
+        tbl_width_chars=1000,  # Ancho máximo de tabla
+        fmt_str_lengths=50     # Largo máximo de strings
+    ):
+        for filtro_col, titulo in filtros_info:
+            # Filtrar ejemplos en memoria (rápido)
+            ejemplos = df_anomalos_particion.filter(pl.col(filtro_col) == True).head(5)
+            n_casos_total = stats_acumulados.get(f"count_{filtro_col.replace('anom_', '')}", 0)
+            
+            if len(ejemplos) > 0:
+                print(f"\n{'='*80}")
+                print(f"📌 {titulo}")
+                print(f"   Total global: {n_casos_total:,} | En esta partición: {len(df_anomalos_particion.filter(pl.col(filtro_col) == True))} | Mostrando: 5")
+                print('-'*80)
+                print(ejemplos)
+            elif n_casos_total > 0:
+                print(f"\n📌 {titulo}: {n_casos_total:,} casos globales (pero 0 en esta partición)")
+            else:
+                print(f"\n📌 {titulo}: 0 casos en todo el dataset")
+    
+    print("\n" + "="*80)
+    print("✅ Revisión de ejemplos completada")
+    print("   💡 Estos son solo ejemplos de 1 partición de 15")
+    print("="*80)
+    
+else:
+    print("⚠️  Ejecuta primero las celdas anteriores.")
+```
+
+## 6) Escritura de los Nuevos Datasets en Silver
+
+### 6.1) Escritura de `viajes_con_indicadores`
+
+Guardamos la tabla completa con las nuevas columnas, incluyendo los viajes marcados como anómalos.
+
+```{python}
+if lf_final is not None:
+    print("--- Iniciando escritura de `viajes_con_indicadores` ---")
+    lf_final.sink_parquet(
+        path=OUTPUT_INDICADORES_PATH,
+        partition_by=["iso_year", "iso_week"],
+        compression="zstd"
+    )
+    print(f"✅ Proceso completado. Dataset guardado en: {OUTPUT_INDICADORES_PATH}")
+else:
+    print("No hay datos para escribir.")
+```
+
+### 6.2) Escritura de `viajes_filtrados`
+
+Filtramos los viajes anómalos y guardamos únicamente los viajes válidos.
+
+```{python}
+if lf_final is not None:
+    print("\n--- Iniciando escritura de `viajes_filtrados` ---")
+    lf_filtrado = lf_final.filter(pl.col("is_anomalo") == False)
+    
+    lf_filtrado.sink_parquet(
+        path=OUTPUT_FILTRADOS_PATH,
+        partition_by=["iso_year", "iso_week"],
+        compression="zstd"
+    )
+    print(f"✅ Proceso completado. Dataset guardado en: {OUTPUT_FILTRADOS_PATH}")
+else:
+    print("No hay datos para escribir.")
+
+```

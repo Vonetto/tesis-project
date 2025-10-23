@@ -1,0 +1,2130 @@
+---
+title: "Tesis — 02 | Análisis de Calidad de Datos y Limpieza"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Este notebook analiza la **calidad de los datos** en la capa Silver (`viajes_enriquecidos`) y realiza una limpieza básica **antes** de aplicar filtros de anomalías comportamentales.
+
+## 📊 Flujo de Datos:
+```
+viajes_enriquecidos (Silver)
+    ↓
+   [Análisis de tiempos]  ← NO filtra, solo analiza
+    ↓
+   [Análisis de distancias]  ← NO filtra, solo analiza
+    ↓
+   [Análisis de paraderos]  ← NO filtra, solo analiza
+    ↓
+   [Filtrado e Imputación]  ← Aplica TODOS los filtros (tiempos + paraderos + distancias)
+    ↓
+viajes_limpios (Silver)
+```
+
+El proceso incluye:
+1. **Análisis** de columnas de tiempo (sin filtrar)
+2. **Análisis** de columnas de distancia (sin filtrar)
+3. **Análisis** de paraderos de origen y destino (sin filtrar)
+4. **Filtrado e Imputación**:
+   - Filtrar viajes con tiempos ≤ 0
+   - Filtrar viajes con paraderos null (origen o destino)
+   - Imputar distancias faltantes cuando sea posible
+   - Filtrar viajes con distancias faltantes no imputables
+5. Creación de dataset `viajes_limpios` en Silver
+
+---
+
+## 1) Setup y Conexión
+
+```{python}
+import os
+import sys
+import gc
+import polars as pl
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.fs as pafs
+import pyarrow.parquet as pq
+import gcsfs
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+
+# --- Autenticación GCS ---
+def enable_adc_crossplatform():
+    """Configura credenciales de Google Cloud para acceso a GCS"""
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return
+    if sys.platform.startswith("win"):
+        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
+    else:
+        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+    if not os.path.exists(adc_path):
+        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
+
+try:
+    enable_adc_crossplatform()
+    gfs = gcsfs.GCSFileSystem(token="google_default")
+    fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
+    print("✅ Conexión con GCS establecida.")
+except FileNotFoundError as e:
+    print(f"❌ Error de autenticación: {e}")
+
+# --- Parámetros ---
+GCS_BUCKET = "tesis-vonetto-datalake"
+SILVER_PATH = f"{GCS_BUCKET}/lake/silver"
+
+# --- Rutas ---
+INPUT_PATH = f"{SILVER_PATH}/viajes_enriquecidos"
+OUTPUT_PATH = f"{SILVER_PATH}/viajes_limpios"
+
+print(f"Ruta de Entrada: {INPUT_PATH}")
+print(f"Ruta de Salida:  {OUTPUT_PATH}")
+
+# --- Partición de análisis ---
+YEAR_ANALISIS = 2024
+WEEK_ANALISIS = 14
+
+print(f"\n📊 Partición para análisis detallado: {YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}")
+
+```
+
+## 2) Carga de Datos (Una Partición para Análisis)
+
+Cargamos SOLO la partición 2024-W14 para hacer análisis exploratorio rápido.
+
+```{python}
+try:
+    # Buscar el archivo de la partición específica
+    print(f"🔍 Buscando archivo de partición {YEAR_ANALISIS}-W{WEEK_ANALISIS}...")
+    
+    # Primero, listar archivos disponibles en la partición
+    particion_path = f"{INPUT_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/"
+    print(f"📁 Explorando directorio: {particion_path}")
+    
+    try:
+        archivos_disponibles = gfs.ls(particion_path)
+        print(f"📋 Archivos encontrados: {archivos_disponibles}")
+        
+        # Buscar archivos .parquet
+        archivos_parquet = [f for f in archivos_disponibles if f.endswith('.parquet')]
+        
+        if not archivos_parquet:
+            print("❌ No se encontraron archivos .parquet en esta partición")
+            print(f"\n🔍 Explorando otras particiones disponibles...")
+            
+            # Listar años disponibles
+            try:
+                años_disponibles = gfs.ls(INPUT_PATH)
+                años_con_datos = [año for año in años_disponibles if 'iso_year=' in año]
+                print(f"📅 Años disponibles: {años_con_datos}")
+                
+                if años_con_datos:
+                    # Explorar semanas del primer año disponible
+                    primer_año = años_con_datos[0]
+                    semanas_disponibles = gfs.ls(f"{INPUT_PATH}/{primer_año}")
+                    semanas_con_datos = [semana for semana in semanas_disponibles if 'iso_week=' in semana]
+                    print(f"📆 Semanas disponibles en {primer_año}: {semanas_con_datos[:5]}{'...' if len(semanas_con_datos) > 5 else ''}")
+                    
+                    if semanas_con_datos:
+                        print(f"\n💡 Sugerencia: Usar una partición disponible, por ejemplo:")
+                        print(f"   YEAR_ANALISIS = {primer_año.split('=')[1]}")
+                        print(f"   WEEK_ANALISIS = {semanas_con_datos[0].split('=')[1]}")
+                        
+            except Exception as e:
+                print(f"❌ Error al explorar particiones: {e}")
+            
+            df_lazy = None
+            df_sample = None
+        else:
+            # Usar el primer archivo parquet encontrado
+            archivo_target = archivos_parquet[0]
+            print(f"✅ Usando archivo: {archivo_target}")
+            
+            # Crear LazyFrame usando el filesystem de GCS
+            # Polars necesita acceso directo al archivo a través del filesystem
+            try:
+                df_lazy = pl.scan_parquet(archivo_target, storage_options={
+                    "google_cloud_storage": True,
+                    "service_account": os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                })
+                print("✅ LazyFrame creado exitosamente con GCS")
+            except Exception as scan_error:
+                print(f"❌ Error al crear LazyFrame: {scan_error}")
+                print("🔄 Intentando método alternativo...")
+                
+                # Método alternativo: usar PyArrow con GCS
+                try:
+                    import pyarrow.parquet as pq
+                    import pyarrow.fs as fs
+                    
+                    # Crear filesystem de GCS
+                    gcs_fs = fs.GcsFileSystem()
+                    
+                    # Leer metadata del archivo
+                    with gcs_fs.open_input_file(archivo_target) as f:
+                        tabla = pq.read_table(f)
+                    
+                    # Convertir a LazyFrame
+                    df_lazy = pl.from_arrow(tabla).lazy()
+                    print("✅ LazyFrame creado usando PyArrow + GCS")
+                    
+                except Exception as arrow_error:
+                    print(f"❌ Error con método alternativo: {arrow_error}")
+                    df_lazy = None
+            
+    except Exception as e:
+        print(f"❌ Error al listar archivos: {e}")
+        df_lazy = None
+        df_sample = None
+    
+    # Solo proceder si el LazyFrame se creó exitosamente
+    if df_lazy is not None:
+        # Obtener solo el conteo y esquema sin cargar todos los datos
+        n_registros = df_lazy.select(pl.len()).collect().item()
+        columnas = df_lazy.columns
+        
+        print(f"✅ LazyFrame creado: {n_registros:,} registros, {len(columnas)} columnas")
+        print(f"📊 Esquema de columnas: {columnas[:10]}{'...' if len(columnas) > 10 else ''}")
+        
+        # Para análisis exploratorio, cargar solo una muestra pequeña
+        print(f"\n🔍 Cargando muestra de 10,000 registros para análisis exploratorio...")
+        df_sample = df_lazy.limit(10000).collect()
+        
+        print(f"✅ Muestra cargada: {len(df_sample):,} registros")
+    else:
+        print("❌ No se pudo crear el LazyFrame")
+    
+except Exception as e:
+    print(f"❌ Error: {e}")
+    df_lazy = None
+    df_sample = None
+
+```
+
+## 2.1) Carga del Archivo Maestro de Paraderos
+
+Cargamos el archivo consolidado de paraderos para usarlo como "fuente de verdad" sobre las Zonas Pagas.
+
+```{python}
+#| eval: false
+
+#import pandas as pd
+
+#maestro_paraderos_path = "/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/tmp/2025-09-06_consolidado_Registro-Paradas_anual.xlsx"
+#
+#try:
+#    print(f"📖 Cargando archivo maestro de paraderos: {os.path.basename(maestro_paraderos_path)}")
+#    # Leer todas las hojas del Excel en un diccionario de DataFrames de Pandas, forzando todo a string
+#    xls = pd.read_excel(maestro_paraderos_path, sheet_name=None, dtype=str)
+#    
+#    # Unir todas las hojas en un solo DataFrame de Polars, estandarizando nombres de columnas
+#    df_maestro_list = []
+#    for sheet_name, df_pd in xls.items():
+#        # Limpiar y estandarizar nombres de columnas
+#        df_pd.columns = [c.lower().replace('\n', '_').replace(' ', '_') for c in df_pd.columns]
+#        df_maestro_list.append(pl.from_pandas(df_pd))
+#        
+#    df_maestro_full = pl.concat(df_maestro_list, how="diagonal")
+#    
+#    print(f"   ✅ Se cargaron y unieron {len(xls)} hojas, con un total de {len(df_maestro_full):,} registros.")
+#
+#    # Limpiar y preparar el DataFrame maestro
+#    df_maestro_paraderos = df_maestro_full.select([
+#        pl.col("código_paradero_ts").alias("paradero"),
+#        pl.col("operación_con_zona_paga").alias("operacion_zp")
+#    ]).with_columns(
+#        # Crear columna booleana para Zonas Pagas
+#        ((pl.col("operacion_zp") == "SI") | (pl.col("operacion_zp") == "Zona Paga")).alias("es_zona_paga")
+#    ).drop_nulls("paradero").unique(subset=["paradero"], keep="first")
+#    
+#    print(f"   ✅ DataFrame maestro limpio con {len(df_maestro_paraderos):,} paraderos únicos.")
+#
+#except Exception as e:
+#    print(f"❌ Error al cargar el archivo maestro de paraderos: {e}")
+#    df_maestro_paraderos = None
+
+```
+
+## 2.2) Verificación Cruzada: tipo_transporte=3 vs. Maestro de Zonas Pagas
+
+Cruzamos los datos de viaje con el maestro de paraderos para validar la hipótesis de que `tipo_transporte=3` corresponde a una Zona Paga.
+
+```{python}
+#| eval: false
+
+#if df is not None and df_maestro_paraderos is not None:
+#    print("🔍 Cruzando datos de viaje con el maestro de paraderos...")
+#    
+#    # 1. Extraer todos los paraderos únicos de las etapas de nuestros viajes
+#    paraderos_viajes = df.select([
+#        "paradero_subida_1", "paradero_subida_2", "paradero_subida_3", "paradero_subida_4"
+#    ]).melt(id_vars=[], value_vars=["paradero_subida_1", "paradero_subida_2", "paradero_subida_3", "paradero_subida_4"])
+#    paraderos_unicos = paraderos_viajes.select(pl.col("value").unique().alias("paradero")).drop_nulls()
+#
+#    # 2. Calcular cobertura del archivo maestro
+#    df_cobertura = paraderos_unicos.join(df_maestro_paraderos, on="paradero", how="left")
+#    paraderos_en_maestro = df_cobertura.filter(pl.col("es_zona_paga").is_not_null()).height
+#    total_paraderos_unicos = len(paraderos_unicos)
+#    cobertura_pct = (paraderos_en_maestro / total_paraderos_unicos * 100) if total_paraderos_unicos > 0 else 0
+#    
+#    print(f"\n📊 Cobertura del Archivo Maestro:")
+#    print(f"   - Paraderos únicos en los datos de viaje: {total_paraderos_unicos:,}")
+#    print(f"   - Paraderos encontrados en el archivo maestro: {paraderos_en_maestro:,} ({cobertura_pct:.2f}%)")
+#
+#    # 3. Validar la hipótesis de tipo_transporte = 3
+#    print("\n🔍 Validando hipótesis de `tipo_transporte = 3` == Zona Paga...")
+#    
+#    # Filtrar viajes que tienen una etapa tipo 3
+#    df_tipo_3 = df.filter(
+#        (pl.col("tipo_transporte_1") == "3") | (pl.col("tipo_transporte_2") == "3") |
+#        (pl.col("tipo_transporte_3") == "3") | (pl.col("tipo_transporte_4") == "3")
+#    )
+#
+#    # Identificar el paradero de la etapa tipo 3
+#    df_tipo_3 = df_tipo_3.with_columns(
+#        pl.when(pl.col("tipo_transporte_1") == "3").then(pl.col("paradero_subida_1"))
+#        .when(pl.col("tipo_transporte_2") == "3").then(pl.col("paradero_subida_2"))
+#        .when(pl.col("tipo_transporte_3") == "3").then(pl.col("paradero_subida_3"))
+#        .when(pl.col("tipo_transporte_4") == "3").then(pl.col("paradero_subida_4"))
+#        .otherwise(None).alias("paradero_tipo_3")
+#    ).drop_nulls("paradero_tipo_3")
+#
+#    if not df_tipo_3.is_empty():
+#        # Cruzar con el maestro de paraderos
+#        df_verificacion = df_tipo_3.join(df_maestro_paraderos, left_on="paradero_tipo_3", right_on="paradero", how="left")
+#        
+#        # Calcular resultados
+#        total_tipo_3_verificables = df_verificacion.filter(pl.col("es_zona_paga").is_not_null()).height
+#        confirmados_zp = df_verificacion.filter(pl.col("es_zona_paga") == True).height
+#        tasa_confirmacion = (confirmados_zp / total_tipo_3_verificables * 100) if total_tipo_3_verificables > 0 else 0
+#
+#        print(f"\n📈 Resultados de la Verificación:")
+#        print(f"   - Total de etapas tipo 3 encontradas: {len(df_tipo_3):,}")
+#        print(f"   - De estas, se pudieron verificar en el maestro: {total_tipo_3_verificables:,}")
+#        print(f"   - De las verificables, son ZP confirmadas: {confirmados_zp:,}")
+#        print(f"   - Tasa de Confirmación: {tasa_confirmacion:.2f}%")
+#        
+#        print("\n💡 Conclusión:")
+#        if tasa_confirmacion > 90:
+#            print("   ✅ La hipótesis es ALTAMENTE PROBABLE. `tipo_transporte = 3` parece ser 'Zona Paga'.")
+#        elif tasa_confirmacion > 70:
+#            print("   ⚠️ La hipótesis es PROBABLE, pero hay inconsistencias. `tipo_transporte = 3` mayormente es 'Zona Paga'.")
+#        else:
+#            print("   ❌ La hipótesis es POCO PROBABLE. `tipo_transporte = 3` parece ser otra cosa.")
+#    else:
+#        print("   No se encontraron etapas con tipo_transporte = 3 para verificar.")
+#
+#else:
+#    print("   No hay datos cargados para realizar el análisis.")
+#
+```
+
+
+## 3) Análisis y Limpieza de Columnas de Tiempo
+
+En esta sección, validaremos la integridad de las columnas de tiempo. A pesar de que el diccionario indica que las unidades están en minutos, hemos verificado que **todas las columnas de tiempo ya se encuentran en segundos**.
+
+**Nuestro plan es:**
+
+1.  **Calcular totales por componente:** Crearemos nuevas columnas que sumen el tiempo total en vehículo, en espera y en caminata, directamente en segundos.
+2.  **Validar `tviaje2`:** Re-calcularemos el tiempo total del viaje sumando nuestros componentes y lo compararemos con la columna `tviaje2` original para detectar inconsistencias.
+
+
+<!-- end list -->
+
+```{python}
+if df_sample is not None:
+    print("🔧 1. Creando columnas de tiempo total por componente (en segundos)...")
+    
+    # Columnas de componentes de tiempo (ya en segundos)
+    cols_tv = ["tv1", "tv2", "tv3", "tv4"]
+    cols_te = ["te0", "te1", "te2", "te3"]
+    cols_tc = ["tc1", "tc2", "tc3"]
+    cols_acceso = ["entrada", "egreso"]
+    
+    df_tiempos = df_sample.with_columns([
+        # Sumar todos los tiempos en vehículo (ya en segundos)
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_tv]).alias("t_vehiculo_total_seg"),
+        
+        # Sumar todos los tiempos de espera (ya en segundos)
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_te]).alias("t_espera_total_seg"),
+        
+        # Sumar todos los tiempos de caminata (ya en segundos)
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_tc]).alias("t_caminata_total_seg"),
+        
+        # Sumar tiempos de acceso/egreso de metro (ya en segundos)
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_acceso]).alias("t_acceso_egreso_total_seg"),
+    ])
+    print("   ✅ `t_vehiculo_total_seg`, `t_espera_total_seg`, `t_caminata_total_seg`, `t_acceso_egreso_total_seg` creadas.")
+
+    print("\n🔬 2. Validando consistencia de `tviaje2`...")
+    
+    df_tiempos = df_tiempos.with_columns([
+        # Calcular el tiempo total sumando nuestros componentes
+        (
+            pl.col("t_vehiculo_total_seg") +
+            pl.col("t_espera_total_seg") +
+            pl.col("t_caminata_total_seg") +
+            pl.col("t_acceso_egreso_total_seg")
+        ).alias("t_total_calculado_seg"),
+        
+    ]).with_columns([
+        # Calcular la diferencia absoluta entre el total original y el nuestro
+        (pl.col("tviaje2") - pl.col("t_total_calculado_seg")).abs().alias("diff_tviaje2_seg")
+    ])
+    
+    print("   ✅ `t_total_calculado_seg` y `diff_tviaje2_seg` creadas.")
+    
+    print("\n 3. Análisis de viajes con tiempos inválidos (≤ 0)...")
+    
+    # Contar viajes con tiempos inválidos
+    n_total_tiempos = len(df_tiempos)
+    viajes_tiempos_invalidos = df_tiempos.filter(
+        (pl.col("t_vehiculo_total_seg") <= 0) |
+        (pl.col("t_total_calculado_seg") <= 0)
+    )
+    n_tiempos_invalidos = len(viajes_tiempos_invalidos)
+    pct_tiempos_invalidos = (n_tiempos_invalidos / n_total_tiempos * 100) if n_total_tiempos > 0 else 0
+    
+    print(f"   - Total de viajes: {n_total_tiempos:,}")
+    print(f"   - Viajes con tiempos ≤ 0: {n_tiempos_invalidos:,} ({pct_tiempos_invalidos:.2f}%)")
+    print(f"   - Viajes con tiempos válidos: {n_total_tiempos - n_tiempos_invalidos:,} ({100-pct_tiempos_invalidos:.2f}%)")
+    
+    # Mostrar ejemplos de viajes con tiempos inválidos
+    if n_tiempos_invalidos > 0:
+        print(f"\n   🔎 Ejemplos de viajes con tiempos ≤ 0 (serán filtrados en Sección 5):")
+        ejemplos_display = viajes_tiempos_invalidos.select([
+            "n_etapas",
+            "t_vehiculo_total_seg",
+            "t_espera_total_seg", 
+            "t_caminata_total_seg",
+            "t_acceso_egreso_total_seg",
+            "t_total_calculado_seg",
+            "tviaje2",
+            "te0", "tv1", "tc1", "te1", "tv2"
+        ]).head(5)
+        with pl.Config(tbl_cols=-1, tbl_rows=10):
+            print(ejemplos_display)
+        
+        print("\n   💡 Razones comunes para tiempos ≤ 0:")
+        print("      - Todos los componentes de tiempo son null o 0")
+        print("      - Errores en la estimación de tiempos de viaje")
+        print("      - Datos corruptos o incompletos")
+    
+    print("\n 4. Analizando inconsistencias en `tviaje2`...")
+    
+    # Contar cuántos viajes tienen una diferencia mayor a 1 segundo (tolerancia para floats)
+    inconsistencias = df_tiempos.filter(pl.col("diff_tviaje2_seg") > 1)
+    n_inconsistencias = len(inconsistencias)
+    n_total = len(df_tiempos)
+    pct_inconsistencias = (n_inconsistencias / n_total * 100) if n_total > 0 else 0
+    
+    print(f"   - Total de viajes analizados: {n_total:,}")
+    print(f"   - Viajes con `tviaje2` inconsistente (diff > 1 seg): {n_inconsistencias:,} ({pct_inconsistencias:.2f}%)")
+    
+    if n_inconsistencias > 0:
+        print("\n Estadísticas de la diferencia (en segundos):")
+        print(inconsistencias.select("diff_tviaje2_seg").describe())
+        
+        print("\n Ejemplos de viajes inconsistentes:")
+        print(inconsistencias.select([
+            "tviaje2", "t_total_calculado_seg", "diff_tviaje2_seg",
+            "t_vehiculo_total_seg", "t_espera_total_seg", "t_caminata_total_seg", "t_acceso_egreso_total_seg"
+        ]).head())
+
+else:
+    print("⚠️ No hay datos de muestra cargados para analizar tiempos.")
+```
+
+
+
+## 4) Análisis y Limpieza de Columnas de Distancia
+
+Ahora que hemos validado las columnas de tiempo, aplicaremos un proceso similar a las de distancia. El objetivo es verificar si las columnas que representan totales (`distancia_ruta`, `dveh_rutafinal`) son consistentes con la suma de sus componentes individuales (`dveh_ruta1`, `dveh_ruta2`, etc.). 
+
+**Nuestro plan es:**
+
+1.  **Calcular totales por componente:** Crearemos `d_vehiculo_ruta_total_m` (suma de distancias en vehículo) y `d_caminata_total_m` (suma de distancias de transbordo).
+2.  **Validar consistencia:** Compararemos nuestras sumas calculadas con las columnas de totales existentes para identificar cualquier discrepancia.
+
+
+```{python}
+# Continuación del Notebook - CELDA CORREGIDA
+
+if 'df_tiempos' in locals() and df_tiempos is not None:
+    print("\n## 4) Análisis de Columnas de Distancia")
+    print("="*80)
+    print(f" Trabajando con {len(df_tiempos):,} viajes (análisis sin filtrar)")
+    print("="*80)
+
+    print("\n 1. Creando columnas de distancia total por componente (en metros)...")
+    
+    # Usamos el DataFrame del paso anterior que tiene las columnas de tiempo calculadas
+    df_dist = df_tiempos
+    
+    # Columnas de componentes de distancia (en metros)
+    cols_dveh_ruta = ["dveh_ruta1", "dveh_ruta2", "dveh_ruta3", "dveh_ruta4"]
+    cols_dt = ["dt1", "dt2", "dt3"]
+    
+    df_dist = df_dist.with_columns([
+        # Sumar todas las distancias recorridas en vehículo en ruta
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_dveh_ruta]).alias("d_vehiculo_ruta_total_m"),
+        
+        # Sumar todas las distancias de caminata (transbordo)
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_dt]).alias("d_caminata_total_m"),
+    ])
+    print("    `d_vehiculo_ruta_total_m` y `d_caminata_total_m` creadas.")
+
+    print("\n 2. Validando consistencia de `distancia_ruta` y `dveh_rutafinal`...")
+    print("   Ambas columnas deberían ser iguales a nuestra suma de componentes 'd_vehiculo_ruta_total_m'")
+    
+    df_dist = df_dist.with_columns([
+        # Calcular la diferencia absoluta entre las columnas pre-calculadas y nuestra suma
+        (pl.col("dveh_rutafinal").cast(pl.Float64) - pl.col("d_vehiculo_ruta_total_m")).abs().alias("diff_dveh_rutafinal_m"),
+        (pl.col("distancia_ruta").cast(pl.Float64) - pl.col("d_vehiculo_ruta_total_m")).abs().alias("diff_distancia_ruta_m"),
+    ])
+    
+    print("    Columnas de diferencia `diff_dveh_rutafinal_m` y `diff_distancia_ruta_m` creadas.")
+
+    print("\n 3. Analizando los resultados de la validación...")
+    
+    # Contar inconsistencias para dveh_rutafinal
+    incons_dveh = df_dist.filter(pl.col("diff_dveh_rutafinal_m") > 0.1) # Usamos una pequeña tolerancia para errores de punto flotante
+    n_incons_dveh = len(incons_dveh)
+    n_total = len(df_dist)
+    pct_incons_dveh = (n_incons_dveh / n_total * 100) if n_total > 0 else 0
+    
+    print(f"   - Viajes con `dveh_rutafinal` inconsistente: {n_incons_dveh:,} ({pct_incons_dveh:.2f}%)")
+
+    # Contar inconsistencias para distancia_ruta
+    incons_dist = df_dist.filter(pl.col("diff_distancia_ruta_m") > 0.1)
+    n_incons_dist = len(incons_dist)
+    pct_incons_dist = (n_incons_dist / n_total * 100) if n_total > 0 else 0
+
+    print(f"   - Viajes con `distancia_ruta` inconsistente: {n_incons_dist:,} ({pct_incons_dist:.2f}%)")
+    
+    print("\n🔬 4. Validando consistencia de distancias EUCLIDIANAS...")
+    print("   Verificaremos dos relaciones:")
+    print("   a) dveh_eucfinal vs suma de componentes (dveh_euc1 + dveh_euc2 + ...)")
+    print("   b) distancia_eucl (O→D directo) vs dveh_eucfinal (suma de etapas)")
+    
+    # Columnas de componentes euclidianos
+    cols_dveh_euc = ["dveh_euc1", "dveh_euc2", "dveh_euc3", "dveh_euc4"]
+    
+    df_dist = df_dist.with_columns([
+        # Sumar todas las distancias euclidianas recorridas en vehículo
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_dveh_euc]).alias("d_vehiculo_eucl_total_m"),
+    ])
+    print("    `d_vehiculo_eucl_total_m` creada (suma de dveh_euc1-4).")
+    
+    # a) Validar dveh_eucfinal vs suma de componentes
+    df_dist = df_dist.with_columns([
+        (pl.col("dveh_eucfinal").cast(pl.Float64) - pl.col("d_vehiculo_eucl_total_m")).abs().alias("diff_dveh_eucfinal_m"),
+    ])
+    
+    incons_euc = df_dist.filter(pl.col("diff_dveh_eucfinal_m") > 0.1)
+    n_incons_euc = len(incons_euc)
+    pct_incons_euc = (n_incons_euc / n_total * 100) if n_total > 0 else 0
+    
+    print(f"\n   a) Consistencia de `dveh_eucfinal`:")
+    print(f"      - Viajes inconsistentes: {n_incons_euc:,} ({pct_incons_euc:.2f}%)")
+    
+    if n_incons_euc > 0 and n_incons_euc < 10:
+        print(f"\n       Ejemplos de inconsistencias en `dveh_eucfinal`:")
+        ejemplos_euc = incons_euc.select([
+            "n_etapas", "dveh_eucfinal", "d_vehiculo_eucl_total_m", "diff_dveh_eucfinal_m",
+            "dveh_euc1", "dveh_euc2", "dveh_euc3", "dveh_euc4"
+        ]).head(5)
+        with pl.Config(tbl_cols=-1):
+            print(ejemplos_euc)
+    
+    print("\n 5. Análisis de Valores Nulos en Columnas Clave de Distancia...")
+    print("="*80)
+    
+    # Contar nulos para cada columna clave
+    n_total_viajes = len(df_dist)
+    
+    # Columnas a analizar
+    cols_analizar = ["distancia_ruta", "distancia_eucl", "dveh_rutafinal", "dveh_eucfinal"]
+    
+    print(f"   Total de viajes analizados: {n_total_viajes:,}\n")
+    
+    # Convertir columnas a float para poder comparar
+    df_dist_temp = df_dist.with_columns([
+        pl.col(col).cast(pl.Float64, strict=False).alias(f"{col}_float")
+        for col in cols_analizar
+    ])
+    
+    for col in cols_analizar:
+        col_float = f"{col}_float"
+        
+        # Contar nulos
+        n_nulos = df_dist_temp.select(pl.col(col).is_null().sum()).item()
+        
+        # Contar negativos (de los no-nulos)
+        n_negativos = df_dist_temp.filter(
+            pl.col(col_float).is_not_null() & (pl.col(col_float) < 0)
+        ).height
+        
+        # Contar ceros (de los no-nulos)
+        n_ceros = df_dist_temp.filter(
+            pl.col(col_float).is_not_null() & (pl.col(col_float) == 0)
+        ).height
+        
+        # Contar positivos
+        n_positivos = df_dist_temp.filter(
+            pl.col(col_float).is_not_null() & (pl.col(col_float) > 0)
+        ).height
+        
+        # Calcular porcentajes
+        n_no_nulos = n_total_viajes - n_nulos
+        pct_nulos = (n_nulos / n_total_viajes * 100) if n_total_viajes > 0 else 0
+        pct_no_nulos = (n_no_nulos / n_total_viajes * 100) if n_total_viajes > 0 else 0
+        pct_negativos = (n_negativos / n_total_viajes * 100) if n_total_viajes > 0 else 0
+        pct_ceros = (n_ceros / n_total_viajes * 100) if n_total_viajes > 0 else 0
+        pct_positivos = (n_positivos / n_total_viajes * 100) if n_total_viajes > 0 else 0
+        
+        print(f"    {col}:")
+        print(f"      - Con datos:    {n_no_nulos:>12,} ({pct_no_nulos:>5.2f}%)")
+        if n_positivos > 0:
+            print(f"        → Positivos:  {n_positivos:>12,} ({pct_positivos:>5.2f}%)")
+        if n_ceros > 0:
+            print(f"        → Cero (=0):  {n_ceros:>12,} ({pct_ceros:>5.2f}%)")
+        if n_negativos > 0:
+            print(f"        → Negativos:  {n_negativos:>12,} ({pct_negativos:>5.2f}%) ⚠️")
+        print(f"      - Nulos:        {n_nulos:>12,} ({pct_nulos:>5.2f}%)")
+        print()
+    
+    # Análisis combinado
+    print(f"\n    Análisis Combinado:")
+    
+    # Casos con todas las distancias disponibles
+    todas_disponibles = df_dist.filter(
+        pl.col("distancia_ruta").is_not_null() &
+        pl.col("distancia_eucl").is_not_null() &
+        pl.col("dveh_rutafinal").is_not_null() &
+        pl.col("dveh_eucfinal").is_not_null()
+    ).height
+    
+    # Casos donde falta al menos una
+    falta_alguna = n_total_viajes - todas_disponibles
+    
+    print(f"      - Todas las distancias disponibles: {todas_disponibles:>12,} ({todas_disponibles/n_total_viajes*100:>5.2f}%)")
+    print(f"      - Falta al menos una distancia:     {falta_alguna:>12,} ({falta_alguna/n_total_viajes*100:>5.2f}%)")
+    
+   
+
+else:
+    print(" No hay datos cargados para analizar. Ejecuta las celdas anteriores primero.")
+```
+
+
+## 5) Análisis de Paraderos (Origen y Destino)
+
+Verificamos la disponibilidad de información de paraderos de inicio y fin de viaje.
+
+```{python}
+if 'df_dist' in locals() and df_dist is not None:
+    print("\n## 5) Análisis de Paraderos (Origen y Destino)")
+    print("="*80)
+    
+    n_total = len(df_dist)
+    
+    # Analizar paradero_inicio_viaje
+    n_origen_null = df_dist.filter(pl.col("paradero_inicio_viaje").is_null()).height
+    n_origen_no_null = n_total - n_origen_null
+    pct_origen_null = (n_origen_null / n_total * 100) if n_total > 0 else 0
+    pct_origen_no_null = (n_origen_no_null / n_total * 100) if n_total > 0 else 0
+    
+    # Analizar paradero_fin_viaje
+    n_destino_null = df_dist.filter(pl.col("paradero_fin_viaje").is_null()).height
+    n_destino_no_null = n_total - n_destino_null
+    pct_destino_null = (n_destino_null / n_total * 100) if n_total > 0 else 0
+    pct_destino_no_null = (n_destino_no_null / n_total * 100) if n_total > 0 else 0
+    
+    print(f"\n📍 Disponibilidad de Paraderos:")
+    print(f"\n   Total de viajes analizados: {n_total:,}\n")
+    
+    print(f"   A) paradero_inicio_viaje:")
+    print(f"      - Con datos:    {n_origen_no_null:>12,} ({pct_origen_no_null:>5.2f}%)")
+    print(f"      - Nulos:        {n_origen_null:>12,} ({pct_origen_null:>5.2f}%)")
+    
+    print(f"\n   B) paradero_fin_viaje:")
+    print(f"      - Con datos:    {n_destino_no_null:>12,} ({pct_destino_no_null:>5.2f}%)")
+    print(f"      - Nulos:        {n_destino_null:>12,} ({pct_destino_null:>5.2f}%)")
+    
+    # Análisis combinado
+    print(f"\n   🔗 Análisis Combinado:")
+    
+    # Ambos disponibles
+    ambos_disponibles = df_dist.filter(
+        pl.col("paradero_inicio_viaje").is_not_null() &
+        pl.col("paradero_fin_viaje").is_not_null()
+    ).height
+    pct_ambos = (ambos_disponibles / n_total * 100) if n_total > 0 else 0
+    
+    # Falta al menos uno
+    falta_alguno = n_total - ambos_disponibles
+    pct_falta = (falta_alguno / n_total * 100) if n_total > 0 else 0
+    
+    # Solo origen null
+    solo_origen_null = df_dist.filter(
+        pl.col("paradero_inicio_viaje").is_null() &
+        pl.col("paradero_fin_viaje").is_not_null()
+    ).height
+    pct_solo_origen = (solo_origen_null / n_total * 100) if n_total > 0 else 0
+    
+    # Solo destino null
+    solo_destino_null = df_dist.filter(
+        pl.col("paradero_inicio_viaje").is_not_null() &
+        pl.col("paradero_fin_viaje").is_null()
+    ).height
+    pct_solo_destino = (solo_destino_null / n_total * 100) if n_total > 0 else 0
+    
+    # Ambos null
+    ambos_null = df_dist.filter(
+        pl.col("paradero_inicio_viaje").is_null() &
+        pl.col("paradero_fin_viaje").is_null()
+    ).height
+    pct_ambos_null = (ambos_null / n_total * 100) if n_total > 0 else 0
+    
+    print(f"      - Ambos disponibles (O-D):       {ambos_disponibles:>12,} ({pct_ambos:>5.2f}%)")
+    print(f"      - Falta al menos uno:            {falta_alguno:>12,} ({pct_falta:>5.2f}%)")
+    if solo_origen_null > 0:
+        print(f"        → Solo origen null:          {solo_origen_null:>12,} ({pct_solo_origen:>5.2f}%)")
+    if solo_destino_null > 0:
+        print(f"        → Solo destino null:         {solo_destino_null:>12,} ({pct_solo_destino:>5.2f}%)")
+    if ambos_null > 0:
+        print(f"        → Ambos null:                {ambos_null:>12,} ({pct_ambos_null:>5.2f}%)")
+    
+    # Relación con distancia_eucl
+    print(f"\n   💡 Relación con distancia_eucl:")
+    dist_eucl_null = df_dist.filter(pl.col("distancia_eucl").is_null()).height
+    paraderos_y_eucl_null = df_dist.filter(
+        (pl.col("paradero_inicio_viaje").is_null() | pl.col("paradero_fin_viaje").is_null()) &
+        pl.col("distancia_eucl").is_null()
+    ).height
+    
+    if dist_eucl_null > 0:
+        pct_paraderos_en_eucl = (paraderos_y_eucl_null / dist_eucl_null * 100)
+        print(f"      - Casos con distancia_eucl null: {dist_eucl_null:,}")
+        print(f"      - De estos, {paraderos_y_eucl_null:,} ({pct_paraderos_en_eucl:.1f}%) tienen paraderos null")
+        print(f"      → Los paraderos null explican {pct_paraderos_en_eucl:.1f}% de las distancias euclidianas faltantes")
+    
+    # Ejemplos
+    if falta_alguno > 0:
+        print(f"\n   🔎 Ejemplos de casos con paraderos null:")
+        
+        if solo_origen_null > 0:
+            ej_solo_origen = df_dist.filter(
+                pl.col("paradero_inicio_viaje").is_null() &
+                pl.col("paradero_fin_viaje").is_not_null()
+            ).select([
+                "n_etapas", "paradero_inicio_viaje", "paradero_fin_viaje", 
+                "distancia_eucl", "tipo_transporte_1"
+            ]).head(2)
+            print(f"\n      Solo origen null:")
+            print(ej_solo_origen)
+        
+        if solo_destino_null > 0:
+            ej_solo_destino = df_dist.filter(
+                pl.col("paradero_inicio_viaje").is_not_null() &
+                pl.col("paradero_fin_viaje").is_null()
+            ).select([
+                "n_etapas", "paradero_inicio_viaje", "paradero_fin_viaje", 
+                "distancia_eucl", "tipo_transporte_1"
+            ]).head(2)
+            print(f"\n      Solo destino null:")
+            print(ej_solo_destino)
+
+else:
+    print(" No hay datos cargados para analizar. Ejecuta las celdas anteriores primero.")
+```
+
+
+# ASUMIENDO que df_filtrado existe de la celda anterior
+```{python}
+
+if 'df_dist' in locals() and df_dist is not None:
+    print("\n## 6.1) VERIFICACIÓN FINAL: `distancia_ruta` vs `dveh_rutafinal`")
+    print("="*80)
+    print("Hipótesis: `dveh_rutafinal` es incorrecta/deprecada, `distancia_ruta` es la correcta distancia EN VEHÍCULO.")
+    print(f"Analizando {len(df_dist):,} viajes limpios...")
+
+    # 1. Asegurar tipos numéricos y calcular diferencia
+    df_check = df_dist.with_columns([
+        pl.col("distancia_ruta").cast(pl.Float64, strict=False).alias("dist_ruta_f"),
+        pl.col("dveh_rutafinal").cast(pl.Float64, strict=False).alias("dveh_ruta_f"),
+        # Mantenemos d_caminata_total_m para contexto - usar strict=False para manejar strings malformados
+        pl.col("d_caminata_total_m").cast(pl.Float64, strict=False).alias("d_caminata_f")
+    ]).with_columns(
+        # Diferencia con signo (para ver cuál es mayor)
+        (pl.col("dist_ruta_f") - pl.col("dveh_ruta_f")).alias("diff_signed_m"),
+        # Diferencia absoluta
+        (pl.col("dist_ruta_f") - pl.col("dveh_ruta_f")).abs().alias("diff_abs_m")
+    )
+
+    # 2. Analizar la distribución de la diferencia
+    print("\n📊 Estadísticas de la diferencia (`distancia_ruta` - `dveh_rutafinal`) en metros:")
+    print(df_check.select("diff_signed_m").describe())
+
+    # 3. Analizar casos con diferencia > 1km
+    df_diff_grande = df_check.filter(pl.col("diff_abs_m") > 1000)
+    n_diff_grande = len(df_diff_grande)
+    n_total = len(df_check)
+    pct_diff_grande = (n_diff_grande / n_total * 100) if n_total > 0 else 0
+
+    print(f"\n📈 Casos con diferencia absoluta > 1 km:")
+    print(f"   - Cantidad: {n_diff_grande:,} ({pct_diff_grande:.2f}%)")
+
+    if n_diff_grande > 0:
+        print("\n   Estadísticas de la diferencia (solo casos > 1km):")
+        print(df_diff_grande.select("diff_signed_m").describe())
+
+        print("\n   🔎 Ejemplos de viajes con diferencia > 1 km:")
+        # Mostrar columnas relevantes para entender el contexto
+        ejemplos = df_diff_grande.select([
+            "n_etapas",
+            "dist_ruta_f",
+            "dveh_ruta1",
+            "dveh_ruta2",
+            "dveh_ruta3",
+            "dveh_ruta4",
+            "dveh_ruta_f",
+            "diff_signed_m",
+            "d_caminata_f", # Distancia de caminata calculada
+            "distancia_eucl", # Distancia euclidiana O-D
+            "t_vehiculo_total_seg",
+            "t_caminata_total_seg"
+        ]).head(10) # Mostrar 10 ejemplos
+
+        with pl.Config(tbl_cols=-1, tbl_rows=15):
+            print(ejemplos)
+
+    # 4. Conclusión basada en los resultados
+    print("\n💡 Conclusión de la Verificación:")
+    mean_diff = df_check.select(pl.mean("diff_signed_m")).item()
+    median_diff = df_check.select(pl.median("diff_signed_m")).item()
+
+    if pct_diff_grande < 1.0 and abs(median_diff) < 50:
+        print("   ✅ **PARECEN MEDIR LO MISMO:** La mayoría de los viajes tienen diferencias pequeñas (< 1km, mediana < 50m).")
+        print("      `distancia_ruta` y `dveh_rutafinal` son probablemente redundantes o casi idénticas.")
+        print("      Recomendación: Podrías elegir una (ej. `distancia_ruta` por completitud) o promediarlas.")
+    elif mean_diff > 50 and pct_diff_grande < 20: # Si distancia_ruta es consistentemente un poco mayor
+        # Verificar si la diferencia se parece a la caminata
+        mean_caminata = df_check.select(pl.mean("d_caminata_f")).item()
+        if abs(mean_diff - mean_caminata) < 100: # Si la diferencia media es similar a la caminata media
+             print("   ⚠️ **`distancia_ruta` PROBABLEMENTE INCLUYE CAMINATA:** `distancia_ruta` es consistentemente mayor que `dveh_rutafinal`, y la diferencia se asemeja a la distancia de caminata.")
+             print("      Recomendación: Usar `dveh_rutafinal` como distancia *en vehículo* y `distancia_ruta` como distancia *total* (vehículo + caminata).")
+        else:
+             print("   ❓ **INCONCLUSO (Diferencia Positiva):** `distancia_ruta` es consistentemente mayor que `dveh_rutafinal`, pero la diferencia no coincide claramente con la caminata. `dveh_rutafinal` podría estar subestimada.")
+             print("      Recomendación: Investiga más los ejemplos. Podría ser más seguro usar `distancia_ruta` como distancia en vehículo si `dveh_rutafinal` parece errónea.")
+    else: # Si hay muchas diferencias grandes y/o erráticas
+        print(f"   ❌ **INCONSISTENCIA SIGNIFICATIVA ({pct_diff_grande:.1f}% > 1km):** Hay diferencias grandes y/o erráticas entre las columnas.")
+        print("      Es difícil determinar cuál es correcta sin una fuente externa.")
+        print("      `dveh_rutafinal` podría estar deprecada/incorrecta como sospechas, o ambas podrían tener problemas.")
+        print("      Recomendación: Revisa los ejemplos cuidadosamente. Si `distancia_ruta` parece más plausible en general, úsala como distancia en vehículo, pero documenta esta incertidumbre.")
+
+else:
+    print("⚠️ No hay datos filtrados (`df_filtrado`) para analizar.")
+
+```
+```{python}
+#| eval: false
+if 'df_check' in locals() and df_check is not None: # Usamos df_check de la sección 6.1
+    print("\n## 6.2) VERIFICACIÓN INDIRECTA 2: Ratios DR/DE Típicos")
+    print("="*80)
+    print("Calculando y analizando DR/DE para `distancia_ruta` y `dveh_rutafinal`...")
+
+    # 1. Calcular ambos ratios DR/DE (asegurando que DE > 0)
+    df_ratios = df_check.filter(
+        pl.col("distancia_eucl").cast(pl.Float64) > 100 # Evitar división por cero o ratios inflados en distancias muy cortas
+    ).with_columns([
+        (pl.col("dist_ruta_f") / pl.col("distancia_eucl").cast(pl.Float64)).alias("dr_de_ruta"),
+        (pl.col("dveh_ruta_f") / pl.col("distancia_eucl").cast(pl.Float64)).alias("dr_de_dveh")
+    ])
+    n_total_ratios = len(df_ratios)
+    print(f"   Analizando {n_total_ratios:,} viajes con DE > 10m")
+
+    if n_total_ratios > 0:
+        # 2. Analizar estadísticas de dr_de_ruta
+        print("\n📊 Estadísticas de DR/DE usando `distancia_ruta`:")
+        print(df_ratios.select("dr_de_ruta").describe())
+
+        # Contar valores fuera de rango plausible (ej: < 1 o > 4)
+        outliers_ruta = df_ratios.filter(
+            (pl.col("dr_de_ruta") < 1.0) | (pl.col("dr_de_ruta") > 4.0)
+        ).height
+        pct_outliers_ruta = (outliers_ruta / n_total_ratios * 100)
+
+        print(f"   → Valores < 1.0: {df_ratios.filter(pl.col('dr_de_ruta') < 1.0).height:,}")
+        print(f"   → Valores > 4.0: {df_ratios.filter(pl.col('dr_de_ruta') > 4.0).height:,}")
+        print(f"   → Total fuera de rango [1.0, 4.0]: {outliers_ruta:,} ({pct_outliers_ruta:.2f}%)")
+
+        # 3. Analizar estadísticas de dr_de_dveh
+        print("\n📊 Estadísticas de DR/DE usando `dveh_rutafinal`:")
+        print(df_ratios.select("dr_de_dveh").describe())
+
+        # Contar valores fuera de rango plausible
+        outliers_dveh = df_ratios.filter(
+            (pl.col("dr_de_dveh") < 1.0) | (pl.col("dr_de_dveh") > 4.0)
+        ).height
+        pct_outliers_dveh = (outliers_dveh / n_total_ratios * 100)
+
+        print(f"   → Valores < 1.0: {df_ratios.filter(pl.col('dr_de_dveh') < 1.0).height:,}")
+        print(f"   → Valores > 4.0: {df_ratios.filter(pl.col('dr_de_dveh') > 4.0).height:,}")
+        print(f"   → Total fuera de rango [1.0, 4.0]: {outliers_dveh:,} ({pct_outliers_dveh:.2f}%)")
+
+        # 4. Conclusión
+        print("\n💡 Conclusión del Ratio DR/DE:")
+        if pct_outliers_ruta < pct_outliers_dveh:
+            print("   ✅ `distancia_ruta` produce ratios DR/DE más plausibles (menos valores < 1 o > 4).")
+        elif pct_outliers_dveh < pct_outliers_ruta:
+            print("   ⚠️ `dveh_rutafinal` produce ratios DR/DE más plausibles.")
+        else:
+            print("   ❓ Ambas columnas producen una cantidad similar de ratios DR/DE fuera del rango esperado.")
+        print("      Considera la mediana y los percentiles para juzgar cuál distribución es más razonable.")
+
+else:
+    print("⚠️ No hay suficientes datos (con DE > 10m) para analizar los ratios.")
+```
+
+```{python}
+if 'df_check' in locals() and df_check is not None:
+    print("\n## 6.3) VERIFICACIÓN INDIRECTA 3: Regla `DR >= DE`")
+    print("="*80)
+    print("Contando violaciones de DR < DE para ambas columnas...")
+
+    tolerancia = -100 # Permitir hasta 100 metros menos por errores de redondeo/precisión
+
+    # 1. Calcular diferencias (ya existen como diff_signed_m, pero recalculamos por claridad)
+    df_rule = df_check.with_columns([
+        (pl.col("dist_ruta_f") - pl.col("distancia_eucl").cast(pl.Float64)).alias("check_ruta"),
+        (pl.col("dveh_ruta_f") - pl.col("distancia_eucl").cast(pl.Float64)).alias("check_dveh")
+    ]).filter( # Solo viajes donde la comparación es válida
+         pl.col("distancia_eucl").cast(pl.Float64).is_not_null() &
+         (pl.col("distancia_eucl").cast(pl.Float64) > 0)
+    )
+    n_total_rule = len(df_rule)
+    print(f"   Analizando {n_total_rule:,} viajes con DE válida")
+
+    if n_total_rule > 0:
+        # 2. Contar violaciones para distancia_ruta
+        violations_ruta = df_rule.filter(pl.col("check_ruta") < tolerancia).height
+        pct_violations_ruta = (violations_ruta / n_total_rule * 100)
+
+        print(f"\n📊 Violaciones usando `distancia_ruta` (DR < DE - {abs(tolerancia)}m):")
+        print(f"   - Cantidad: {violations_ruta:,} ({pct_violations_ruta:.4f}%)")
+
+        # 3. Contar violaciones para dveh_rutafinal
+        violations_dveh = df_rule.filter(pl.col("check_dveh") < tolerancia).height
+        pct_violations_dveh = (violations_dveh / n_total_rule * 100)
+
+        print(f"\n📊 Violaciones usando `dveh_rutafinal` (DR < DE - {abs(tolerancia)}m):")
+        print(f"   - Cantidad: {violations_dveh:,} ({pct_violations_dveh:.4f}%)")
+
+        # 4. Conclusión
+        print("\n💡 Conclusión de la Regla DR >= DE:")
+        if pct_violations_ruta < pct_violations_dveh:
+            print(f"   ✅ `distancia_ruta` viola la regla DR >= DE significativamente menos veces ({pct_violations_ruta:.4f}% vs {pct_violations_dveh:.4f}%).")
+        elif pct_violations_dveh < pct_violations_ruta:
+            print(f"   ⚠️ `dveh_rutafinal` viola la regla DR >= DE significativamente menos veces ({pct_violations_dveh:.4f}% vs {pct_violations_ruta:.4f}%).")
+        else:
+            print("   ❓ Ambas columnas violan la regla DR >= DE con frecuencia similar.")
+
+else:
+    print("⚠️ No hay suficientes datos para verificar la regla DR >= DE.")
+```
+
+## 6) Estrategia de Procesamiento Eficiente
+
+Para evitar problemas de memoria con 21+ millones de registros, usaremos LazyFrame para procesar los datos de forma eficiente.
+
+```{python}
+def procesar_datos_eficiente(df_input, archivo_salida):
+    """
+    Procesa los datos usando LazyFrame o DataFrame para evitar problemas de memoria.
+    Aplica todos los filtros y transformaciones de forma eficiente.
+    """
+    print("🔄 Procesando datos...")
+    
+    # Determinar si es LazyFrame o DataFrame
+    if hasattr(df_input, 'lazy'):
+        print("📊 Usando DataFrame (convertido a LazyFrame)")
+        df_lazy = df_input.lazy()
+    else:
+        print("📊 Usando LazyFrame directamente")
+        df_lazy = df_input
+    
+    # 1. Crear columnas calculadas de tiempo (lazy)
+    df_procesado = df_lazy.with_columns([
+        # Sumar tiempos en vehículo
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in ["tv1", "tv2", "tv3", "tv4"]]).alias("t_vehiculo_total_seg"),
+        
+        # Sumar tiempos de espera
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in ["te0", "te1", "te2", "te3"]]).alias("t_espera_total_seg"),
+        
+        # Sumar tiempos de caminata
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in ["tc1", "tc2", "tc3"]]).alias("t_caminata_total_seg"),
+        
+        # Sumar distancias en vehículo
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in ["dveh_ruta1", "dveh_ruta2", "dveh_ruta3", "dveh_ruta4"]]).alias("d_vehiculo_ruta_total_m"),
+        
+        # Sumar distancias euclidianas en vehículo
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in ["dveh_euc1", "dveh_euc2", "dveh_euc3", "dveh_euc4"]]).alias("d_vehiculo_eucl_total_m"),
+    ])
+    
+    # 2. Aplicar filtros (lazy)
+    df_filtrado = df_procesado.filter(
+        # Filtrar tiempos válidos
+        (pl.col("t_vehiculo_total_seg") > 0) &
+        (pl.col("tviaje2") > 0) &
+        
+        # Filtrar paraderos válidos
+        pl.col("paradero_inicio_viaje").is_not_null() &
+        pl.col("paradero_fin_viaje").is_not_null() &
+        
+        # Filtrar distancias válidas
+        pl.col("distancia_ruta").cast(pl.Float64, strict=False).is_not_null() &
+        (pl.col("distancia_ruta").cast(pl.Float64, strict=False) > 0) &
+        pl.col("distancia_eucl").cast(pl.Float64, strict=False).is_not_null() &
+        (pl.col("distancia_eucl").cast(pl.Float64, strict=False) > 0)
+    )
+    
+    # 3. Imputar dveh_eucfinal si es null
+    df_final = df_filtrado.with_columns([
+        pl.when(pl.col("dveh_eucfinal").is_null())
+          .then(pl.col("d_vehiculo_eucl_total_m"))
+          .otherwise(pl.col("dveh_eucfinal"))
+          .alias("dveh_eucfinal"),
+    ])
+    
+    # 4. Seleccionar solo las columnas necesarias para reducir memoria
+    columnas_finales = [
+        "id_tarjeta", "id_viaje", "tiempo_inicio_viaje", "tiempo_fin_viaje",
+        "n_etapas", "paradero_inicio_viaje", "paradero_fin_viaje",
+        "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4",
+        "paradero_subida_1", "paradero_subida_2", "paradero_subida_3", "paradero_subida_4",
+        "paradero_bajada_1", "paradero_bajada_2", "paradero_bajada_3", "paradero_bajada_4",
+        "srv_1", "srv_2", "srv_3", "srv_4",
+        "tv1", "tv2", "tv3", "tv4", "te0", "te1", "te2", "te3", "tc1", "tc2", "tc3",
+        "tviaje2", "t_vehiculo_total_seg", "t_espera_total_seg", "t_caminata_total_seg",
+        "distancia_ruta", "distancia_eucl", "dveh_rutafinal", "dveh_eucfinal",
+        "d_vehiculo_ruta_total_m", "d_vehiculo_eucl_total_m"
+    ]
+    
+    df_limpio = df_final.select(columnas_finales)
+    
+    # 5. Guardar directamente desde LazyFrame (streaming)
+    print(f"💾 Guardando datos limpios en: {archivo_salida}")
+    df_limpio.sink_parquet(archivo_salida, compression="snappy")
+    
+    # 6. Obtener estadísticas finales
+    stats = df_limpio.select([
+        pl.len().alias("total_viajes"),
+        pl.mean("tviaje2").alias("tiempo_promedio_seg"),
+        pl.mean("distancia_ruta").alias("distancia_promedio_m"),
+        pl.mean("n_etapas").alias("etapas_promedio")
+    ]).collect()
+    
+    return stats
+
+# Ejecutar procesamiento eficiente
+if df_lazy is not None:
+    archivo_salida = f"{OUTPUT_PATH}/viajes_limpios_iso_year={YEAR_ANALISIS}_iso_week={WEEK_ANALISIS}.parquet"
+    
+    # Crear directorio si no existe
+    os.makedirs(os.path.dirname(archivo_salida), exist_ok=True)
+    
+    # Si df_lazy es realmente un DataFrame (del método alternativo), usarlo directamente
+    if hasattr(df_lazy, 'collect'):
+        # Es un LazyFrame
+        stats = procesar_datos_eficiente(df_lazy, archivo_salida)
+    else:
+        # Es un DataFrame, convertirlo a LazyFrame
+        stats = procesar_datos_eficiente(df_lazy, archivo_salida)
+    
+    print(f"\n✅ Procesamiento completado!")
+    print(f"📊 Estadísticas finales:")
+    print(f"   - Total de viajes limpios: {stats['total_viajes'][0]:,}")
+    print(f"   - Tiempo promedio: {stats['tiempo_promedio_seg'][0]:.1f} segundos")
+    print(f"   - Distancia promedio: {stats['distancia_promedio_m'][0]:.1f} metros")
+    print(f"   - Etapas promedio: {stats['etapas_promedio'][0]:.2f}")
+    print(f"   - Archivo guardado: {archivo_salida}")
+    
+else:
+    print("❌ No hay LazyFrame disponible para procesar.")
+
+```
+
+## 7) Filtrado e Imputación (Método Tradicional - Comentado)
+
+Aplicaremos la siguiente lógica en orden:
+
+## 7) Verificación de Imputación de Tiempos de Metro
+
+Usando los códigos de transporte validados (1=Bus, 2=Metro, 3=Zona Paga), verificamos si los tiempos de acceso/egreso en estaciones de Metro ya están incluidos en los datos.
+
+```{python}
+if 'df_dist' in locals() and df_dist is not None:
+    print("\n## 7) Verificación de Imputación de Tiempos de Metro")
+    print("="*80)
+    
+    # --- Caso 1: Transbordo Bus -> Metro ---
+    print("\n🔍 Analizando transbordos Bus -> Metro (tipo 1 -> 2)...")
+    df_bus_metro = df_dist.filter(
+        (pl.col("n_etapas") >= 2) & 
+        (pl.col("tipo_transporte_1") == '1') & 
+        (pl.col("tipo_transporte_2") == '2')
+    )
+    if not df_bus_metro.is_empty():
+        print("   Estadísticas de `tc1` (caminata en 1er transbordo, debería incluir acceso a Metro):")
+        print(df_bus_metro.select("tc1").describe())
+        cero_count = df_bus_metro.filter(pl.col("tc1") <= 10).height
+        print(f"   → Casos con caminata casi nula (≤ 10 seg): {cero_count / len(df_bus_metro) * 100:.2f}%")
+    else: print("   No se encontraron viajes Bus -> Metro.")
+
+    # --- Caso 2: Transbordo Zona Paga -> Metro ---
+    print("\n🔍 Analizando transbordos Zona Paga -> Metro (tipo 3 -> 2)...")
+    df_zp_metro = df_dist.filter(
+        (pl.col("n_etapas") >= 2) & 
+        (pl.col("tipo_transporte_1") == '3') & 
+        (pl.col("tipo_transporte_2") == '2')
+    )
+    if not df_zp_metro.is_empty():
+        print("   Estadísticas de `tc1` (caminata en 1er transbordo, debería incluir acceso a Metro):")
+        print(df_zp_metro.select("tc1").describe())
+        cero_count = df_zp_metro.filter(pl.col("tc1") <= 10).height
+        print(f"   → Casos con caminata casi nula (≤ 10 seg): {cero_count / len(df_zp_metro) * 100:.2f}%")
+    else: print("   No se encontraron viajes Zona Paga -> Metro.")
+
+    # --- Caso 3: Transbordo Metro -> Bus ---
+    print("\n🔍 Analizando transbordos Metro -> Bus (tipo 2 -> 1)...")
+    df_metro_bus = df_dist.filter(
+        (pl.col("n_etapas") >= 2) & 
+        (pl.col("tipo_transporte_1") == '2') & 
+        (pl.col("tipo_transporte_2") == '1')
+    )
+    if not df_metro_bus.is_empty():
+        print("   Estadísticas de `tc1` (caminata en 1er transbordo, debería incluir egreso de Metro):")
+        print(df_metro_bus.select("tc1").describe())
+        cero_count = df_metro_bus.filter(pl.col("tc1") <= 10).height
+        print(f"   → Casos con caminata casi nula (≤ 10 seg): {cero_count / len(df_metro_bus) * 100:.2f}%")
+    else: print("   No se encontraron viajes Metro -> Bus.")
+
+    # --- Caso 4: Transbordo Metro -> Zona Paga ---
+    print("\n🔍 Analizando transbordos Metro -> Zona Paga (tipo 2 -> 3)...")
+    df_metro_zp = df_dist.filter(
+        (pl.col("n_etapas") >= 2) & 
+        (pl.col("tipo_transporte_1") == '2') & 
+        (pl.col("tipo_transporte_2") == '3')
+    )
+    if not df_metro_zp.is_empty():
+        print("   Estadísticas de `tc1` (caminata en 1er transbordo, debería incluir egreso de Metro):")
+        print(df_metro_zp.select("tc1").describe())
+        cero_count = df_metro_zp.filter(pl.col("tc1") <= 10).height
+        print(f"   → Casos con caminata casi nula (≤ 10 seg): {cero_count / len(df_metro_zp) * 100:.2f}%")
+    else: print("   No se encontraron viajes Metro -> Zona Paga.")
+
+    print("\n💡 Conclusión General: Si los porcentajes de caminata casi nula son altos (>90%), es muy probable que los tiempos de acceso/egreso NO estén imputados.")
+else:
+    print("No hay datos filtrados para analizar.")
+
+```
+Aplicaremos la siguiente lógica en orden:
+
+### A) Filtrado por Tiempos:
+1. **Filtrar** viajes con `t_vehiculo_total_seg ≤ 0`
+2. **Filtrar** viajes con `t_total_calculado_seg ≤ 0`
+
+### B) Filtrado por Paraderos:
+1. **paradero_inicio_viaje**: Si es null → Filtrar
+2. **paradero_fin_viaje**: Si es null → Filtrar
+
+### C) Imputación y Filtrado por Distancias:
+1. **distancia_ruta**: Si es null o ≤ 0 → Filtrar
+2. **distancia_eucl**: Si es null o ≤ 0 → Filtrar
+3. **dveh_eucfinal**: Si es null → Intentar imputar con suma de dveh_euc1-4, si sigue null o ≤ 0 → Filtrar
+
+```{python}
+if 'df_dist' in locals() and df_dist is not None:
+    print("\n## 6) FILTRADO E IMPUTACIÓN")
+    print("="*80)
+    print(f"📌 Datos de entrada: {len(df_dist):,} viajes (sin filtrar)")
+    print("="*80)
+    
+    n_inicial = len(df_dist)
+    
+    # ========================================================================
+    # PASO A: FILTRADO POR TIEMPOS
+    # ========================================================================
+    print("\n🕐 A) FILTRADO POR TIEMPOS")
+    print("-"*80)
+    
+    print("\n1. Capturando ejemplos de viajes con tiempos ≤ 0...")
+    ej_tiempos_invalidos = df_dist.filter(
+        (pl.col("t_vehiculo_total_seg") <= 0) |
+        (pl.col("t_total_calculado_seg") <= 0)
+    ).head(3)
+    
+    print("\n2. Filtrando viajes con tiempos ≤ 0...")
+    n_antes_filtro_tiempo = len(df_dist)
+    df_filtrado = df_dist.filter(
+        (pl.col("t_vehiculo_total_seg") > 0) &
+        (pl.col("t_total_calculado_seg") > 0)
+    )
+    n_despues_filtro_tiempo = len(df_filtrado)
+    n_filtrados_tiempo = n_antes_filtro_tiempo - n_despues_filtro_tiempo
+    
+    print(f"   - Viajes antes del filtro: {n_antes_filtro_tiempo:,}")
+    print(f"   - Viajes filtrados (tiempos ≤ 0): {n_filtrados_tiempo:,} ({n_filtrados_tiempo/n_antes_filtro_tiempo*100:.2f}%)")
+    print(f"   - Viajes después del filtro: {n_despues_filtro_tiempo:,}")
+    
+    if len(ej_tiempos_invalidos) > 0:
+        print(f"\n   🔎 Ejemplos de viajes filtrados por tiempos ≤ 0:")
+        print(ej_tiempos_invalidos.select([
+            "n_etapas", "t_vehiculo_total_seg", "t_total_calculado_seg",  "paradero_fin_viaje",
+            "tviaje2", "te0", "tv1", "tv2"
+        ]))
+    
+    # ========================================================================
+    # PASO B: FILTRADO POR PARADEROS
+    # ========================================================================
+    print("\n\n📍 B) FILTRADO POR PARADEROS")
+    print("-"*80)
+    
+    print("\n1. Capturando ejemplos de viajes con paraderos null...")
+    
+    # Ejemplo 1: paradero_inicio_viaje null
+    ej_origen_null = df_filtrado.filter(pl.col("paradero_inicio_viaje").is_null()).head(2)
+    
+    # Ejemplo 2: paradero_fin_viaje null
+    ej_destino_null = df_filtrado.filter(pl.col("paradero_fin_viaje").is_null()).head(2)
+    
+    print("\n2. Filtrando viajes con paraderos null...")
+    n_antes_filtro_paraderos = len(df_filtrado)
+    
+    # Contar casos a filtrar
+    n_origen_null = df_filtrado.filter(pl.col("paradero_inicio_viaje").is_null()).height
+    n_destino_null = df_filtrado.filter(pl.col("paradero_fin_viaje").is_null()).height
+    
+    # Aplicar filtro
+    df_filtrado = df_filtrado.filter(
+        pl.col("paradero_inicio_viaje").is_not_null() &
+        pl.col("paradero_fin_viaje").is_not_null()
+    )
+    n_despues_filtro_paraderos = len(df_filtrado)
+    n_filtrados_paraderos = n_antes_filtro_paraderos - n_despues_filtro_paraderos
+    
+    print(f"   - Viajes antes del filtro: {n_antes_filtro_paraderos:,}")
+    print(f"   - paradero_inicio_viaje null: {n_origen_null:,}")
+    print(f"   - paradero_fin_viaje null: {n_destino_null:,}")
+    print(f"   - Viajes filtrados (paraderos null): {n_filtrados_paraderos:,} ({n_filtrados_paraderos/n_antes_filtro_paraderos*100:.2f}%)")
+    print(f"   - Viajes después del filtro: {n_despues_filtro_paraderos:,}")
+    
+    if len(ej_origen_null) > 0:
+        print(f"\n   🔎 Ejemplos filtrados por paradero_inicio_viaje null:")
+        print(ej_origen_null.select([
+            "n_etapas", "paradero_inicio_viaje", "paradero_fin_viaje",
+            "distancia_eucl", "tipo_transporte_1"
+        ]))
+    
+    if len(ej_destino_null) > 0:
+        print(f"\n   🔎 Ejemplos filtrados por paradero_fin_viaje null:")
+        print(ej_destino_null.select([
+            "n_etapas", "paradero_inicio_viaje", "paradero_fin_viaje",
+            "distancia_eucl", "tipo_transporte_1"
+        ]))
+    
+    # ========================================================================
+    # PASO C: FILTRADO E IMPUTACIÓN POR DISTANCIAS
+    # ========================================================================
+    print("\n\n📏 C) IMPUTACIÓN Y FILTRADO POR DISTANCIAS")
+    print("-"*80)
+    
+    n_antes_dist = len(df_filtrado)
+    
+    # ========================================================================
+    # PASO 1: Capturar ejemplos ANTES de filtrar/imputar distancias
+    # ========================================================================
+    print("\n🔍 Capturando ejemplos de cada caso ANTES de procesar distancias...")
+    
+    # Convertir a Float para poder comparar
+    df_temp = df_filtrado.with_columns([
+        pl.col("distancia_ruta").cast(pl.Float64, strict=False).alias("distancia_ruta_float"),
+        pl.col("distancia_eucl").cast(pl.Float64, strict=False).alias("distancia_eucl_float"),
+    ])
+    
+    # Ejemplo 1: distancia_ruta null
+    ej_dist_ruta_null = df_temp.filter(pl.col("distancia_ruta").is_null()).head(1)
+    
+    # Ejemplo 1b: distancia_ruta ≤ 0
+    ej_dist_ruta_neg = df_temp.filter(
+        pl.col("distancia_ruta_float").is_not_null() & (pl.col("distancia_ruta_float") <= 0)
+    ).head(1)
+    
+    # Ejemplo 2: distancia_eucl null
+    ej_dist_eucl_null = df_temp.filter(pl.col("distancia_eucl").is_null()).head(1)
+    
+    # Ejemplo 2b: distancia_eucl ≤ 0
+    ej_dist_eucl_neg = df_temp.filter(
+        pl.col("distancia_eucl_float").is_not_null() & (pl.col("distancia_eucl_float") <= 0)
+    ).head(1)
+    
+    # Ejemplo 3: dveh_eucfinal null (que SÍ se puede imputar)
+    ej_dveh_euc_imputable = df_filtrado.filter(
+        pl.col("dveh_eucfinal").is_null() &
+        pl.col("d_vehiculo_eucl_total_m").is_not_null() &
+        (pl.col("d_vehiculo_eucl_total_m") > 0)
+    ).head(1)
+    
+    # Ejemplo 4: dveh_eucfinal null (que NO se puede imputar)
+    ej_dveh_euc_no_imputable = df_filtrado.filter(
+        pl.col("dveh_eucfinal").is_null() &
+        (pl.col("d_vehiculo_eucl_total_m").is_null() | (pl.col("d_vehiculo_eucl_total_m") == 0))
+    ).head(1)
+    
+    print("   ✅ Ejemplos capturados")
+    
+    # ========================================================================
+    # PASO 2: Contar casos iniciales (después de filtrar por tiempo)
+    # ========================================================================
+    print("\n Estado de las distancias (después de filtrar por tiempos y paraderos):")
+    
+    n_dist_ruta_null = df_filtrado.filter(pl.col("distancia_ruta").is_null()).height
+    n_dist_eucl_null = df_filtrado.filter(pl.col("distancia_eucl").is_null()).height
+    n_dveh_euc_null = df_filtrado.filter(pl.col("dveh_eucfinal").is_null()).height
+    
+    print(f"   - distancia_ruta null:    {n_dist_ruta_null:>10,} ({n_dist_ruta_null/n_antes_dist*100:>5.2f}%)")
+    print(f"   - distancia_eucl null:    {n_dist_eucl_null:>10,} ({n_dist_eucl_null/n_antes_dist*100:>5.2f}%)")
+    print(f"   - dveh_eucfinal null:     {n_dveh_euc_null:>10,} ({n_dveh_euc_null/n_antes_dist*100:>5.2f}%)")
+    
+    # ========================================================================
+    # PASO 3: Imputar dveh_eucfinal
+    # ========================================================================
+    print("\n🔧 1. Imputando `dveh_eucfinal` con suma de componentes...")
+    
+    df_filtrado = df_filtrado.with_columns([
+        pl.when(pl.col("dveh_eucfinal").is_null())
+          .then(pl.col("d_vehiculo_eucl_total_m"))
+          .otherwise(pl.col("dveh_eucfinal"))
+          .alias("dveh_eucfinal_imputado")
+    ])
+    
+    n_imputados_euc = df_filtrado.filter(
+        pl.col("dveh_eucfinal").is_null() & 
+        pl.col("dveh_eucfinal_imputado").is_not_null()
+    ).height
+    
+    print(f"   ✅ Imputados: {n_imputados_euc:,} casos")
+    
+    # ========================================================================
+    # PASO 4: Filtrar casos con distancias inválidas (null o ≤ 0)
+    # ========================================================================
+    print("\n🧹 2. Filtrando casos con distancias inválidas (null o ≤ 0)...")
+    
+    # Convertir columnas a Float64 para poder comparar
+    df_filtrado = df_filtrado.with_columns([
+        pl.col("distancia_ruta").cast(pl.Float64, strict=False).alias("distancia_ruta_float"),
+        pl.col("distancia_eucl").cast(pl.Float64, strict=False).alias("distancia_eucl_float"),
+    ])
+    
+    # Contar casos a filtrar por cada criterio
+    filtrados_dist_ruta_null = df_filtrado.filter(pl.col("distancia_ruta").is_null()).height
+    filtrados_dist_ruta_neg = df_filtrado.filter(
+        pl.col("distancia_ruta_float").is_not_null() & (pl.col("distancia_ruta_float") <= 0)
+    ).height
+    
+    filtrados_dist_eucl_null = df_filtrado.filter(pl.col("distancia_eucl").is_null()).height
+    filtrados_dist_eucl_neg = df_filtrado.filter(
+        pl.col("distancia_eucl_float").is_not_null() & (pl.col("distancia_eucl_float") <= 0)
+    ).height
+    
+    filtrados_dveh_euc_null = df_filtrado.filter(pl.col("dveh_eucfinal_imputado").is_null()).height
+    filtrados_dveh_euc_neg = df_filtrado.filter(
+        pl.col("dveh_eucfinal_imputado").is_not_null() & (pl.col("dveh_eucfinal_imputado") <= 0)
+    ).height
+    
+    print(f"\n   📊 Casos a filtrar por criterio:")
+    print(f"\n   A) distancia_ruta:")
+    print(f"      - null:                       {filtrados_dist_ruta_null:>10,}")
+    print(f"      - ≤ 0 (valor inválido):       {filtrados_dist_ruta_neg:>10,}")
+    
+    print(f"\n   B) distancia_eucl:")
+    print(f"      - null:                       {filtrados_dist_eucl_null:>10,}")
+    print(f"      - ≤ 0 (valor inválido):       {filtrados_dist_eucl_neg:>10,}")
+    
+    print(f"\n   C) dveh_eucfinal:")
+    print(f"      - null (no imputable):        {filtrados_dveh_euc_null:>10,}")
+    print(f"      - ≤ 0 (valor inválido):       {filtrados_dveh_euc_neg:>10,}")
+    
+    # Aplicar filtros (not null AND > 0)
+    df_filtrado = df_filtrado.filter(
+        pl.col("distancia_ruta_float").is_not_null() &
+        (pl.col("distancia_ruta_float") > 0) &
+        pl.col("distancia_eucl_float").is_not_null() &
+        (pl.col("distancia_eucl_float") > 0) &
+        pl.col("dveh_eucfinal_imputado").is_not_null() &
+        (pl.col("dveh_eucfinal_imputado") > 0)
+    ).drop(["distancia_ruta_float", "distancia_eucl_float"])
+    
+    # Reemplazar columna original con la imputada
+    df_filtrado = df_filtrado.with_columns([
+        pl.col("dveh_eucfinal_imputado").alias("dveh_eucfinal"),
+    ]).drop(["dveh_eucfinal_imputado"])
+    
+    n_final = len(df_filtrado)
+    n_filtrados_dist = n_antes_dist - n_final
+    n_total_filtrados = n_inicial - n_final
+    
+    print(f"\n📊 RESUMEN FINAL:")
+    print(f"="*80)
+    print(f"   Viajes iniciales:                     {n_inicial:>12,}")
+    print(f"")
+    print(f"   A) Filtrados por tiempos:             {n_filtrados_tiempo:>12,} ({n_filtrados_tiempo/n_inicial*100:>5.2f}%)")
+    print(f"   → Viajes después filtro tiempo:       {n_despues_filtro_tiempo:>12,}")
+    print(f"")
+    print(f"   B) Filtrados por paraderos:           {n_filtrados_paraderos:>12,} ({n_filtrados_paraderos/n_antes_filtro_paraderos*100:>5.2f}%)")
+    print(f"   → Viajes después filtro paraderos:    {n_despues_filtro_paraderos:>12,}")
+    print(f"")
+    print(f"   C) Imputados (dveh_eucfinal):         {n_imputados_euc:>12,}")
+    print(f"")
+    print(f"   D) Filtrados por distancias:          {n_filtrados_dist:>12,} ({n_filtrados_dist/n_antes_dist*100:>5.2f}%)")
+    print(f"")
+    print(f"   TOTAL FILTRADOS (A + B + D):          {n_total_filtrados:>12,} ({n_total_filtrados/n_inicial*100:>5.2f}%)")
+    print(f"   VIAJES FINALES:                       {n_final:>12,} ({n_final/n_inicial*100:>5.2f}%)")
+    print(f"="*80)
+    
+    # ========================================================================
+    # PASO 6: Mostrar ejemplos de cada caso
+    # ========================================================================
+    print("\n" + "="*80)
+    print("🔎 EJEMPLOS DE CASOS FILTRADOS E IMPUTADOS")
+    print("="*80)
+    
+    # Ejemplos de filtrado por tiempos
+    if len(ej_tiempos_invalidos) > 0:
+        print("\n0️⃣ Ejemplos filtrados por TIEMPOS ≤ 0:")
+        print(ej_tiempos_invalidos.select([
+            "n_etapas", "t_vehiculo_total_seg", "t_total_calculado_seg",
+            "tviaje2", "te0", "tv1", "tv2", "tc1"
+        ]))
+    else:
+        print("\n0️⃣ No hay casos con tiempos ≤ 0")
+    
+    # Ejemplos de filtrado por paraderos
+    if len(ej_origen_null) > 0:
+        print("\n0a️⃣ Ejemplos filtrados por PARADERO_INICIO_VIAJE null:")
+        print(ej_origen_null.select([
+            "n_etapas", "paradero_inicio_viaje", "paradero_fin_viaje",
+            "distancia_eucl", "tipo_transporte_1"
+        ]))
+    else:
+        print("\n0a️⃣ No hay casos con paradero_inicio_viaje null")
+    
+    if len(ej_destino_null) > 0:
+        print("\n0b️⃣ Ejemplos filtrados por PARADERO_FIN_VIAJE null:")
+        print(ej_destino_null.select([
+            "n_etapas", "paradero_inicio_viaje", "paradero_fin_viaje",
+            "distancia_eucl", "tipo_transporte_1"
+        ]))
+    else:
+        print("\n0b️⃣ No hay casos con paradero_fin_viaje null")
+    
+    # Ejemplos de filtrado por distancias
+    if len(ej_dist_ruta_null) > 0:
+        print("\n1️⃣ Ejemplo filtrado por `distancia_ruta` null:")
+        print(ej_dist_ruta_null.select([
+            "n_etapas", "distancia_ruta", "dveh_rutafinal", 
+            "dveh_ruta1", "dveh_ruta2", "dveh_ruta3", "dveh_ruta4"
+        ]))
+    else:
+        print("\n1️⃣ No hay casos con `distancia_ruta` null")
+    
+    if len(ej_dist_ruta_neg) > 0:
+        print("\n1b️⃣ Ejemplo filtrado por `distancia_ruta` ≤ 0:")
+        print(ej_dist_ruta_neg.select([
+            "n_etapas", "distancia_ruta", "distancia_ruta_float", "dveh_rutafinal", 
+            "dveh_ruta1", "dveh_ruta2"
+        ]))
+    else:
+        print("\n1b️⃣ No hay casos con `distancia_ruta` ≤ 0")
+    
+    if len(ej_dist_eucl_null) > 0:
+        print("\n2️⃣ Ejemplo filtrado por `distancia_eucl` null:")
+        print(ej_dist_eucl_null.select([
+            "n_etapas", "distancia_eucl", "dveh_eucfinal",
+            "paradero_inicio_viaje", "paradero_fin_viaje"
+        ]))
+    else:
+        print("\n2️⃣ No hay casos con `distancia_eucl` null")
+    
+    if len(ej_dist_eucl_neg) > 0:
+        print("\n2b️⃣ Ejemplo filtrado por `distancia_eucl` ≤ 0:")
+        print(ej_dist_eucl_neg.select([
+            "n_etapas", "distancia_eucl", "distancia_eucl_float", "dveh_eucfinal",
+            "paradero_inicio_viaje", "paradero_fin_viaje"
+        ]))
+    else:
+        print("\n2b️⃣ No hay casos con `distancia_eucl` ≤ 0")
+    
+    if len(ej_dveh_euc_imputable) > 0:
+        print("\n3️⃣ Ejemplo de `dveh_eucfinal` null que FUE IMPUTADO:")
+        print(ej_dveh_euc_imputable.select([
+            "n_etapas", "dveh_eucfinal", "d_vehiculo_eucl_total_m",
+            "dveh_euc1", "dveh_euc2", "dveh_euc3", "dveh_euc4"
+        ]))
+    else:
+        print("\n3️⃣ No hay casos de `dveh_eucfinal` imputables")
+    
+    if len(ej_dveh_euc_no_imputable) > 0:
+        print("\n4️⃣ Ejemplo de `dveh_eucfinal` null que NO SE PUDO IMPUTAR (filtrado):")
+        print(ej_dveh_euc_no_imputable.select([
+            "n_etapas", "dveh_eucfinal", "d_vehiculo_eucl_total_m",
+            "dveh_euc1", "dveh_euc2", "dveh_euc3", "dveh_euc4"
+        ]))
+    else:
+        print("\n4️⃣ No hay casos de `dveh_eucfinal` no imputables")
+    
+    print("\n" + "="*80)
+    print(f"✅ Proceso completado. DataFrame final: `df_filtrado` con {len(df_filtrado):,} viajes")
+    print("="*80)
+    
+    # ========================================================================
+    # PASO 7: Guardar datos filtrados
+    # ========================================================================
+    print("\n\n💾 GUARDANDO DATOS FILTRADOS")
+    print("="*80)
+    
+    # Crear ruta de salida para esta partición
+    output_partition = f"{OUTPUT_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}"
+    output_file = f"{output_partition}/data-0.parquet"
+    
+    print(f"\n📁 Ruta de salida: gs://{output_file}")
+    
+    try:
+        # Remover columnas temporales de análisis (para reducir tamaño y memoria)
+        columnas_temporales = [
+            'diff_tviaje2_seg',
+            'diff_dveh_rutafinal_m', 'diff_distancia_ruta_m', 'diff_dveh_eucfinal_m',
+            'diff_eucl_directa_vs_etapas_m', 'ratio_etapas_vs_directa'
+        ]
+        
+        # Eliminar solo las columnas que existen
+        columnas_a_eliminar = [col for col in columnas_temporales if col in df_filtrado.columns]
+        
+        if columnas_a_eliminar:
+            df_para_guardar = df_filtrado.drop(columnas_a_eliminar)
+            print(f"   Removidas {len(columnas_a_eliminar)} columnas temporales de análisis")
+        else:
+            df_para_guardar = df_filtrado
+        
+        # Asegurar que el directorio existe
+        gfs.makedirs(output_partition, exist_ok=True)
+        
+        # Guardar usando Polars directamente (más eficiente en memoria)
+        full_path = f"gs://{output_file}"
+        
+        with gfs.open(output_file, 'wb') as f:
+            df_para_guardar.write_parquet(f, compression='snappy')
+        
+        print(f"✅ Datos guardados exitosamente: {len(df_para_guardar):,} viajes")
+        print(f"   Columnas guardadas: {len(df_para_guardar.columns)}")
+        print(f"   Partición: {YEAR_ANALISIS}-W{WEEK_ANALISIS}")
+        print(f"   Ubicación: {full_path}")
+        
+    except Exception as e:
+        print(f"❌ Error al guardar los datos: {e}")
+        import traceback
+        traceback.print_exc()
+
+else:
+    print("⚠️ No hay datos cargados. Ejecuta las celdas anteriores primero.")
+```
+
+---
+
+## 7) 📋 Resumen de Filtros Aplicados
+
+### ✅ Filtros Implementados:
+
+Este notebook aplica los siguientes filtros para garantizar la calidad de los datos:
+
+#### **A) Filtros de Tiempos:**
+- ❌ **Tiempos de vehículo no positivos**: Se eliminan viajes donde `t_vehiculo_total_seg ≤ 0`
+  - `t_vehiculo_total_seg = tv1 + tv2 + tv3 + tv4`
+- ❌ **Tiempo total calculado no positivo**: Se eliminan viajes donde `t_total_calculado_seg ≤ 0`
+  - `t_total_calculado_seg = te0 + tv1 + tc1 + te1 + tv2 + tc2 + te2 + tv3 + tc3 + te3 + tv4`
+
+#### **B) Filtros de Paraderos:**
+- ❌ **Paradero de origen null**: Se eliminan viajes donde `paradero_inicio_viaje IS NULL`
+- ❌ **Paradero de destino null**: Se eliminan viajes donde `paradero_fin_viaje IS NULL`
+
+#### **C) Filtros de Distancias:**
+- ❌ **Distancia en ruta null o ≤ 0**: Se eliminan viajes donde `distancia_ruta IS NULL OR distancia_ruta ≤ 0`
+- ❌ **Distancia euclidiana null o ≤ 0**: Se eliminan viajes donde `distancia_eucl IS NULL OR distancia_eucl ≤ 0`
+- ❌ **Distancia euclidiana en vehículo null o ≤ 0**: Se eliminan viajes donde `dveh_eucfinal IS NULL OR dveh_eucfinal ≤ 0`
+  - **Nota**: Se intenta imputar `dveh_eucfinal` con la suma de `dveh_euc1 + dveh_euc2 + dveh_euc3 + dveh_euc4` antes de filtrar
+
+### ⚠️ Filtros NO Implementados:
+
+#### **Columnas excluidas del filtrado:**
+- ✅ **dveh_rutafinal**: NO se filtra ni imputa
+  - **Razón**: Esta columna presenta inconsistencias con `distancia_ruta` y no es crítica para análisis posteriores
+  - **Alternativa**: Se usa `distancia_ruta` como fuente de verdad para distancias en ruta
+
+### 📍 Ubicación de Datos Limpios:
+
+Los datos filtrados se guardan en:
+```
+gs://tesis-vonetto-datalake/lake/silver/viajes_limpios/iso_year=YYYY/iso_week=WW/data-0.parquet
+```
+
+**Estructura de particionamiento**: Por `iso_year` e `iso_week`
+
+### 📊 Flujo Completo:
+
+```
+1. viajes_enriquecidos (Silver) → Datos de entrada
+2. Análisis de tiempos → Identificación de problemas (sin filtrar)
+3. Análisis de distancias → Identificación de problemas (sin filtrar)
+4. Análisis de paraderos → Identificación de problemas (sin filtrar)
+5. Filtrado e Imputación → Aplicación de TODOS los filtros
+6. viajes_limpios (Silver) → Datos de salida
+```
+
+### 🎯 Próximo Paso:
+
+Los datos en `viajes_limpios` están listos para:
+- **Feature Engineering** (`03_feature_engineering.qmd`)
+- **Filtros de Anomalías Comportamentales** (criterios del paper)
+
+---
+
+## 8) 🔄 Procesamiento en Batch (Todas las Particiones)
+
+La sección anterior (6) procesa solo UNA partición para análisis exploratorio. Si deseas procesar **TODAS** las particiones de una vez, ejecuta la siguiente celda.
+
+**⚠️ Advertencia**: Este proceso puede tomar varios minutos dependiendo de la cantidad de datos.
+
+```{python}
+#| eval: false
+#| echo: true
+
+# Esta celda está deshabilitada por defecto (eval: false)
+# Cambia a eval: true para ejecutar el procesamiento en batch
+
+print("\n🔄 PROCESAMIENTO EN BATCH DE TODAS LAS PARTICIONES")
+print("="*80)
+
+# Función para aplicar los filtros a un DataFrame
+def aplicar_filtros(df):
+    """
+    Aplica todos los filtros de calidad de datos a un DataFrame.
+    
+    Returns:
+        df_filtrado: DataFrame con los filtros aplicados
+        stats: Diccionario con estadísticas de filtrado
+    """
+    n_inicial = len(df)
+    
+    # Crear columnas calculadas de tiempo
+    df = df.with_columns([
+        (pl.col("tv1").fill_null(0) + pl.col("tv2").fill_null(0) + 
+         pl.col("tv3").fill_null(0) + pl.col("tv4").fill_null(0)).alias("t_vehiculo_total_seg"),
+        
+        (pl.col("te0").fill_null(0) + pl.col("tv1").fill_null(0) + pl.col("tc1").fill_null(0) +
+         pl.col("te1").fill_null(0) + pl.col("tv2").fill_null(0) + pl.col("tc2").fill_null(0) +
+         pl.col("te2").fill_null(0) + pl.col("tv3").fill_null(0) + pl.col("tc3").fill_null(0) +
+         pl.col("te3").fill_null(0) + pl.col("tv4").fill_null(0)).alias("t_total_calculado_seg"),
+        
+        # Calcular suma de distancias euclidianas de vehículo
+        (pl.col("dveh_euc1").fill_null(0) + pl.col("dveh_euc2").fill_null(0) + 
+         pl.col("dveh_euc3").fill_null(0) + pl.col("dveh_euc4").fill_null(0)).alias("d_vehiculo_eucl_total_m"),
+    ])
+    
+    # A) Filtrar por tiempos
+    df = df.filter(
+        (pl.col("t_vehiculo_total_seg") > 0) &
+        (pl.col("t_total_calculado_seg") > 0)
+    )
+    n_despues_tiempo = len(df)
+    n_filtrados_tiempo = n_inicial - n_despues_tiempo
+    
+    # B) Filtrar por paraderos
+    df = df.filter(
+        pl.col("paradero_inicio_viaje").is_not_null() &
+        pl.col("paradero_fin_viaje").is_not_null()
+    )
+    n_despues_paraderos = len(df)
+    n_filtrados_paraderos = n_despues_tiempo - n_despues_paraderos
+    
+    # C) Imputar y filtrar por distancias
+    # Imputar dveh_eucfinal si es null
+    df = df.with_columns([
+        pl.when(pl.col("dveh_eucfinal").is_null())
+          .then(pl.col("d_vehiculo_eucl_total_m"))
+          .otherwise(pl.col("dveh_eucfinal"))
+          .alias("dveh_eucfinal"),
+    ])
+    
+    # Convertir distancias a Float para comparación
+    df = df.with_columns([
+        pl.col("distancia_ruta").cast(pl.Float64, strict=False).alias("distancia_ruta_float"),
+        pl.col("distancia_eucl").cast(pl.Float64, strict=False).alias("distancia_eucl_float"),
+    ])
+    
+    # Filtrar distancias inválidas (null o <= 0)
+    df = df.filter(
+        pl.col("distancia_ruta_float").is_not_null() &
+        (pl.col("distancia_ruta_float") > 0) &
+        pl.col("distancia_eucl_float").is_not_null() &
+        (pl.col("distancia_eucl_float") > 0) &
+        pl.col("dveh_eucfinal").is_not_null() &
+        (pl.col("dveh_eucfinal") > 0)
+    )
+    
+    # Eliminar columnas temporales
+    columnas_temporales = [
+        "distancia_ruta_float", "distancia_eucl_float"
+    ]
+    columnas_a_eliminar = [col for col in columnas_temporales if col in df.columns]
+    if columnas_a_eliminar:
+        df = df.drop(columnas_a_eliminar)
+    
+    n_final = len(df)
+    n_filtrados_dist = n_despues_paraderos - n_final
+    
+    stats = {
+        'n_inicial': n_inicial,
+        'n_filtrados_tiempo': n_filtrados_tiempo,
+        'n_filtrados_paraderos': n_filtrados_paraderos,
+        'n_filtrados_dist': n_filtrados_dist,
+        'n_final': n_final,
+        'pct_retenido': (n_final / n_inicial * 100) if n_inicial > 0 else 0
+    }
+    
+    return df, stats
+
+# Listar todas las particiones disponibles
+print("\n🔍 Buscando particiones disponibles...")
+try:
+    # Listar años
+    years_dirs = [d for d in gfs.ls(INPUT_PATH) if 'iso_year=' in d]
+    
+    particiones = []
+    for year_dir in years_dirs:
+        year = int(year_dir.split('iso_year=')[1])
+        weeks_dirs = [d for d in gfs.ls(year_dir) if 'iso_week=' in d]
+        
+        for week_dir in weeks_dirs:
+            week = int(week_dir.split('iso_week=')[1])
+            # Verificar que existe el archivo de datos
+            data_file = f"{week_dir}/data-0.parquet"
+            if gfs.exists(data_file):
+                particiones.append({
+                    'year': year,
+                    'week': week,
+                    'path': data_file
+                })
+    
+    print(f"✅ Se encontraron {len(particiones)} particiones para procesar")
+    print(f"   Años: {sorted(set(p['year'] for p in particiones))}")
+    print(f"   Semanas por año: {len(particiones) // len(set(p['year'] for p in particiones)):.0f} (aprox.)")
+    
+except Exception as e:
+    print(f"❌ Error al listar particiones: {e}")
+    particiones = []
+
+# Procesar cada partición
+if particiones:
+    print("\n" + "="*80)
+    print("🚀 INICIANDO PROCESAMIENTO EN BATCH")
+    print("="*80)
+    
+    # Parámetro de control: forzar reprocesamiento
+    FORCE_REPROCESS = False  # Cambiar a True para reprocesar todo
+    
+    # Verificar cuántas particiones ya existen
+    particiones_pendientes = []
+    particiones_existentes = 0
+    
+    for p in particiones:
+        output_file = f"{OUTPUT_PATH}/iso_year={p['year']}/iso_week={p['week']}/data-0.parquet"
+        if gfs.exists(output_file) and not FORCE_REPROCESS:
+            particiones_existentes += 1
+        else:
+            particiones_pendientes.append(p)
+    
+    print(f"\n📊 Estado de particiones:")
+    print(f"   - Total disponibles: {len(particiones)}")
+    print(f"   - Ya procesadas (skip): {particiones_existentes}")
+    print(f"   - Pendientes de procesar: {len(particiones_pendientes)}")
+    
+    if len(particiones_pendientes) == 0:
+        print("\n✅ Todas las particiones ya fueron procesadas!")
+        print("   Para reprocesar, cambia FORCE_REPROCESS = True")
+    else:
+        print(f"\n⏱️  Tiempo estimado: ~{len(particiones_pendientes) * 0.5:.1f} - {len(particiones_pendientes) * 2:.1f} minutos")
+        print("💾 Memoria: Se libera explícitamente después de cada partición")
+    
+    stats_globales = {
+        'n_inicial': 0,
+        'n_filtrados_tiempo': 0,
+        'n_filtrados_paraderos': 0,
+        'n_filtrados_dist': 0,
+        'n_final': 0,
+        'particiones_procesadas': 0,
+        'particiones_skipped': particiones_existentes,
+        'particiones_fallidas': 0
+    }
+    
+    for particion in tqdm(particiones_pendientes, desc="Procesando particiones"):
+        year = None
+        week = None
+        try:
+            year = particion['year']
+            week = particion['week']
+            input_file = particion['path']
+            
+            # Leer partición
+            with fs_arrow.open_input_file(input_file) as f:
+                tabla = pq.read_table(f)
+            df = pl.from_arrow(tabla)
+            
+            # Liberar tabla de Arrow inmediatamente
+            del tabla
+            
+            # Aplicar filtros
+            df_filtrado, stats = aplicar_filtros(df)
+            
+            # Liberar DataFrame original
+            del df
+            
+            # Acumular estadísticas
+            stats_globales['n_inicial'] += stats['n_inicial']
+            stats_globales['n_filtrados_tiempo'] += stats['n_filtrados_tiempo']
+            stats_globales['n_filtrados_paraderos'] += stats['n_filtrados_paraderos']
+            stats_globales['n_filtrados_dist'] += stats['n_filtrados_dist']
+            stats_globales['n_final'] += stats['n_final']
+            
+            # Guardar partición filtrada
+            output_partition = f"{OUTPUT_PATH}/iso_year={year}/iso_week={week}"
+            output_file = f"{output_partition}/data-0.parquet"
+            
+            gfs.makedirs(output_partition, exist_ok=True)
+            
+            # Usar Polars directamente (más eficiente en memoria)
+            with gfs.open(output_file, 'wb') as f:
+                df_filtrado.write_parquet(f, compression='snappy')
+            
+            # Liberar DataFrame filtrado
+            del df_filtrado
+            
+            # Forzar liberación de memoria
+            gc.collect()
+            
+            stats_globales['particiones_procesadas'] += 1
+            
+        except Exception as e:
+            error_msg = f"\n⚠️ Error procesando {year}-W{week}: {e}"
+            print(error_msg)
+            
+            # Mostrar traceback para debugging
+            import traceback
+            traceback.print_exc()
+            
+            stats_globales['particiones_fallidas'] += 1
+            
+            # Liberar memoria en caso de error
+            gc.collect()
+            continue
+    
+    # Mostrar resumen final
+    print("\n" + "="*80)
+    print("📊 RESUMEN FINAL DEL PROCESAMIENTO EN BATCH")
+    print("="*80)
+    print(f"\n📦 Particiones:")
+    print(f"   - Total: {len(particiones)}")
+    print(f"   - Skipped (ya existían): {stats_globales['particiones_skipped']}")
+    print(f"   - Procesadas exitosamente: {stats_globales['particiones_procesadas']}")
+    print(f"   - Fallidas: {stats_globales['particiones_fallidas']}")
+    
+    if stats_globales['n_inicial'] > 0:
+        print(f"\n📈 Viajes totales (de particiones procesadas):")
+        print(f"   - Iniciales: {stats_globales['n_inicial']:,}")
+        print(f"   - Finales: {stats_globales['n_final']:,}")
+        print(f"   - Retenidos: {stats_globales['n_final']/stats_globales['n_inicial']*100:.2f}%")
+        print(f"\n🗑️ Filtrados:")
+        print(f"   - Por tiempos: {stats_globales['n_filtrados_tiempo']:,} ({stats_globales['n_filtrados_tiempo']/stats_globales['n_inicial']*100:.2f}%)")
+        print(f"   - Por paraderos: {stats_globales['n_filtrados_paraderos']:,} ({stats_globales['n_filtrados_paraderos']/stats_globales['n_inicial']*100:.2f}%)")
+        print(f"   - Por distancias: {stats_globales['n_filtrados_dist']:,} ({stats_globales['n_filtrados_dist']/stats_globales['n_inicial']*100:.2f}%)")
+    
+    print(f"\n💾 Ubicación de salida:")
+    print(f"   gs://{OUTPUT_PATH}/iso_year=YYYY/iso_week=WW/data-0.parquet")
+    print("="*80)
+    print("✅ PROCESAMIENTO EN BATCH COMPLETADO")
+    print("="*80)
+    
+else:
+    print("\n⚠️ No se encontraron particiones para procesar")
+```
+
+### 💡 Cómo usar esta sección:
+
+1. **Análisis exploratorio** (Sección 6): Procesa solo 1 partición para ver estadísticas y ejemplos
+2. **Procesamiento completo** (Sección 8): Procesa TODAS las particiones cuando estés listo
+
+Para ejecutar el procesamiento en batch:
+- Cambia `eval: false` a `eval: true` en la celda anterior
+- O ejecuta manualmente la celda en Jupyter/VSCode
+
+### ⚡ Características de rendimiento:
+
+#### **Idempotencia** ✅
+- **Skip automático**: Las particiones ya procesadas se omiten automáticamente
+- **Control manual**: Cambia `FORCE_REPROCESS = True` para reprocesar todo
+- **Reanudar**: Si el proceso se interrumpe, continúa desde donde quedó
+
+#### **Velocidad** 🚀
+- **Tiempo por partición**: ~60-120 segundos (depende del tamaño)
+- **Liberación de memoria**: Explícita después de cada partición
+- **Para procesar más rápido**: Ver sección siguiente sobre procesamiento paralelo
+
+---
+
+## 9) 🚀 OPCIONAL: Procesamiento Paralelo (Más Rápido)
+
+Si necesitas procesar más rápido, puedes usar un script Python con procesamiento paralelo:
+
+```python
+# archivo: batch_parallel_process.py
+import multiprocessing as mp
+from functools import partial
+
+# Usar la misma función aplicar_filtros() de la sección anterior
+
+def procesar_particion_wrapper(particion, input_path, output_path, gfs, fs_arrow):
+    """Wrapper para procesar una partición en un proceso separado"""
+    try:
+        year = particion['year']
+        week = particion['week']
+        
+        # Verificar si ya existe
+        output_file = f"{output_path}/iso_year={year}/iso_week={week}/data-0.parquet"
+        if gfs.exists(output_file):
+            return {'status': 'skipped', 'year': year, 'week': week}
+        
+        # Leer, filtrar y guardar (mismo código que antes)
+        # ... [código de procesamiento]
+        
+        return {'status': 'success', 'year': year, 'week': week, 'stats': stats}
+    except Exception as e:
+        return {'status': 'error', 'year': year, 'week': week, 'error': str(e)}
+
+# Procesar en paralelo (usar 2-4 workers para evitar problemas de memoria)
+num_workers = 2  # Ajustar según memoria disponible
+with mp.Pool(num_workers) as pool:
+    resultados = pool.map(procesar_particion_wrapper, particiones)
+```
+
+**Ventajas del procesamiento paralelo:**
+- ⚡ **2-4x más rápido** (dependiendo de los cores disponibles)
+- 🔄 **Aprovecha múltiples CPU cores**
+- ⚠️ **Mayor uso de memoria** (1-2 particiones cargadas simultáneamente)
+
+**Recomendación:** Si tienes > 16GB RAM, usa 2-3 workers. Si tienes < 16GB, mejor usa el procesamiento secuencial (Sección 8).
+
+---
+
+## 10) ✅ Verificación de Integridad de Datos
+
+Después de ejecutar el procesamiento en batch (secuencial o paralelo), es importante **verificar que todos los datos se procesaron correctamente**.
+
+### 10.1) Verificar que todas las particiones se procesaron
+
+```{python}
+#| eval: false
+print("🔍 Verificando integridad del procesamiento en batch...\n")
+print("="*80)
+
+# Listar particiones de entrada
+input_partitions = set()
+years_dirs = [d for d in gfs.ls(INPUT_PATH) if 'iso_year=' in d]
+for year_dir in years_dirs:
+    year = int(year_dir.split('iso_year=')[1])
+    weeks_dirs = [d for d in gfs.ls(year_dir) if 'iso_week=' in d]
+    for week_dir in weeks_dirs:
+        week = int(week_dir.split('iso_week=')[1])
+        data_file = f"{week_dir}/data-0.parquet"
+        if gfs.exists(data_file):
+            input_partitions.add((year, week))
+
+# Listar particiones de salida
+output_partitions = set()
+if gfs.exists(OUTPUT_PATH):
+    years_dirs = [d for d in gfs.ls(OUTPUT_PATH) if 'iso_year=' in d]
+    for year_dir in years_dirs:
+        year = int(year_dir.split('iso_year=')[1])
+        weeks_dirs = [d for d in gfs.ls(year_dir) if 'iso_week=' in d]
+        for week_dir in weeks_dirs:
+            week = int(week_dir.split('iso_week=')[1])
+            data_file = f"{week_dir}/data-0.parquet"
+            if gfs.exists(data_file):
+                output_partitions.add((year, week))
+
+# Comparar
+print(f"📊 Resumen de particiones:")
+print(f"   - Input:  {len(input_partitions)} particiones")
+print(f"   - Output: {len(output_partitions)} particiones")
+
+missing_partitions = input_partitions - output_partitions
+if missing_partitions:
+    print(f"\n⚠️ Particiones faltantes ({len(missing_partitions)}):")
+    for year, week in sorted(missing_partitions):
+        print(f"   - {year}-W{week:02d}")
+else:
+    print(f"\n✅ Todas las particiones fueron procesadas correctamente!")
+
+print("="*80)
+```
+
+### 10.2) Verificar conteo de filas por partición
+
+```{python}
+#| eval: false
+print("\n📈 Comparando conteos de filas (Input vs Output)...\n")
+print(f"{'Partición':<15} {'Input':>12} {'Output':>12} {'Retenido':>10} {'Tasa':>8}")
+print("="*80)
+
+for year, week in sorted(input_partitions):  # Mostrar primeras 5
+    # Contar input
+    input_file = f"{INPUT_PATH}/iso_year={year}/iso_week={week}/data-0.parquet"
+    with fs_arrow.open_input_file(input_file) as f:
+        input_count = pq.read_table(f, columns=[]).num_rows
+    
+    # Contar output
+    output_file = f"{OUTPUT_PATH}/iso_year={year}/iso_week={week}/data-0.parquet"
+    if gfs.exists(output_file):
+        with fs_arrow.open_input_file(output_file) as f:
+            output_count = pq.read_table(f, columns=[]).num_rows
+        
+        tasa = (output_count / input_count * 100) if input_count > 0 else 0
+        print(f"{year}-W{week:02d}        {input_count:>12,} {output_count:>12,} {output_count:>10,} {tasa:>7.1f}%")
+    else:
+        print(f"{year}-W{week:02d}        {input_count:>12,}  {'NO PROCESADO':>12}")
+
+print("="*80)
+print("\n✅ Si las tasas son consistentes (~60%), la integridad es correcta.")
+```
+
+### 10.3) Verificar que el orden se preserva dentro de cada partición
+
+```{python}
+#| eval: false
+print("\n🔍 Verificando preservación del orden en una partición de muestra...\n")
+
+# Tomar una partición de ejemplo
+year, week = list(output_partitions)[0]
+output_file = f"{OUTPUT_PATH}/iso_year={year}/iso_week={week}/data-0.parquet"
+
+with fs_arrow.open_input_file(output_file) as f:
+    df_output = pl.from_arrow(pq.read_table(f))
+
+# Verificar que tiempo_inicio_viaje está ordenado (o casi, ya que filtramos)
+df_sorted = df_output.sort("tiempo_inicio_viaje")
+
+# Comparar primeros 10 registros
+print(f"Partición: {year}-W{week:02d}")
+print(f"Total de filas: {len(df_output):,}")
+print(f"\nPrimeros 5 tiempos de inicio (orden original):")
+print(df_output.select("tiempo_inicio_viaje").head(5))
+
+print(f"\nÚltimos 5 tiempos de inicio (después de ordenar):")
+print(df_sorted.select("tiempo_inicio_viaje").head(5))
+
+# Verificar si hay muchos registros fuera de orden
+is_sorted = (df_output["tiempo_inicio_viaje"] == df_sorted["tiempo_inicio_viaje"]).sum()
+total = len(df_output)
+sorted_pct = (is_sorted / total * 100) if total > 0 else 0
+
+print(f"\n{'='*80}")
+print(f"📊 Análisis de orden:")
+print(f"   - Registros en orden correcto: {is_sorted:,} / {total:,} ({sorted_pct:.1f}%)")
+
+if sorted_pct > 95:
+    print(f"   ✅ El orden se preservó casi perfectamente dentro de la partición")
+elif sorted_pct > 80:
+    print(f"   ⚠️ Hay algunas variaciones de orden (normal por filtrado)")
+else:
+    print(f"   ⚠️ Considera ordenar explícitamente si necesitas orden estricto")
+
+print("="*80)
+```
+
+### 10.4) Verificar que no hay duplicados
+
+```{python}
+#| eval: false
+print("\n🔍 Verificando duplicados en los datos procesados...\n")
+
+# Verificar en una partición de muestra
+year, week = list(output_partitions)[0]
+output_file = f"{OUTPUT_PATH}/iso_year={year}/iso_week={week}/data-0.parquet"
+
+with fs_arrow.open_input_file(output_file) as f:
+    df_output = pl.from_arrow(pq.read_table(f))
+
+# Buscar duplicados por id_tarjeta + id_viaje + tiempo_inicio_viaje
+duplicados = df_output.group_by(["id_tarjeta", "id_viaje", "tiempo_inicio_viaje"]).agg(
+    pl.count().alias("count")
+).filter(pl.col("count") > 1)
+
+print(f"Partición analizada: {year}-W{week:02d}")
+print(f"Total de registros: {len(df_output):,}")
+print(f"Duplicados encontrados: {len(duplicados):,}")
+
+if len(duplicados) == 0:
+    print(f"\n✅ No se encontraron duplicados. La integridad es correcta.")
+else:
+    print(f"\n⚠️ Se encontraron {len(duplicados):,} combinaciones duplicadas:")
+    print(duplicados.head(10))
+
+print("="*80)
+```
+
+---
+
+## 📋 Resumen de Garantías de Integridad
+
+| Aspecto | Garantía | Verificación |
+|:--------|:---------|:-------------|
+| **Completitud** | ✅ Todas las filas de cada partición se leen y procesan | Sección 10.2 |
+| **Orden dentro de partición** | ✅ Se preserva (Polars mantiene orden al filtrar) | Sección 10.3 |
+| **Orden entre particiones** | ⚠️ No garantizado (pero no importa, son independientes) | N/A |
+| **Sin duplicados** | ✅ No se crean duplicados durante el procesamiento | Sección 10.4 |
+| **Sin corrupción** | ✅ Cada worker escribe en archivos separados | Diseño del script |
+| **Idempotencia** | ✅ Re-ejecutar produce el mismo resultado | `FORCE_REPROCESS=False` |
+
+### ⚠️ Nota sobre el orden entre particiones
+
+El procesamiento paralelo **NO garantiza** que W14 se procese antes que W15, pero esto **NO afecta la integridad** porque:
+
+1. Cada partición es **independiente** (iso_year + iso_week)
+2. Al consultar después, puedes **ordenar por `tiempo_inicio_viaje`**
+3. Las particiones representan **períodos temporales distintos** sin superposición
+
+Si necesitas orden cronológico estricto en tus análisis, simplemente ordena al leer:
+
+```python
+df = pl.scan_parquet(f"{OUTPUT_PATH}/**/*.parquet").sort("tiempo_inicio_viaje").collect()
+```
