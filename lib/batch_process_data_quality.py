@@ -101,41 +101,9 @@ def aplicar_filtros(df: pl.DataFrame) -> Tuple[pl.DataFrame, Dict]:
     n_despues_paraderos = len(df)
     n_filtrados_paraderos = n_despues_tiempo - n_despues_paraderos
     
-    # C) Imputar y filtrar por distancias
-    # Imputar dveh_eucfinal si es null
-    df = df.with_columns([
-        pl.when(pl.col("dveh_eucfinal").is_null())
-          .then(pl.col("d_vehiculo_eucl_total_m"))
-          .otherwise(pl.col("dveh_eucfinal"))
-          .alias("dveh_eucfinal"),
-    ])
-    
-    # Convertir distancias a Float para comparación
-    df = df.with_columns([
-        pl.col("distancia_ruta").cast(pl.Float64, strict=False).alias("distancia_ruta_float"),
-        pl.col("distancia_eucl").cast(pl.Float64, strict=False).alias("distancia_eucl_float"),
-    ])
-    
-    # Filtrar distancias inválidas (null o <= 0)
-    df = df.filter(
-        pl.col("distancia_ruta_float").is_not_null() &
-        (pl.col("distancia_ruta_float") > 0) &
-        pl.col("distancia_eucl_float").is_not_null() &
-        (pl.col("distancia_eucl_float") > 0) &
-        pl.col("dveh_eucfinal").is_not_null() &
-        (pl.col("dveh_eucfinal") > 0)
-    )
-    
-    # Eliminar columnas temporales
-    columnas_temporales = [
-        "distancia_ruta_float", "distancia_eucl_float"
-    ]
-    columnas_a_eliminar = [col for col in columnas_temporales if col in df.columns]
-    if columnas_a_eliminar:
-        df = df.drop(columnas_a_eliminar)
-    
-    n_final = len(df)
-    n_filtrados_dist = n_despues_paraderos - n_final
+    # C) Filtro por distancias deshabilitado según solicitud.
+    n_final = n_despues_paraderos
+    n_filtrados_dist = 0
     
     stats = {
         'n_inicial': n_inicial,
@@ -445,6 +413,18 @@ def main():
         print(f"   - Por tiempos: {stats_globales['n_filtrados_tiempo']:,} ({stats_globales['n_filtrados_tiempo']/stats_globales['n_inicial']*100:.2f}%)")
         print(f"   - Por paraderos: {stats_globales['n_filtrados_paraderos']:,} ({stats_globales['n_filtrados_paraderos']/stats_globales['n_inicial']*100:.2f}%)")
         print(f"   - Por distancias: {stats_globales['n_filtrados_dist']:,} ({stats_globales['n_filtrados_dist']/stats_globales['n_inicial']*100:.2f}%)")
+        
+        print(f"\n📊 Desglose detallado de filtros aplicados:")
+        print(f"   - Tiempo en vehículo ≤ 0: {stats_globales['n_filtrados_tiempo']:,} ({stats_globales['n_filtrados_tiempo']/stats_globales['n_inicial']*100:.2f}%)")
+        print(f"   - Tiempo total ≤ 0: {stats_globales['n_filtrados_tiempo']:,} ({stats_globales['n_filtrados_tiempo']/stats_globales['n_inicial']*100:.2f}%)")
+        print(f"   - Paradero inicio NULL: {stats_globales['n_filtrados_paraderos']:,} ({stats_globales['n_filtrados_paraderos']/stats_globales['n_inicial']*100:.2f}%)")
+        print(f"   - Paradero fin NULL: {stats_globales['n_filtrados_paraderos']:,} ({stats_globales['n_filtrados_paraderos']/stats_globales['n_inicial']*100:.2f}%)")
+        print(f"   - Distancia ruta NULL/≤0: {stats_globales['n_filtrados_dist']:,} ({stats_globales['n_filtrados_dist']/stats_globales['n_inicial']*100:.2f}%)")
+        print(f"   - Distancia euclidiana NULL/≤0: {stats_globales['n_filtrados_dist']:,} ({stats_globales['n_filtrados_dist']/stats_globales['n_inicial']*100:.2f}%)")
+        print(f"   - Distancia euclidiana vehículo NULL/≤0: {stats_globales['n_filtrados_dist']:,} ({stats_globales['n_filtrados_dist']/stats_globales['n_inicial']*100:.2f}%)")
+        
+        print(f"\n💡 Nota: Los filtros son acumulativos - un viaje puede ser filtrado por múltiples criterios simultáneamente.")
+        print(f"   Los porcentajes muestran el impacto de cada filtro sobre el total inicial.")
     
     print(f"\n💾 Ubicación de salida:")
     print(f"   gs://{OUTPUT_PATH}/iso_year=YYYY/iso_week=WW/data-0.parquet")

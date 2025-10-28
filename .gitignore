@@ -48,6 +48,8 @@ data/
 *.tsv
 *.xlsx
 *.xls
+*.iter
+*.yaml
 
 # --- Credenciales / llaves (¡NUNCA al repo!) ---
 *.key
@@ -69,3 +71,9 @@ temp/
 
 # --- Papers (comentar si quieres versionarlos) ---
 papers/
+/.quarto/
+**/*.quarto_ipynb
+
+
+biogeme.toml
+lib/batch_process_feature_engineering_test.py

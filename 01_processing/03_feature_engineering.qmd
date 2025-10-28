@@ -166,7 +166,6 @@ if lf_viajes is not None:
 
 else:
     lf_with_features = None
-
 ```
 
 ## 4.1) Verificación de Cálculos (Muestra)
@@ -324,7 +323,6 @@ if lf_with_features is not None:
     print("   - Ejecuta la siguiente celda para ver el desglose detallado (instantáneo)")
 else:
     lf_final = None
-
 ```
 
 ## 5.1) Auditoría Detallada por Condición
@@ -365,7 +363,7 @@ if lf_final is not None and 'stats_acumulados' in globals():
     # Imprimir resultados ordenados por cantidad (mayor a menor)
     print(" RESULTADOS (ordenados por impacto):")
     print("-"*80)
-    print(f"{'Código':<25} {'Descripción':<40} {'Viajes':>12} {'%':>7}")
+    print(f"{ 'Código':<25} {'Descripción':<40} {'Viajes':>12} {'%':>7}")
     print("-"*80)
     
     # Ordenar por count descendente
@@ -379,7 +377,7 @@ if lf_final is not None and 'stats_acumulados' in globals():
         print(f"{codigo:<25} {desc:<40} {count:>12,} {pct:>6.2f}%")
     
     print("-"*80)
-    print(f"{'TOTAL (al menos uno)':<25} {'Viajes marcados como anómalos':<40} {anomalos:>12,} {pct_anomalos_global:>6.2f}%")
+    print(f"{ 'TOTAL (al menos uno)':<25} {'Viajes marcados como anómalos':<40} {anomalos:>12,} {pct_anomalos_global:>6.2f}%")
     print(f"{'VÁLIDOS':<25} {'Viajes que pasan todos los filtros':<40} {validos_globales:>12,} {100-pct_anomalos_global:>6.2f}%")
     print("="*80)
     
@@ -400,7 +398,7 @@ Esta celda muestra 5 casos reales de viajes descartados por cada filtro para val
 if lf_final is not None:
     print("🔍 EJEMPLOS DE VIAJES ANÓMALOS POR CATEGORÍA")
     print("="*80)
-    print("\n⏱️  Extrayendo ejemplos (procesando solo 1 partición para rapidez)...\n")
+    print("\n⏱️  Extrayendo ejemplos (procesando solo 1 partición para rapidez)...")
     
     # OPTIMIZACIÓN: Procesar SOLO una partición representativa (mucho más rápido)
     # Usamos la partición 2024-W14 específicamente
@@ -481,41 +479,71 @@ else:
     print("⚠️  Ejecuta primero las celdas anteriores.")
 ```
 
-## 6) Escritura de los Nuevos Datasets en Silver
+## 6) Escritura de Resultados
 
-### 6.1) Escritura de `viajes_con_indicadores`
+El procesamiento y la escritura de los resultados se ha movido a un script optimizado para ejecución en batch. Para generar los datasets `viajes_con_indicadores` y `viajes_filtrados`, ejecuta el siguiente comando en tu terminal:
 
-Guardamos la tabla completa con las nuevas columnas, incluyendo los viajes marcados como anómalos.
-
-```{python}
-if lf_final is not None:
-    print("--- Iniciando escritura de `viajes_con_indicadores` ---")
-    lf_final.sink_parquet(
-        path=OUTPUT_INDICADORES_PATH,
-        partition_by=["iso_year", "iso_week"],
-        compression="zstd"
-    )
-    print(f"✅ Proceso completado. Dataset guardado en: {OUTPUT_INDICADORES_PATH}")
-else:
-    print("No hay datos para escribir.")
+```bash
+python lib/batch_process_feature_engineering.py
 ```
 
-### 6.2) Escritura de `viajes_filtrados`
+Este script procesará las particiones de `viajes_limpios` en paralelo, aplicará el feature engineering y los filtros de anomalías, y guardará los resultados en las carpetas correspondientes de la capa Silver.
 
-Filtramos los viajes anómalos y guardamos únicamente los viajes válidos.
+
+## 7) Verificación Cruzada (Notebook vs. Script)
+
+Esta sección final realiza la validación más importante: compara el resultado teórico calculado en este notebook con el resultado real generado por el script batch. Esto nos asegura que la lógica implementada en el script es consistente con la definida y explorada aquí.
 
 ```{python}
-if lf_final is not None:
-    print("\n--- Iniciando escritura de `viajes_filtrados` ---")
-    lf_filtrado = lf_final.filter(pl.col("is_anomalo") == False)
+# Requisito: La celda 5 debe haber sido ejecutada para tener los conteos teóricos.
+
+print("VALIDACIÓN CRUZADA: Notebook vs. Script Batch")
+print("="*80)
+print("Comparando el conteo teórico del notebook con el resultado real del script.")
+
+if 'validos_globales' in globals() and 'total_viajes' in globals():
     
-    lf_filtrado.sink_parquet(
-        path=OUTPUT_FILTRADOS_PATH,
-        partition_by=["iso_year", "iso_week"],
-        compression="zstd"
-    )
-    print(f"✅ Proceso completado. Dataset guardado en: {OUTPUT_FILTRADOS_PATH}")
+    # 1. Obtener conteo teórico del notebook
+    validos_notebook = validos_globales
+    total_notebook = total_viajes
+    print(f"\n📈 Conteos del Notebook (calculados en Celda 5):")
+    print(f"   - Viajes totales procesados: {total_notebook: ,}")
+    print(f"   - Viajes válidos esperados:  {validos_notebook: ,}")
+    
+    try:
+        # 2. Obtener conteo real del script batch
+        print("\n🔍 Escaneando 'viajes_filtrados' (output del script)...")
+        
+        # Scan the entire partitioned dataset
+        lf_filtrados_real = pl.scan_pyarrow_dataset(
+            ds.dataset(OUTPUT_FILTRADOS_PATH, filesystem=fs_arrow, format="parquet")
+        )
+        
+        # Get the total row count
+        conteo_real = lf_filtrados_real.select(pl.len()).collect().item()
+        
+        print(f"   - Viajes reales en la salida: {conteo_real: ,}")
+
+        # 3. Comparar y validar
+        print("\n📊 Comparando resultados...")
+        
+        if validos_notebook == conteo_real:
+            print("\n✅ ¡VALIDACIÓN EXITOSA!")
+            print("   El número de filas en 'viajes_filtrados' coincide con el cálculo teórico del notebook.")
+        else:
+            print("\n❌ ¡FALLO DE VALIDACIÓN!")
+            print(f"   - Esperado (notebook): {validos_notebook: ,} filas")
+            print(f"   - Encontrado (script): {conteo_real: ,} filas")
+            print(f"   - Diferencia: {abs(validos_notebook - conteo_real): ,} filas")
+            print("\n   Esto indica una discrepancia entre la lógica del notebook y la del script batch.")
+
+    except Exception as e:
+        print(f"\n❌ No se pudo leer el directorio 'viajes_filtrados'.")
+        print(f"   Error: {e}")
+        print("   Asegúrate de que el script batch se haya ejecutado correctamente.")
+
 else:
-    print("No hay datos para escribir.")
+    print("\n⚠️ No se encontraron las variables 'validos_globales' y 'total_viajes'.")
+    print("   Por favor, ejecuta la Celda 5) antes de correr esta validación.")
 
 ```
