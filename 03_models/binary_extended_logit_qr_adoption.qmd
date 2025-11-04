@@ -1,0 +1,1290 @@
+---
+title: "Modelo Logit Binario Extendido - Adopción QR vs Bip"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: auto
+---
+
+# Objetivo
+
+Este notebook tiene como objetivo:
+
+1. Estimar un modelo Logit Binario extendido usando `biogeme` que incorpore no solo variables temporales (como en el modelo baseline), sino también **atributos del viaje** (tiempo en vehículo, número de trasbordos, tiempo de caminata, esperas, modos de transporte).
+
+2. Analizar e interpretar los resultados del modelo extendido, comparando diferentes configuraciones de muestreo (20% y 50%) para validar la eficiencia del muestreo estratificado.
+
+3. Extraer conclusiones sobre cómo los atributos del viaje influyen en la elección entre pago con QR y Tarjeta Bip!.
+
+---
+
+::: {.callout-note}
+# Navegación Rápida
+
+En caso de querer leer solo la definición del modelo y los resultados, puede saltar directamente a las secciones de [Definición del Modelo Logit Extendido](#definición-del-modelo-logit-extendido) y [Resultados del Modelo Extendido](#resultados-del-modelo-extendido).
+:::
+
+::: {.callout-warning}
+# ⚠️ Limitación Importante: Transbordos Internos entre Metro
+
+**IMPORTANTE:** Los resultados de este modelo deben interpretarse con precaución debido a la presencia de **transbordos  internos entre metro no mostrados no mostrados** en los datos. Estos transbordos no detectados están sesgando las siguientes variables del modelo:
+
+- **Número de trasbordos (`VAR_N_TRASBORDOS`)**: Se está sobreestimando el número real de trasbordos cuando en realidad algunos son transbordos internos dentro de la misma red de Metro.
+
+- **Tiempos de espera en trasbordo (`VAR_T_ESPERA_TRASBORDO_MIN`)**: Los tiempos de espera asociados a estos transbordos fantasmas no reflejan esperas reales entre modos distintos.
+
+- **Tiempos de caminata (`VAR_T_CAMINATA_MIN`)**: Los tiempos de caminata entre etapas que en realidad son transbordos internos están siendo contabilizados incorrectamente.
+
+- **Modos de transporte (`DUMMY_SOLO_METRO`, `DUMMY_METRO_BUS`)**: La clasificación de modos puede estar incorrecta cuando hay transbordos internos no detectados.
+
+Para una interpretación correcta de los resultados, se recomienda:
+1. Revisar los resultados del notebook de corrección de transbordos internos (`04_transbordos_metro.qmd`).
+2. Considerar que los coeficientes de variables relacionadas con trasbordos y tiempos pueden estar subestimados o sobreestimados.
+3. Las variables temporales (horas punta, días laborales) no se ven afectadas por este problema.
+:::
+
+### Setup e Importación de Librerías
+
+```{python}
+#|label: setup-and-imports
+import os
+import sys
+import polars as pl
+import gcsfs
+import pyarrow.fs as pafs
+import pyarrow.dataset as ds
+from datetime import date
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Importar biogeme
+import biogeme.database as db
+import biogeme.biogeme as bio
+from biogeme import models
+from biogeme.expressions import Beta, Variable
+
+
+# --- Autenticación GCS ---
+# (Puedes copiar tu función enable_adc_crossplatform aquí o importarla si está en lib)
+def enable_adc_crossplatform():
+    """Configura credenciales de Google Cloud para acceso a GCS"""
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return
+    if sys.platform.startswith("win"):
+        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
+    else:
+        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+    if not os.path.exists(adc_path):
+        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
+
+try:
+    enable_adc_crossplatform()
+    gfs = gcsfs.GCSFileSystem(token="google_default")
+    fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
+    print("✅ Conexión con GCS establecida.")
+except FileNotFoundError as e:
+    print(f"❌ Error de autenticación: {e}")
+
+# --- Parámetros ---
+GCS_BUCKET = "tesis-vonetto-datalake"
+SILVER_PATH = f"gs://{GCS_BUCKET}/lake/silver"
+# Usaremos 'viajes_limpios' como base, ya que contiene todos los viajes válidos
+INPUT_DATASET_PATH = f"{SILVER_PATH}/viajes_filtrados"
+
+# --- Partición para Análisis Inicial ---
+# Elige una partición representativa
+YEAR_ANALISIS = 2025 
+WEEK_ANALISIS = 17
+PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
+
+print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
+```
+
+
+
+```{python}
+#|label: helper-functions
+#|include: false
+
+# --- Constantes del Modelo ---
+HORAS_PUNTA_MANANA = [7, 8]
+HORAS_PUNTA_TARDE = [18, 19]
+
+# --- Helper para Feature Engineering (Modelo Simple) ---
+
+def prepare_features(lazy_frame):
+    lf_prep = lazy_frame.select(
+        "is_qr", "tiempo_inicio_viaje", "tipodia"
+    ).with_columns([
+        pl.col("is_qr").cast(pl.Int8).alias("choice"),
+        pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
+    ]).with_columns([
+        pl.col("ts_local").dt.hour().alias("hora"),
+        pl.col("ts_local").dt.weekday().alias("dia_semana"),
+        (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+    ]).with_columns([
+        pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+        (pl.col("dia_semana") == 5).alias("es_viernes"),
+        pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
+    ]).with_columns([
+        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+        (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+        (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+    ])
+    cols_modelo = ["choice", "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+    return lf_prep.select(cols_modelo)
+
+# --- Helper para Muestreo Estratificado ---
+
+def get_stratified_sample(df, fraction, seed):
+    total_rows = len(df)
+    target_rows = int(total_rows * fraction)
+    counts = df.group_by("choice").agg(pl.len().alias("count")).sort("choice")
+    bip_count = counts.filter(pl.col("choice") == 0)["count"][0] if len(counts.filter(pl.col("choice") == 0)) > 0 else 0
+    qr_count = counts.filter(pl.col("choice") == 1)["count"][0] if len(counts.filter(pl.col("choice") == 1)) > 0 else 0
+    total_original = bip_count + qr_count
+    if total_original == 0:
+        return df
+    bip_proportion = bip_count / total_original
+    qr_proportion = qr_count / total_original
+    target_bip = int(target_rows * bip_proportion)
+    target_qr = int(target_rows * qr_proportion)
+    actual_total = target_bip + target_qr
+    if actual_total < target_rows and qr_count > 0:
+        target_qr += (target_rows - actual_total)
+    elif actual_total < target_rows and bip_count > 0:
+        target_bip += (target_rows - actual_total)
+    samples = []
+    if target_bip > 0 and bip_count > 0:
+        df_sample_bip = df.filter(pl.col("choice") == 0).sample(
+            n=min(target_bip, bip_count), shuffle=True, seed=seed
+        )
+        samples.append(df_sample_bip)
+    if target_qr > 0 and qr_count > 0:
+        df_sample_qr = df.filter(pl.col("choice") == 1).sample(
+            n=min(target_qr, qr_count), shuffle=True, seed=seed
+        )
+        samples.append(df_sample_qr)
+    if samples:
+        df_model_sample = pl.concat(samples).sample(fraction=1.0, shuffle=True, seed=seed)
+        return df_model_sample
+    else:
+        return df
+print("✅ Funciones de ayuda `prepare_features` y `get_stratified_sample` definidas.")
+
+  # --- Helper para Feature Engineering (Modelo Extendido) ---
+def prepare_features_extended(lazy_frame):
+        cols_necesarias = [
+             "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
+             "tiempo_vehiculo_seg", "te0", 
+             "tc1", "tc2", "tc3",
+             "te1", "te2", "te3",
+             "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
+         ]
+        
+        # 1. Crear variables base y dummies temporales
+        lf_prep_ext = lazy_frame.select(cols_necesarias).with_columns([
+            pl.col("is_qr").cast(pl.Int8).alias("choice"),
+            pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias(
+      "ts_local"),
+        ]).with_columns([
+            pl.col("ts_local").dt.hour().alias("hora"),
+            pl.col("ts_local").dt.weekday().alias("dia_semana"),
+            (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+        ]).with_columns([
+            pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+            pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+            (pl.col("dia_semana") == 5).alias("es_viernes"),
+            pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
+        ]).with_columns([
+            (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+            (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+            (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+            (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+        ])
+    
+        # 2. Ingeniería de variables de viaje
+        lf_prep_ext = lf_prep_ext.with_columns([
+            (pl.col("tiempo_vehiculo_seg") / 60).alias("VAR_T_VEHICULO_MIN"),
+            (pl.col("n_etapas") - 1).alias("VAR_N_TRASBORDOS"),
+            ((pl.col("tc1").fill_null(0) + pl.col("tc2").fill_null(0) + pl.col("tc3").fill_null(0)) / 60).alias(
+      "VAR_T_CAMINATA_MIN"),
+            ((pl.col("te1").fill_null(0) + pl.col("te2").fill_null(0) + pl.col("te3").fill_null(0)) / 60).alias(
+      "VAR_T_ESPERA_TRASBORDO_MIN"),
+            (pl.col("te0") / 60).alias("VAR_T_ESPERA_INICIAL_MIN"),
+        ])
+    
+        # 3. Dummies de modo de transporte
+        cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
+        for col in cols_modos:
+            lf_prep_ext = lf_prep_ext.with_columns([
+                pl.when(pl.col(col).cast(pl.Utf8) == '4').then(pl.lit('2'))
+                  .when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))
+                  .otherwise(pl.col(col).cast(pl.Utf8))
+                  .alias(col)
+            ])
+        
+        lf_prep_ext = lf_prep_ext.with_columns([
+            pl.any_horizontal([pl.col(c) == '1' for c in cols_modos]).alias("usa_bus"),
+            pl.any_horizontal([pl.col(c) == '2' for c in cols_modos]).alias("usa_metro"),
+        ]).with_columns([
+            (pl.col("usa_metro") & ~pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+            (pl.col("usa_metro") & pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+        ])
+    
+        # 4. Seleccionar columnas finales
+        cols_modelo_ext = [
+            "choice", "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB",
+            "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS", "VAR_T_CAMINATA_MIN",
+            "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN",
+            "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS"
+        ]
+        
+        return lf_prep_ext.select(cols_modelo_ext).fill_null(0)
+    
+        print("✅ Función de ayuda `prepare_features_extended` definida.")
+```
+
+### Carga de Datos (Una Partición para Análisis)
+
+```{python}
+#|label: load-data
+print(f"Cargando partición {PARTITION_LABEL} desde {INPUT_DATASET_PATH}...")
+
+partition_path_glob = f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
+
+try:
+    # Usamos scan_parquet para cargar de forma perezosa (LazyFrame)
+    lf_data = pl.scan_parquet(partition_path_glob)
+
+    # Verificamos el esquema y contamos filas (esto sí ejecuta parte de la query)
+    schema = lf_data.collect_schema()
+    n_rows = lf_data.select(pl.len()).collect().item()
+
+    print(f"✅ Partición cargada (LazyFrame): {n_rows:,} filas.")
+    print(f"   Columnas disponibles: {len(schema.names())}")
+    # Mostramos algunas columnas relevantes para confirmar
+    relevant_cols = ["is_qr", "tiempo_inicio_viaje", "tipodia"]
+    print(f"   Columnas clave presentes: {[c for c in relevant_cols if c in schema.names()]}")
+
+except Exception as e:
+    print(f"❌ Error al cargar la partición: {e}")
+    print(f"   Verifica que la ruta y partición existan: {partition_path_glob}")
+    lf_data = None
+```
+
+
+
+```{python}
+#| label: define-logit-model
+
+if 'biodb' in locals() and biodb is not None:
+    print("Especificando el modelo Logit Binario en Biogeme...")
+
+    # 1. Definir las Variables de Biogeme a partir de las columnas del DataFrame
+    #    (Asegúrate de que los nombres coincidan EXACTAMENTE con las columnas de pandas_df)
+    print("   Definiendo variables...")
+    PM_LAB = Variable('DUMMY_PM_LAB')
+    PT_LAB = Variable('DUMMY_PT_LAB')
+    LJ_LAB = Variable('DUMMY_LJ_LAB')
+    VIE_LAB = Variable('DUMMY_VIE_LAB')
+
+    CHOICE = Variable('choice') # La variable dependiente
+
+
+    # 2. Definir los Parámetros (Betas) a estimar
+    print("   Definiendo parámetros (Betas)...")
+    # (Nombre, Valor Inicial, Límite Inf, Límite Sup, Fijo=0 -> Estimar)
+    # --- 2. Definir los PARÁMETROS (Betas a estimar) ---
+    ASC_QR = Beta('ASC_QR', 0, None, None, 0) # Constante para QR
+    B_PM_LAB = Beta('B_PM_LAB', 0, None, None, 0) # Hora punta mañana laboral
+    B_PT_LAB = Beta('B_PT_LAB', 0, None, None, 0) # Hora punta tarde laboral
+    B_LJ_LAB = Beta('B_LJ_LAB', 0, None, None, 0) # Lunes a Jueves laboral
+    B_VIE_LAB = Beta('B_VIE_LAB', 0, None, None, 0) # Viernes laboral
+
+    # --- 3. Formular las Funciones de Utilidad (V) ---
+    # Normalizamos la utilidad de Bip! (choice=0) a cero
+    print("   Definiendo funciones de utilidad...")
+    V_BIP = 0
+    
+    # Alternativa 1: Pago QR
+    V_QR = ASC_QR + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB
+
+    # 4. Asociar cada función de utilidad con su ID en la columna 'CHOICE'
+    print("   Asociando funciones de utilidad con ID de elección...")
+    V = {
+        0: V_BIP, # Utilidad para la elección 0 (Bip!)
+        1: V_QR   # Utilidad para la elección 1 (QR)
+    }
+    
+    # Definir la disponibilidad (ambas opciones siempre están disponibles)
+    print("   Definiendo disponibilidad...")
+    av = {
+        0: 1, # Bip! siempre disponible
+        1: 1 # QR siempre disponible
+    }
+
+    print("✅ Funciones de utilidad y parámetros listos.")
+
+```
+
+## Modelo Extendido: Atributos del Viaje
+
+En esta sección, enriqueceremos el modelo anterior añadiendo variables que describen las características del viaje en sí, como su duración, complejidad y modos de transporte utilizados.
+
+### Preparación de Datos para Modelo Extendido
+
+```{python}
+#|label: prepare-extended-model-data
+
+if lf_data is not None:
+    print("🔧 Preparando variables para el MODELO EXTENDIDO...")
+
+
+    print(f"✅ lf_data está disponible: {type(lf_data)}")
+    
+
+    try:
+        schema = lf_data.collect_schema()
+        available_cols = list(schema.keys())
+        print(f"📋 Columnas disponibles en el dataset: {len(available_cols)} columnas")
+        print(f"🔍 Verificando columnas necesarias...")
+        
+        # Verificar si las columnas necesarias están disponibles
+        cols_necesarias = [
+            "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
+            "tiempo_vehiculo_seg", "te0", 
+            "tc1", "tc2", "tc3",  # Tiempos de caminata por etapa
+            "te1", "te2", "te3",  # Tiempos de espera por etapa
+            "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
+        ]
+        
+        missing_cols = [col for col in cols_necesarias if col not in available_cols]
+        if missing_cols:
+            print(f"❌ Columnas faltantes: {missing_cols}")
+            print(f"✅ Columnas disponibles: {available_cols}")
+            raise ValueError(f"Columnas faltantes: {missing_cols}")
+        else:
+            print(f"✅ Todas las columnas necesarias están disponibles")
+            
+    except Exception as e:
+        print(f"❌ Error al verificar el esquema: {e}")
+        raise
+    
+    print(f"🔍 Verificando tipos de datos de columnas clave...")
+    sample_schema = lf_data.select(["tipodia", "is_qr", "n_etapas"]).collect_schema()
+    for col_name in ["tipodia", "is_qr", "n_etapas"]:
+        if col_name in sample_schema:
+            print(f"   {col_name}: {sample_schema[col_name]}")
+    
+    # 1. Crear variables base y dummies temporales (lógica anterior)
+    lf_prep_ext = lf_data.select(cols_necesarias).with_columns([
+        pl.col("is_qr").cast(pl.Int8).alias("choice"),
+        pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
+    ]).with_columns([
+        pl.col("ts_local").dt.hour().alias("hora"),
+        pl.col("ts_local").dt.weekday().alias("dia_semana"),
+        # Arreglar el problema de tipos: convertir tipodia a string primero, luego a int
+        (pl.col("tipodia").cast(pl.Utf8).cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+    ]).with_columns([
+        pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+        (pl.col("dia_semana") == 5).alias("es_viernes"),
+        pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
+    ]).with_columns([
+        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+        (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+        (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+    ])
+
+    # 2. Ingeniería de las 6 NUEVAS variables del viaje
+    lf_prep_ext = lf_prep_ext.with_columns([
+        # Crear primero las columnas de tiempo total de caminata y espera
+        (pl.col("tc1").fill_null(0) + pl.col("tc2").fill_null(0) + pl.col("tc3").fill_null(0)).alias("t_caminata_total_seg"),
+        (pl.col("te1").fill_null(0) + pl.col("te2").fill_null(0) + pl.col("te3").fill_null(0)).alias("t_espera_total_seg"),
+    ]).with_columns([
+        # Var 1: Tiempo de viaje en vehículo (en minutos)
+        (pl.col("tiempo_vehiculo_seg") / 60).alias("VAR_T_VEHICULO_MIN"),
+        
+        # Var 2: Número de trasbordos
+        (pl.col("n_etapas") - 1).alias("VAR_N_TRASBORDOS"),
+        
+        # Var 3: Tiempo de caminata total (en minutos)
+        (pl.col("t_caminata_total_seg") / 60).alias("VAR_T_CAMINATA_MIN"),
+        
+        # Var 4: Tiempo de espera en trasbordo (en minutos)
+        ((pl.col("te1").fill_null(0) + pl.col("te2").fill_null(0) + pl.col("te3").fill_null(0)) / 60).alias("VAR_T_ESPERA_TRASBORDO_MIN"),
+          
+        # Var 5: Tiempo de espera inicial (en minutos)
+        (pl.col("te0") / 60).alias("VAR_T_ESPERA_INICIAL_MIN"),
+    ])
+
+    # Var 6: Dummies de modo de transporte
+    # Reclasificar modos: MetroTren(4)->Metro(2), ZonaPaga(3)->Bus(1)
+    cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
+    for col in cols_modos:
+        lf_prep_ext = lf_prep_ext.with_columns([
+            pl.when(pl.col(col).cast(pl.Utf8) == '4').then(pl.lit('2')) # MetroTren -> Metro
+              .when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1')) # ZonaPaga -> Bus
+              .otherwise(pl.col(col).cast(pl.Utf8))
+              .alias(col)
+        ])
+    
+    # Crear flags de modos presentes en el viaje (usando strings)
+    lf_prep_ext = lf_prep_ext.with_columns([
+        pl.any_horizontal([pl.col(c) == '1' for c in cols_modos]).alias("usa_bus"),
+        pl.any_horizontal([pl.col(c) == '2' for c in cols_modos]).alias("usa_metro"),
+    ]).with_columns([
+        # DUMMY_SOLO_METRO: usa metro y NO usa bus
+        (pl.col("usa_metro") & ~pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+        # DUMMY_METRO_BUS: usa metro Y usa bus
+        (pl.col("usa_metro") & pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+    ])
+
+    # 3. Seleccionar columnas finales para el modelo extendido
+    cols_modelo_ext = [
+        "choice", 
+        # Dummies temporales
+        "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB",
+        # Nuevas variables de viaje
+        "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS", "VAR_T_CAMINATA_MIN",
+        "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN",
+        "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS"
+    ]
+    
+    lf_model_ready_ext = lf_prep_ext.select(cols_modelo_ext).fill_null(0) # Rellenar nulos con 0
+    
+    # 4. Cargar datos en memoria
+    print(f"⚙️  Calculando variables extendidas y cargando en memoria para {PARTITION_LABEL}...")
+    try:
+        df_model_data_ext = lf_model_ready_ext.collect()
+        print(f"✅ Datos para modelo extendido listos: {len(df_model_data_ext):,} filas, {len(df_model_data_ext.columns)} columnas.")
+        
+        # 5. Convertir a Pandas y crear DB Biogeme
+        pandas_df_ext = df_model_data_ext.to_pandas()
+        biodb_ext = db.Database('viajes_qr_bip_ext', pandas_df_ext)
+        print("✅ Base de datos Biogeme 'biodb_ext' creada.")
+
+    except Exception as e:
+        print(f"❌ Error durante la preparación de datos extendidos: {e}")
+        biodb_ext = None
+
+else:
+    print("⚠️ No hay datos cargados (`lf_data`) para preparar.")
+    biodb_ext = None
+
+```
+
+### Definición del Modelo Logit Extendido
+
+En esta sección se documenta el modelo extendido:
+
+- Variables temporales (dummies creadas desde hora/día laboral):
+  - `DUMMY_PM_LAB`: 1 si viaje inicia en hora punta mañana (7–8) y día laboral (`tipodia == 0`), 0 en caso contrario. Se construye como `(punta_manana & is_laboral).cast(Int8)`.
+  - `DUMMY_PT_LAB`: 1 si viaje inicia en hora punta tarde (18–19) y día laboral, 0 si no. Se construye como `(punta_tarde & is_laboral).cast(Int8)`.
+  - `DUMMY_LJ_LAB`: 1 si es lunes–jueves y laboral, 0 si no. Se construye como `(es_lun_jue & is_laboral).cast(Int8)`.
+  - `DUMMY_VIE_LAB`: 1 si es viernes y laboral, 0 si no. Se construye como `(es_viernes & is_laboral).cast(Int8)`.
+- Atributos del viaje (derivados de tiempos y etapas):
+  - `VAR_T_VEHICULO_MIN`: minutos en vehículo. Se calcula como `tiempo_vehiculo_seg / 60`.
+  - `VAR_N_TRASBORDOS`: cantidad de trasbordos. Se calcula como `n_etapas - 1`.
+  - `VAR_T_CAMINATA_MIN`: minutos totales de caminata. Se calcula como `(tc1 + tc2 + tc3) / 60` (con `fill_null(0)`).
+  - `VAR_T_ESPERA_TRASBORDO_MIN`: minutos de espera en trasbordos. Se calcula como `(te1 + te2 + te3) / 60` (con `fill_null(0)`).
+  - `VAR_T_ESPERA_INICIAL_MIN`: minutos de espera inicial antes del primer abordaje. Se calcula como `te0 / 60`.
+  - `DUMMY_SOLO_METRO`: 1 si usa Metro y no usa Bus en ninguna etapa; 0 en caso contrario. Se obtiene recodificando `tipo_transporte_i` (4→2, 3→1) y evaluando presencia exclusiva de Metro.
+  - `DUMMY_METRO_BUS`: 1 si el viaje combina Metro y Bus en sus etapas; 0 si no. Se obtiene tras la misma recodificación verificando presencia conjunta.
+- Parámetros del modelo: `ASC_QR_EXT` (constante de QR) y betas para cada variable anterior.
+
+#### Ecuaciones de Utilidad
+
+Para poder identificar el modelo, la utilidad de una de las alternativas se normaliza a cero. En este caso, la utilidad de la Tarjeta Bip! se establece como la base:
+
+$$V_{Bip} = 0$$
+
+La utilidad de elegir QR se modela como una función lineal de las variables explicativas temporales y de atributos del viaje:
+
+$$V_{QR} = ASC_{QR} + \beta_{PM} \cdot DUMMY\_PM\_LAB + \beta_{PT} \cdot DUMMY\_PT\_LAB + \beta_{LJ} \cdot DUMMY\_LJ\_LAB + \beta_{VIE} \cdot DUMMY\_VIE\_LAB + \beta_{Tveh} \cdot VAR\_T\_VEHICULO\_MIN + \beta_{Ntr} \cdot VAR\_N\_TRASBORDOS + \beta_{Tcam} \cdot VAR\_T\_CAMINATA\_MIN + \beta_{Ttrasb} \cdot VAR\_T\_ESPERA\_TRASBORDO\_MIN + \beta_{Tini} \cdot VAR\_T\_ESPERA\_INICIAL\_MIN + \beta_{soloM} \cdot DUMMY\_SOLO\_METRO + \beta_{MB} \cdot DUMMY\_METRO\_BUS$$
+
+La probabilidad de que un individuo elija QR se calcula entonces mediante la fórmula del Logit:
+
+$$P(QR) = \frac{e^{V_{QR}}}{e^{V_{Bip}} + e^{V_{QR}}} = \frac{e^{V_{QR}}}{1 + e^{V_{QR}}}$$
+
+A continuación, se implementa esta especificación en Biogeme.
+
+```{python}
+#|label: define-extended-logit-model
+
+if 'biodb_ext' in locals() and biodb_ext is not None:
+    print("Especificando el MODELO EXTENDIDO...")
+
+    # 1. Definir Betas para las variables originales
+    ASC_QR_EXT = Beta('ASC_QR_EXT', 0, None, None, 0)
+    B_PM_LAB_EXT = Beta('B_PM_LAB_EXT', 0, None, None, 0)
+    B_PT_LAB_EXT = Beta('B_PT_LAB_EXT', 0, None, None, 0)
+    B_LJ_LAB_EXT = Beta('B_LJ_LAB_EXT', 0, None, None, 0)
+    B_VIE_LAB_EXT = Beta('B_VIE_LAB_EXT', 0, None, None, 0)
+
+    # 2. Definir Betas para las NUEVAS variables de viaje
+    B_T_VEHICULO = Beta('B_T_VEHICULO', 0, None, None, 0)
+    B_N_TRASBORDOS = Beta('B_N_TRASBORDOS', 0, None, None, 0)
+    B_T_CAMINATA = Beta('B_T_CAMINATA', 0, None, None, 0)
+    B_T_ESPERA_TRASB = Beta('B_T_ESPERA_TRASB', 0, None, None, 0)
+    B_T_ESPERA_INI = Beta('B_T_ESPERA_INI', 0, None, None, 0)
+    B_SOLO_METRO = Beta('B_SOLO_METRO', 0, None, None, 0)
+    B_METRO_BUS = Beta('B_METRO_BUS', 0, None, None, 0)
+
+    # 3. Definir las Variables de Biogeme
+    # ... (originales)
+    PM_LAB_EXT = Variable('DUMMY_PM_LAB')
+    PT_LAB_EXT = Variable('DUMMY_PT_LAB')
+    LJ_LAB_EXT = Variable('DUMMY_LJ_LAB')
+    VIE_LAB_EXT = Variable('DUMMY_VIE_LAB')
+    # ... (nuevas)
+    T_VEHICULO = Variable('VAR_T_VEHICULO_MIN')
+    N_TRASBORDOS = Variable('VAR_N_TRASBORDOS')
+    T_CAMINATA = Variable('VAR_T_CAMINATA_MIN')
+    T_ESPERA_TRASB = Variable('VAR_T_ESPERA_TRASBORDO_MIN')
+    T_ESPERA_INI = Variable('VAR_T_ESPERA_INICIAL_MIN')
+    SOLO_METRO = Variable('DUMMY_SOLO_METRO')
+    METRO_BUS = Variable('DUMMY_METRO_BUS')
+    
+    CHOICE_EXT = Variable('choice')
+
+    # 4. Formular la NUEVA Función de Utilidad
+    V_BIP_EXT = 0
+    V_QR_EXT = (
+        ASC_QR_EXT + 
+        B_PM_LAB_EXT * PM_LAB_EXT + 
+        B_PT_LAB_EXT * PT_LAB_EXT + 
+        B_LJ_LAB_EXT * LJ_LAB_EXT + 
+        B_VIE_LAB_EXT * VIE_LAB_EXT + 
+        B_T_VEHICULO * T_VEHICULO + 
+        B_N_TRASBORDOS * N_TRASBORDOS + 
+        B_T_CAMINATA * T_CAMINATA + 
+        B_T_ESPERA_TRASB * T_ESPERA_TRASB + 
+        B_T_ESPERA_INI * T_ESPERA_INI + 
+        B_SOLO_METRO * SOLO_METRO + 
+        B_METRO_BUS * METRO_BUS
+    )
+
+    V_EXT = {0: V_BIP_EXT, 1: V_QR_EXT}
+    av_ext = {0: 1, 1: 1}
+
+    print("✅ Especificación del modelo extendido lista.")
+
+```
+
+### Estimación del Modelo Extendido
+
+```{python}
+##|eval: false
+##| label: estimate-extended-logit-model
+#
+#import biogeme.biogeme_logging as blog
+#from biogeme.version import get_text as biogeme_version_text
+#import biogeme.results_processing as br
+#from biogeme.results_processing import get_pandas_estimated_parameters
+#import pandas as pd
+#
+#logger = blog.get_screen_logger(level=blog.INFO)
+#logger.info(biogeme_version_text())
+#
+#if 'biodb_ext' in locals() and biodb_ext is not None:
+#    print(f"🚀 Iniciando estimación del MODELO EXTENDIDO para la partición {PARTITION_LABEL}...")
+#
+#    # 1. Definir el log-likelihood con las variables extendidas
+#    logprob_ext = models.loglogit(V_EXT, av_ext, CHOICE_EXT)
+#
+#    # 2. Definir carpeta de salida
+#    OUTPUT_DIR = "model_outputs"
+#    os.makedirs(OUTPUT_DIR, exist_ok=True)
+#
+#    # 3. Crear un nombre de modelo único para la versión extendida
+#    model_name_ext = f'logit_qr_bip_ext_{PARTITION_LABEL}'
+#    # 4. Crear el objeto Biogeme
+#    print("   Creando objeto Biogeme para el modelo extendido...")
+#    biogeme_model_ext = bio.BIOGEME(
+#        biodb_ext, 
+#        logprob_ext
+#    )
+#    biogeme_model_ext.model_name = model_name_ext
+#    # 5. Cambiar al directorio de salida
+#    original_cwd = os.getcwd()
+#    os.chdir(OUTPUT_DIR)
+#    print(f"   OK. Archivos de salida se guardarán en: ./{OUTPUT_DIR}/")
+#    # 6. Estimar el modelo
+#    print("   Estimando el modelo extendido...")
+#    try:
+#        results_ext = biogeme_model_ext.estimate()
+#        print("\n✅ Estimación del modelo extendido completada!")
+#        # 7. Guardar resultados en formato CSV
+#        params_df_ext = get_pandas_estimated_parameters(estimation_results=results_ext)
+#        stats_dict_ext = results_ext.get_general_statistics()
+#        params_df_ext.to_csv(f'params_ext_{PARTITION_LABEL}.csv')
+#        pd.DataFrame([stats_dict_ext]).to_csv(f'stats_ext_{PARTITION_LABEL}.csv', index=False)
+#        print(f"📁 Resultados del modelo extendido guardados:")
+#        print(f"   - Parámetros: params_ext_{PARTITION_LABEL}.csv")
+#        print(f"   - Estadísticas: stats_ext_{PARTITION_LABEL}.csv")
+#        # 8. Imprimir resumen en pantalla
+#        stats_ext = results_ext.get_general_statistics()
+#        def g(k, alt_keys=()):
+#            for key in (k, *alt_keys):
+#                if key in stats_ext:
+#                    return stats_ext[key]
+#            return None
+#        print("\n📊 RESUMEN DE ESTIMACIÓN (MODELO EXTENDIDO):")
+#        print(f"Log-likelihood Inicial: {g('Init log likelihood', ('Null log likelihood',))}")
+#        print(f"Log-likelihood Final:   {g('Final log likelihood')}")
+#        print(f"Rho-cuadrado:           {g('Rho-square', ('Rho-square for the null model', 'Rho-square for the init. model'))}")
+#        print(f"Rho-cuadrado ajustado:  {g('Rho-square-bar', ('Rho-square-bar for the null model', 'Rho-square-bar for the init. model'))}")
+#        print(f"Observaciones:          {g('Number of observations', ('Sample size',))}")
+#        parametros_ext = get_pandas_estimated_parameters(estimation_results=results_ext)
+#        print("\n📋 Parámetros estimados (Modelo Extendido):")
+#        print(parametros_ext)
+#    except Exception as e:
+#        print(f"❌ Error durante la estimación del modelo extendido: {e}")
+#    finally:
+#        os.chdir(original_cwd)
+#else:
+#        print("⚠️ No se encontró la base de datos 'biodb_ext'. Ejecuta la celda anterior para prepararla.")
+#
+```
+
+### Celda 1: Configuración de Ejecución Secuencial (Modelo Extendido)
+
+```{python}
+#|label: setup-sequential-run-extended
+
+# --- 1. CONFIGURACIÓN DE LA EJECUCIÓN (MODELO EXTENDIDO) ---
+PARTICIONES_A_PROCESAR_EXT = [
+    (2025, 17), 
+    (2025, 18)  
+]
+APPLY_SAMPLING_EXT = True
+SAMPLE_FRACTION_EXT = 0.5
+# Directorio base para los resultados
+BASE_OUTPUT_DIR_EXT = "model_outputs"
+
+print("--- Configuración de Ejecución Lista (Modelo Extendido) ---")
+print(f"Particiones a procesar: {PARTICIONES_A_PROCESAR_EXT}")
+print(f"Aplicar muestreo: {APPLY_SAMPLING_EXT}")
+if APPLY_SAMPLING_EXT:
+    print(f"Fracción de muestreo: {SAMPLE_FRACTION_EXT}")
+```
+
+### Celda 2: Estimación Secuencial del Modelo Extendido
+
+```{python}
+#|label: sequential-estimation-extended
+#|eval: false # Recuerda quitar esto si quieres ejecutar
+
+import biogeme.biogeme_logging as blog
+from biogeme.version import get_text as biogeme_version_text
+import biogeme.results_processing as br
+from biogeme.results_processing import get_pandas_estimated_parameters
+import pandas as pd
+import gc
+import time
+
+SEED = 42
+
+logger = blog.get_screen_logger(level=blog.INFO)
+logger.info(biogeme_version_text())
+
+# --- BUCLE DE PROCESAMIENTO SECUENCIAL (MODELO EXTENDIDO) ---
+print("--- Iniciando Proceso de Estimación Secuencial (Modelo Extendido) ---")
+
+for year, week in PARTICIONES_A_PROCESAR_EXT:
+    partition_label = f"{year}-W{week}"
+    print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} (Extendido) ---\n{'='*60}")
+
+    # a. Definir y crear directorio de salida único
+    output_dir_partition = os.path.join(BASE_OUTPUT_DIR_EXT, f"W{week}-extended-sample{int(SAMPLE_FRACTION_EXT*100)}pct") # Nombre carpeta con %
+    os.makedirs(output_dir_partition, exist_ok=True)
+    print(f"    Resultados se guardarán en: {output_dir_partition}")
+
+    # Definir variables para limpieza
+    lf_data, df_model_data, df_for_pandas, pandas_df, biodb, biogeme_model, results = (None,) * 7
+    try:
+        # b. Cargar datos
+        input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+        lf_data = pl.scan_parquet(input_path_glob)
+        print(f"    Cargando datos desde: {input_path_glob}")
+
+        # c. Preparar features (usando la función helper extendida)
+        #    Asegúrate que prepare_features_extended esté corregida (VAR_T_ESPERA_TRASBORDO_MIN)
+        lf_model_ready = prepare_features_extended(lf_data)
+        df_model_data = lf_model_ready.collect()
+
+        # d. Muestreo condicional
+        if APPLY_SAMPLING_EXT:
+            print(f"    Aplicando muestreo estratificado ({SAMPLE_FRACTION_EXT*100:.0f}%). Filas antes: {len(df_model_data):,}")
+            df_for_pandas = get_stratified_sample(df_model_data, SAMPLE_FRACTION_EXT, SEED)
+            print(f"    Filas después del muestreo: {len(df_for_pandas):,}")
+        else:
+            print("    Usando el dataset completo (sin muestreo - ¡RIESGO DE OOM!).")
+            df_for_pandas = df_model_data
+
+        pandas_df = df_for_pandas.to_pandas()
+
+        # e. Setup Biogeme (REDEFINIR Betas y Utilidad DENTRO del bucle)
+        print("    Definiendo especificación del modelo extendido...")
+        biodb = db.Database(f'db_ext_{partition_label}', pandas_df)
+
+        # Betas y Variables (se definen DENTRO del bucle con nombres únicos)
+        ASC_QR = Beta(f'ASC_QR_ext_{partition_label}', 0, None, None, 0)
+        B_PM_LAB = Beta(f'B_PM_LAB_ext_{partition_label}', 0, None, None, 0)
+        B_PT_LAB = Beta(f'B_PT_LAB_ext_{partition_label}', 0, None, None, 0)
+        B_LJ_LAB = Beta(f'B_LJ_LAB_ext_{partition_label}', 0, None, None, 0)
+        B_VIE_LAB = Beta(f'B_VIE_LAB_ext_{partition_label}', 0, None, None, 0)
+        B_T_VEHICULO = Beta(f'B_T_VEHICULO_ext_{partition_label}', 0, None, None, 0)
+        B_N_TRASBORDOS = Beta(f'B_N_TRASBORDOS_ext_{partition_label}', 0, None, None, 0)
+        B_T_CAMINATA = Beta(f'B_T_CAMINATA_ext_{partition_label}', 0, None, None, 0)
+        B_T_ESPERA_TRASB = Beta(f'B_T_ESPERA_TRASB_ext_{partition_label}', 0, None, None, 0)
+        B_T_ESPERA_INI = Beta(f'B_T_ESPERA_INI_ext_{partition_label}', 0, None, None, 0)
+        B_SOLO_METRO = Beta(f'B_SOLO_METRO_ext_{partition_label}', 0, None, None, 0)
+        B_METRO_BUS = Beta(f'B_METRO_BUS_ext_{partition_label}', 0, None, None, 0)
+
+        # Definir Variables usando los nombres de columna del DataFrame
+        V_QR = (ASC_QR + B_PM_LAB * Variable('DUMMY_PM_LAB') + B_PT_LAB * Variable('DUMMY_PT_LAB') +
+                B_LJ_LAB * Variable('DUMMY_LJ_LAB') + B_VIE_LAB * Variable('DUMMY_VIE_LAB') +
+                B_T_VEHICULO * Variable('VAR_T_VEHICULO_MIN') + B_N_TRASBORDOS * Variable('VAR_N_TRASBORDOS') +
+                B_T_CAMINATA * Variable('VAR_T_CAMINATA_MIN') + B_T_ESPERA_TRASB * Variable('VAR_T_ESPERA_TRASBORDO_MIN') +
+                B_T_ESPERA_INI * Variable('VAR_T_ESPERA_INICIAL_MIN') + B_SOLO_METRO * Variable('DUMMY_SOLO_METRO') +
+                B_METRO_BUS * Variable('DUMMY_METRO_BUS'))
+
+        V = {0: 0, 1: V_QR}
+        av = {0: 1, 1: 1}
+        logprob = models.loglogit(V, av, Variable('choice'))
+
+        # f. Estimar el modelo
+        model_name = f'logit_qr_bip_ext_{partition_label}' # Nombre base del archivo
+        biogeme_model = bio.BIOGEME(biodb, logprob) # Añadir paralelismo si quieres
+        biogeme_model.model_name = model_name
+        original_cwd = os.getcwd()
+        os.chdir(output_dir_partition)
+        print("    Estimando el modelo extendido...")
+        results = biogeme_model.estimate()
+        print("    ✅ Estimación completada!")
+
+        # g. Guardar resultados
+        params_df = br.get_pandas_estimated_parameters(estimation_results=results) # Usar br.
+        stats_dict = results.get_general_statistics()
+        params_df.to_csv(f'params_ext_{partition_label}.csv')
+        pd.DataFrame([stats_dict]).to_csv(f'stats_ext_{partition_label}.csv', index=False)
+        print(f"    📁 Resultados guardados en formato CSV y HTML.")
+
+        os.chdir(original_cwd)
+    except Exception as e:
+        print(f"    ❌ ERROR procesando {partition_label}: {e}")
+        if 'original_cwd' in locals() and os.getcwd() != original_cwd:
+            os.chdir(original_cwd)
+
+    finally:
+        # h. Limpieza de memoria
+        print("    Limpiando memoria de la partición...")
+        del lf_data, df_model_data, df_for_pandas, pandas_df, biodb, biogeme_model, results
+        gc.collect()
+        time.sleep(2)
+
+print(f"\n{'='*60}\n--- Proceso Finalizado (Modelo Extendido) ---\n{'='*60}")
+```
+
+## Resultados del Modelo Extendido
+
+A continuación, se presentan y analizan los resultados del modelo logit extendido, estimado sobre muestras estratificadas de las semanas 17 y 18 del año 2025.
+
+### Carga de Resultados
+
+Primero, cargamos los resultados previamente calculados para nuestras semanas de estudio.
+
+```{python}
+#| label: load-extended-results
+import pandas as pd
+import numpy as np
+import os
+
+# --- Configuración ---
+BASE_RESULTS_DIR = "model_outputs"
+
+# Semanas y configuraciones de muestreo
+PARTITIONS = ["2025-W17", "2025-W18"]
+SAMPLE_CONFIGS = {
+    "20%": "extended-sample20pct",
+    "50%": "extended-sample50pct"
+}
+
+# Diccionario para almacenar los resultados
+results_data = {}
+
+for partition in PARTITIONS:
+    year, week = partition.split("-W")
+    week_num = week
+    
+    results_data[partition] = {}
+    
+    for sample_label, folder_suffix in SAMPLE_CONFIGS.items():
+        folder_name = f"W{week_num}-{folder_suffix}"
+        results_folder = os.path.join(BASE_RESULTS_DIR, folder_name)
+        
+        params_file = os.path.join(results_folder, f"params_ext_{partition}.csv")
+        stats_file = os.path.join(results_folder, f"stats_ext_{partition}.csv")
+        
+        try:
+            df_params = pd.read_csv(params_file, index_col=0)
+            df_stats = pd.read_csv(stats_file)
+            
+            # Limpiar nombres de parámetros (remover sufijos de partición y normalizar)
+            # Primero remover sufijos de partición si existen
+            df_params['Name'] = df_params['Name'].str.replace(f'_ext_{partition}', '', regex=False)
+            # Remover sufijos _EXT o _ext al final
+            df_params['Name'] = df_params['Name'].str.replace('_EXT$', '', regex=True)
+            df_params['Name'] = df_params['Name'].str.replace('_ext$', '', regex=True)
+            # Normalizar nombres específicos (remover cualquier sufijo restante)
+            name_mapping = {
+                'ASC_QR_EXT': 'ASC_QR',
+                'ASC_QR_ext': 'ASC_QR',
+                'B_PM_LAB_EXT': 'B_PM_LAB',
+                'B_PM_LAB_ext': 'B_PM_LAB',
+                'B_PT_LAB_EXT': 'B_PT_LAB',
+                'B_PT_LAB_ext': 'B_PT_LAB',
+                'B_LJ_LAB_EXT': 'B_LJ_LAB',
+                'B_LJ_LAB_ext': 'B_LJ_LAB',
+                'B_VIE_LAB_EXT': 'B_VIE_LAB',
+                'B_VIE_LAB_ext': 'B_VIE_LAB',
+                'B_T_VEHICULO_ext': 'B_T_VEHICULO',
+                'B_N_TRASBORDOS_ext': 'B_N_TRASBORDOS',
+                'B_T_CAMINATA_ext': 'B_T_CAMINATA',
+                'B_T_ESPERA_TRASB_ext': 'B_T_ESPERA_TRASB',
+                'B_T_ESPERA_INI_ext': 'B_T_ESPERA_INI',
+                'B_SOLO_METRO_ext': 'B_SOLO_METRO',
+                'B_METRO_BUS_ext': 'B_METRO_BUS'
+            }
+            df_params['Name'] = df_params['Name'].replace(name_mapping)
+            df_params.index = df_params['Name']
+            
+            results_data[partition][sample_label] = {
+                'params': df_params,
+                'stats': df_stats
+            }
+            
+            print(f"✅ {partition} ({sample_label}): Cargado desde {results_folder}")
+            
+        except FileNotFoundError:
+            print(f"⚠️  {partition} ({sample_label}): No se encontraron archivos en {results_folder}")
+            results_data[partition][sample_label] = None
+        except Exception as e:
+            print(f"❌ {partition} ({sample_label}): Error al cargar - {e}")
+            results_data[partition][sample_label] = None
+
+print(f"\n✅ Carga de resultados completada para {len(PARTITIONS)} particiones.")
+```
+### Análisis de la Estimación
+
+#### Bondad de Ajuste
+
+La tabla siguiente resume las métricas de calidad del modelo extendido para ambas semanas y configuraciones de muestreo.
+
+```{python}
+#| label: display-extended-stats
+if 'results_data' in locals():
+    # Crear tabla consolidada de estadísticas
+    stats_rows = []
+    
+    for partition in PARTITIONS:
+        for sample_label in SAMPLE_CONFIGS.keys():
+            if results_data[partition][sample_label] is not None:
+                df_stats = results_data[partition][sample_label]['stats']
+                stats_row = {
+                    'Partición': partition,
+                    'Muestra': sample_label,
+                    'Observaciones': df_stats.iloc[0]['Sample size'] if 'Sample size' in df_stats.columns else None,
+                    'Log-Likelihood Final': df_stats.iloc[0]['Final log likelihood'] if 'Final log likelihood' in df_stats.columns else None,
+                    'Rho-cuadrado': df_stats.iloc[0]['Rho-square for the init. model'] if 'Rho-square for the init. model' in df_stats.columns else None,
+                    'Rho-cuadrado Ajustado': df_stats.iloc[0]['Rho-square-bar for the init. model'] if 'Rho-square-bar for the init. model' in df_stats.columns else None
+                }
+                stats_rows.append(stats_row)
+    
+    if stats_rows:
+        df_stats_display = pd.DataFrame(stats_rows)
+        
+        # Formatear valores
+        if 'Observaciones' in df_stats_display.columns:
+            df_stats_display['Observaciones'] = df_stats_display['Observaciones'].apply(
+                lambda x: f"{int(x):,}" if pd.notna(x) else "N/A"
+            )
+        if 'Log-Likelihood Final' in df_stats_display.columns:
+            df_stats_display['Log-Likelihood Final'] = df_stats_display['Log-Likelihood Final'].apply(
+                lambda x: f"{float(x):.2f}" if pd.notna(x) else "N/A"
+            )
+        if 'Rho-cuadrado' in df_stats_display.columns:
+            df_stats_display['Rho-cuadrado'] = df_stats_display['Rho-cuadrado'].apply(
+                lambda x: f"{float(x):.3f}" if pd.notna(x) else "N/A"
+            )
+        if 'Rho-cuadrado Ajustado' in df_stats_display.columns:
+            df_stats_display['Rho-cuadrado Ajustado'] = df_stats_display['Rho-cuadrado Ajustado'].apply(
+                lambda x: f"{float(x):.3f}" if pd.notna(x) else "N/A"
+            )
+        
+        print("Tabla 1: Estadísticas Generales del Modelo Extendido")
+        display(df_stats_display)
+    else:
+        print("⚠️ No se encontraron datos de estadísticas para mostrar.")
+else:
+    print("❌ No se han cargado los resultados. Ejecuta la celda anterior primero.")
+```
+
+#### Parámetros Estimados - Semana 2025-W17
+
+La siguiente tabla compara los parámetros estimados para la semana 2025-W17 usando muestras del 20% y 50%.
+
+```{python}
+#| label: display-params-w17
+if 'results_data' in locals() and '2025-W17' in results_data:
+    partition = '2025-W17'
+    
+    # Preparar datos para comparación
+    comparison_data = []
+    
+    if results_data[partition]['20%'] is not None and results_data[partition]['50%'] is not None:
+        params_20 = results_data[partition]['20%']['params']
+        params_50 = results_data[partition]['50%']['params']
+        
+        # Obtener nombres de parámetros únicos
+        all_params = set(params_20.index.tolist() + params_50.index.tolist())
+        
+        # Función helper para normalizar t-stats infinitos o muy grandes
+        def format_tstat(tstat_val):
+            if pd.isna(tstat_val) or tstat_val is None:
+                return None
+            try:
+                tstat_float = float(tstat_val)
+                # Si es muy grande (mayor a 1e10) o infinito, mostrar "N/A" o "Inf"
+                if abs(tstat_float) > 1e10 or not np.isfinite(tstat_float):
+                    return "N/A"
+                return tstat_float
+            except (ValueError, TypeError):
+                return None
+        
+        for param_name in sorted(all_params):
+            row = {'Parámetro': param_name}
+            
+            # Valores del 20%
+            if param_name in params_20.index:
+                row['Beta (20%)'] = params_20.loc[param_name, 'Value']
+                row['t-stat (20%)'] = format_tstat(params_20.loc[param_name, 'Robust t-stat.'])
+            else:
+                row['Beta (20%)'] = None
+                row['t-stat (20%)'] = None
+            
+            # Valores del 50%
+            if param_name in params_50.index:
+                row['Beta (50%)'] = params_50.loc[param_name, 'Value']
+                row['t-stat (50%)'] = format_tstat(params_50.loc[param_name, 'Robust t-stat.'])
+            else:
+                row['Beta (50%)'] = None
+                row['t-stat (50%)'] = None
+            
+            comparison_data.append(row)
+        
+        df_comparison_w17 = pd.DataFrame(comparison_data)
+        df_comparison_w17 = df_comparison_w17.set_index('Parámetro')
+        
+        print("Tabla 2: Parámetros Estimados del Modelo Extendido - Semana 2025-W17")
+        display(df_comparison_w17.style.format({
+            'Beta (20%)': '{:.4f}',
+            'Beta (50%)': '{:.4f}',
+            't-stat (20%)': lambda x: 'N/A' if x == 'N/A' or pd.isna(x) else f'{float(x):.1f}',
+            't-stat (50%)': lambda x: 'N/A' if x == 'N/A' or pd.isna(x) else f'{float(x):.1f}'
+        }).highlight_null(color='transparent'))
+    else:
+        print("⚠️ No se encontraron datos completos para la comparación de W17.")
+else:
+    print("❌ No se han cargado los resultados. Ejecuta la celda de carga primero.")
+```
+
+#### Parámetros Estimados - Semana 2025-W18
+
+La siguiente tabla compara los parámetros estimados para la semana 2025-W18 usando muestras del 20% y 50%.
+
+```{python}
+#| label: display-params-w18
+if 'results_data' in locals() and '2025-W18' in results_data:
+    partition = '2025-W18'
+    
+    # Preparar datos para comparación
+    comparison_data = []
+    
+    if results_data[partition]['20%'] is not None and results_data[partition]['50%'] is not None:
+        params_20 = results_data[partition]['20%']['params']
+        params_50 = results_data[partition]['50%']['params']
+        
+        # Obtener nombres de parámetros únicos
+        all_params = set(params_20.index.tolist() + params_50.index.tolist())
+        
+        # Función helper para normalizar t-stats infinitos o muy grandes
+        def format_tstat(tstat_val):
+            if pd.isna(tstat_val) or tstat_val is None:
+                return None
+            try:
+                tstat_float = float(tstat_val)
+                # Si es muy grande (mayor a 1e10) o infinito, mostrar "N/A"
+                if abs(tstat_float) > 1e10 or not np.isfinite(tstat_float):
+                    return "N/A"
+                return tstat_float
+            except (ValueError, TypeError):
+                return None
+        
+        for param_name in sorted(all_params):
+            row = {'Parámetro': param_name}
+            
+            # Valores del 20%
+            if param_name in params_20.index:
+                row['Beta (20%)'] = params_20.loc[param_name, 'Value']
+                row['t-stat (20%)'] = format_tstat(params_20.loc[param_name, 'Robust t-stat.'])
+            else:
+                row['Beta (20%)'] = None
+                row['t-stat (20%)'] = None
+            
+            # Valores del 50%
+            if param_name in params_50.index:
+                row['Beta (50%)'] = params_50.loc[param_name, 'Value']
+                row['t-stat (50%)'] = format_tstat(params_50.loc[param_name, 'Robust t-stat.'])
+            else:
+                row['Beta (50%)'] = None
+                row['t-stat (50%)'] = None
+            
+            comparison_data.append(row)
+        
+        df_comparison_w18 = pd.DataFrame(comparison_data)
+        df_comparison_w18 = df_comparison_w18.set_index('Parámetro')
+        
+        print("Tabla 3: Parámetros Estimados del Modelo Extendido - Semana 2025-W18")
+        display(df_comparison_w18.style.format({
+            'Beta (20%)': '{:.4f}',
+            'Beta (50%)': '{:.4f}',
+            't-stat (20%)': lambda x: 'N/A' if x == 'N/A' or pd.isna(x) else f'{float(x):.1f}',
+            't-stat (50%)': lambda x: 'N/A' if x == 'N/A' or pd.isna(x) else f'{float(x):.1f}'
+        }).highlight_null(color='transparent'))
+    else:
+        print("⚠️ No se encontraron datos completos para la comparación de W18.")
+else:
+    print("❌ No se han cargado los resultados. Ejecuta la celda de carga primero.")
+```
+
+### Validación de Muestreo Estratificado
+
+Para validar la eficiencia de usar una muestra en lugar del dataset completo, se estimó el mismo modelo extendido sobre muestras estratificadas del **20% y 50%**. El muestreo estratificado garantiza que la proporción de usuarios QR y Bip! en la muestra sea idéntica a la proporción en el dataset completo. Las tablas anteriores permiten comparar los resultados entre ambas configuraciones de muestreo.
+
+**Análisis de la Comparación:**
+
+1. **Bondad de Ajuste Consistente:** El **Rho-cuadrado ajustado** es prácticamente idéntico entre ambas configuraciones de muestreo para cada semana, demostrando que el muestreo estratificado al 20% captura el poder explicativo del modelo de manera equivalente al 50%.
+
+2. **Coeficientes Estables:** Los valores de los coeficientes (Betas) son extremadamente similares entre ambos modelos. Las pequeñas diferencias son despreciables y no alteran ninguna de las conclusiones.
+
+3. **Estadísticos t (Esperados):** Como es de esperar, los estadísticos t tienden a ser ligeramente menores en la muestra del 20% debido al mayor error estándar en muestras más pequeñas. Sin embargo, los valores siguen siendo altamente significativos, validando la robustez de los hallazgos.
+
+### Interpretación y Conclusiones
+
+Los resultados del modelo extendido nos permiten extraer conclusiones más profundas sobre el comportamiento de los usuarios, incorporando tanto factores temporales como atributos del viaje:
+
+#### Variables Temporales (Consistentes con el Modelo Baseline)
+
+1. **Preferencia Base por la Tarjeta Bip!**: El coeficiente de la constante (`ASC_QR`) es fuertemente negativo en ambas semanas, indicando una preferencia inherente por usar la tarjeta Bip! sobre el código QR en la situación de referencia.
+
+2. **El Efecto de la Rutina**: Los coeficientes para los días laborales fuera de punta (`B_LJ_LAB` y `B_VIE_LAB`) son negativos, sugiriendo que los viajeros habituales en sus trayectos cotidianos son más propensos a usar la tarjeta Bip!, probablemente por hábito e inercia.
+
+3. **El QR como Alternativa de Conveniencia**: Los coeficientes para las horas punta (`B_PM_LAB` y `B_PT_LAB`) son positivos y significativos, revelando que durante los períodos de mayor congestión, la probabilidad de usar QR aumenta considerablemente.
+
+#### Atributos del Viaje (Nuevos Hallazgos)
+
+::: {.callout-warning}
+# ⚠️ Interpretación con Precaución
+
+Las siguientes interpretaciones sobre atributos del viaje deben considerarse con precaución debido a la presencia de **transbordos fantasmas internos entre metro** en los datos. Los valores de número de trasbordos, tiempos de caminata y esperas pueden estar sesgados, lo que afecta la interpretación de sus coeficientes.
+:::
+
+4. **Tiempo en Vehículo**: El coeficiente `B_T_VEHICULO` es ligeramente positivo, indicando que viajes más largos aumentan la preferencia por QR. Esto podría sugerir que los usuarios valoran más la conveniencia del QR en viajes que requieren mayor tiempo de espera. **Nota:** Esta variable puede verse afectada por el problema de transbordos fantasmas.
+
+5. **Complejidad del Viaje**: Los coeficientes `B_N_TRASBORDOS`, `B_T_CAMINATA`, y `B_T_ESPERA_TRASBORDO` son negativos y significativos, mostrando que la complejidad del viaje (más trasbordos, más caminata, más esperas) reduce la preferencia por QR. Esto sugiere que los usuarios prefieren la familiaridad de la tarjeta Bip! en viajes complejos. **⚠️ Limitación:** Estos coeficientes pueden estar sesgados debido a transbordos fantasmas internos entre metro que inflan artificialmente el número de trasbordos y los tiempos asociados.
+
+6. **Tiempo de Espera Inicial**: El coeficiente `B_T_ESPERA_INI` es negativo aunque de menor magnitud, indicando una ligera penalización al QR cuando aumenta el tiempo de espera inicial. **Nota:** Esta variable no se ve directamente afectada por transbordos fantasmas, pero podría estar indirectamente relacionada si estos transbordos afectan la medición del tiempo inicial.
+
+7. **Modos de Transporte**: El coeficiente `B_METRO_BUS` es negativo y significativo, mostrando que viajes que combinan Metro y Bus reducen la preferencia por QR. Por otro lado, `B_SOLO_METRO` no está identificado (valor = 0), lo que podría indicar problemas de identificación o colinealidad. **⚠️ Limitación:** La clasificación de modos puede estar incorrecta cuando hay transbordos fantasmas internos entre metro que no se detectan correctamente, lo que afecta la precisión de estas variables dummy.
+
+#### Diferencias entre Semanas
+
+8. **Evolución Temporal**: La semana W18 muestra una menor magnitud negativa en `ASC_QR` comparada con W17, sugiriendo una mayor preferencia base por QR en la semana más reciente. Esto podría indicar una tendencia de adopción creciente del QR a lo largo del tiempo.
+
+En resumen, el modelo extendido confirma y amplía los hallazgos del modelo baseline: la **tarjeta Bip! domina por hábito** en los viajes regulares y simples, mientras que el **código QR se posiciona como una herramienta de conveniencia** valorada en situaciones de mayor demanda temporal y para viajes más largos, pero menos preferida en viajes complejos que involucran múltiples trasbordos y modos de transporte.
+
+### Consolidación de Resultados del Modelo Extendido{.visually-hidden}
+
+``` {python}
+#| label: consolidate-extended-results
+#| eval: false
+import pandas as pd
+import glob
+import os
+
+print("📊 Consolidando resultados del modelo extendido...")
+
+# Directorio base donde se guardaron los resultados
+BASE_DIR = "model_outputs"
+
+# Buscar todos los archivos de parámetros
+param_files = glob.glob(f"{BASE_DIR}/**/params*.csv", recursive=True)
+
+if param_files:
+    all_params = []
+    
+    for f in param_files:
+        # Extraer información de la partición del nombre del archivo y ruta
+        # Formato esperado: model_outputs/W17-extended-0.2/params_ext_2025-W17.csv
+        try:
+            # Leer el archivo
+            df = pd.read_csv(f)
+            
+            # Extraer la partición del nombre del archivo
+            filename = os.path.basename(f)
+            # Formato: params_ext_2025-W17.csv -> 2025-W17
+            partition = filename.replace('params_', '').replace('.csv', '')
+            
+            # Extraer el directorio para distinguir configuraciones
+            dir_name = os.path.basename(os.path.dirname(f))
+            
+            # Crear un identificador único que incluya el directorio
+            partition_full = f"{partition} ({dir_name})"
+            
+            # Agregar columna de partición
+            df['partition'] = partition_full
+            all_params.append(df)
+            print(f"✅ Procesado: {filename} (partición: {partition_full})")
+        except Exception as e:
+            print(f"❌ Error procesando {f}: {e}")
+    
+    if all_params:
+        # Consolidar todos los parámetros
+        df_consolidated_params = pd.concat(all_params, ignore_index=True)
+        
+        print(f"\n✅ Datos consolidados:")
+        print(f"   - Total de parámetros: {len(df_consolidated_params)} filas")
+        print(f"   - Particiones procesadas: {df_consolidated_params['partition'].nunique()}")
+        print(f"   - Parámetros únicos: {df_consolidated_params['Name'].nunique()}")
+        
+        # Verificar duplicados
+        duplicates = df_consolidated_params[df_consolidated_params.duplicated(subset=['partition', 'Name'], keep=False)]
+        if not duplicates.empty:
+            print(f"\n⚠️  Advertencia: Se encontraron {len(duplicates)} entradas duplicadas (misma partición + parámetro)")
+            print("   Removiendo duplicados...")
+            df_consolidated_params = df_consolidated_params.drop_duplicates(subset=['partition', 'Name'], keep='first')
+        
+        # Mostrar resumen
+        print("\n--- Resumen por Partición ---")
+        summary = df_consolidated_params.groupby('partition').agg({
+            'Name': 'count'
+        }).rename(columns={'Name': 'num_params'})
+        print(summary)
+        
+        # Crear pivote para facilitar la visualización (solo si no hay duplicados)
+        try:
+            df_pivot = df_consolidated_params.pivot(
+                index='partition',
+                columns='Name',
+                values='Value'
+            )
+            
+            print("\n--- Parámetros por Partición ---")
+            print(df_pivot)
+        except ValueError as e:
+            print(f"\n❌ Error al crear pivote: {e}")
+            print("   Intenta revisar si hay duplicados en la combinación partition+Name")
+        
+    else:
+        print("❌ No se encontraron archivos de parámetros para consolidar.")
+        df_consolidated_params = None
+else:
+    print("❌ No se encontraron archivos params_ext_*.csv en el directorio model_outputs")
+    df_consolidated_params = None
+
+```
+
+```{python}
+#| label: 6-plot-coefficients
+#| eval: false
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+
+# --- 1. CONFIGURATION ---
+# Select the partition you want to visualize
+# Note: partition format is now "YYYY-WXX (directory_name)"
+PARTITION_TO_PLOT = '2025-W17 (W17-baseline)' # Or any other partition from df_consolidated_params
+CONFIDENCE_LEVEL = 0.95 # For 95% confidence intervals
+Z_SCORE = 1.96 # Z-score for 95% confidence
+
+print(f"Generating coefficient plot for partition: {PARTITION_TO_PLOT}")
+
+if 'df_consolidated_params' in locals():
+    # --- 2. PREPARE DATA for the selected partition ---
+    df_plot = df_consolidated_params[df_consolidated_params['partition'] == PARTITION_TO_PLOT].copy()
+
+    # Calculate confidence interval bounds
+    # Ensure Robust std err. is numeric
+    df_plot['Robust std err.'] = pd.to_numeric(df_plot['Robust std err.'], errors='coerce')
+    df_plot = df_plot.dropna(subset=['Value', 'Robust std err.']) # Drop if std err is missing/invalid
+
+    # Calculate the error margin (half the width of the CI)
+    df_plot['error_margin'] = Z_SCORE * df_plot['Robust std err.']
+    df_plot['ci_lower'] = df_plot['Value'] - df_plot['error_margin']
+    df_plot['ci_upper'] = df_plot['Value'] + df_plot['error_margin']
+
+    # Sort parameters for consistent plotting order (optional, alphabetical here)
+    df_plot = df_plot.sort_values('Name', ascending=False)
+
+    if not df_plot.empty:
+        # --- 3. CREATE THE PLOT ---
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        # Create the error bars (whiskers)
+        # Use error_margin directly for symmetrical error bars around the Value point
+        ax.errorbar(
+            x=df_plot['Value'],
+            y=df_plot['Name'],
+            xerr=df_plot['error_margin'],
+            fmt='o', # 'o' means plot the points as well
+            color='darkblue',
+            capsize=5, # Adds caps to the error bars
+            linestyle='None', # Don't connect the points with a line
+            label=f'{CONFIDENCE_LEVEL*100:.0f}% Confidence Interval'
+        )
+
+        # Add a vertical line at x=0 for reference (significance)
+        ax.axvline(x=0, color='red', linestyle='--', linewidth=0.8, label='Zero (No Effect)')
+
+        # --- 4. CUSTOMIZE APPEARANCE ---
+        ax.set_title(f'Coeficientes del Modelo Logit (Partición: {PARTITION_TO_PLOT})', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Valor Estimado del Coeficiente (Beta)')
+        ax.set_ylabel('Parámetro')
+        ax.grid(axis='x', linestyle='--', alpha=0.6)
+        ax.legend()
+
+        plt.tight_layout()
+        plt.show()
+
+    else:
+        print(f"❌ No se encontraron datos válidos para la partición {PARTITION_TO_PLOT} o errores estándar inválidos.")
+
+else:
+    print("❌ DataFrame 'df_consolidated_params' no encontrado. Ejecuta la celda de consolidación primero.")
+```
+
+
+

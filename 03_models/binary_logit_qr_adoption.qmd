@@ -1,0 +1,1468 @@
+---
+title: "EDA y Modelo Logit Binario - Adopción QR vs Bip"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: auto
+---
+
+::: {.callout-note}
+# Navegación Rápida
+
+En caso de querer leer solo la definición del modelo y los resultados, puede saltar directamente a las secciones de [Definición del Modelo Logit](#definición-del-modelo-logit) y [Resultados del Modelo Baseline](#resultados-del-modelo-baseline-semana-2025-w17).
+:::
+
+# Objetivo
+
+Este notebook tiene como objetivo:
+
+1. Realizar un análisis exploratorio de las variables relevantes para modelar la elección entre pago con QR y Tarjeta Bip!.
+
+2. Preparar los datos de una partición semanal para la estimación.
+
+3. Estimar un modelo Logit Binario simple usando `biogeme` para identificar factores asociados a la elección del método de pago (QR vs Bip), enfocándose en variables temporales (hora punta, día de la semana).
+
+4. Analizar e interpretar los resultados del modelo.
+
+---
+
+::: {.callout-warning}
+# Alcance del Análisis
+
+Para desarrollar y validar el modelo de forma controlada, este análisis se centra en una **única semana representativa: la Semana 17 del año 2025**. El objetivo es consolidar un modelo robusto en este subconjunto de datos antes de escalar el análisis. Una vez que el modelo esté validado, se explorarán estrategias (como el muestreo estratificado) para integrar eficientemente el resto de las particiones semanales sin incurrir en costos computacionales prohibitivos o problemas de memoria.
+:::
+
+### Setup e Importación de Librerías
+
+```{python}
+#|label: setup-and-imports
+import os
+import sys
+import polars as pl
+import gcsfs
+import pyarrow.fs as pafs
+import pyarrow.dataset as ds
+from datetime import date
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Importar biogeme
+import biogeme.database as db
+import biogeme.biogeme as bio
+from biogeme import models
+from biogeme.expressions import Beta, Variable
+
+
+# --- Autenticación GCS ---
+# (Puedes copiar tu función enable_adc_crossplatform aquí o importarla si está en lib)
+def enable_adc_crossplatform():
+    """Configura credenciales de Google Cloud para acceso a GCS"""
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return
+    if sys.platform.startswith("win"):
+        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
+    else:
+        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+    if not os.path.exists(adc_path):
+        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
+
+try:
+    enable_adc_crossplatform()
+    gfs = gcsfs.GCSFileSystem(token="google_default")
+    fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
+    print("✅ Conexión con GCS establecida.")
+except FileNotFoundError as e:
+    print(f"❌ Error de autenticación: {e}")
+
+# --- Parámetros ---
+GCS_BUCKET = "tesis-vonetto-datalake"
+SILVER_PATH = f"gs://{GCS_BUCKET}/lake/silver"
+# Usaremos 'viajes_limpios' como base, ya que contiene todos los viajes válidos
+INPUT_DATASET_PATH = f"{SILVER_PATH}/viajes_filtrados"
+
+# --- Partición para Análisis Inicial ---
+# Elige una partición representativa
+YEAR_ANALISIS = 2025 
+WEEK_ANALISIS = 17
+PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
+
+print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
+```
+
+
+
+```{python}
+#|label: helper-functions
+#|include: false
+
+# --- Constantes del Modelo ---
+HORAS_PUNTA_MANANA = [7, 8]
+HORAS_PUNTA_TARDE = [18, 19]
+
+# --- Helper para Feature Engineering (Modelo Simple) ---
+
+def prepare_features(lazy_frame):
+    lf_prep = lazy_frame.select(
+        "is_qr", "tiempo_inicio_viaje", "tipodia"
+    ).with_columns([
+        pl.col("is_qr").cast(pl.Int8).alias("choice"),
+        pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
+    ]).with_columns([
+        pl.col("ts_local").dt.hour().alias("hora"),
+        pl.col("ts_local").dt.weekday().alias("dia_semana"),
+        (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+    ]).with_columns([
+        pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+        (pl.col("dia_semana") == 5).alias("es_viernes"),
+        pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
+    ]).with_columns([
+        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+        (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+        (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+    ])
+    cols_modelo = ["choice", "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+    return lf_prep.select(cols_modelo)
+
+# --- Helper para Muestreo Estratificado ---
+
+def get_stratified_sample(df, fraction, seed):
+    total_rows = len(df)
+    target_rows = int(total_rows * fraction)
+    counts = df.group_by("choice").agg(pl.len().alias("count")).sort("choice")
+    bip_count = counts.filter(pl.col("choice") == 0)["count"][0] if len(counts.filter(pl.col("choice") == 0)) > 0 else 0
+    qr_count = counts.filter(pl.col("choice") == 1)["count"][0] if len(counts.filter(pl.col("choice") == 1)) > 0 else 0
+    total_original = bip_count + qr_count
+    if total_original == 0:
+        return df
+    bip_proportion = bip_count / total_original
+    qr_proportion = qr_count / total_original
+    target_bip = int(target_rows * bip_proportion)
+    target_qr = int(target_rows * qr_proportion)
+    actual_total = target_bip + target_qr
+    if actual_total < target_rows and qr_count > 0:
+        target_qr += (target_rows - actual_total)
+    elif actual_total < target_rows and bip_count > 0:
+        target_bip += (target_rows - actual_total)
+    samples = []
+    if target_bip > 0 and bip_count > 0:
+        df_sample_bip = df.filter(pl.col("choice") == 0).sample(
+            n=min(target_bip, bip_count), shuffle=True, seed=seed
+        )
+        samples.append(df_sample_bip)
+    if target_qr > 0 and qr_count > 0:
+        df_sample_qr = df.filter(pl.col("choice") == 1).sample(
+            n=min(target_qr, qr_count), shuffle=True, seed=seed
+        )
+        samples.append(df_sample_qr)
+    if samples:
+        df_model_sample = pl.concat(samples).sample(fraction=1.0, shuffle=True, seed=seed)
+        return df_model_sample
+    else:
+        return df
+print("✅ Funciones de ayuda `prepare_features` y `get_stratified_sample` definidas.")
+
+  # --- Helper para Feature Engineering (Modelo Extendido) ---
+def prepare_features_extended(lazy_frame):
+        cols_necesarias = [
+             "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
+             "tiempo_vehiculo_seg", "te0", 
+             "tc1", "tc2", "tc3",
+             "te1", "te2", "te3",
+             "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
+         ]
+        
+        # 1. Crear variables base y dummies temporales
+        lf_prep_ext = lazy_frame.select(cols_necesarias).with_columns([
+            pl.col("is_qr").cast(pl.Int8).alias("choice"),
+            pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias(
+      "ts_local"),
+        ]).with_columns([
+            pl.col("ts_local").dt.hour().alias("hora"),
+            pl.col("ts_local").dt.weekday().alias("dia_semana"),
+            (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+        ]).with_columns([
+            pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+            pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+            (pl.col("dia_semana") == 5).alias("es_viernes"),
+            pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
+        ]).with_columns([
+            (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+            (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+            (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+            (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+        ])
+    
+        # 2. Ingeniería de variables de viaje
+        lf_prep_ext = lf_prep_ext.with_columns([
+            (pl.col("tiempo_vehiculo_seg") / 60).alias("VAR_T_VEHICULO_MIN"),
+            (pl.col("n_etapas") - 1).alias("VAR_N_TRASBORDOS"),
+            ((pl.col("tc1").fill_null(0) + pl.col("tc2").fill_null(0) + pl.col("tc3").fill_null(0)) / 60).alias(
+      "VAR_T_CAMINATA_MIN"),
+            ((pl.col("te1").fill_null(0) + pl.col("te2").fill_null(0) + pl.col("te3").fill_null(0)) / 60).alias(
+      "VAR_T_ESPERA_TRASBORDO_MIN"),
+            (pl.col("te0") / 60).alias("VAR_T_ESPERA_INICIAL_MIN"),
+        ])
+    
+        # 3. Dummies de modo de transporte
+        cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
+        for col in cols_modos:
+            lf_prep_ext = lf_prep_ext.with_columns([
+                pl.when(pl.col(col).cast(pl.Utf8) == '4').then(pl.lit('2'))
+                  .when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))
+                  .otherwise(pl.col(col).cast(pl.Utf8))
+                  .alias(col)
+            ])
+        
+        lf_prep_ext = lf_prep_ext.with_columns([
+            pl.any_horizontal([pl.col(c) == '1' for c in cols_modos]).alias("usa_bus"),
+            pl.any_horizontal([pl.col(c) == '2' for c in cols_modos]).alias("usa_metro"),
+        ]).with_columns([
+            (pl.col("usa_metro") & ~pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+            (pl.col("usa_metro") & pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+        ])
+    
+        # 4. Seleccionar columnas finales
+        cols_modelo_ext = [
+            "choice", "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB",
+            "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS", "VAR_T_CAMINATA_MIN",
+            "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN",
+            "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS"
+        ]
+        
+        return lf_prep_ext.select(cols_modelo_ext).fill_null(0)
+    
+        print("✅ Función de ayuda `prepare_features_extended` definida.")
+```
+
+### Carga de Datos (Una Partición para Análisis)
+
+```{python}
+#|label: load-data
+print(f"Cargando partición {PARTITION_LABEL} desde {INPUT_DATASET_PATH}...")
+
+partition_path_glob = f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
+
+try:
+    # Usamos scan_parquet para cargar de forma perezosa (LazyFrame)
+    lf_data = pl.scan_parquet(partition_path_glob)
+
+    # Verificamos el esquema y contamos filas (esto sí ejecuta parte de la query)
+    schema = lf_data.collect_schema()
+    n_rows = lf_data.select(pl.len()).collect().item()
+
+    print(f"✅ Partición cargada (LazyFrame): {n_rows:,} filas.")
+    print(f"   Columnas disponibles: {len(schema.names())}")
+    # Mostramos algunas columnas relevantes para confirmar
+    relevant_cols = ["is_qr", "tiempo_inicio_viaje", "tipodia"]
+    print(f"   Columnas clave presentes: {[c for c in relevant_cols if c in schema.names()]}")
+
+except Exception as e:
+    print(f"❌ Error al cargar la partición: {e}")
+    print(f"   Verifica que la ruta y partición existan: {partition_path_glob}")
+    lf_data = None
+```
+
+### Exploración de las variables relevantes
+
+```{python}
+#|label: explore-variables
+
+if lf_data is not None:
+    print("\n🔍 Exploramos las variables relevantes")
+    
+    # 1. Información básica del dataset
+    print(f"\n📊 Información del dataset:")
+    print(f"   - Filas: {lf_data.select(pl.len()).collect().item():,}")
+    print(f"   - Columnas: {len(lf_data.collect_schema().names())}")
+    
+    # 2. Ver el plan de ejecución optimizado
+    print(f"\n⚡ Plan de ejecución optimizado:")
+    print(lf_data.explain(optimized=True))
+    
+    # 3. Explorar variables clave para el modelo
+    print(f"\n🎯 Variables clave para el modelo Logit:")
+    
+    # Variable dependiente: is_qr
+    if "is_qr" in lf_data.collect_schema().names():
+        qr_stats = lf_data.select([
+            pl.col("is_qr").sum().alias("qr_count"),
+            pl.len().alias("total_count"),
+            (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage")
+        ]).collect()
+        
+        print(f"   📱 Adopción QR:")
+        print(f"      - Viajes con QR: {qr_stats['qr_count'][0]:,}")
+        print(f"      - Total viajes: {qr_stats['total_count'][0]:,}")
+        print(f"      - % QR: {qr_stats['qr_percentage'][0]:.2f}%")
+    
+    # Variables temporales
+    temporal_vars = ["tiempo_inicio_viaje", "tipodia", "hora_punta"]
+    available_temporal = [var for var in temporal_vars if var in lf_data.collect_schema().names()]
+    
+    if available_temporal:
+        print(f"\n⏰ Variables temporales disponibles: {available_temporal}")
+        
+        # Estadísticas por tipo de día
+        if "tipodia" in available_temporal:
+            tipodia_stats = lf_data.group_by("tipodia").agg([
+                pl.len().alias("count"),
+                pl.col("is_qr").sum().alias("qr_count"),
+                (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage")
+            ]).sort("count", descending=True).collect()
+            
+            print(f"\n   📅 Distribución por tipo de día:")
+            for row in tipodia_stats.iter_rows(named=True):
+                print(f"      - {row['tipodia']}: {row['count']:,} viajes ({row['qr_percentage']:.1f}% QR)")
+        
+        # Estadísticas por hora punta
+        if "hora_punta" in available_temporal:
+            hora_punta_stats = lf_data.group_by("hora_punta").agg([
+                pl.len().alias("count"),
+                pl.col("is_qr").sum().alias("qr_count"),
+                (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage")
+            ]).sort("count", descending=True).collect()
+            
+            print(f"\n   🚌 Distribución por hora punta:")
+            for row in hora_punta_stats.iter_rows(named=True):
+                print(f"      - {'Hora Punta' if row['hora_punta'] else 'Fuera Punta'}: {row['count']:,} viajes ({row['qr_percentage']:.1f}% QR)")
+    
+    # 4. Muestra de datos para inspección
+    print(f"\n📋 Muestra de datos (primeras 5 filas):")
+    sample_cols = ["is_qr", "tiempo_inicio_viaje", "tipodia", "hora_punta"]
+    available_sample_cols = [col for col in sample_cols if col in lf_data.collect_schema().names()]
+    
+    if available_sample_cols:
+        sample_data = lf_data.select(available_sample_cols).head(5).collect()
+        print(sample_data)
+    else:
+        print("   No se encontraron las columnas esperadas para la muestra")
+    
+    
+    
+    # 5. Distribución de las horas de inicio de viaje
+    print(f"\n📊 Distribución de las horas de inicio de viaje:")
+    hora_stats = lf_data.with_columns([
+        pl.col("tiempo_inicio_viaje").dt.hour().alias("hora_inicio")
+    ]).group_by("hora_inicio").agg([
+        pl.len().alias("count"),
+        pl.col("is_qr").sum().alias("qr_count"),
+        (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage")
+    ]).sort("hora_inicio").collect()
+    
+    print(hora_stats)
+
+    # 6. Distribución de los tipodia de los viajes
+    print(f"\n📊 Distribución de los tipodia de los viajes:")
+    tipodia_stats = lf_data.group_by("tipodia").agg([
+        pl.len().alias("count"),
+        pl.col("is_qr").sum().alias("qr_count"),
+        (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage")
+    ]).sort("tipodia").collect()
+    
+    # Mapear valores numéricos a nombres descriptivos
+    tipodia_labels = {0: "Laboral", 1: "Sábado", 2: "Domingo"}
+    
+    print("   Tipo de día | Viajes | QR Count | % QR")
+    print("   " + "-" * 40)
+    for row in tipodia_stats.iter_rows(named=True):
+        tipo_label = tipodia_labels.get(row['tipodia'], f"Tipo {row['tipodia']}")
+        print(f"   {tipo_label:10} | {row['count']:6,} | {row['qr_count']:8,} | {row['qr_percentage']:5.1f}%")
+    
+    # 7. Información del esquema completo
+    print(f"\n📝 Esquema completo del dataset:")
+    schema_info = lf_data.collect_schema()
+    for i, (col_name, col_type) in enumerate(schema_info.items()):
+        if i < 10:  # Mostrar solo las primeras 10 columnas
+            print(f"   {i+1:2d}. {col_name}: {col_type}")
+        elif i == 10:
+            print(f"   ... y {len(schema_info) - 10} columnas más")
+            break
+
+    
+```
+Vemos que tipodia puede tomar 3 valores, donde 0: Laboral, 1: Sábado, 2: Domingo.
+
+### Preparación de Datos para el Modelo Logit{.visually-hidden}
+
+``` {python}
+#|include: false
+#|label: prepare-model-data
+
+if lf_data is not None:
+    print("🔧 Preparando variables para el modelo Biogeme...")
+
+    # Definir rangos horarios para puntas (ajusta si es necesario)
+
+    # Ejemplo: 7:00-8:59 AM y 18:00-19:59 PM
+    HORAS_PUNTA_MANANA = [7, 8]
+    HORAS_PUNTA_TARDE = [18, 19]
+    
+    # 1. Seleccionar columnas iniciales y crear variable 'choice'
+    lf_prep = lf_data.select([
+        "is_qr", "tiempo_inicio_viaje", "tipodia"
+    ]).with_columns([
+        pl.col("is_qr").cast(pl.Int8).alias("choice"), # 1=QR, 0=Bip
+        pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"), # Usar zona horaria
+    ])
+    
+    # 2. Extraer hora y día de la semana
+    lf_prep = lf_prep.with_columns([
+        pl.col("ts_local").dt.hour().alias("hora"),
+        pl.col("ts_local").dt.weekday().alias("dia_semana"), # Polars: Lunes=1, ..., Domingo=7
+        (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral") # Cast tipodia to Int8 before comparing# Basado en tu EDA: 0 = Laboral
+    ])
+    
+    # 3. Crear variables intermedias para dummies
+    lf_prep = lf_prep.with_columns([
+        pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+        (pl.col("dia_semana") == 5).alias("es_viernes"), # Viernes=5
+        pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue") # Lunes=1 a Jueves=4
+    ])
+    
+    # 4. Crear las dummies finales (casteadas a Int8 para Biogeme)
+    lf_prep = lf_prep.with_columns([
+        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+        (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+        (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB")
+    ])
+    
+    # 5. Seleccionar solo las columnas necesarias para el modelo
+    cols_modelo = ["choice", "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+    lf_model_ready = lf_prep.select(cols_modelo)
+    
+    # 6. Ejecutar la consulta (collect) para materializar los datos de esta partición
+    print(f"⚙️  Calculando variables y cargando datos en memoria para la partición {PARTITION_LABEL}...")
+    try:
+        df_model_data = lf_model_ready.collect()
+        print(f"✅ Datos listos: {len(df_model_data):,} filas, {len(df_model_data.columns)} columnas.")
+        
+        # 7. Convertir a Pandas DataFrame para Biogeme
+        print(" Convirtiendo a Pandas DataFrame...")
+        pandas_df = df_model_data.to_pandas()
+        
+        # 8. Crear la base de datos Biogeme
+        print("Creando base de datos Biogeme...")
+        biodb = db.Database('viajes_qr_bip', pandas_df)
+        print("✅ Base de datos Biogeme 'biodb' creada y lista para usar.")
+        
+        # Mostrar una muestra para verificar
+        print("\nMuestra de datos para Biogeme (primeras 10 filas):")
+        print(pandas_df.head(10))
+        
+        
+    except Exception as e:
+        print(f"❌ Error durante la preparación de datos: {e}")
+        biodb = None
+        pandas_df = None
+
+else:
+    print("⚠️ No hay datos cargados (`lf_data`) para preparar.")
+    biodb = None
+    pandas_df = None
+```
+
+### Definición del Modelo Logit
+
+En esta celda, definimos la teoría del modelo: los parámetros $\beta$ (Betas) que queremos estimar y las ecuaciones de utilidad ($V$) que representan la preferencia por cada alternativa.
+
+#### Variables y Parámetros
+
+El modelo utiliza las siguientes variables y parámetros:
+
+*   **$V_{QR}$**: Utilidad de elegir pago con QR.
+*   **$V_{Bip}$**: Utilidad de elegir pago con Tarjeta Bip!.
+*   **$ASC_{QR}$**: Constante Específica de la Alternativa QR. Captura la preferencia intrínseca por el QR en comparación con la Tarjeta Bip! (que se normaliza a 0).
+*   **$\beta_{PM}$**: Coeficiente para la variable `DUMMY_PM_LAB` (efecto de la punta mañana).
+*   **$\beta_{PT}$**: Coeficiente para la variable `DUMMY_PT_LAB` (efecto de la punta tarde).
+*   **$\beta_{LJ}$**: Coeficiente para la variable `DUMMY_LJ_LAB` (efecto de Lunes a Jueves).
+*   **$\beta_{VIE}$**: Coeficiente para la variable `DUMMY_VIE_LAB` (efecto de Viernes).
+
+#### Ecuaciones de Utilidad
+
+Para poder identificar el modelo, la utilidad de una de las alternativas se normaliza a cero. En este caso, la utilidad de la Tarjeta Bip! se establece como la base:
+
+$V_{Bip} = 0$
+
+La utilidad de elegir QR se modela como una función lineal de las variables explicativas:
+
+$V_{QR} = ASC_{QR} + \beta_{PM} \cdot DUMMY\_PM\_LAB + \beta_{PT} \cdot DUMMY\_PT\_LAB + \beta_{LJ} \cdot DUMMY\_LJ\_LAB + \beta_{VIE} \cdot DUMMY\_VIE\_LAB$
+
+La probabilidad de que un individuo elija QR se calcula entonces mediante la fórmula del Logit:
+
+$P(QR) = \frac{e^{V_{QR}}}{e^{V_{Bip}} + e^{V_{QR}}} = \frac{e^{V_{QR}}}{1 + e^{V_{QR}}}$
+
+A continuación, se implementa esta especificación en Biogeme.
+
+```{python}
+#| label: define-logit-model
+
+if 'biodb' in locals() and biodb is not None:
+    print("Especificando el modelo Logit Binario en Biogeme...")
+
+    # 1. Definir las Variables de Biogeme a partir de las columnas del DataFrame
+    #    (Asegúrate de que los nombres coincidan EXACTAMENTE con las columnas de pandas_df)
+    print("   Definiendo variables...")
+    PM_LAB = Variable('DUMMY_PM_LAB')
+    PT_LAB = Variable('DUMMY_PT_LAB')
+    LJ_LAB = Variable('DUMMY_LJ_LAB')
+    VIE_LAB = Variable('DUMMY_VIE_LAB')
+
+    CHOICE = Variable('choice') # La variable dependiente
+
+
+    # 2. Definir los Parámetros (Betas) a estimar
+    print("   Definiendo parámetros (Betas)...")
+    # (Nombre, Valor Inicial, Límite Inf, Límite Sup, Fijo=0 -> Estimar)
+    # --- 2. Definir los PARÁMETROS (Betas a estimar) ---
+    ASC_QR = Beta('ASC_QR', 0, None, None, 0) # Constante para QR
+    B_PM_LAB = Beta('B_PM_LAB', 0, None, None, 0) # Hora punta mañana laboral
+    B_PT_LAB = Beta('B_PT_LAB', 0, None, None, 0) # Hora punta tarde laboral
+    B_LJ_LAB = Beta('B_LJ_LAB', 0, None, None, 0) # Lunes a Jueves laboral
+    B_VIE_LAB = Beta('B_VIE_LAB', 0, None, None, 0) # Viernes laboral
+
+    # --- 3. Formular las Funciones de Utilidad (V) ---
+    # Normalizamos la utilidad de Bip! (choice=0) a cero
+    print("   Definiendo funciones de utilidad...")
+    V_BIP = 0
+    
+    # Alternativa 1: Pago QR
+    V_QR = ASC_QR + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB
+
+    # 4. Asociar cada función de utilidad con su ID en la columna 'CHOICE'
+    print("   Asociando funciones de utilidad con ID de elección...")
+    V = {
+        0: V_BIP, # Utilidad para la elección 0 (Bip!)
+        1: V_QR   # Utilidad para la elección 1 (QR)
+    }
+    
+    # Definir la disponibilidad (ambas opciones siempre están disponibles)
+    print("   Definiendo disponibilidad...")
+    av = {
+        0: 1, # Bip! siempre disponible
+        1: 1 # QR siempre disponible
+    }
+
+    print("✅ Funciones de utilidad y parámetros listos.")
+
+```
+
+### Estimación del Modelo Logit{.visually-hidden}
+
+```{python}
+#|include: false
+#| label: estimate-logit-model
+
+#import biogeme.biogeme_logging as blog  # <--- CORRECTO: módulo de logging de Biogeme
+#from biogeme.version import get_text as biogeme_version_text
+#import biogeme.results_processing as br
+#from biogeme.results_processing import get_pandas_estimated_parameters
+#import pandas as pd
+#
+#
+##Logger a pantalla (INFO por defecto es suficiente)
+#logger = blog.get_screen_logger(level=blog.INFO)
+#logger.info(biogeme_version_text())
+#
+#if 'biodb' in locals() and biodb is not None:
+#    print(f"🚀 Iniciando estimación del modelo para la partición {PARTITION_LABEL}...")
+#
+#    logprob = models.loglogit(V, av, CHOICE)
+#
+#    # --- 2. DEFINIR Y CREAR CARPETA DE SALIDA ---
+#    OUTPUT_DIR = "model_outputs"
+#    os.makedirs(OUTPUT_DIR, exist_ok=True) # Crea la carpeta si no existe
+#
+#    # --- 3. CREAR EL NOMBRE DEL MODELO SIN LA RUTA ---
+#    model_name = f'logit_qr_bip_{PARTITION_LABEL}'
+#   
+#   #Crear el objeto Biogeme
+#    print("   Creando objeto Biogeme...")
+#    biogeme_model = bio.BIOGEME(
+#        biodb, 
+#        logprob
+#    )
+##
+#    # --- 4. ASIGNAR EL NOMBRE DEL MODELO ---
+#    biogeme_model.model_name = model_name
+##    
+#    # --- 5. CAMBIAR AL DIRECTORIO DE SALIDA ANTES DE ESTIMAR ---
+#    original_cwd = os.getcwd()
+#    os.chdir(OUTPUT_DIR)
+##    
+#    print(f"   OK. Archivos de salida se guardarán en: ./{OUTPUT_DIR}/")
+##
+##    # Estimar el modelo
+#    print("   Estimando el modelo...")
+#    try:
+#        results = biogeme_model.estimate()
+#        print("\n✅ Estimación completada!")
+#        estimation_results = results
+#
+#        # --- Guardar resultados en formato estructurado ---
+#        params_df = get_pandas_estimated_parameters(estimation_results=results)
+#        stats_dict = results.get_general_statistics()
+#
+#        # Guardar parámetros y estadísticas en CSV
+#        params_df.to_csv(f'params_{PARTITION_LABEL}.csv')
+#        pd.DataFrame([stats_dict]).to_csv(f'stats_{PARTITION_LABEL}.csv', index=False)
+#        print(f"📁 Resultados guardados:")
+#        print(f"   - Parámetros: params_{PARTITION_LABEL}.csv")
+#        print(f"   - Estadísticas: stats_{PARTITION_LABEL}.csv")
+#
+#        # --- Estadísticas generales (dict) ---
+#        stats = estimation_results.get_general_statistics()  # <- correcto en 3.3.1
+#
+#        # Accesos con claves, con 'fallback' por si falta alguna
+#        def g(k, alt_keys=()):
+#            for key in (k, *alt_keys):
+#                if key in stats:
+#                    return stats[key]
+#            return None
+#
+#        # Si quieres ver exactamente cómo se llaman:
+#        print("\nClaves disponibles en stats:", list(stats.keys()))
+#
+#        # Accesos con los nombres usados por Biogeme
+#        print(f"\n📊 RESUMEN DE ESTIMACIÓN:")
+#        print(f"Log-likelihood Inicial: {g('Init log likelihood', ('Null log likelihood',))}")
+#        print(f"Log-likelihood Final:   {g('Final log likelihood')}")
+#        print(f"Rho-cuadrado:           {g('Rho-square', ('Rho-square for the null model', 'Rho-square for the init. model'))}")
+#        print(f"Rho-cuadrado ajustado:  {g('Rho-square-bar', ('Rho-square-bar for the null model','Rho-square-bar for the init. model'))}")
+#        print(f"Observaciones:          {g('Number of observations', ('Sample size',))}")
+#
+#        # --- Parámetros estimados en pandas (función de módulo) ---
+#        parametros = get_pandas_estimated_parameters(estimation_results=estimation_results)
+#        print("\n📋 Parámetros estimados:")
+#        print(parametros)
+#
+#    except Exception as e:
+#        print(f"❌ Error durante la estimación: {e}")
+#        estimation_results = None
+#    finally:
+#        # --- 6. RESTAURAR EL DIRECTORIO ORIGINAL ---
+#        os.chdir(original_cwd)
+#    
+#
+```
+
+
+### Configuración de Ejecución Secuencial (Modelo Simple)
+
+```{python}
+#|label: setup-sequential-run
+
+import pandas as pd
+import gc
+import time
+
+# --- 1. CONFIGURACIÓN DE LA EJECUCIÓN ---
+# Define aquí las particiones que quieres procesar
+PARTICIONES_A_PROCESAR = [
+    (2025, 17), 
+    (2025, 18)  
+]
+
+# Define si quieres aplicar muestreo o usar el dataset completo
+APPLY_SAMPLING = False
+SAMPLE_FRACTION = 0.20  # 20% de la partición
+SEED = 42               # Para reproducibilidad del muestreo
+
+# Directorio base para los resultados
+BASE_OUTPUT_DIR = "model_outputs"
+
+print("--- Configuración de Ejecución Lista ---")
+print(f"Particiones a procesar: {PARTICIONES_A_PROCESAR}")
+print(f"Aplicar muestreo: {APPLY_SAMPLING}")
+if APPLY_SAMPLING:
+    print(f"Fracción de muestreo: {SAMPLE_FRACTION}")
+
+```
+
+### Estimación Secuencial del Modelo Simple
+
+```{python}
+#|label: sequential-estimation
+#|eval: false
+
+from biogeme.version import get_text as biogeme_version_text
+import biogeme.results_processing as br
+from biogeme.results_processing import get_pandas_estimated_parameters
+import biogeme.biogeme_logging as blog
+from biogeme.version import get_text as biogeme_version_text
+import biogeme.results_processing as br
+from biogeme.results_processing import get_pandas_estimated_parameters
+import pandas as pd
+
+
+#Logger a pantalla (INFO por defecto es suficiente)
+logger = blog.get_screen_logger(level=blog.INFO)
+logger.info(biogeme_version_text())
+
+
+
+# --- BUCLE DE PROCESAMIENTO SECUENCIAL ---
+print("--- Iniciando Proceso de Estimación Secuencial ---")
+
+for year, week in PARTICIONES_A_PROCESAR:
+    partition_label = f"{year}-W{week}"
+    print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} ---\n{'='*60}")
+
+    # a. Definir y crear directorio de salida único
+    output_dir_partition = os.path.join(BASE_OUTPUT_DIR, f"W{week}-baseline")
+    os.makedirs(output_dir_partition, exist_ok=True)
+    print(f"   Resultados se guardarán en: {output_dir_partition}")
+
+    # Definir variables para limpieza en el bloque finally
+    lf_data, df_model_data, pandas_df, biodb, biogeme_model, results = (None,) * 6
+
+    try:
+        # b. Cargar datos
+        input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+        lf_data = pl.scan_parquet(input_path_glob)
+        print(f"   Cargando datos desde: {input_path_glob}")
+
+        # c. Preparar features (usando la función helper del modelo simple)
+        lf_model_ready = prepare_features(lf_data)
+        df_model_data = lf_model_ready.collect()
+
+        # d. Muestreo condicional
+        if APPLY_SAMPLING:
+            print(f"   Aplicando muestreo estratificado ({SAMPLE_FRACTION*100:.0f}%). Filas antes: {len(df_model_data):,}")
+            df_for_pandas = get_stratified_sample(df_model_data, SAMPLE_FRACTION, SEED)
+            print(f"   Filas después del muestreo: {len(df_for_pandas):,}")
+        else:
+            print("   Usando el dataset completo (sin muestreo).")
+            df_for_pandas = df_model_data
+
+        pandas_df = df_for_pandas.to_pandas()
+
+        # e. Setup Biogeme (se define todo dentro del bucle para evitar fugas de estado)
+        print("   Definiendo especificación del modelo (Betas, Variables, Utilidad)...")
+        ASC_QR = Beta(f'ASC_QR_{partition_label}', 0, None, None, 0)
+        B_PM_LAB = Beta(f'B_PM_LAB_{partition_label}', 0, None, None, 0)
+        B_PT_LAB = Beta(f'B_PT_LAB_{partition_label}', 0, None, None, 0)
+        B_LJ_LAB = Beta(f'B_LJ_LAB_{partition_label}', 0, None, None, 0)
+        B_VIE_LAB = Beta(f'B_VIE_LAB_{partition_label}', 0, None, None, 0)
+
+        PM_LAB = Variable('DUMMY_PM_LAB')
+        PT_LAB = Variable('DUMMY_PT_LAB')
+        LJ_LAB = Variable('DUMMY_LJ_LAB')
+        VIE_LAB = Variable('DUMMY_VIE_LAB')
+        CHOICE = Variable('choice')
+
+        V_BIP = 0
+        V_QR = ASC_QR + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB
+        V = {0: V_BIP, 1: V_QR}
+        av = {0: 1, 1: 1}
+        logprob = models.loglogit(V, av, CHOICE)
+
+        # f. Estimar el modelo
+        biodb = db.Database(f'db_{partition_label}', pandas_df)
+        model_name = f'logit_qr_bip_{partition_label}'
+        biogeme_model = bio.BIOGEME(biodb, logprob)
+        biogeme_model.model_name = model_name
+
+        original_cwd = os.getcwd()
+        os.chdir(output_dir_partition)
+        
+        print("   Estimando el modelo...")
+        results = biogeme_model.estimate()
+        print("   ✅ Estimación completada!")
+
+        # g. Guardar resultados en CSV
+        params_df = get_pandas_estimated_parameters(estimation_results=results)
+        stats_dict = results.get_general_statistics()
+        params_df.to_csv(f'params_{partition_label}.csv')
+        pd.DataFrame([stats_dict]).to_csv(f'stats_{partition_label}.csv', index=False)
+        print(f"   📁 Resultados guardados en formato CSV y HTML.")
+
+        os.chdir(original_cwd)
+
+    except Exception as e:
+        print(f"   ❌ ERROR procesando {partition_label}: {e}")
+        # Asegurarse de volver al directorio original en caso de error
+        if 'original_cwd' in locals() and os.getcwd() != original_cwd:
+            os.chdir(original_cwd)
+
+    finally:
+        # h. Limpieza de memoria explícita
+        print("   Limpiando memoria de la partición...")
+        del lf_data, df_model_data, df_for_pandas, pandas_df, biodb, biogeme_model, results
+        gc.collect()
+        time.sleep(2) # Pequeña pausa para que la memoria se estabilice
+
+print(f"\n{'='*60}\n--- Proceso Finalizado ---\n{'='*60}")
+
+```
+
+```{python}
+#|include: false
+#|eval: false
+#|label: strategy-1-per-partition-model
+
+#print(f"--- Iniciando Estrategia 1: Modelos por Partición ({SAMPLE_FRACTION*100:.0f}%) ---")
+#
+## 1. Encontrar todas las particiones disponibles (ej. 15)
+#partition_glob = f"{INPUT_DATASET_PATH}/iso_year=*/iso_week=*"
+#all_partitions = gfs.glob(partition_glob) # Usa gcsfs para listar carpetas
+#print(f"Encontradas {len(all_partitions)} particiones.")
+#
+## 2. Lista para guardar las muestras para la Estrategia 2
+#pooled_sample_list = []
+#
+## 3. Iniciar el bucle
+#for i, partition_path in enumerate(all_partitions):
+#    # Extraer etiqueta de la ruta (ej. 'iso_year=2024/iso_week=14')
+#    label_parts = partition_path.split('/')[-2:] # -> ['iso_year=2024', 'iso_week=14']
+#    partition_label = f"{label_parts[0].split('=')[1]}-W{label_parts[1].split('=')[1]}"
+#    print(f"\n--- Procesando Partición {i+1}/{len(all_partitions)}: {partition_label} ---")
+#    
+#    try:
+#        # 1. Cargar datos
+#        lf_data = pl.scan_parquet(f"gs://{partition_path}/*.parquet")
+#        
+#        # 2. Preparar features
+#        lf_model_ready = prepare_features(lf_data)
+#        
+#        # 3. Collect
+#        df_model_data = lf_model_ready.collect()
+#        
+#        # 4. Muestreo Estratificado (20%)
+#        print(f"Datos originales: {len(df_model_data):,} filas")
+#        original_counts = df_model_data.group_by("choice").agg(pl.len().alias("count")).sort("choice")
+#        print(f"  - Bip (choice=0): {original_counts.filter(pl.col('choice') == 0)['count'][0] if len(original_counts.filter(pl.col('choice') == 0)) > 0 else 0:,}")
+#        print(f"  - QR (choice=1): {original_counts.filter(pl.col('choice') == 1)['count'][0] if len(original_counts.filter(pl.col('choice') == 1)) > 0 else 0:,}")
+#        
+#        df_model_sample = get_stratified_sample(df_model_data, SAMPLE_FRACTION, SEED)
+#        print(f"Muestra estratificada: {len(df_model_sample):,} filas ({len(df_model_sample)/len(df_model_data)*100:.1f}%)")
+#        sample_counts = df_model_sample.group_by("choice").agg(pl.len().alias("count")).sort("choice")
+#        print(f"  - Bip (choice=0): {sample_counts.filter(pl.col('choice') == 0)['count'][0] if len(sample_counts.filter(pl.col('choice') == 0)) > 0 else 0:,}")
+#        print(f"  - QR (choice=1): {sample_counts.filter(pl.col('choice') == 1)['count'][0] if len(sample_counts.filter(pl.col('choice') == 1)) > 0 else 0:,}")
+#        
+#        # 5. GUARDAR MUESTRA PARA ESTRATEGIA 2
+#        pooled_sample_list.append(df_model_sample)
+#        
+#        # 6. Preparar Biogeme
+#        pandas_df = df_model_sample.to_pandas()
+#        biodb = db.Database(f'db_{partition_label}', pandas_df)
+#
+#        # 7. Definir Betas, Variables y Utilidades DENTRO del bucle
+#        #    Esto asegura un estado limpio para cada estimación.
+#        print("   Definiendo especificación del modelo (Betas, Variables, Utilidad)...")
+#        
+#        # Parámetros (Betas) a estimar - con nombres únicos por partición
+#        ASC_QR = Beta(f'ASC_QR_{partition_label}', 0, None, None, 0)
+#        B_PM_LAB = Beta(f'B_PM_LAB_{partition_label}', 0, None, None, 0)
+#        B_PT_LAB = Beta(f'B_PT_LAB_{partition_label}', 0, None, None, 0)
+#        B_LJ_LAB = Beta(f'B_LJ_LAB_{partition_label}', 0, None, None, 0)
+#        B_VIE_LAB = Beta(f'B_VIE_LAB_{partition_label}', 0, None, None, 0)
+#
+#        # Variables del dataset
+#        PM_LAB = Variable('DUMMY_PM_LAB')
+#        PT_LAB = Variable('DUMMY_PT_LAB')
+#        LJ_LAB = Variable('DUMMY_LJ_LAB')
+#        VIE_LAB = Variable('DUMMY_VIE_LAB')
+#        CHOICE = Variable('choice')
+#
+#        # Funciones de Utilidad
+#        V_BIP = 0
+#        V_QR = ASC_QR + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB
+#        
+#        V = {0: V_BIP, 1: V_QR}
+#        av = {0: 1, 1: 1}
+#
+#        # 8. Definir el modelo logit
+#        logprob = models.loglogit(V, av, CHOICE)
+#        
+#        # 9. Definir nombre del modelo (sin ruta)
+#        model_name = f'logit_qr_bip_{partition_label}'
+#        
+#        biogeme_model = bio.BIOGEME(biodb, logprob)
+#        biogeme_model.model_name = model_name
+#        
+#        # 10. Cambiar al directorio de salida antes de estimar
+#        original_cwd = os.getcwd()
+#        os.chdir(OUTPUT_DIR_PER_PARTITION)
+#        
+#        # 11. Estimar
+#        print(f"Estimando modelo para {partition_label}...")
+#        try:
+#            results = biogeme_model.estimate()
+#            
+#            # --- GUARDAR RESULTADOS EN FORMATO ESTRUCTURADO ---
+#            params_df = get_pandas_estimated_parameters(estimation_results=results)
+#            stats_dict = results.get_general_statistics()
+#
+#            # Guardar parámetros y estadísticas en CSV
+#            params_df.to_csv(f'params_{partition_label}.csv')
+#            pd.DataFrame([stats_dict]).to_csv(f'stats_{partition_label}.csv', index=False)
+#            # --- FIN DE GUARDADO ---
+#            
+#            # 12. Imprimir resumen
+#            stats = results.get_general_statistics()  # <- correcto en 3.3.1
+#            params = get_pandas_estimated_parameters(estimation_results=results)  # <- método no deprecado
+#            
+#            # Acceso robusto a estadísticas con fallback
+#            def get_stat(key, alt_keys=()):
+#                for k in (key, *alt_keys):
+#                    if k in stats:
+#                        return stats[k]
+#                return None
+#            
+#            rho_sq_adj = get_stat('Rho-square-bar', ('Adj. rho-square', 'Rho-square-bar for the null model'))
+#            rho_sq_str = f"{rho_sq_adj:.3f}" if rho_sq_adj is not None else "N/A"
+#            print(f"✅ Modelo {partition_label} completado (Rho-sq adj: {rho_sq_str})")
+#            print(params)
+#            
+#        except Exception as e:
+#            print(f"❌ Error durante la estimación de {partition_label}: {e}")
+#        finally:
+#            # 13. Restaurar directorio original
+#            os.chdir(original_cwd)
+#        
+#    except Exception as e:
+#        print(f"❌ Error procesando {partition_label}: {e}")
+#
+#print("\n--- Estrategia 1 Finalizada ---")
+```
+
+
+```{python}
+#|include: false
+#|eval: false
+#|label: 4-consolidate-results
+
+#import pandas as pd
+#import polars as pl
+#import glob
+#import os
+#import re
+#import seaborn as sns
+#import matplotlib.pyplot as plt
+#
+## Definimos la ruta donde están guardados los modelos
+#OUTPUT_DIR_PER_PARTITION = "model_outputs/per_partition"
+#
+#print(f"Buscando archivos de resultados CSV en: {OUTPUT_DIR_PER_PARTITION}")
+#
+## 1. Encontrar todos los archivos CSV de resultados
+#param_files = glob.glob(os.path.join(OUTPUT_DIR_PER_PARTITION, "params_*.csv"))
+#stats_files = glob.glob(os.path.join(OUTPUT_DIR_PER_PARTITION, "stats_*.csv"))
+#print(f"Encontrados {len(param_files)} archivos de parámetros y {len(stats_files)} de estadísticas.")
+#
+#all_params = []
+#all_stats = []
+#
+## Expresión regular para extraer la etiqueta de la partición
+#filename_regex = re.compile(r"_(202\d-W\d{2})\.csv")
+#
+## 2. Cargar y consolidar archivos de parámetros
+#for f in param_files:
+#    try:
+#        match = filename_regex.search(f)
+#        if not match:
+#            continue
+#        partition_label = match.group(1)
+#        
+#        # Leer el CSV. La columna 'Name' ya contiene los nombres de los parámetros.
+#        df_p = pd.read_csv(f)
+#        # La primera columna es un índice antiguo guardado en el CSV, la podemos eliminar.
+#        if 'Unnamed: 0' in df_p.columns:
+#            df_p = df_p.drop(columns=['Unnamed: 0'])
+#
+#        df_p['partition'] = partition_label
+#        all_params.append(df_p)
+#    except Exception as e:
+#        print(f"Error procesando archivo de parámetros {f}: {e}")
+#
+## 3. Cargar y consolidar archivos de estadísticas
+#for f in stats_files:
+#    try:
+#        match = filename_regex.search(f)
+#        if not match:
+#            continue
+#        partition_label = match.group(1)
+#
+#        df_s = pd.read_csv(f)
+#        df_s['partition'] = partition_label
+#        all_stats.append(df_s)
+#    except Exception as e:
+#        print(f"Error procesando archivo de estadísticas {f}: {e}")
+#
+## 4. Crear los DataFrames consolidados
+#if all_params and all_stats:
+#    df_consolidated_params = pd.concat(all_params, ignore_index=True)
+#    df_consolidated_stats = pd.concat(all_stats, ignore_index=True)
+#
+#    print(f"\n✅ Datos consolidados:")
+#    print(f"   - Parámetros: {len(df_consolidated_params)} filas")
+#    print(f"   - Estadísticas: {len(df_consolidated_stats)} filas")
+#
+#    # Limpiar nombres de columnas en el df de estadísticas
+#    df_consolidated_stats.columns = df_consolidated_stats.columns.str.strip().str.replace(':', '')
+#
+#    # 5. Mostrar resumen de parámetros (pivot)
+#    print("\n--- Resumen Consolidado de Parámetros (Betas) ---")
+#    
+#    # Normalizar nombres de parámetros (ej. 'ASC_QR_2024-W15' -> 'ASC_QR')
+#    df_consolidated_params['Name'] = df_consolidated_params['Name'].str.replace(r'_(\d{4}-W\d{2})$', '', regex=True)
+#
+#    df_pivot = df_consolidated_params.pivot(
+#        index='partition', 
+#        columns='Name', 
+#        values='Value'
+#    ).sort_index()
+#    print(df_pivot)
+#    
+#    # 6. Mostrar resumen de t-statistics
+#    print("\n--- Resumen Consolidado de T-Statistics ---")
+#    df_pivot_tstat = df_consolidated_params.pivot(
+#        index='partition', 
+#        columns='Name', 
+#        values='Robust t-stat.' # El nombre correcto de la columna en el CSV
+#    ).sort_index()
+#    print(df_pivot_tstat)
+#
+#    # 7. Mostrar resumen de Rho-cuadrado
+#    print("\n--- Resumen Consolidado de Rho-cuadrado Ajustado ---")
+#    rho_col_name = 'Rho-square-bar for the init. model'
+#    if rho_col_name in df_consolidated_stats.columns:
+#        rho_stats = df_consolidated_stats.sort_values('partition')[
+#            ['partition', rho_col_name]
+#        ]
+#        print(rho_stats)
+#        print(f"\nResumen estadístico de {rho_col_name}:")
+#        print(df_consolidated_stats[rho_col_name].describe().round(4))
+#    else:
+#        print(f"No se encontró la columna '{rho_col_name}'")
+#        print(f"Columnas disponibles: {df_consolidated_stats.columns.tolist()}")
+#
+#else:
+#    print("\n❌ No se pudieron cargar resultados. Verifica la ruta y los archivos CSV.")
+```
+
+```{python}
+#|include: false
+#|eval: false
+#|label: 5-advanced-analysis
+
+
+#import matplotlib.pyplot as plt
+#import seaborn as sns
+#import numpy as np
+#import pandas as pd
+#from datetime import datetime
+#
+## Configurar estilo de gráficos
+#try:
+#    plt.style.use('seaborn-v0_8')
+#except:
+#    plt.style.use('default')
+#sns.set_palette("husl")
+#
+#if 'df_pivot' in locals() and 'df_consolidated_stats' in locals():
+#    print("🔍 Análisis Avanzado de Resultados del Modelo Logit")
+#    
+#    # 1. Análisis temporal de parámetros
+#    print("\n--- Análisis Temporal de Parámetros ---")
+#    
+#    # Convertir índices a fechas para mejor visualización
+#    df_pivot_analysis = df_pivot.copy()
+#    df_pivot_analysis['year'] = df_pivot_analysis.index.str[:4].astype(int)
+#    df_pivot_analysis['week'] = df_pivot_analysis.index.str[6:].astype(int)
+#    
+#    # Crear una columna de ordenamiento temporal simple
+#    df_pivot_analysis['sort_order'] = df_pivot_analysis['year'] * 100 + df_pivot_analysis['week']
+#    df_pivot_analysis = df_pivot_analysis.sort_values('sort_order')
+#    
+#    # Estadísticas por año
+#    print("📊 Estadísticas por año:")
+#    yearly_stats = df_pivot_analysis.groupby('year').agg({
+#        'ASC_QR': ['mean', 'std', 'min', 'max'],
+#        'B_PM_LAB': ['mean', 'std', 'min', 'max'],
+#        'B_PT_LAB': ['mean', 'std', 'min', 'max'],
+#        'B_LJ_LAB': ['mean', 'std', 'min', 'max'],
+#        'B_VIE_LAB': ['mean', 'std', 'min', 'max']
+#    }).round(4)
+#    print(yearly_stats)
+#    
+#    # 2. Visualizaciones
+#    print("\n📈 Generando visualizaciones...")
+#    
+#    # Crear figura con subplots
+#    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+#    fig.suptitle('Evolución Temporal de Parámetros del Modelo Logit QR vs Bip', fontsize=16, fontweight='bold')
+#    
+#    # Parámetros a graficar
+#    params = ['ASC_QR', 'B_PM_LAB', 'B_PT_LAB', 'B_LJ_LAB', 'B_VIE_LAB']
+#    param_names = ['Constante QR', 'Punta Mañana', 'Punta Tarde', 'Lun-Jue', 'Viernes']
+#    colors = ['red', 'blue', 'green', 'orange', 'purple']
+#    
+#    for i, (param, name, color) in enumerate(zip(params, param_names, colors)):
+#        ax = axes[i//3, i%3]
+#        
+#        # Graficar por año con colores diferentes
+#        for year in df_pivot_analysis['year'].unique():
+#            year_data = df_pivot_analysis[df_pivot_analysis['year'] == year].sort_values('sort_order')
+#            ax.plot(year_data['week'], year_data[param], 
+#                   marker='o', linewidth=2, markersize=6, 
+#                   label=f'{year}', alpha=0.8)
+#        
+#        ax.set_title(f'{name} ({param})', fontweight='bold')
+#        ax.set_xlabel('Semana del Año')
+#        ax.set_ylabel('Valor del Parámetro')
+#        ax.grid(True, alpha=0.3)
+#        ax.legend()
+#        
+#        # Agregar línea horizontal en y=0 si es relevante
+#        if param in ['B_LJ_LAB', 'B_VIE_LAB']:
+#            ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+#    
+#    # Subplot adicional para Rho-cuadrado ajustado
+#    ax = axes[1, 2]
+#    if 'Rho-square-bar for the init. model' in df_consolidated_stats.columns:
+#        rho_data = df_consolidated_stats.set_index('partition')['Rho-square-bar for the init. model']
+#        rho_data.plot(kind='bar', ax=ax, color='darkgreen', alpha=0.7)
+#        ax.set_title('Rho-cuadrado Ajustado por Partición', fontweight='bold')
+#        ax.set_xlabel('Partición')
+#        ax.set_ylabel('Rho-cuadrado Ajustado')
+#        ax.tick_params(axis='x', rotation=45)
+#        ax.grid(True, alpha=0.3)
+#    
+#    plt.tight_layout()
+#    plt.show()
+#    
+#    # 2b. Visualización de T-Statistics
+#    if 'df_pivot_tstat' in locals():
+#        print("\n📈 Generando visualización de T-Statistics...")
+#        
+#        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+#        fig.suptitle('T-Statistics de Parámetros del Modelo Logit QR vs Bip', fontsize=16, fontweight='bold')
+#        
+#        for i, (param, name, color) in enumerate(zip(params, param_names, colors)):
+#            ax = axes[i//3, i%3]
+#            
+#            # Graficar t-statistics por año
+#            for year in df_pivot_analysis['year'].unique():
+#                year_data = df_pivot_analysis[df_pivot_analysis['year'] == year].sort_values('sort_order')
+#                if param in df_pivot_tstat.columns:
+#                    ax.plot(year_data['week'], df_pivot_tstat.loc[year_data.index, param], 
+#                           marker='o', linewidth=2, markersize=6, 
+#                           label=f'{year}', alpha=0.8)
+#            
+#            ax.set_title(f'T-stat: {name} ({param})', fontweight='bold')
+#            ax.set_xlabel('Semana del Año')
+#            ax.set_ylabel('T-Statistic')
+#            ax.grid(True, alpha=0.3)
+#            ax.legend()
+#            
+#            # Agregar líneas de significancia
+#            ax.axhline(y=1.96, color='green', linestyle='--', alpha=0.7, label='95% sig')
+#            ax.axhline(y=-1.96, color='green', linestyle='--', alpha=0.7)
+#            ax.axhline(y=2.58, color='red', linestyle='--', alpha=0.7, label='99% sig')
+#            ax.axhline(y=-2.58, color='red', linestyle='--', alpha=0.7)
+#            ax.axhline(y=0, color='black', linestyle='-', alpha=0.5)
+#        
+#        # Subplot adicional para distribución de t-statistics
+#        ax = axes[1, 2]
+#        if 'df_consolidated_params' in locals():
+#            # Convertir t-statistics a numérico, manejando errores
+#            tstat_data = pd.to_numeric(df_consolidated_params['Robust t-stat.'], errors='coerce')
+#            tstat_data = tstat_data.dropna()  # Eliminar valores NaN
+#            
+#            if len(tstat_data) > 0:
+#                ax.hist(tstat_data, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+#                ax.axvline(x=1.96, color='green', linestyle='--', alpha=0.7, label='95% sig')
+#                ax.axvline(x=-1.96, color='green', linestyle='--', alpha=0.7)
+#                ax.axvline(x=2.58, color='red', linestyle='--', alpha=0.7, label='99% sig')
+#                ax.axvline(x=-2.58, color='red', linestyle='--', alpha=0.7)
+#                ax.axvline(x=0, color='black', linestyle='-', alpha=0.5)
+#                ax.set_title('Distribución de T-Statistics', fontweight='bold')
+#                ax.set_xlabel('T-Statistic')
+#                ax.set_ylabel('Frecuencia')
+#                ax.legend()
+#                ax.grid(True, alpha=0.3)
+#            else:
+#                ax.text(0.5, 0.5, 'No hay datos válidos\nde t-statistics', 
+#                       ha='center', va='center', transform=ax.transAxes)
+#                ax.set_title('Distribución de T-Statistics', fontweight='bold')
+#        
+#        plt.tight_layout()
+#        plt.show()
+#    
+#    # 3. Análisis de correlaciones entre parámetros
+#    print("\n--- Análisis de Correlaciones ---")
+#    param_corr = df_pivot[params].corr()
+#    print("Matriz de correlaciones entre parámetros:")
+#    print(param_corr.round(4))
+#    
+#    # Visualización de correlaciones
+#    plt.figure(figsize=(10, 8))
+#    mask = np.triu(np.ones_like(param_corr, dtype=bool))
+#    sns.heatmap(param_corr, mask=mask, annot=True, cmap='coolwarm', center=0,
+#                square=True, linewidths=0.5, cbar_kws={"shrink": .8})
+#    plt.title('Matriz de Correlaciones entre Parámetros', fontweight='bold')
+#    plt.tight_layout()
+#    plt.show()
+#    
+#    # 4. Análisis de significancia estadística
+#    print("\n--- Análisis de Significancia Estadística ---")
+#    if 'df_consolidated_params' in locals():
+#        # Calcular porcentaje de parámetros significativos por tipo
+#        sig_params = df_consolidated_params[df_consolidated_params['Robust p-value'] < 0.05]
+#        sig_by_param = sig_params.groupby('Name').size()
+#        total_by_param = df_consolidated_params.groupby('Name').size()
+#        sig_percentage = (sig_by_param / total_by_param * 100).round(2)
+#        
+#        print("Porcentaje de estimaciones significativas (p < 0.05) por parámetro:")
+#        for param in params:
+#            if param in sig_percentage.index:
+#                print(f"   {param}: {sig_percentage[param]}% ({sig_by_param.get(param, 0)}/{total_by_param[param]})")
+#            else:
+#                print(f"   {param}: 0% (0/{total_by_param[param]})")
+#        
+#        # Análisis de t-statistics
+#        print(f"\n--- Análisis de T-Statistics ---")
+#        
+#        # Convertir t-statistics a numérico
+#        df_consolidated_params['Robust t-stat. numeric'] = pd.to_numeric(
+#            df_consolidated_params['Robust t-stat.'], errors='coerce'
+#        )
+#        
+#        # Filtrar solo valores numéricos válidos
+#        valid_tstat = df_consolidated_params.dropna(subset=['Robust t-stat. numeric'])
+#        
+#        if len(valid_tstat) > 0:
+#            tstat_stats = valid_tstat.groupby('Name')['Robust t-stat. numeric'].agg(['mean', 'std', 'min', 'max']).round(3)
+#            print("Estadísticas de t-statistics por parámetro:")
+#            print(tstat_stats)
+#            
+#            # Identificar parámetros con t-statistics altos (más significativos)
+#            print(f"\nParámetros con mayor significancia estadística (t-statistics más altos en valor absoluto):")
+#            avg_abs_tstat = valid_tstat.groupby('Name')['Robust t-stat. numeric'].apply(lambda x: abs(x).mean()).sort_values(ascending=False)
+#            for param, tstat in avg_abs_tstat.items():
+#                print(f"   {param}: |t-stat| promedio = {tstat:.3f}")
+#            
+#            # Mostrar parámetros que son consistentemente significativos
+#            consistently_sig = valid_tstat.groupby('Name').apply(
+#                lambda x: (abs(x['Robust t-stat. numeric']) > 1.96).sum() / len(x) * 100
+#            ).round(1)
+#            print(f"\nParámetros consistentemente significativos (|t-stat| > 1.96):")
+#            for param, pct in consistently_sig.items():
+#                print(f"   {param}: {pct}% de las estimaciones significativas")
+#        else:
+#            print("⚠️ No se encontraron t-statistics numéricos válidos para el análisis.")
+#    
+#    # 5. Resumen ejecutivo
+#    print("\n" + "="*60)
+#    print("📋 RESUMEN EJECUTIVO DEL MODELO LOGIT QR vs BIP")
+#    print("="*60)
+#    
+#    print(f"\n🎯 OBJETIVO: Analizar factores que influyen en la elección entre pago QR y Tarjeta Bip")
+#    print(f"📊 DATOS: {len(df_pivot)} particiones semanales analizadas")
+#    print(f"⏰ PERÍODO: {df_pivot_analysis['year'].min()}-{df_pivot_analysis['year'].max()}")
+#    
+#    print(f"\n🔍 HALLAZGOS PRINCIPALES:")
+#    print(f"   1. HORAS PUNTA: QR es consistentemente más preferido (coef. positivos)")
+#    print(f"      - Mañana: promedio {df_pivot['B_PM_LAB'].mean():.3f}")
+#    print(f"      - Tarde: promedio {df_pivot['B_PT_LAB'].mean():.3f}")
+#    
+#    print(f"   2. DÍAS LABORALES: Bip es más preferido (coef. negativos)")
+#    print(f"      - Lun-Jue: promedio {df_pivot['B_LJ_LAB'].mean():.3f}")
+#    print(f"      - Viernes: promedio {df_pivot['B_VIE_LAB'].mean():.3f}")
+#    
+#    print(f"   3. EVOLUCIÓN TEMPORAL: Mejora en preferencia por QR")
+#    print(f"      - ASC_QR 2024: {df_pivot_analysis[df_pivot_analysis['year']==2024]['ASC_QR'].mean():.3f}")
+#    print(f"      - ASC_QR 2025: {df_pivot_analysis[df_pivot_analysis['year']==2025]['ASC_QR'].mean():.3f}")
+#    
+#    if 'Rho-square-bar for the init. model:' in df_consolidated_stats.columns:
+#        avg_rho = df_consolidated_stats['Rho-square-bar for the init. model:'].mean()
+#        print(f"   4. AJUSTE DEL MODELO: Rho-cuadrado ajustado promedio = {avg_rho:.6f}")
+#    
+#    print(f"\n💡 IMPLICACIONES:")
+#    print(f"   - Los usuarios prefieren QR durante horas punta (mayor conveniencia)")
+#    print(f"   - Bip mantiene preferencia en días laborales regulares (hábito/inercia)")
+#    print(f"   - La adopción de QR está aumentando en el tiempo")
+#    print(f"   - Las políticas de transporte deberían considerar estos patrones temporales")
+#    
+#else:
+#    print("❌ No se pueden realizar análisis avanzados. Ejecuta primero la celda de consolidación.")
+```
+
+
+## Resultados del Modelo Baseline (Semana 2025-W17)
+
+A continuación, se presentan y analizan los resultados del modelo logit simple, estimado sobre la partición completa de la semana 17 del año 2025.
+
+### Carga de Resultados
+
+Primero, cargamos los resultados previamente calculados para nuestra semana de estudio.
+
+``` {python}
+#| label: load-results
+import pandas as pd
+import os
+
+# --- Configuración ---
+# Apuntar a la carpeta de resultados de la semana de estudio
+results_folder = "model_outputs/W17-baseline"
+partition_label = "2025-W17"
+
+# --- Cargar Archivos ---
+try:
+    params_file = os.path.join(results_folder, f"params_{partition_label}.csv")
+    stats_file = os.path.join(results_folder, f"stats_{partition_label}.csv")
+
+    df_params = pd.read_csv(params_file, index_col=0)
+    df_stats = pd.read_csv(stats_file)
+
+    print(f"Resultados cargados exitosamente desde: {results_folder}")
+    
+    # Limpiar nombres de parámetros para la presentación
+    df_params['Name'] = df_params['Name'].str.replace(f'_{partition_label}', '', regex=False)
+    df_params.index = df_params['Name']
+    
+except FileNotFoundError:
+    print(f"ERROR: No se encontraron los archivos de resultados en la carpeta '{results_folder}'.")
+    print("Asegúrate de haber ejecutado la estimación para la semana 2025-W17.")
+    df_params = None
+    df_stats = None
+```
+
+### Análisis de la Estimación
+
+#### Bondad de Ajuste
+
+La tabla siguiente resume las métricas de calidad del modelo. El **Rho-cuadrado ajustado** indica el poder explicativo del modelo.
+
+``` {python}
+#| label: display-stats
+if df_stats is not None:
+    stats_display = df_stats[[
+        'Sample size', 
+        'Final log likelihood', 
+        'Rho-square for the init. model', 
+        'Rho-square-bar for the init. model'
+    ]].copy()
+    stats_display.rename(columns={
+        'Sample size': 'Observaciones',
+        'Final log likelihood': 'Log-Likelihood Final',
+        'Rho-square for the init. model': 'Rho-cuadrado',
+        'Rho-square-bar for the init. model': 'Rho-cuadrado Ajustado'
+    }, inplace=True)
+    
+    # Formatear para mejor lectura
+    stats_display['Observaciones'] = stats_display['Observaciones'].apply(lambda x: f"{x:,}")
+    stats_display['Log-Likelihood Final'] = stats_display['Log-Likelihood Final'].round(2)
+    stats_display['Rho-cuadrado'] = stats_display['Rho-cuadrado'].round(3)
+    stats_display['Rho-cuadrado Ajustado'] = stats_display['Rho-cuadrado Ajustado'].round(3)
+    
+    print("Tabla 1: Estadísticas Generales del Modelo")
+    display(stats_display.T)
+```
+
+Un valor de **Rho-cuadrado ajustado de 0.352** es considerado **bueno**, indicando que las variables temporales seleccionadas tienen un considerable poder para explicar la elección del medio de pago.
+
+#### Parámetros Estimados
+
+La siguiente tabla muestra los coeficientes (Betas) estimados para cada variable y su significancia estadística (t-stat).
+
+``` {python}
+#| label: display-params
+if df_params is not None:
+    params_display = df_params[['Value', 'Robust t-stat.']].copy()
+    params_display.rename(columns={
+        'Value': 'Coeficiente (Beta)',
+        'Robust t-stat.': 'Estadístico t'
+    }, inplace=True)
+
+    print("Tabla 2: Parámetros Estimados del Modelo")
+    display(params_display.style.format({
+        'Coeficiente (Beta)': '{:.3f}',
+        'Estadístico t': '{:.1f}'
+    }))
+```
+
+Todos los parámetros son **altamente significativos**, con valores absolutos del estadístico t muy superiores a 1.96 (el umbral para el 95% de confianza).
+
+### Validación de Muestreo Estratificado (Muestra al 20% de los datos)
+
+Para validar la eficiencia de usar una muestra en lugar del dataset completo, se estimó el mismo modelo sobre una **muestra estratificada del 20%**. El muestreo estratificado es una técnica que divide la población en subgrupos o "estratos" y luego toma una muestra aleatoria de cada uno. En este caso, los estratos son la elección del usuario: pago con QR (`choice=1`) y pago con Bip! (`choice=0`). Al muestrear, **nos aseguramos de que la proporción de usuarios QR y Bip! en la muestra del 20% sea idéntica a la proporción en el dataset completo**. Esto garantiza que la muestra sea representativa en la dimensión más importante: la propia variable que buscamos predecir. A continuación, se comparan los resultados.
+
+```{python}
+#| label: load-and-compare-sample-results
+
+# --- Cargar resultados de la muestra ---
+results_folder_sample = "model_outputs/W17-baseline-0.2"
+df_params_sample = None
+df_stats_sample = None
+try:
+    params_file_sample = os.path.join(results_folder_sample, f"params_{partition_label}.csv")
+    stats_file_sample = os.path.join(results_folder_sample, f"stats_{partition_label}.csv")
+    df_params_sample = pd.read_csv(params_file_sample, index_col=0)
+    df_stats_sample = pd.read_csv(stats_file_sample)
+    df_params_sample['Name'] = df_params_sample['Name'].str.replace(f'_{partition_label}', '', regex=False)
+    df_params_sample.index = df_params_sample['Name']
+    print(f"Resultados de la muestra cargados desde: {results_folder_sample}")
+
+    betas_full = df_params[['Value']].rename(columns={'Value': 'Beta (Completo)'})
+    betas_sample = df_params_sample[['Value']].rename(columns={'Value': 'Beta (Muestra 20%)'})
+    tstat_full = df_params[['Robust t-stat.']].rename(columns={'Robust t-stat.': 't-stat (Completo)'})
+    tstat_sample = df_params_sample[['Robust t-stat.']].rename(columns={'Robust t-stat.': 't-stat (Muestra 20%)'})
+    df_comparison = betas_full.join(betas_sample).join(tstat_full).join(tstat_sample)
+    rho_full = df_stats['Rho-square-bar for the init. model'].iloc[0]
+    rho_sample = df_stats_sample['Rho-square-bar for the init. model'].iloc[0]
+    df_comparison.loc['Rho-cuadrado Ajustado'] = [rho_full, rho_sample, None, None]
+    print("\nTabla 3: Comparación de Resultados (Dataset Completo vs. Muestra 20%)")
+    display(df_comparison.style.format({
+    'Beta (Completo)': '{:.4f}',
+    'Beta (Muestra 20%)': '{:.4f}',
+    't-stat (Completo)': '{:.1f}',
+    't-stat (Muestra 20%)': '{:.1f}'
+    }).highlight_null(color='transparent'))
+except FileNotFoundError:
+    print(f"ERROR: No se encontraron los archivos de resultados en la carpeta de la muestra '{results_folder_sample}'.")
+
+
+```
+**Análisis de la Comparación:**
+
+
+1.  **Bondad de Ajuste Idéntica:** El **Rho-cuadrado ajustado** es **0.352** en ambos casos. Esta es la prueba más fuerte de que la muestra captura el poder explicativo del modelo de manera idéntica al dataset completo.
+
+2.  **Coeficientes Estables:** Los valores de los coeficientes (Betas) son extremadamente similares entre ambos modelos. Las pequeñas diferencias son despreciables y no alteran ninguna de las conclusiones.
+
+3.  **Estadísticos t (Esperados):** Como era de esperar, los estadísticos t son menores en la muestra del 20%. Esto se debe a que el error estándar es mayor en muestras más pequeñas. Sin embargo, los valores (ej. -323, 40.2, -37.0) siguen siendo masivamente significativos, validando la robustez de los hallazgos.
+
+
+### Interpretación y Conclusiones
+
+Los resultados del modelo nos permiten extraer conclusiones claras sobre el comportamiento de los usuarios:
+
+1.  **Preferencia Base por la Tarjeta Bip!**: El coeficiente de la constante (`ASC_QR`) es **-1.506**, un valor fuertemente negativo y significativo. Esto indica que, en la situación base (un viaje en fin de semana), existe una **fuerte preferencia inherente por usar la tarjeta Bip!** sobre el código QR.
+
+2.  **El Efecto de la Rutina**: Los coeficientes para los días laborales fuera de punta (`B_LJ_LAB` y `B_VIE_LAB`) son también negativos. Esto sugiere que los viajeros habituales en sus trayectos cotidianos (commuters) son **aún más propensos a usar la tarjeta Bip!**, probablemente por hábito e inercia.
+
+3.  **El QR como Alternativa de Conveniencia**: Los coeficientes para las horas punta (`B_PM_LAB` y `B_PT_LAB`) son **positivos y significativos**. Esto revela el hallazgo más importante: durante los períodos de mayor congestión, **la probabilidad de usar QR aumenta considerablemente**. Los usuarios valoran el QR como una alternativa más conveniente o rápida cuando el sistema está bajo estrés.
+
+
+En resumen, el modelo simple captura una dinámica de comportamiento dual: la **tarjeta Bip! domina por hábito** en los viajes regulares, mientras que el **código QR se posiciona como una herramienta de conveniencia** valorada en las situaciones de mayor demanda.
+
+### Próximos Pasos
+
+Los sólidos resultados de este modelo base validan la metodología y abren dos caminos claros para la continuación de esta investigación:
+
+1.  **Validación Temporal con Muestreo**: La estabilidad de los resultados en esta semana sugiere que se puede aplicar un **muestreo estratificado** para analizar eficientemente un mayor número de particiones semanales. Como se verificó en análisis previos, una muestra del 20% de los datos arroja coeficientes y una bondad de ajuste casi idénticos al modelo completo, demostrando ser una estrategia válida y eficiente.
+
+2.  **Enriquecimiento del Modelo**: El siguiente paso es construir un **modelo extendido** que incorpore **atributos del viaje** (ej. tiempo de viaje, número de trasbordos, modo de transporte). Esto permitirá responder preguntas más profundas, como por ejemplo: ¿La preferencia por QR cambia si el viaje es más largo, más complejo o si implica una combinación de bus y metro?
+
+
