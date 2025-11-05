@@ -1,0 +1,760 @@
+<?xml version='1.0' encoding='utf-8'?>
+<graphml xmlns="http://graphml.graphdrawing.org/xmlns" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://graphml.graphdrawing.org/xmlns http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd"><key id="d2" for="edge" attr.name="name" attr.type="string"/>
+<key id="d1" for="edge" attr.name="line" attr.type="string"/>
+<key id="d0" for="edge" attr.name="type" attr.type="string"/>
+<graph edgedefault="undirected"><node id="SAN PABLO L1"/>
+<node id="NEPTUNO L1"/>
+<node id="PAJARITOS L1"/>
+<node id="LAS REJAS L1"/>
+<node id="ECUADOR L1"/>
+<node id="SAN ALBERTO HURTADO L1"/>
+<node id="UNIVERSIDAD DE SANTIAGO L1"/>
+<node id="ESTACION CENTRAL L1"/>
+<node id="U L A L1"/>
+<node id="REPUBLICA L1"/>
+<node id="LOS HEROES L1"/>
+<node id="LA MONEDA L1"/>
+<node id="UNIVERSIDAD DE CHILE L1"/>
+<node id="SANTA LUCIA L1"/>
+<node id="UNIVERSIDAD CATOLICA L1"/>
+<node id="BAQUEDANO L1"/>
+<node id="SALVADOR L1"/>
+<node id="MANUEL MONTT L1"/>
+<node id="PEDRO DE VALDIVIA L1"/>
+<node id="LOS LEONES L1"/>
+<node id="TOBALABA L1"/>
+<node id="EL GOLF L1"/>
+<node id="ALCANTARA L1"/>
+<node id="ESCUELA MILITAR L1"/>
+<node id="MANQUEHUE L1"/>
+<node id="HERNANDO DE MAGALLANES L1"/>
+<node id="LOS DOMINICOS L1"/>
+<node id="HOSPITAL EL PINO L2"/>
+<node id="COPA LO MARTINEZ L2"/>
+<node id="OBSERVATORIO L2"/>
+<node id="EL BOSQUE L2"/>
+<node id="LA CISTERNA L2"/>
+<node id="EL PARRON L2"/>
+<node id="LO OVALLE L2"/>
+<node id="CIUDAD DEL NINO L2"/>
+<node id="DEPARTAMENTAL L2"/>
+<node id="LO VIAL L2"/>
+<node id="SAN MIGUEL L2"/>
+<node id="EL LLANO L2"/>
+<node id="FRANKLIN L2"/>
+<node id="RONDIZZONI L2"/>
+<node id="PARQUE OHIGGINS L2"/>
+<node id="TOESCA L2"/>
+<node id="LOS HEROES L2"/>
+<node id="SANTA ANA L2"/>
+<node id="PUENTE CAL Y CANTO L2"/>
+<node id="PATRONATO L2"/>
+<node id="CERRO BLANCO L2"/>
+<node id="CEMENTERIOS L2"/>
+<node id="EINSTEIN L2"/>
+<node id="DORSAL L2"/>
+<node id="ZAPADORES L2"/>
+<node id="VESPUCIO NORTE L2"/>
+<node id="PLAZA QUILICURA L3"/>
+<node id="LO CRUZAT L3"/>
+<node id="FERROCARRIL L3"/>
+<node id="LOS LIBERTADORES L3"/>
+<node id="CARDENAL CARO L3"/>
+<node id="VIVACETA L3"/>
+<node id="CONCHALI L3"/>
+<node id="PLAZA CHACABUCO L3"/>
+<node id="HOSPITALES L3"/>
+<node id="PUENTE CAL Y CANTO L3"/>
+<node id="PLAZA DE ARMAS L3"/>
+<node id="UNIVERSIDAD DE CHILE L3"/>
+<node id="PARQUE ALMAGRO L3"/>
+<node id="MATTA L3"/>
+<node id="IRARRAZAVAL L3"/>
+<node id="MONSENOR EYZAGUIRRE L3"/>
+<node id="NUNOA L3"/>
+<node id="CHILE ESPANA L3"/>
+<node id="VILLA FREI L3"/>
+<node id="PLAZA EGANA L3"/>
+<node id="FERNANDO CASTILLO VELASCO L3"/>
+<node id="TOBALABA L4"/>
+<node id="CRISTOBAL COLON L4"/>
+<node id="FRANCISCO BILBAO L4"/>
+<node id="PRINCIPE DE GALES L4"/>
+<node id="SIMON BOLIVAR L4"/>
+<node id="PLAZA EGANA L4"/>
+<node id="LOS ORIENTALES L4"/>
+<node id="GRECIA L4"/>
+<node id="LOS PRESIDENTES L4"/>
+<node id="QUILIN L4"/>
+<node id="LAS TORRES L4"/>
+<node id="MACUL L4"/>
+<node id="VICUNA MACKENNA L4"/>
+<node id="VICENTE VALDES L4"/>
+<node id="ROJAS MAGALLANES L4"/>
+<node id="TRINIDAD L4"/>
+<node id="SAN JOSE DE LA ESTRELLA L4"/>
+<node id="LOS QUILLAYES L4"/>
+<node id="ELISA CORREA L4"/>
+<node id="HOSPITAL SOTERO DEL RIO L4"/>
+<node id="PROTECTORA DE LA INFANCIA L4"/>
+<node id="LAS MERCEDES L4"/>
+<node id="PLAZA DE PUENTE ALTO L4"/>
+<node id="VICUNA MACKENNA L4A"/>
+<node id="SANTA JULIA L4A"/>
+<node id="LA GRANJA L4A"/>
+<node id="SANTA ROSA L4A"/>
+<node id="SAN RAMON L4A"/>
+<node id="LA CISTERNA L4A"/>
+<node id="PLAZA DE MAIPU L5"/>
+<node id="SANTIAGO BUERAS L5"/>
+<node id="DEL SOL L5"/>
+<node id="MONTE TABOR L5"/>
+<node id="LAS PARCELAS L5"/>
+<node id="LAGUNA SUR L5"/>
+<node id="BARRANCAS L5"/>
+<node id="PUDAHUEL L5"/>
+<node id="SAN PABLO L5"/>
+<node id="LO PRADO L5"/>
+<node id="BLANQUEADO L5"/>
+<node id="GRUTA DE LOURDES L5"/>
+<node id="QUINTA NORMAL L5"/>
+<node id="CUMMING L5"/>
+<node id="SANTA ANA L5"/>
+<node id="PLAZA DE ARMAS L5"/>
+<node id="BELLAS ARTES L5"/>
+<node id="BAQUEDANO L5"/>
+<node id="PARQUE BUSTAMANTE L5"/>
+<node id="SANTA ISABEL L5"/>
+<node id="IRARRAZAVAL L5"/>
+<node id="NUBLE L5"/>
+<node id="RODRIGO DE ARAYA L5"/>
+<node id="CARLOS VALDOVINOS L5"/>
+<node id="CAMINO AGRICOLA L5"/>
+<node id="SAN JOAQUIN L5"/>
+<node id="PEDRERO L5"/>
+<node id="MIRADOR L5"/>
+<node id="BELLAVISTA DE LA FLORIDA L5"/>
+<node id="VICENTE VALDES L5"/>
+<node id="CERRILLOS L6"/>
+<node id="LO VALLEDOR L6"/>
+<node id="PDTE PEDRO AGUIRRE CERDA L6"/>
+<node id="FRANKLIN L6"/>
+<node id="BIO BIO L6"/>
+<node id="NUBLE L6"/>
+<node id="ESTADIO NACIONAL L6"/>
+<node id="NUNOA L6"/>
+<node id="INES DE SUAREZ L6"/>
+<node id="LOS LEONES L6"/>
+<edge source="SAN PABLO L1" target="NEPTUNO L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="SAN PABLO L1" target="SAN PABLO L5">
+  <data key="d0">transfer</data>
+  <data key="d2">SAN PABLO</data>
+</edge>
+<edge source="NEPTUNO L1" target="PAJARITOS L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="PAJARITOS L1" target="LAS REJAS L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="LAS REJAS L1" target="ECUADOR L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="ECUADOR L1" target="SAN ALBERTO HURTADO L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="SAN ALBERTO HURTADO L1" target="UNIVERSIDAD DE SANTIAGO L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="UNIVERSIDAD DE SANTIAGO L1" target="ESTACION CENTRAL L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="ESTACION CENTRAL L1" target="U L A L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="U L A L1" target="REPUBLICA L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="REPUBLICA L1" target="LOS HEROES L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="LOS HEROES L1" target="LA MONEDA L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="LOS HEROES L1" target="LOS HEROES L2">
+  <data key="d0">transfer</data>
+  <data key="d2">LOS HEROES</data>
+</edge>
+<edge source="LA MONEDA L1" target="UNIVERSIDAD DE CHILE L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="UNIVERSIDAD DE CHILE L1" target="SANTA LUCIA L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="UNIVERSIDAD DE CHILE L1" target="UNIVERSIDAD DE CHILE L3">
+  <data key="d0">transfer</data>
+  <data key="d2">UNIVERSIDAD DE CHILE</data>
+</edge>
+<edge source="SANTA LUCIA L1" target="UNIVERSIDAD CATOLICA L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="UNIVERSIDAD CATOLICA L1" target="BAQUEDANO L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="BAQUEDANO L1" target="SALVADOR L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="BAQUEDANO L1" target="BAQUEDANO L5">
+  <data key="d0">transfer</data>
+  <data key="d2">BAQUEDANO</data>
+</edge>
+<edge source="SALVADOR L1" target="MANUEL MONTT L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="MANUEL MONTT L1" target="PEDRO DE VALDIVIA L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="PEDRO DE VALDIVIA L1" target="LOS LEONES L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="LOS LEONES L1" target="TOBALABA L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="LOS LEONES L1" target="LOS LEONES L6">
+  <data key="d0">transfer</data>
+  <data key="d2">LOS LEONES</data>
+</edge>
+<edge source="TOBALABA L1" target="EL GOLF L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="TOBALABA L1" target="TOBALABA L4">
+  <data key="d0">transfer</data>
+  <data key="d2">TOBALABA</data>
+</edge>
+<edge source="EL GOLF L1" target="ALCANTARA L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="ALCANTARA L1" target="ESCUELA MILITAR L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="ESCUELA MILITAR L1" target="MANQUEHUE L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="MANQUEHUE L1" target="HERNANDO DE MAGALLANES L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="HERNANDO DE MAGALLANES L1" target="LOS DOMINICOS L1">
+  <data key="d0">travel</data>
+  <data key="d1">L1</data>
+</edge>
+<edge source="HOSPITAL EL PINO L2" target="COPA LO MARTINEZ L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="COPA LO MARTINEZ L2" target="OBSERVATORIO L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="OBSERVATORIO L2" target="EL BOSQUE L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="EL BOSQUE L2" target="LA CISTERNA L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="LA CISTERNA L2" target="EL PARRON L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="LA CISTERNA L2" target="LA CISTERNA L4A">
+  <data key="d0">transfer</data>
+  <data key="d2">LA CISTERNA</data>
+</edge>
+<edge source="EL PARRON L2" target="LO OVALLE L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="LO OVALLE L2" target="CIUDAD DEL NINO L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="CIUDAD DEL NINO L2" target="DEPARTAMENTAL L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="DEPARTAMENTAL L2" target="LO VIAL L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="LO VIAL L2" target="SAN MIGUEL L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="SAN MIGUEL L2" target="EL LLANO L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="EL LLANO L2" target="FRANKLIN L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="FRANKLIN L2" target="RONDIZZONI L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="FRANKLIN L2" target="FRANKLIN L6">
+  <data key="d0">transfer</data>
+  <data key="d2">FRANKLIN</data>
+</edge>
+<edge source="RONDIZZONI L2" target="PARQUE OHIGGINS L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="PARQUE OHIGGINS L2" target="TOESCA L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="TOESCA L2" target="LOS HEROES L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="LOS HEROES L2" target="SANTA ANA L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="SANTA ANA L2" target="PUENTE CAL Y CANTO L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="SANTA ANA L2" target="SANTA ANA L5">
+  <data key="d0">transfer</data>
+  <data key="d2">SANTA ANA</data>
+</edge>
+<edge source="PUENTE CAL Y CANTO L2" target="PATRONATO L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="PUENTE CAL Y CANTO L2" target="PUENTE CAL Y CANTO L3">
+  <data key="d0">transfer</data>
+  <data key="d2">PUENTE CAL Y CANTO</data>
+</edge>
+<edge source="PATRONATO L2" target="CERRO BLANCO L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="CERRO BLANCO L2" target="CEMENTERIOS L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="CEMENTERIOS L2" target="EINSTEIN L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="EINSTEIN L2" target="DORSAL L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="DORSAL L2" target="ZAPADORES L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="ZAPADORES L2" target="VESPUCIO NORTE L2">
+  <data key="d0">travel</data>
+  <data key="d1">L2</data>
+</edge>
+<edge source="PLAZA QUILICURA L3" target="LO CRUZAT L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="LO CRUZAT L3" target="FERROCARRIL L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="FERROCARRIL L3" target="LOS LIBERTADORES L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="LOS LIBERTADORES L3" target="CARDENAL CARO L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="CARDENAL CARO L3" target="VIVACETA L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="VIVACETA L3" target="CONCHALI L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="CONCHALI L3" target="PLAZA CHACABUCO L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="PLAZA CHACABUCO L3" target="HOSPITALES L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="HOSPITALES L3" target="PUENTE CAL Y CANTO L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="PUENTE CAL Y CANTO L3" target="PLAZA DE ARMAS L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="PLAZA DE ARMAS L3" target="UNIVERSIDAD DE CHILE L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="PLAZA DE ARMAS L3" target="PLAZA DE ARMAS L5">
+  <data key="d0">transfer</data>
+  <data key="d2">PLAZA DE ARMAS</data>
+</edge>
+<edge source="UNIVERSIDAD DE CHILE L3" target="PARQUE ALMAGRO L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="PARQUE ALMAGRO L3" target="MATTA L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="MATTA L3" target="IRARRAZAVAL L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="IRARRAZAVAL L3" target="MONSENOR EYZAGUIRRE L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="IRARRAZAVAL L3" target="IRARRAZAVAL L5">
+  <data key="d0">transfer</data>
+  <data key="d2">IRARRAZAVAL</data>
+</edge>
+<edge source="MONSENOR EYZAGUIRRE L3" target="NUNOA L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="NUNOA L3" target="CHILE ESPANA L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="NUNOA L3" target="NUNOA L6">
+  <data key="d0">transfer</data>
+  <data key="d2">NUNOA</data>
+</edge>
+<edge source="CHILE ESPANA L3" target="VILLA FREI L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="VILLA FREI L3" target="PLAZA EGANA L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="PLAZA EGANA L3" target="FERNANDO CASTILLO VELASCO L3">
+  <data key="d0">travel</data>
+  <data key="d1">L3</data>
+</edge>
+<edge source="PLAZA EGANA L3" target="PLAZA EGANA L4">
+  <data key="d0">transfer</data>
+  <data key="d2">PLAZA EGANA</data>
+</edge>
+<edge source="TOBALABA L4" target="CRISTOBAL COLON L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="CRISTOBAL COLON L4" target="FRANCISCO BILBAO L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="FRANCISCO BILBAO L4" target="PRINCIPE DE GALES L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="PRINCIPE DE GALES L4" target="SIMON BOLIVAR L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="SIMON BOLIVAR L4" target="PLAZA EGANA L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="PLAZA EGANA L4" target="LOS ORIENTALES L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="LOS ORIENTALES L4" target="GRECIA L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="GRECIA L4" target="LOS PRESIDENTES L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="LOS PRESIDENTES L4" target="QUILIN L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="QUILIN L4" target="LAS TORRES L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="LAS TORRES L4" target="MACUL L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="MACUL L4" target="VICUNA MACKENNA L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="VICUNA MACKENNA L4" target="VICENTE VALDES L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="VICUNA MACKENNA L4" target="VICUNA MACKENNA L4A">
+  <data key="d0">transfer</data>
+  <data key="d2">VICUNA MACKENNA</data>
+</edge>
+<edge source="VICENTE VALDES L4" target="ROJAS MAGALLANES L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="VICENTE VALDES L4" target="VICENTE VALDES L5">
+  <data key="d0">transfer</data>
+  <data key="d2">VICENTE VALDES</data>
+</edge>
+<edge source="ROJAS MAGALLANES L4" target="TRINIDAD L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="TRINIDAD L4" target="SAN JOSE DE LA ESTRELLA L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="SAN JOSE DE LA ESTRELLA L4" target="LOS QUILLAYES L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="LOS QUILLAYES L4" target="ELISA CORREA L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="ELISA CORREA L4" target="HOSPITAL SOTERO DEL RIO L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="HOSPITAL SOTERO DEL RIO L4" target="PROTECTORA DE LA INFANCIA L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="PROTECTORA DE LA INFANCIA L4" target="LAS MERCEDES L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="LAS MERCEDES L4" target="PLAZA DE PUENTE ALTO L4">
+  <data key="d0">travel</data>
+  <data key="d1">L4</data>
+</edge>
+<edge source="VICUNA MACKENNA L4A" target="SANTA JULIA L4A">
+  <data key="d0">travel</data>
+  <data key="d1">L4A</data>
+</edge>
+<edge source="SANTA JULIA L4A" target="LA GRANJA L4A">
+  <data key="d0">travel</data>
+  <data key="d1">L4A</data>
+</edge>
+<edge source="LA GRANJA L4A" target="SANTA ROSA L4A">
+  <data key="d0">travel</data>
+  <data key="d1">L4A</data>
+</edge>
+<edge source="SANTA ROSA L4A" target="SAN RAMON L4A">
+  <data key="d0">travel</data>
+  <data key="d1">L4A</data>
+</edge>
+<edge source="SAN RAMON L4A" target="LA CISTERNA L4A">
+  <data key="d0">travel</data>
+  <data key="d1">L4A</data>
+</edge>
+<edge source="PLAZA DE MAIPU L5" target="SANTIAGO BUERAS L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="SANTIAGO BUERAS L5" target="DEL SOL L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="DEL SOL L5" target="MONTE TABOR L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="MONTE TABOR L5" target="LAS PARCELAS L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="LAS PARCELAS L5" target="LAGUNA SUR L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="LAGUNA SUR L5" target="BARRANCAS L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="BARRANCAS L5" target="PUDAHUEL L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="PUDAHUEL L5" target="SAN PABLO L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="SAN PABLO L5" target="LO PRADO L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="LO PRADO L5" target="BLANQUEADO L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="BLANQUEADO L5" target="GRUTA DE LOURDES L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="GRUTA DE LOURDES L5" target="QUINTA NORMAL L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="QUINTA NORMAL L5" target="CUMMING L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="CUMMING L5" target="SANTA ANA L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="SANTA ANA L5" target="PLAZA DE ARMAS L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="PLAZA DE ARMAS L5" target="BELLAS ARTES L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="BELLAS ARTES L5" target="BAQUEDANO L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="BAQUEDANO L5" target="PARQUE BUSTAMANTE L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="PARQUE BUSTAMANTE L5" target="SANTA ISABEL L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="SANTA ISABEL L5" target="IRARRAZAVAL L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="IRARRAZAVAL L5" target="NUBLE L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="NUBLE L5" target="RODRIGO DE ARAYA L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="NUBLE L5" target="NUBLE L6">
+  <data key="d0">transfer</data>
+  <data key="d2">NUBLE</data>
+</edge>
+<edge source="RODRIGO DE ARAYA L5" target="CARLOS VALDOVINOS L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="CARLOS VALDOVINOS L5" target="CAMINO AGRICOLA L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="CAMINO AGRICOLA L5" target="SAN JOAQUIN L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="SAN JOAQUIN L5" target="PEDRERO L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="PEDRERO L5" target="MIRADOR L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="MIRADOR L5" target="BELLAVISTA DE LA FLORIDA L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="BELLAVISTA DE LA FLORIDA L5" target="VICENTE VALDES L5">
+  <data key="d0">travel</data>
+  <data key="d1">L5</data>
+</edge>
+<edge source="CERRILLOS L6" target="LO VALLEDOR L6">
+  <data key="d0">travel</data>
+  <data key="d1">L6</data>
+</edge>
+<edge source="LO VALLEDOR L6" target="PDTE PEDRO AGUIRRE CERDA L6">
+  <data key="d0">travel</data>
+  <data key="d1">L6</data>
+</edge>
+<edge source="PDTE PEDRO AGUIRRE CERDA L6" target="FRANKLIN L6">
+  <data key="d0">travel</data>
+  <data key="d1">L6</data>
+</edge>
+<edge source="FRANKLIN L6" target="BIO BIO L6">
+  <data key="d0">travel</data>
+  <data key="d1">L6</data>
+</edge>
+<edge source="BIO BIO L6" target="NUBLE L6">
+  <data key="d0">travel</data>
+  <data key="d1">L6</data>
+</edge>
+<edge source="NUBLE L6" target="ESTADIO NACIONAL L6">
+  <data key="d0">travel</data>
+  <data key="d1">L6</data>
+</edge>
+<edge source="ESTADIO NACIONAL L6" target="NUNOA L6">
+  <data key="d0">travel</data>
+  <data key="d1">L6</data>
+</edge>
+<edge source="NUNOA L6" target="INES DE SUAREZ L6">
+  <data key="d0">travel</data>
+  <data key="d1">L6</data>
+</edge>
+<edge source="INES DE SUAREZ L6" target="LOS LEONES L6">
+  <data key="d0">travel</data>
+  <data key="d1">L6</data>
+</edge>
+</graph></graphml>
