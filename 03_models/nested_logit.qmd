@@ -1,0 +1,1241 @@
+---
+title: "Tesis — 03 | Modelo Nested Logit"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Este notebook tiene como objetivo:
+1.  Preparar los datos para un modelo Logit Anidado (Nested Logit - NL).
+2.  Definir la estructura de un modelo NL base donde la elección superior es entre Bip! y QR, y la elección inferior (dentro de QR) es entre la App Red y Otras Apps.
+3.  Estimar este modelo NL base usando distintas variables como predictores.
+4.  Implementar una estructura para estimar el modelo secuencialmente sobre múltiples particiones semanales, con opción de muestreo.
+
+---
+
+::: {.callout-warning}
+# ⚠️ Limitación Importante: Transbordos Internos entre Metro
+
+**IMPORTANTE:** Los resultados de este modelo deben interpretarse con precaución debido a la presencia de **transbordos internos entre metro no detectados** en los datos. Estos transbordos no detectados están sesgando las siguientes variables del modelo:
+
+- **Número de trasbordos (`VAR_N_TRASBORDOS`)**: Se está sobreestimando el número real de trasbordos cuando en realidad algunos son transbordos internos dentro de la misma red de Metro.
+
+- **Tiempos de espera en trasbordo (`VAR_T_ESPERA_TRASBORDO_MIN`)**: Los tiempos de espera asociados a estos transbordos fantasmas no reflejan esperas reales entre modos distintos.
+
+- **Tiempos de caminata (`VAR_T_CAMINATA_MIN`)**: Los tiempos de caminata entre etapas que en realidad son transbordos internos están siendo contabilizados incorrectamente.
+
+- **Modos de transporte (`DUMMY_SOLO_METRO`, `DUMMY_METRO_BUS`)**: La clasificación de modos puede estar incorrecta cuando hay transbordos internos no detectados.
+
+Para una interpretación correcta de los resultados, se recomienda:
+1. Revisar los resultados del notebook de corrección de transbordos internos (`04_transbordos_metro.qmd`).
+2. Considerar que los coeficientes de variables relacionadas con trasbordos y tiempos pueden estar subestimados o sobreestimados.
+3. Las variables temporales (horas punta, días laborales) y el parámetro del nido (`MU_QR`) no se ven afectadas por este problema.
+:::
+
+---
+## Modelo Nested Logit Base
+### 1) Setup y Conexión
+
+```{python}
+#|label: setup-imports-nested
+import os
+import sys
+import polars as pl
+import pandas as pd
+import gcsfs
+import pyarrow.fs as pafs
+import logging
+import gc
+import time
+
+# Importar biogeme
+from biogeme.version import get_text as biogeme_version_text
+import biogeme.results_processing as br
+from biogeme.results_processing import get_pandas_estimated_parameters
+import biogeme.biogeme_logging as blog
+from biogeme.version import get_text as biogeme_version_text
+import biogeme.results_processing as br
+from biogeme.results_processing import get_pandas_estimated_parameters
+import biogeme.database as db
+import biogeme.biogeme as bio
+from biogeme import models
+from biogeme.expressions import Beta, Variable
+
+
+# --- Configuración Logging Biogeme ---
+# Configura el logger una sola vez para evitar duplicados
+logger = blog.get_screen_logger(level=blog.INFO)
+logger.info(biogeme_version_text())
+
+# --- Autenticación GCS ---
+def enable_adc_crossplatform():
+    """Configura credenciales de Google Cloud para acceso a GCS"""
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"): return
+    if sys.platform.startswith("win"):
+        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
+    else:
+        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+    if not os.path.exists(adc_path):
+        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
+
+try:
+    enable_adc_crossplatform()
+    gfs = gcsfs.GCSFileSystem(token="google_default")
+    print("✅ Conexión con GCS establecida.")
+except FileNotFoundError as e:
+    print(f"❌ Error de autenticación: {e}")
+
+# --- Parámetros Generales ---
+GCS_BUCKET = "tesis-vonetto-datalake"
+SILVER_PATH = f"gs://{GCS_BUCKET}/lake/silver"
+INPUT_DATASET_PATH = f"{SILVER_PATH}/viajes_filtrados" # Usar datos filtrados
+
+# --- Parámetros del Modelo Anidado ---
+
+CONTRATO_IDS_RED = [29]
+
+# Códigos para la variable 'choice_nested'
+CHOICE_BIP = 0
+CHOICE_QR_RED = 1
+CHOICE_QR_OTHER = 2
+
+# --- Constantes Temporales ---
+HORAS_PUNTA_MANANA = [7, 8]
+HORAS_PUNTA_TARDE = [18, 19]
+
+# --- Parámetros de Ejecución Secuencial ---
+
+PARTICIONES_A_PROCESAR = [
+    (2025, 17),
+    (2025, 18)
+]
+
+APPLY_SAMPLING = False # Cambiar a False para usar partición completa (riesgo OOM)
+SAMPLE_FRACTION = 0.20 # 20% estratificado por la nueva elección anidada
+SEED = 42
+BASE_OUTPUT_DIR = "model_outputs_nl_base" # Directorio específico para este modelo
+
+
+print(f"\n Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f" Códigos elección: BIP={CHOICE_BIP}, QR_RED={CHOICE_QR_RED}, QR_OTHER={CHOICE_QR_OTHER}")
+print(f" IDs Contrato App Red: {CONTRATO_IDS_RED}")
+print(f" Aplicar muestreo: {APPLY_SAMPLING} (Fracción: {SAMPLE_FRACTION if APPLY_SAMPLING else 'N/A'})")
+print(f" Directorio base de salida: {BASE_OUTPUT_DIR}")
+
+# --- Paralelismo ---
+N_THREADS = max(1, (os.cpu_count() or 2) // 2)  # usa ~50% de CPUs por seguridad
+```  
+
+### 1.1) Documentación del Modelo Nested Logit (Baseline y Extendido)
+
+En el esquema Nested Logit considerado:
+
+- Codificación de elección `choice_nested`:
+  - 0 = `BIP` (pago con Bip!).
+  - 1 = `QR_RED` (QR App Red).
+  - 2 = `QR_OTHER` (otras Apps QR).
+
+- Estructura de nidos:
+  - Nido `BIP`: contiene la alternativa 0 con parámetro de nido fijado en 1.0 (base).
+  - Nido `QR`: contiene las alternativas 1 y 2 con parámetro de nido `MU_QR ≥ 1` a estimar.
+
+- Variables temporales (creadas a partir de fecha/hora):
+  - `DUMMY_PM_LAB`: 1 si (hora ∈ {7,8} y día laboral), 0 en caso contrario.
+  - `DUMMY_PT_LAB`: 1 si (hora ∈ {18,19} y día laboral), 0 si no.
+  - `DUMMY_LJ_LAB`: 1 si (lunes–jueves laboral), 0 si no.
+  - `DUMMY_VIE_LAB`: 1 si (viernes laboral), 0 si no.
+
+- Modelo baseline:
+  - Utilidades: \(V_{BIP}=0\), \(V_{QR\_RED}=ASC\_{QR\_RED}+\beta\cdot X\), \(V_{QR\_OTHER}=0+\beta\cdot X\) con las dummies temporales.
+  - Nidos: `(1.0, [BIP])` y `(MU_QR, [QR_RED, QR_OTHER])`.
+
+- Modelo extendido (análogo, pero con atributos adicionales del viaje):
+  - Atributos típicos: minutos en vehículo, trasbordos, caminata, esperas; y combinaciones modales.
+  - Las utilidades para QR_RED y QR_OTHER comparten estructura y difieren en la constante de QR_RED.
+
+La probabilidad se calcula con la función `lognested(V, av, nests, CHOICE_NESTED)` de Biogeme.
+
+### 2) Funciones de Ayuda
+```{python}
+#|label: helper-functions-nested
+
+# --- Helper para Muestreo Estratificado por 'choice_nested' ---
+def get_stratified_sample_nested(df: pl.DataFrame, fraction: float, seed: int) -> pl.DataFrame:
+    """Realiza muestreo estratificado por la columna 'choice_nested'."""
+    total_rows = len(df)
+    if total_rows == 0: return df.clear() # Devuelve vacío si no hay datos
+    target_rows = int(total_rows * fraction)
+    if target_rows == 0: return df.clear() # Devuelve vacío si la muestra es 0
+
+    counts = df.group_by("choice_nested").agg(pl.len().alias("count")).sort("choice_nested")
+
+    # Calcula proporciones solo si hay filas
+    if total_rows > 0:
+         proportions = counts.with_columns(
+             (pl.col("count") / total_rows).alias("proportion")
+         )
+    else:
+         return df.clear()
+
+    samples = []
+    total_sampled = 0
+    num_groups = len(proportions)
+
+    for i, row in enumerate(proportions.iter_rows(named=True)):
+        choice_code = row['choice_nested']
+        count = row['count']
+        proportion = row['proportion']
+        
+        # Calcular n para este grupo
+        target_n = int(round(target_rows * proportion)) # Redondear al más cercano
+
+        # Ajuste simple para asegurar tamaño total correcto (añadir/quitar del último grupo)
+        if i == num_groups - 1:
+            target_n = target_rows - total_sampled
+
+        target_n = max(0, min(target_n, count)) # Asegurar que n esté entre 0 y count
+
+        if target_n > 0:
+            df_sample_group = df.filter(pl.col("choice_nested") == choice_code).sample(
+                n=target_n, shuffle=True, seed=seed + i # Usar seed diferente por grupo
+            )
+            samples.append(df_sample_group)
+            total_sampled += target_n
+
+    if samples:
+        # Concatenar y barajar una vez más
+        df_model_sample = pl.concat(samples).sample(fraction=1.0, shuffle=True, seed=seed + num_groups)
+        # Verificar tamaño final (puede variar ligeramente por redondeo)
+        if abs(len(df_model_sample) - target_rows) > num_groups : # Tolerancia
+             print(f"      Advertencia: Tamaño final de muestra ({len(df_model_sample)}) difiere del objetivo ({target_rows}).")
+        return df_model_sample
+    else:
+        return df.clear() # Devuelve DataFrame vacío si no se pudo muestrear
+
+# --- Helper para Feature Engineering (Modelo Anidado Base) ---
+def prepare_nested_base_features(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
+    """Prepara las features para el modelo anidado base (solo temporales)."""
+    # Columnas necesarias mínimas
+    cols_necesarias = ["is_qr", "contrato", "tiempo_inicio_viaje", "tipodia"]
+    
+    # Verificar si 'contrato' existe, si no, asignar un valor default para que no falle
+    schema = lazy_frame.collect_schema()
+    if 'contrato' not in schema:
+        print("      Advertencia: Columna 'contrato' no encontrada. Asumiendo todos los QR como 'OTHER'.")
+        lazy_frame = lazy_frame.with_columns(pl.lit(None).alias('contrato')) # Añadir columna nula
+
+    lf_prep = lazy_frame.select(cols_necesarias).with_columns([
+        # Crear choice_nested (0=BIP, 1=QR_RED, 2=QR_OTHER)
+        pl.when(pl.col("is_qr") == False).then(pl.lit(CHOICE_BIP))
+          .when(pl.col("contrato").cast(pl.Int64, strict=False).is_in(CONTRATO_IDS_RED)).then(pl.lit(CHOICE_QR_RED))
+          .otherwise(pl.lit(CHOICE_QR_OTHER)) # Asume qr=True y no RED es OTHER
+          .cast(pl.Int8)
+          .alias("choice_nested"),
+        pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
+    ]).with_columns([
+        pl.col("ts_local").dt.hour().alias("hora"),
+        pl.col("ts_local").dt.weekday().alias("dia_semana"),
+        (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+    ]).with_columns([
+        pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+        (pl.col("dia_semana") == 5).alias("es_viernes"),
+        pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
+    ]).with_columns([
+        # Dummies temporales
+        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+        (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+        (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+    ])
+    
+    # Seleccionar columnas finales
+    cols_modelo = ["choice_nested", "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+    return lf_prep.select(cols_modelo).fill_null(0)
+
+print("✅ Funciones de ayuda `prepare_nested_base_features` y `get_stratified_sample_nested` definidas.")
+
+
+
+# --- Helper para Feature Engineering (Modelo Extendido - CORREGIDO y ROBUSTO) ---
+def prepare_features_extended(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Prepara las features para el modelo anidado extendido,
+    incluyendo variables temporales y de atributos de viaje.
+    """
+    # Columnas necesarias mínimas + base para cálculos
+    cols_necesarias = [
+        "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
+        "tiempo_vehiculo_seg", "te0",
+        "tc1", "tc2", "tc3",
+        "te1", "te2", "te3",
+        "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4",
+        "contrato" # Necesario para choice_nested
+    ]
+
+    # Verificar si 'contrato' existe, si no, asignar un valor default
+    schema = lazy_frame.collect_schema()
+    if 'contrato' not in schema:
+        print("      Advertencia: Columna 'contrato' no encontrada. Asumiendo todos los QR como 'OTHER'.")
+        lazy_frame = lazy_frame.with_columns(pl.lit(None).alias('contrato'))
+
+    # Seleccionar y pre-procesar columnas base (con fill_null temprano)
+    lf_prep_ext = lazy_frame.select(cols_necesarias).with_columns([
+        pl.col("is_qr").cast(pl.Int8).alias("choice_raw"), # Usar nombre intermedio
+        pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
+        pl.col("n_etapas").fill_null(1).cast(pl.Int8), # Asumir 1 etapa si es nulo
+        pl.col("tiempo_vehiculo_seg").fill_null(0).cast(pl.Float64),
+        pl.col("te0").fill_null(0).cast(pl.Float64),
+        pl.col("tc1").fill_null(0).cast(pl.Float64),
+        pl.col("tc2").fill_null(0).cast(pl.Float64),
+        pl.col("tc3").fill_null(0).cast(pl.Float64),
+        pl.col("te1").fill_null(0).cast(pl.Float64),
+        pl.col("te2").fill_null(0).cast(pl.Float64),
+        pl.col("te3").fill_null(0).cast(pl.Float64),
+        # Convertir tipodia robustamente
+        (pl.col("tipodia").cast(pl.Utf8).cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+        # Crear choice_nested (0=BIP, 1=QR_RED, 2=QR_OTHER)
+        pl.when(pl.col("is_qr") == False).then(pl.lit(CHOICE_BIP))
+          .when(pl.col("contrato").cast(pl.Int64, strict=False).is_in(CONTRATO_IDS_RED)).then(pl.lit(CHOICE_QR_RED))
+          .otherwise(pl.lit(CHOICE_QR_OTHER)) # Asume qr=True y no RED es OTHER
+          .cast(pl.Int8)
+          .alias("choice_nested"),
+    ]).drop("is_qr", "contrato") # Eliminar columnas originales si ya no se necesitan
+
+    # 1. Dummies temporales
+    lf_prep_ext = lf_prep_ext.with_columns([
+        pl.col("ts_local").dt.hour().alias("hora"),
+        pl.col("ts_local").dt.weekday().alias("dia_semana"),
+    ]).with_columns([
+        pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+        (pl.col("dia_semana") == 5).alias("es_viernes"),
+        pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
+    ]).with_columns([
+        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+        (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+        (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+    ])
+
+    # 2. Variables de atributos de viaje
+    lf_prep_ext = lf_prep_ext.with_columns([
+        (pl.col("tiempo_vehiculo_seg") / 60.0).alias("VAR_T_VEHICULO_MIN"),
+        (pl.col("n_etapas") - 1).alias("VAR_N_TRASBORDOS"), # Ya es Int8
+        ((pl.col("tc1") + pl.col("tc2") + pl.col("tc3")) / 60.0).alias("VAR_T_CAMINATA_MIN"),
+        # --- CORRECCIÓN AQUÍ ---
+        pl.when(pl.col("n_etapas") > 1)
+          .then((pl.col("te1") + pl.col("te2") + pl.col("te3")) / 60.0)
+          .otherwise(0.0) # <-- Importante: 0 si n_etapas es 1
+          .alias("VAR_T_ESPERA_TRASBORDO_MIN"),
+        # ----------------------
+        (pl.col("te0") / 60.0).alias("VAR_T_ESPERA_INICIAL_MIN"),
+    ])
+
+    # 3. Dummies de modo de transporte
+    cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
+    for col in cols_modos:
+        lf_prep_ext = lf_prep_ext.with_columns([
+            pl.when(pl.col(col).cast(pl.Utf8) == '4').then(pl.lit('2')) # MetroTren -> Metro
+              .when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1')) # ZonaPaga -> Bus
+              .otherwise(pl.col(col).cast(pl.Utf8)) # Mantener 1, 2, u otros/nulos
+              .alias(col)
+        ])
+
+    lf_prep_ext = lf_prep_ext.with_columns([
+        # Verifica si algún tipo de transporte relevante (1 a n_etapas) fue Bus ('1')
+        pl.any_horizontal([
+            pl.when(pl.col("n_etapas") >= i).then(pl.col(f"tipo_transporte_{i}") == '1').otherwise(False)
+            for i in range(1, 5)
+        ]).alias("usa_bus"),
+        # Verifica si algún tipo de transporte relevante (1 a n_etapas) fue Metro ('2')
+        pl.any_horizontal([
+            pl.when(pl.col("n_etapas") >= i).then(pl.col(f"tipo_transporte_{i}") == '2').otherwise(False)
+            for i in range(1, 5)
+        ]).alias("usa_metro"),
+    ]).with_columns([
+        (pl.col("usa_metro") & ~pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+        (pl.col("usa_metro") & pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+    ])
+
+    # 4. Seleccionar columnas finales y rellenar nulos residuales
+    cols_modelo_ext = [
+        "choice_nested", # <-- Usar la nueva variable de elección
+        "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB",
+        "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS", "VAR_T_CAMINATA_MIN",
+        "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN",
+        "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS"
+    ]
+
+    # Seleccionar y aplicar fill_null final como salvaguarda
+    lf_final = lf_prep_ext.select(cols_modelo_ext).fill_null(0)
+
+    # Opcional: Verificar tipos finales
+    # print("Schema final:")
+    # print(lf_final.collect_schema())
+
+    return lf_final
+
+print("✅ Función de ayuda `prepare_features_extended` (corregida) definida.")
+```
+
+### 3) Estimación Secuencial del Modelo Nested Logit Base
+```{python}
+#|label: sequential-estimation-nl-base
+#|eval: false # Quitar para ejecutar
+
+
+# --- Configuración del Logger ---
+logger = blog.get_screen_logger(level=blog.INFO)
+
+# --- BUCLE DE PROCESAMIENTO SECUENCIAL ---
+print("--- Iniciando Proceso de Estimación Secuencial (Nested Logit Base) ---")
+
+# Asegúrate de que las particiones, muestreo, etc., estén definidos
+# en la celda #|label: setup-sequential-run-nl
+
+for year, week in PARTICIONES_A_PROCESAR:
+    partition_label = f"{year}-W{week}"
+    print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} ---\n{'='*60}")
+
+    # --- CORRECCIÓN DE NOMBRE DE CARPETA ---
+    # a. Definir y crear directorio de salida único
+    if APPLY_SAMPLING:
+        sample_label = f"sample{int(SAMPLE_FRACTION*100)}pct"
+    else:
+        sample_label = "full"
+    
+    output_dir_partition = os.path.join(BASE_OUTPUT_DIR, f"W{week}-nested-base-{sample_label}")
+    # ------------------------------------
+
+    os.makedirs(output_dir_partition, exist_ok=True)
+    print(f"    Resultados se guardarán en: {output_dir_partition}")
+
+    # Definir variables para limpieza en el bloque finally
+    lf_data, df_model_data, df_for_pandas, pandas_df, biodb, biogeme_model, results = (None,) * 7
+
+    try:
+        # b. Cargar datos
+        input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+        lf_data = pl.scan_parquet(input_path_glob)
+        print(f"    Cargando datos desde: {input_path_glob}")
+
+        # c. Preparar features (usando la función helper anidada base)
+        lf_model_ready = prepare_nested_base_features(lf_data)
+        df_model_data = lf_model_ready.collect()
+        print(f"    Variables calculadas. Filas antes de muestreo: {len(df_model_data):,}")
+        
+        # Verificar distribución antes de muestrear
+        print("      Distribución choice_nested (antes):")
+        print(df_model_data['choice_nested'].value_counts().sort('choice_nested'))
+
+
+        # d. Muestreo condicional
+        if APPLY_SAMPLING:
+            print(f"    Aplicando muestreo estratificado por 'choice_nested' ({SAMPLE_FRACTION*100:.0f}%)...")
+            df_for_pandas = get_stratified_sample_nested(df_model_data, SAMPLE_FRACTION, SEED)
+            print(f"    Filas después del muestreo: {len(df_for_pandas):,}")
+            # Verificar distribución después de muestrear
+            if len(df_for_pandas) > 0:
+                 print("      Distribución choice_nested (después):")
+                 print(df_for_pandas['choice_nested'].value_counts().sort('choice_nested'))
+            else:
+                 print("      Muestra vacía después del muestreo.")
+                 continue # Saltar a la siguiente partición si la muestra es vacía
+        else:
+            print("    Usando el dataset completo (sin muestreo).")
+            df_for_pandas = df_model_data
+            
+        if len(df_for_pandas) == 0:
+             print("      Dataset vacío para procesar. Saltando partición.")
+             continue
+
+        pandas_df = df_for_pandas.to_pandas()
+        
+        # Limpieza intermedia
+        del df_model_data, df_for_pandas
+        gc.collect()
+
+        # e. Setup Biogeme (Definición del Modelo NESTED LOGIT BASE)
+        #    Se define DENTRO del bucle con nombres únicos.
+        print("    Definiendo especificación del modelo (Betas, Variables, Nidos)...")
+
+        # (1) Definir Betas
+        B_PM_LAB = Beta(f'B_PM_LAB_{partition_label}', 0, None, None, 0)
+        B_PT_LAB = Beta(f'B_PT_LAB_{partition_label}', 0, None, None, 0)
+        B_LJ_LAB = Beta(f'B_LJ_LAB_{partition_label}', 0, None, None, 0)
+        B_VIE_LAB = Beta(f'B_VIE_LAB_{partition_label}', 0, None, None, 0)
+        ASC_QR_RED = Beta(f'ASC_QR_RED_{partition_label}', 0, None, None, 0) 
+        MU_QR = Beta(f'MU_QR_{partition_label}', 1, 1, None, 0) # Mu >= 1
+
+        # (2) Definir Variables
+        PM_LAB = Variable('DUMMY_PM_LAB')
+        PT_LAB = Variable('DUMMY_PT_LAB')
+        LJ_LAB = Variable('DUMMY_LJ_LAB')
+        VIE_LAB = Variable('DUMMY_VIE_LAB')
+        CHOICE_NESTED = Variable('choice_nested')
+
+        # (3) Definir Funciones de Utilidad (V)
+        V_BIP = 0 # Base general
+        V_QR_RED = (ASC_QR_RED + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + 
+                    B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB)
+        V_QR_OTHER = (0 + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + # Base dentro del nido QR
+                      B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB)
+
+        V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+
+        # (4) Definir Disponibilidad (av) - Todas disponibles
+        av = {CHOICE_BIP: 1, CHOICE_QR_RED: 1, CHOICE_QR_OTHER: 1}
+
+        # (5) Definir Nidos (μ y alternativas en cada nido)
+        nests = (
+             (1.0, [CHOICE_BIP]), 
+             (MU_QR, [CHOICE_QR_RED, CHOICE_QR_OTHER])
+        )
+
+        # (6) Definir Log-Probabilidad
+        logprob = models.lognested(V, av, nests, CHOICE_NESTED)
+        
+        print("    Especificación del Modelo Nested Logit definida.")
+
+        # f. Estimar el modelo
+        biodb = db.Database(f'db_nl_base_{partition_label}', pandas_df)
+        model_name = f'nested_logit_base_{partition_label}'
+        biogeme_model = bio.BIOGEME(biodb, logprob)
+        biogeme_model.model_name = model_name
+
+        original_cwd = os.getcwd()
+        os.chdir(output_dir_partition)
+        
+        print(f"    Estimando el modelo para {partition_label}...")
+        results = biogeme_model.estimate()
+        print("    ✅ Estimación completada!")
+
+        # g. Guardar resultados en CSV
+        params_df = br.get_pandas_estimated_parameters(estimation_results=results)
+        stats_dict = results.get_general_statistics()
+        params_df.to_csv(f'params_{model_name}.csv')
+        pd.DataFrame([stats_dict]).to_csv(f'stats_{model_name}.csv', index=False)
+        print(f"    📁 Resultados guardados en formato CSV y HTML.")
+
+        # (Guardar resumen para comparación final - Opcional)
+        # ...
+
+        os.chdir(original_cwd)
+
+    except Exception as e:
+        print(f"    ❌ ERROR procesando {partition_label}: {e}")
+        # Asegurarse de volver al directorio original en caso de error
+        if 'original_cwd' in locals() and os.getcwd() != original_cwd:
+            os.chdir(original_cwd)
+
+    finally:
+        # h. Limpieza de memoria explícita
+        print("    Limpiando memoria de la partición...")
+        try:
+            del pandas_df, biodb, biogeme_model, results
+        except NameError:
+            pass
+        try:
+            del V, av, nests, logprob  # Limpiar especificaciones del modelo
+        except NameError:
+            pass
+        gc.collect()
+        time.sleep(2) # Pequeña pausa
+
+print(f"\n{'='*60}\n--- Proceso Finalizado (Nested Logit Base) ---\n{'='*60}")
+```
+
+## Modelo Nested Logit Extendido
+
+### 1) Setup y Conexión
+```{python}
+#|label: setup-sequential-run-nl-extended
+
+
+# --- 1. CONFIGURACIÓN DE LA EJECUCIÓN ---
+# Define aquí las particiones que quieres procesar
+PARTICIONES_A_PROCESAR_NL_EXT = [
+    (2025, 17),
+    (2025, 18)
+]
+
+# Define si quieres aplicar muestreo o usar el dataset completo
+APPLY_SAMPLING_NL_EXT = True # <-- MUY RECOMENDADO para el modelo extendido
+SAMPLE_FRACTION_NL_EXT = 0.50 # 20% (ajusta si es necesario, ej. 0.1)
+SEED = 42               # Para reproducibilidad del muestreo
+
+# Directorio base para los resultados (distinto al base simple)
+BASE_OUTPUT_DIR_NL_EXT = "model_outputs_nl_extended"
+
+print("--- Configuración de Ejecución (Nested Logit Extendido) Lista ---")
+print(f"Particiones a procesar: {PARTICIONES_A_PROCESAR_NL_EXT}")
+print(f"Aplicar muestreo: {APPLY_SAMPLING_NL_EXT}")
+if APPLY_SAMPLING_NL_EXT:
+    print(f"Fracción de muestreo: {SAMPLE_FRACTION_NL_EXT}")
+print(f"Directorio base de salida: {BASE_OUTPUT_DIR_NL_EXT}")
+
+# Variables globales asumidas (definidas en celdas anteriores)
+# INPUT_DATASET_PATH, CHOICE_BIP, CHOICE_QR_RED, CHOICE_QR_OTHER,
+# CONTRATO_IDS_RED, HORAS_PUNTA_MANANA, HORAS_PUNTA_TARDE, N_THREADS
+```
+
+### 2) Estimación Secuencial del Modelo Nested Logit Extendido
+
+
+```{python}
+#|label: sequential-estimation-nl-extended
+#|eval: false # Quitar para ejecutar
+
+
+# --- Configuración del Logger ---
+logger = blog.get_screen_logger(level=blog.INFO)
+
+# --- BUCLE DE PROCESAMIENTO SECUENCIAL ---
+print("--- Iniciando Proceso de Estimación Secuencial (Nested Logit Extendido) ---")
+
+results_summary_ext = {} # Diccionario para guardar resumen
+
+for year, week in PARTICIONES_A_PROCESAR_NL_EXT:
+    partition_label = f"{year}-W{week}"
+    print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} (Extendido) ---\n{'='*60}")
+
+    # a. Definir y crear directorio de salida único
+    if APPLY_SAMPLING_NL_EXT:
+        sample_label = f"sample{int(SAMPLE_FRACTION_NL_EXT*100)}pct"
+    else:
+        sample_label = "full"
+    output_dir_partition = os.path.join(BASE_OUTPUT_DIR_NL_EXT, f"W{week}-nested-ext-{sample_label}")
+    os.makedirs(output_dir_partition, exist_ok=True)
+    print(f"    Resultados se guardarán en: {output_dir_partition}")
+
+    # Definir variables para limpieza en el bloque finally
+    lf_data, df_model_data, df_for_pandas, pandas_df, biodb, biogeme_model, results = (None,) * 7
+
+    try:
+        # b. Cargar datos
+        input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+        lf_data = pl.scan_parquet(input_path_glob)
+        print(f"    Cargando datos desde: {input_path_glob}")
+
+        # c. Preparar features (usando la función helper EXTENDIDA)
+        #    Asegúrate que prepare_features_extended esté corregida
+        lf_model_ready = prepare_features_extended(lf_data)
+        df_model_data = lf_model_ready.collect()
+        print(f"    Variables extendidas calculadas. Filas antes de muestreo: {len(df_model_data):,}")
+
+        # Verificar distribución 'choice_nested' antes de muestrear
+        print("      Distribución choice_nested (antes):")
+        print(df_model_data['choice_nested'].value_counts().sort('choice_nested'))
+
+        # d. Muestreo condicional
+        if APPLY_SAMPLING_NL_EXT:
+            print(f"    Aplicando muestreo estratificado por 'choice_nested' ({SAMPLE_FRACTION_NL_EXT*100:.0f}%)...")
+            df_for_pandas = get_stratified_sample_nested(df_model_data, SAMPLE_FRACTION_NL_EXT, SEED)
+            print(f"    Filas después del muestreo: {len(df_for_pandas):,}")
+            if len(df_for_pandas) > 0:
+                 print("      Distribución choice_nested (después):")
+                 print(df_for_pandas['choice_nested'].value_counts().sort('choice_nested'))
+            else:
+                 print("      Muestra vacía después del muestreo.")
+                 continue
+        else:
+            print("    Usando el dataset completo (sin muestreo - ¡RIESGO ALTO DE OOM!).")
+            df_for_pandas = df_model_data
+
+        if len(df_for_pandas) == 0:
+             print("      Dataset vacío para procesar. Saltando partición.")
+             continue
+
+        pandas_df = df_for_pandas.to_pandas()
+
+        # Limpieza intermedia
+        del df_model_data, df_for_pandas
+        gc.collect()
+
+        # e. Setup Biogeme (Definición del Modelo NESTED LOGIT EXTENDIDO)
+        print("    Definiendo especificación del modelo extendido (Betas, Variables, Nidos)...")
+
+        # (1) Definir Betas (Todos los parámetros, con nombres únicos)
+        # Temporales
+        ASC_QR_RED = Beta(f'ASC_QR_RED_ext_{partition_label}', 0, None, None, 0)
+        B_PM_LAB = Beta(f'B_PM_LAB_ext_{partition_label}', 0, None, None, 0)
+        B_PT_LAB = Beta(f'B_PT_LAB_ext_{partition_label}', 0, None, None, 0)
+        B_LJ_LAB = Beta(f'B_LJ_LAB_ext_{partition_label}', 0, None, None, 0)
+        B_VIE_LAB = Beta(f'B_VIE_LAB_ext_{partition_label}', 0, None, None, 0)
+        # Atributos de Viaje
+        B_T_VEHICULO = Beta(f'B_T_VEHICULO_ext_{partition_label}', 0, None, None, 0)
+        B_N_TRASBORDOS = Beta(f'B_N_TRASBORDOS_ext_{partition_label}', 0, None, None, 0)
+        B_T_CAMINATA = Beta(f'B_T_CAMINATA_ext_{partition_label}', 0, None, None, 0)
+        B_T_ESPERA_TRASB = Beta(f'B_T_ESPERA_TRASB_ext_{partition_label}', 0, None, None, 0)
+        B_T_ESPERA_INI = Beta(f'B_T_ESPERA_INI_ext_{partition_label}', 0, None, None, 0)
+        B_SOLO_METRO = Beta(f'B_SOLO_METRO_ext_{partition_label}', 0, None, None, 0)
+        B_METRO_BUS = Beta(f'B_METRO_BUS_ext_{partition_label}', 0, None, None, 0)
+        # Parámetro del Nido
+        MU_QR = Beta(f'MU_QR_ext_{partition_label}', 1, 1, None, 0) # Mu >= 1
+
+        # (2) Definir Variables
+        # Temporales
+        PM_LAB = Variable('DUMMY_PM_LAB')
+        PT_LAB = Variable('DUMMY_PT_LAB')
+        LJ_LAB = Variable('DUMMY_LJ_LAB')
+        VIE_LAB = Variable('DUMMY_VIE_LAB')
+        # Atributos de Viaje
+        T_VEHICULO = Variable('VAR_T_VEHICULO_MIN')
+        N_TRASBORDOS = Variable('VAR_N_TRASBORDOS')
+        T_CAMINATA = Variable('VAR_T_CAMINATA_MIN')
+        T_ESPERA_TRASB = Variable('VAR_T_ESPERA_TRASBORDO_MIN')
+        T_ESPERA_INI = Variable('VAR_T_ESPERA_INICIAL_MIN')
+        SOLO_METRO = Variable('DUMMY_SOLO_METRO')
+        METRO_BUS = Variable('DUMMY_METRO_BUS')
+        # Elección
+        CHOICE_NESTED = Variable('choice_nested')
+
+        # (3) Definir Funciones de Utilidad (V) - Modelo Extendido
+        V_BIP = 0 # Base general
+        # Utilidad común (genérica) para ambas apps QR
+        V_COMMON_QR = ( B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB +
+                        B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB +
+                        B_T_VEHICULO * T_VEHICULO + B_N_TRASBORDOS * N_TRASBORDOS +
+                        B_T_CAMINATA * T_CAMINATA + B_T_ESPERA_TRASB * T_ESPERA_TRASB +
+                        B_T_ESPERA_INI * T_ESPERA_INI + B_SOLO_METRO * SOLO_METRO +
+                        B_METRO_BUS * METRO_BUS )
+
+        V_QR_RED = ASC_QR_RED + V_COMMON_QR
+        V_QR_OTHER = 0 + V_COMMON_QR # Base dentro del nido QR
+
+        V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+
+        # (4) Definir Disponibilidad (av) - Todas disponibles
+        av = {CHOICE_BIP: 1, CHOICE_QR_RED: 1, CHOICE_QR_OTHER: 1}
+
+        # (5) Definir Nidos (μ y alternativas en cada nido) - Igual que en el base
+        nests = (
+             (1.0, [CHOICE_BIP]),
+             (MU_QR, [CHOICE_QR_RED, CHOICE_QR_OTHER])
+        )
+
+        # (6) Definir Log-Probabilidad
+        logprob = models.lognested(V, av, nests, CHOICE_NESTED)
+
+        print("    Especificación del Modelo Nested Logit Extendido definida.")
+
+        # f. Estimar el modelo
+        biodb = db.Database(f'db_nl_ext_{partition_label}', pandas_df)
+        model_name = f'nested_logit_ext_{partition_label}' # Nombre base del archivo
+        biogeme_model = bio.BIOGEME(biodb, logprob)
+        biogeme_model.model_name = model_name
+
+        original_cwd = os.getcwd()
+        os.chdir(output_dir_partition)
+
+        print(f"    Estimando el modelo extendido para {partition_label}...")
+        results = biogeme_model.estimate()
+        print("    ✅ Estimación completada!")
+
+        # g. Guardar resultados en CSV
+        params_df = br.get_pandas_estimated_parameters(estimation_results=results)
+        stats_dict = results.get_general_statistics()
+        params_df.to_csv(f'params_{model_name}.csv')
+        pd.DataFrame([stats_dict]).to_csv(f'stats_{model_name}.csv', index=False)
+        print(f"    📁 Resultados guardados en formato CSV y HTML.")
+
+        # Guardar resumen
+        stats = results.get_general_statistics()
+        def g(k, alt_keys=()):
+             for key in (k, *alt_keys):
+                 if key in stats: return stats[key]
+             return None
+        results_summary_ext[partition_label] = {
+            'LL_Final': g('Final log likelihood'),
+            'Rho_Adj': g('Rho-square-bar', ('Adj. rho-square', 'Rho-square-bar for the null model','Rho-square-bar for the init. model')),
+            'N_Obs': g('Number of observations', ('Sample size',)),
+            'Params': params_df.set_index('Name')['Value'].to_dict()
+        }
+
+        os.chdir(original_cwd)
+
+    except Exception as e:
+        print(f"    ❌ ERROR procesando {partition_label}: {e}")
+        if 'original_cwd' in locals() and os.getcwd() != original_cwd:
+            os.chdir(original_cwd)
+
+    finally:
+        # h. Limpieza de memoria explícita
+        print("    Limpiando memoria de la partición...")
+        try:
+            del pandas_df, biodb, biogeme_model, results
+        except NameError:
+            pass
+        try:
+            del V, av, nests, logprob # Limpiar especificaciones
+        except NameError:
+            pass
+        gc.collect()
+        time.sleep(2)
+
+print(f"\n{'='*60}\n--- Proceso Finalizado (Nested Logit Extendido) ---\n{'='*60}")
+
+# Imprimir un resumen final de los resultados guardados
+print("\n--- Resumen de Resultados Guardados (Modelo Extendido) ---")
+if results_summary_ext:
+    summary_df_ext = pd.DataFrame.from_dict(results_summary_ext, orient='index')
+    # Extraer valores específicos
+    for param_name in ['MU_QR', 'ASC_QR_RED']: # Añadir otros si quieres
+        summary_df_ext[param_name] = summary_df_ext['Params'].apply(lambda x: x.get(next((k for k in x if k.startswith(param_name)), None)))
+    summary_df_ext = summary_df_ext.drop(columns=['Params'])
+    print(summary_df_ext)
+else:
+    print("No se generaron resultados.")
+
+```
+
+## Resultados del Modelo Nested Logit
+
+A continuación se presentan y analizan los resultados de los modelos Nested Logit (baseline y extendido), estimados sobre diferentes configuraciones de muestreo para las semanas 17 y 18 del año 2025.
+
+### Carga de Resultados
+
+Primero, cargamos los resultados previamente calculados para ambos modelos.
+
+```{python}
+#| label: load-nested-results
+import pandas as pd
+import numpy as np
+import os
+
+# --- Configuración ---
+BASE_RESULTS_DIR_BASELINE = "model_outputs_nl_base"
+BASE_RESULTS_DIR_EXTENDED = "model_outputs_nl_extended"
+
+# Semanas y configuraciones de muestreo
+PARTITIONS = ["2025-W17", "2025-W18"]
+
+# Diccionario para almacenar los resultados
+results_data_nl = {
+    'baseline': {},
+    'extended': {}
+}
+
+# Cargar resultados baseline
+for partition in PARTITIONS:
+    year, week = partition.split("-W")
+    week_num = week
+    
+    results_data_nl['baseline'][partition] = {}
+    
+    # Buscar carpetas baseline (pueden ser "full" o "sample20pct")
+    baseline_folders = [
+        f"W{week_num}-nested-base",
+        f"W{week_num}-nested-base-sample20pct"
+    ]
+    
+    for folder_name in baseline_folders:
+        results_folder = os.path.join(BASE_RESULTS_DIR_BASELINE, folder_name)
+        
+        params_file = os.path.join(results_folder, f"params_nested_logit_base_{partition}.csv")
+        stats_file = os.path.join(results_folder, f"stats_nested_logit_base_{partition}.csv")
+        
+        if os.path.exists(params_file) and os.path.exists(stats_file):
+            try:
+                df_params = pd.read_csv(params_file, index_col=0)
+                df_stats = pd.read_csv(stats_file)
+                
+                # Determinar etiqueta de muestra
+                if "sample20pct" in folder_name:
+                    sample_label = "20%"
+                else:
+                    sample_label = "Full"
+                
+                # Limpiar nombres de parámetros
+                df_params['Name'] = df_params['Name'].str.replace(f'_{partition}', '', regex=False)
+                df_params.index = df_params['Name']
+                
+                results_data_nl['baseline'][partition][sample_label] = {
+                    'params': df_params,
+                    'stats': df_stats
+                }
+                
+                print(f"✅ Baseline {partition} ({sample_label}): Cargado desde {results_folder}")
+                
+            except Exception as e:
+                print(f"❌ Baseline {partition} ({sample_label}): Error al cargar - {e}")
+
+# Cargar resultados extended
+for partition in PARTITIONS:
+    year, week = partition.split("-W")
+    week_num = week
+    
+    results_data_nl['extended'][partition] = {}
+    
+    # Buscar carpetas extended (sample20pct y sample50pct)
+    extended_folders = [
+        f"W{week_num}-nested-ext-sample20pct",
+        f"W{week_num}-nested-ext-sample50pct"
+    ]
+    
+    for folder_name in extended_folders:
+        results_folder = os.path.join(BASE_RESULTS_DIR_EXTENDED, folder_name)
+        
+        params_file = os.path.join(results_folder, f"params_nested_logit_ext_{partition}.csv")
+        stats_file = os.path.join(results_folder, f"stats_nested_logit_ext_{partition}.csv")
+        
+        if os.path.exists(params_file) and os.path.exists(stats_file):
+            try:
+                df_params = pd.read_csv(params_file, index_col=0)
+                df_stats = pd.read_csv(stats_file)
+                
+                # Determinar etiqueta de muestra
+                if "sample20pct" in folder_name:
+                    sample_label = "20%"
+                elif "sample50pct" in folder_name:
+                    sample_label = "50%"
+                else:
+                    sample_label = "Full"
+                
+                # Limpiar nombres de parámetros
+                df_params['Name'] = df_params['Name'].str.replace(f'_ext_{partition}', '', regex=False)
+                df_params['Name'] = df_params['Name'].str.replace('_ext$', '', regex=True)
+                df_params.index = df_params['Name']
+                
+                results_data_nl['extended'][partition][sample_label] = {
+                    'params': df_params,
+                    'stats': df_stats
+                }
+                
+                print(f"✅ Extended {partition} ({sample_label}): Cargado desde {results_folder}")
+                
+            except Exception as e:
+                print(f"❌ Extended {partition} ({sample_label}): Error al cargar - {e}")
+
+print(f"\n✅ Carga de resultados completada.")
+```
+
+### Análisis de la Estimación
+
+#### Bondad de Ajuste
+
+Las tablas siguientes resumen las métricas de calidad del modelo para ambos modelos (baseline y extendido) y diferentes configuraciones de muestreo.
+
+```{python}
+#| label: display-nested-stats
+if 'results_data_nl' in locals():
+    # Crear tabla consolidada de estadísticas
+    stats_rows = []
+    
+    for model_type in ['baseline', 'extended']:
+        for partition in PARTITIONS:
+            if partition in results_data_nl[model_type]:
+                for sample_label in results_data_nl[model_type][partition].keys():
+                    if results_data_nl[model_type][partition][sample_label] is not None:
+                        df_stats = results_data_nl[model_type][partition][sample_label]['stats']
+                        stats_row = {
+                            'Modelo': 'Baseline' if model_type == 'baseline' else 'Extendido',
+                            'Partición': partition,
+                            'Muestra': sample_label,
+                            'Observaciones': df_stats.iloc[0]['Sample size'] if 'Sample size' in df_stats.columns else None,
+                            'Log-Likelihood Final': df_stats.iloc[0]['Final log likelihood'] if 'Final log likelihood' in df_stats.columns else None,
+                            'Rho-cuadrado': df_stats.iloc[0]['Rho-square for the init. model'] if 'Rho-square for the init. model' in df_stats.columns else None,
+                            'Rho-cuadrado Ajustado': df_stats.iloc[0]['Rho-square-bar for the init. model'] if 'Rho-square-bar for the init. model' in df_stats.columns else None
+                        }
+                        stats_rows.append(stats_row)
+    
+    if stats_rows:
+        df_stats_display = pd.DataFrame(stats_rows)
+        
+        # Formatear valores
+        if 'Observaciones' in df_stats_display.columns:
+            df_stats_display['Observaciones'] = df_stats_display['Observaciones'].apply(
+                lambda x: f"{int(x):,}" if pd.notna(x) else "N/A"
+            )
+        if 'Log-Likelihood Final' in df_stats_display.columns:
+            df_stats_display['Log-Likelihood Final'] = df_stats_display['Log-Likelihood Final'].apply(
+                lambda x: f"{float(x):.2f}" if pd.notna(x) else "N/A"
+            )
+        if 'Rho-cuadrado' in df_stats_display.columns:
+            df_stats_display['Rho-cuadrado'] = df_stats_display['Rho-cuadrado'].apply(
+                lambda x: f"{float(x):.3f}" if pd.notna(x) else "N/A"
+            )
+        if 'Rho-cuadrado Ajustado' in df_stats_display.columns:
+            df_stats_display['Rho-cuadrado Ajustado'] = df_stats_display['Rho-cuadrado Ajustado'].apply(
+                lambda x: f"{float(x):.3f}" if pd.notna(x) else "N/A"
+            )
+        
+        print("Tabla 1: Estadísticas Generales del Modelo Nested Logit")
+        display(df_stats_display.sort_values(['Modelo', 'Partición', 'Muestra']))
+    else:
+        print("⚠️ No se encontraron datos de estadísticas para mostrar.")
+else:
+    print("❌ No se han cargado los resultados. Ejecuta la celda anterior primero.")
+```
+
+#### Parámetros Estimados - Modelo Baseline
+
+La siguiente tabla compara los parámetros estimados del modelo baseline para ambas semanas.
+
+```{python}
+#| label: display-params-baseline
+if 'results_data_nl' in locals() and 'baseline' in results_data_nl:
+    # Función helper para normalizar t-stats infinitos o muy grandes
+    def format_tstat(tstat_val):
+        if pd.isna(tstat_val) or tstat_val is None:
+            return None
+        try:
+            tstat_float = float(tstat_val)
+            if abs(tstat_float) > 1e10 or not np.isfinite(tstat_float):
+                return "N/A"
+            return tstat_float
+        except (ValueError, TypeError):
+            return None
+    
+    comparison_data = []
+    
+    for partition in PARTITIONS:
+        if partition in results_data_nl['baseline']:
+            # Buscar configuraciones disponibles
+            available_configs = list(results_data_nl['baseline'][partition].keys())
+            
+            for config in available_configs:
+                if results_data_nl['baseline'][partition][config] is not None:
+                    params = results_data_nl['baseline'][partition][config]['params']
+                    
+                    for param_name in params.index:
+                        row = {
+                            'Parámetro': param_name,
+                            'Partición': partition,
+                            'Muestra': config,
+                            'Beta': params.loc[param_name, 'Value'],
+                            't-stat': format_tstat(params.loc[param_name, 'Robust t-stat.'])
+                        }
+                        comparison_data.append(row)
+    
+    if comparison_data:
+        df_comparison = pd.DataFrame(comparison_data)
+        df_pivot = df_comparison.pivot_table(
+            index='Parámetro',
+            columns=['Partición', 'Muestra'],
+            values=['Beta', 't-stat'],
+            aggfunc='first'
+        )
+        
+        print("Tabla 2: Parámetros Estimados del Modelo Nested Logit Baseline")
+        display(df_pivot.style.format({
+            ('Beta',): lambda x: f'{float(x):.4f}' if pd.notna(x) else 'N/A',
+            ('t-stat',): lambda x: 'N/A' if x == 'N/A' or pd.isna(x) else f'{float(x):.1f}'
+        }, na_rep='N/A').highlight_null(color='transparent'))
+    else:
+        print("⚠️ No se encontraron datos completos para el modelo baseline.")
+else:
+    print("❌ No se han cargado los resultados. Ejecuta la celda de carga primero.")
+```
+
+#### Parámetros Estimados - Modelo Extendido
+
+La siguiente tabla compara los parámetros estimados del modelo extendido para ambas semanas y configuraciones de muestreo.
+
+```{python}
+#| label: display-params-extended
+if 'results_data_nl' in locals() and 'extended' in results_data_nl:
+    # Función helper para normalizar t-stats infinitos o muy grandes
+    def format_tstat(tstat_val):
+        if pd.isna(tstat_val) or tstat_val is None:
+            return None
+        try:
+            tstat_float = float(tstat_val)
+            if abs(tstat_float) > 1e10 or not np.isfinite(tstat_float):
+                return "N/A"
+            return tstat_float
+        except (ValueError, TypeError):
+            return None
+    
+    comparison_data = []
+    
+    for partition in PARTITIONS:
+        if partition in results_data_nl['extended']:
+            # Buscar configuraciones disponibles (20% y 50%)
+            available_configs = list(results_data_nl['extended'][partition].keys())
+            
+            for config in available_configs:
+                if results_data_nl['extended'][partition][config] is not None:
+                    params = results_data_nl['extended'][partition][config]['params']
+                    
+                    for param_name in params.index:
+                        row = {
+                            'Parámetro': param_name,
+                            'Partición': partition,
+                            'Muestra': config,
+                            'Beta': params.loc[param_name, 'Value'],
+                            't-stat': format_tstat(params.loc[param_name, 'Robust t-stat.'])
+                        }
+                        comparison_data.append(row)
+    
+    if comparison_data:
+        df_comparison = pd.DataFrame(comparison_data)
+        
+        # Crear tablas separadas por semana para mejor visualización
+        for partition in PARTITIONS:
+            df_partition = df_comparison[df_comparison['Partición'] == partition]
+            if not df_partition.empty:
+                df_pivot = df_partition.pivot_table(
+                    index='Parámetro',
+                    columns='Muestra',
+                    values=['Beta', 't-stat'],
+                    aggfunc='first'
+                )
+                
+                print(f"Tabla 3: Parámetros Estimados del Modelo Nested Logit Extendido - {partition}")
+                display(df_pivot.style.format({
+                    ('Beta',): lambda x: f'{float(x):.4f}' if pd.notna(x) else 'N/A',
+                    ('t-stat',): lambda x: 'N/A' if x == 'N/A' or pd.isna(x) else f'{float(x):.1f}'
+                }, na_rep='N/A').highlight_null(color='transparent'))
+    else:
+        print("⚠️ No se encontraron datos completos para el modelo extendido.")
+else:
+    print("❌ No se han cargado los resultados. Ejecuta la celda de carga primero.")
+```
+
+### Interpretación de Resultados
+
+#### Parámetro del Nido (`MU_QR`)
+
+El parámetro `MU_QR` mide la correlación entre las alternativas dentro del nido QR. Valores mayores a 1 indican que existe correlación significativa entre las elecciones de App Red y otras Apps QR, justificando la estructura anidada del modelo.
+
+#### Variables Temporales
+
+Los coeficientes temporales (`B_PM_LAB`, `B_PT_LAB`, `B_LJ_LAB`, `B_VIE_LAB`) muestran patrones similares a los modelos binarios: las horas punta favorecen el uso de QR, mientras que los días laborales fuera de punta favorecen Bip!.
+
+#### Atributos del Viaje (Modelo Extendido)
+
+::: {.callout-warning}
+# ⚠️ Interpretación con Precaución
+
+Las siguientes interpretaciones sobre atributos del viaje deben considerarse con precaución debido a la presencia de **transbordos internos entre metro no detectados** en los datos. Los valores de número de trasbordos, tiempos de caminata y esperas pueden estar sesgados, lo que afecta la interpretación de sus coeficientes.
+:::
+
+Los coeficientes de atributos del viaje (`B_N_TRASBORDOS`, `B_T_CAMINATA`, `B_T_ESPERA_TRASBORDO`, `B_T_ESPERA_INI`) muestran que la complejidad del viaje reduce la preferencia por QR. **⚠️ Limitación:** Estos coeficientes pueden estar sesgados debido a transbordos internos entre metro que inflan artificialmente el número de trasbordos y los tiempos asociados.
+
+## Consolidación y Análisis de Resultados (Base vs Extendido){.visually-hidden}
+
+```{python}
+#|label: consolidate-analyze-nl
+#|eval: false
+import glob
+import os
+import pandas as pd
+
+BASE_DIRS = {
+    'baseline': 'model_outputs_nl_base',
+    'extended': 'model_outputs_nl_extended',
+}
+
+def load_results_nl(root_dir: str, kind: str):
+    params, stats = [], []
+    for f in glob.glob(os.path.join(root_dir, '**', 'params_*.csv'), recursive=True):
+        try:
+            df = pd.read_csv(f)
+            dir_name = os.path.basename(os.path.dirname(f))
+            fn = os.path.basename(f)
+            part = fn.split('_')[-1].replace('.csv', '')
+            df['partition'] = f"{part} ({dir_name})"
+            df['model_kind'] = kind
+            params.append(df)
+        except Exception as e:
+            print(f"Error leyendo {f}: {e}")
+    for f in glob.glob(os.path.join(root_dir, '**', 'stats_*.csv'), recursive=True):
+        try:
+            df = pd.read_csv(f)
+            dir_name = os.path.basename(os.path.dirname(f))
+            fn = os.path.basename(f)
+            part = fn.split('_')[-1].replace('.csv', '')
+            df['partition'] = f"{part} ({dir_name})"
+            df['model_kind'] = kind
+            stats.append(df)
+        except Exception as e:
+            print(f"Error leyendo {f}: {e}")
+    return (pd.concat(params, ignore_index=True) if params else None,
+            pd.concat(stats, ignore_index=True) if stats else None)
+
+print('📊 Cargando resultados Nested Logit (base y extendido)...')
+params_base, stats_base = load_results_nl(BASE_DIRS['baseline'], 'baseline')
+params_ext, stats_ext = load_results_nl(BASE_DIRS['extended'], 'extended')
+
+if params_base is None and params_ext is None:
+    print('❌ No se encontraron resultados para consolidar.')
+else:
+    df_params_all = pd.concat([df for df in [params_base, params_ext] if df is not None], ignore_index=True)
+    df_stats_all = pd.concat([df for df in [stats_base, stats_ext] if df is not None], ignore_index=True)
+
+    # Normalizar nombres de parámetros (remover sufijo _YYYY-WXX cuando exista)
+    df_params_all['Name_clean'] = df_params_all['Name'].str.replace(r'_(\d{4}-W\d{2})$', '', regex=True)
+
+    # Tabla de parámetros por partición y tipo de modelo
+    pivot_params = df_params_all.pivot_table(
+        index=['partition', 'model_kind'],
+        columns='Name_clean',
+        values='Value',
+        aggfunc='first'
+    ).sort_index()
+
+    # Métricas de ajuste disponibles
+    wanted_stats = [
+        'Sample size',
+        'Final log likelihood',
+        'Rho-square for the init. model',
+        'Rho-square-bar for the init. model'
+    ]
+    stats_cols = [c for c in wanted_stats if c in df_stats_all.columns]
+    stats_view = df_stats_all[['partition', 'model_kind'] + stats_cols].drop_duplicates()
+
+    print('\n--- Parámetros por partición y tipo de modelo ---')
+    print(pivot_params)
+
+    print('\n--- Métricas de ajuste ---')
+    print(stats_view.sort_values(['partition', 'model_kind']))
+
+    # Comparación rápida baseline vs extendido (si ambos existen)
+    try:
+        comp = pivot_params.reset_index().pivot_table(
+            index='partition',
+            columns='model_kind',
+            values=['ASC_QR_RED', 'MU_QR', 'B_PM_LAB', 'B_PT_LAB', 'B_LJ_LAB', 'B_VIE_LAB'],
+            aggfunc='first'
+        )
+        print('\n--- Comparación rápida (baseline vs extendido) ---')
+        print(comp)
+    except Exception as e:
+        print(f"Aviso: comparación rápida no disponible: {e}")
+
+    # Hint de interpretación automática por partición (si columnas presentes)
+    for part in sorted(stats_view['partition'].unique()):
+        base_rho = stats_view[(stats_view['partition']==part) & (stats_view['model_kind']=='baseline')]['Rho-square-bar for the init. model']
+        ext_rho = stats_view[(stats_view['partition']==part) & (stats_view['model_kind']=='extended')]['Rho-square-bar for the init. model']
+        if len(base_rho)>0 and len(ext_rho)>0:
+            delta = float(ext_rho.iloc[0]) - float(base_rho.iloc[0])
+            print(f"Partición {part}: Δ Rho-bar (ext - base) = {delta:+.3f}")
+```
+
+
+
+## Conclusiones por partición (resumen)
+
+- 2025-W17
+  - Baseline (full/20%): `MU_QR` ≈ 4.01/3.77 confirma correlación fuerte en QR. `B_PM_LAB`≈0.18–0.19, `B_PT_LAB`≈0.25 positivos; `B_LJ_LAB`≈−1.71, `B_VIE_LAB`≈−1.69 negativos. `ASC_QR_RED` negativo (App Red < otras apps dentro de QR).
+  - Extendido (20%/50%): `MU_QR` ≈ 3.77/4.05 estable. Complejidad penaliza QR: `B_N_TRASBORDOS`<0, `B_T_ESPERA_TRASB`<0, `B_T_ESPERA_INI`<0, `B_T_CAMINATA`<0; `B_T_VEHICULO` levemente <0. `SOLO_METRO` y `METRO_BUS` <0.
+
+- 2025-W18
+  - Baseline (full/20%): `MU_QR` ≈ 3.69/4.29. Temporales con signos esperados; `B_VIE_LAB`=0 sugiere no-identificación en esta partición. `ASC_QR_RED` negativo.
+  - Extendido (20%/50%): `MU_QR` ≈ 3.91/3.78. Complejidad penaliza (signos <0 consistentes); `B_T_VEHICULO` muy pequeño (ligero >0). `SOLO_METRO` cercano a 0 (posible baja identificación).
+
+- Implicancias generales
+  - El muestreo estratificado al 20% reproduce bien parámetros y ajuste → viable para escalar.
+  - El nido QR está bien justificado (`MU_QR`>1 en todas las corridas).
+  - QR gana en horas punta; Bip! domina fuera de punta laboral.
+  - Atributos de complejidad (trasbordos, caminata, esperas) reducen preferencia por QR; el extendido agrega valor explicativo.
+  - Revisar identificación de `B_VIE_LAB` (W18 baseline) y `SOLO_METRO` (extendido) antes de conclusiones fuertes.
