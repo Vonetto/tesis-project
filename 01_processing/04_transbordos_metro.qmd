@@ -1,0 +1,1132 @@
+---
+title: "Tesis — 04 | Corrección de transbordos internos (metro - metro) usando un Grafo de la Red de Metro"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Este notebook tiene como objetivo:
+1.  Construir un grafo de la red de Metro.
+
+
+---
+
+```{python} 
+
+#|label: build-metro-graph
+import networkx as nx 
+import pickle
+import re
+from itertools import combinations
+from collections import defaultdict
+import unicodedata
+
+def normalize_station_name(name: str) -> str:
+    """
+    Estandariza un nombre de estación de forma robusta:
+    1. Quita ' L1', ' L2', etc. si existen al final.
+    2. Pone en MAYÚSCULAS.
+    3. Quita tildes (ej. "REPÚBLICA" -> "REPUBLICA").
+    4. Realiza reemplazos específicos para inconsistencias conocidas.
+    5. Quita toda la puntuación ('.', '-', '’', "'").
+    6. Normaliza espacios.
+    """
+    if not isinstance(name, str):
+        return ""
+    
+    # 1. Quitar ' L1', ' L2', etc.
+    base_name = re.sub(r" (L\d[A]?)$", "", name.strip())
+    
+    # 2. Quitar tildes y poner en mayúsculas
+    upper_name = base_name.upper()
+    no_tildes = ''.join(
+        c for c in unicodedata.normalize('NFD', upper_name)
+        if unicodedata.category(c) != 'Mn'
+    )
+    
+    # 3. Correcciones ortográficas específicas antes de tratar puntuación
+    text = no_tildes
+    text = text.replace("RONDIZONNI", "RONDIZZONI")
+    text = text.replace("PLAZA MAIPU", "PLAZA DE MAIPU")
+    text = text.replace("UNION LATINO AMERICANA", "U L A")
+    text = text.replace("U.L.A.", "U L A")
+    text = text.replace("PDTE. PEDRO AGUIRRE CERDA", "PDTE PEDRO AGUIRRE CERDA")
+    
+    # 4. Tratar puntuación: guiones como espacio; quitar apóstrofes y puntos
+    text = re.sub(r"-", " ", text)           # '-' -> espacio (p.ej. CHILE-ESPANA)
+    text = re.sub(r"[.'’]", "", text)        # quitar apóstrofes y puntos
+    
+    # 5. Normalizar espacios
+    text = re.sub(r"\s+", " ", text).strip()
+    
+    # 6. Reglas seguras de aliasado
+    # 6.a CAL Y CANTO: solo anteponer PUENTE si no existe ya
+    if re.search(r"\bCAL Y CANTO\b", text) and not re.search(r"\bPUENTE\b", text):
+        text = re.sub(r"\bCAL Y CANTO\b", "PUENTE CAL Y CANTO", text)
+    # 6.b Si quedó concatenado CHILEESPANA en alguna etapa, separarlo
+    text = re.sub(r"\bCHILEESPANA\b", "CHILE ESPANA", text)
+    
+    return text
+
+print("Construyendo el grafo de la red de Metro...")
+
+# 1. Datos de las líneas (como los proporcionaste)
+all_lines_raw = {
+    "L1": """San Pablo L1
+Neptuno
+Pajaritos
+Las rejas
+Ecuador
+San Alberto Hurtado
+Universidad de Santiago
+Estación Central
+U.L.A.
+República
+Los Héroes L1
+La Moneda
+Universidad de Chile L1
+Santa Lucía
+Universidad Católica
+Baquedano L1
+Salvador
+Manuel Montt
+Pedro de Valdivia
+Los Leones L1
+Tobalaba L1
+El Golf
+Alcántara
+Escuela Militar
+Manquehue
+Hernando de Magallanes
+Los Dominicos""",
+    
+    "L2": """Hospital El Pino
+Copa Lo Martinez
+Observatorio
+El Bosque
+La cisterna L2
+El Parrón
+Lo Ovalle
+Ciudad del Niño
+Departamental
+Lo Vial
+San Miguel
+El Llano
+Franklin L2
+Rondizzoni
+Parque O’Higgins
+Toesca
+Los Héroes L2
+Santa Ana L2
+Puente Cal y Canto L2
+Patronato
+Cerro Blanco
+Cementerios
+Einstein
+Dorsal
+Zapadores
+Vespucio Norte""",
+    
+    "L3": """Plaza Quilicura
+Lo Cruzat
+Ferrocarril    
+Los Libertadores
+Cardenal Caro
+Vivaceta
+Conchalí
+Plaza Chacabuco
+Hospitales
+Puente Cal y Canto L3
+Plaza de Armas L3
+Universidad de Chile L3
+Parque Almagro
+Matta
+Irarrázaval L3
+Monseñor Eyzaguirre
+Ñuñoa L3
+Chile-España
+Villa Frei
+Plaza Egaña L3
+Fernando Castillo Velasco""",
+    
+    "L4": """Tobalaba L4
+Cristóbal Colón
+Francisco Bilbao
+Principe de Gales
+Simón Bolivar
+Plaza Egaña L4
+Los Orientales
+Grecia
+Los Presidentes
+Quilín
+Las Torres
+Macul
+Vicuña Mackenna L4
+Vicente Valdés L4
+Rojas Magallanes
+Trinidad
+San José de la Estrella
+Los Quillayes
+Elisa Correa
+Hospital Sótero del Rio
+Protectora de la Infancia
+Las Mercedes
+Plaza de Puente Alto""",
+    
+    "L4A": """Vicuña Mackenna L4A
+Santa Julia
+La Granja
+Santa Rosa
+San Ramón
+La Cisterna L4A""",
+    
+    "L5": """Plaza de Maipú
+Santiago Bueras
+Del Sol
+Monte Tabor
+Las Parcelas
+Laguna Sur
+Barrancas
+Pudahuel
+San Pablo L5
+Lo Prado
+Blanqueado
+Gruta de Lourdes
+Quinta Normal
+Cumming
+Santa Ana L5
+Plaza de Armas L5
+Bellas Artes
+Baquedano L5
+Parque Bustamante
+Santa Isabel
+Irarrázaval L5
+Ñuble L5
+Rodrigo de Araya
+Carlos Valdovinos
+Camino Agrícola
+San Joaquín
+Pedrero
+Mirador
+Bellavista de La Florida
+Vicente Valdés L5""",
+    
+    "L6": """Cerrillos
+Lo Valledor
+Pdte. Pedro Aguirre Cerda
+Franklin L6
+Bío Bío
+Ñuble L6
+Estadio Nacional
+Ñuñoa L6
+Inés de Suárez
+Los Leones L6"""
+}
+
+# 2. Crear el objeto Grafo
+G = nx.Graph()
+
+# 3. Procesar datos y añadir nodos/aristas
+transfer_station_nodes = defaultdict(list)
+all_edges = []
+all_nodes = []
+
+# Expresión regular para separar nombre base y línea (ej. "Los Héroes L1")
+station_regex = re.compile(r"^(.*?) (L\d[A]?)$")
+
+print("Procesando líneas y encontrando nodos...")
+for line_name, line_string in all_lines_raw.items():
+    stations_on_this_line = []
+    
+    # Limpiar nombres de estación y encontrar nodos
+    for station_name in line_string.strip().split('\n'):
+        
+        # --- LÓGICA DE NORMALIZACIÓN APLICADA ---
+        base_name_normalized = normalize_station_name(station_name)
+        node_name_normalized = f"{base_name_normalized} {line_name}" # ej. "REPUBLICA L1"
+        # --- FIN DE LÓGICA ---
+        
+        stations_on_this_line.append(node_name_normalized)
+        all_nodes.append(node_name_normalized)
+        
+        if node_name_normalized not in transfer_station_nodes[base_name_normalized]:
+            transfer_station_nodes[base_name_normalized].append(node_name_normalized)
+
+    # Añadir aristas de VIAJE
+    for i in range(len(stations_on_this_line) - 1):
+        node_a = stations_on_this_line[i]
+        node_b = stations_on_this_line[i+1]
+        G.add_edge(node_a, node_b, type='travel', line=line_name)
+
+G.add_nodes_from(set(all_nodes))
+
+print("Añadiendo aristas de TRANSBORDO...")
+# Añadir aristas de TRANSBORDO (entre líneas en la misma estación)
+transfer_count = 0
+for base_name, nodes in transfer_station_nodes.items():
+    if len(nodes) > 1: # Es una estación de transbordo
+        transfer_count += 1
+        # Añadir aristas entre todas las combinaciones de líneas en esa estación
+        for node_a, node_b in combinations(nodes, 2):
+            G.add_edge(node_a, node_b, type='transfer', name=base_name)
+
+print(f"\n✅ Grafo construido exitosamente.")
+print(f"   - Nodos Totales (Estación-Línea): {G.number_of_nodes()}")
+print(f"   - Aristas Totales: {G.number_of_edges()}")
+print(f"   - Estaciones de Transbordo: {transfer_count}")
+
+# 4. Verificar resultados (Ejemplos)
+print("\n--- Ejemplos de Vecinos ---")
+
+# Ejemplo 1: Estación de Transbordo (Los Héroes L1)
+try:
+    nodo = f"{normalize_station_name('Los Héroes')} L1"
+    lh1_neighbors = list(G.neighbors(nodo))
+    print(f"Vecinos de '{nodo}': {lh1_neighbors}")
+except nx.NetworkXError:
+    print("Error: Nodo 'Los Héroes L1' no encontrado. Verifica los nombres.")
+
+# Ejemplo 2: Estación Simple (Neptuno L1)
+try:
+    nodo = f"{normalize_station_name('Neptuno')} L1"
+    neptuno_neighbors = list(G.neighbors(nodo))
+    print(f"Vecinos de '{nodo}': {neptuno_neighbors}")
+except nx.NetworkXError:
+    print("Error: Nodo 'Neptuno L1' no encontrado. Verifica los nombres.")
+
+# Ejemplo 3: Estación de Transbordo Compleja (Universidad de Chile L1)
+try:
+    nodo = f"{normalize_station_name('Universidad de Chile')} L1"
+    uchile_neighbors = list(G.neighbors(nodo))
+    print(f"Vecinos de '{nodo}': {uchile_neighbors}")
+except nx.NetworkXError:
+    print("Error: Nodo 'Universidad de Chile L1' no encontrado.")
+
+
+#5. Guardar el grafo
+with open("metro_santiago_graph.gpickle", "wb") as _f:
+    pickle.dump(G, _f)
+    nx.write_graphml(G, "metro_santiago_graph.graphml")
+with open("metro_santiago_graph.gpickle", "rb") as _f:
+    G = pickle.load(_f)
+
+```
+
+## Carga del Grafo y Partición de Datos
+```{python}
+#|label: load-graph-and-data
+import os
+import sys
+import polars as pl
+import pandas as pd
+import gcsfs
+import pyarrow.fs as pafs
+import logging
+import gc
+import time
+from pathlib import Path
+import glob
+
+import networkx as nx 
+import pickle
+import re
+from itertools import combinations
+from collections import defaultdict
+
+
+GCS_BUCKET = "tesis-vonetto-datalake"
+SILVER_PATH = f"gs://{GCS_BUCKET}/lake/silver"
+INPUT_DATASET_PATH = f"{SILVER_PATH}/viajes_filtrados" # Usar datos filtrados
+
+YEAR_ANALISIS = 2025
+WEEK_ANALISIS = 17
+PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
+
+
+## --- 1. Cargar Grafo ---
+G_metro = None
+try:
+    with open("metro_santiago_graph.gpickle", "rb") as _f:
+        G_metro = pickle.load(_f)
+        print(f"✅ Grafo de Metro cargado: {G_metro.number_of_nodes()} nodos, {G_metro.number_of_edges()} aristas.")
+except Exception as e:
+    print(f"❌ No se pudo cargar el grafo desde 'metro_santiago_graph.gpickle': {e}")
+
+
+# --- 2. Cargar el LazyFrame de la Partición ---
+# (Asumiendo que PARTITION_LABEL e INPUT_DATASET_PATH están definidos)
+partition_path_glob = f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
+try:
+    lf_data = pl.scan_parquet(partition_path_glob)
+    total_viajes = lf_data.select(pl.len()).collect().item()
+    print(f"✅ Partición {PARTITION_LABEL} cargada desde GCS: {total_viajes:,} viajes.")
+except Exception as e:
+    print(f"⚠️ Error al cargar desde GCS: {e}")
+    lf_data = None
+    total_viajes = None
+    # Fallback local: buscar archivos en '../tmp' o './tmp'
+    cwd = Path.cwd()
+    fallback_patterns = [
+        str(cwd / ".." / "tmp" / f"lake_silver_viajes_filtrados_iso_year={YEAR_ANALISIS}_iso_week={WEEK_ANALISIS}_data-*.parquet"),
+        str(cwd / "tmp" / f"lake_silver_viajes_filtrados_iso_year={YEAR_ANALISIS}_iso_week={WEEK_ANALISIS}_data-*.parquet"),
+    ]
+    matched_files = []
+    for pat in fallback_patterns:
+        matched_files = glob.glob(pat)
+        if matched_files:
+            break
+    if matched_files:
+        print(f"🔎 Cargando fallback local: {len(matched_files)} archivo(s) encontrado(s).")
+        lf_data = pl.scan_parquet(matched_files)
+        total_viajes = lf_data.select(pl.len()).collect().item()
+        print(f"✅ Partición {PARTITION_LABEL} cargada localmente: {total_viajes:,} viajes.")
+    else:
+        print("❌ No se encontraron archivos locales de fallback en 'tmp/'.")
+
+# Guardar referencias "originales" si la carga fue exitosa
+if lf_data is not None:
+    lf_data_original = lf_data
+    total_viajes_original = total_viajes
+
+```
+
+## Función de Validación del Grafo
+```{python}
+#|label: graph-validation-function
+
+
+
+print("Construyendo el grafo de la red de Metro (con nombres ESTANDARIZADOS ROBUSTOS)...")
+
+def is_direct_path_valid(graph, origen_name, destino_name, linea_name):
+    """
+    Verifica si existe un camino directo en el grafo G
+    entre origen y destino USANDO SOLO la línea especificada.
+    Usa nombres estandarizados.
+    """
+    # 1. Normalizar todos los inputs
+    if not graph or not origen_name or not destino_name or not linea_name:
+        return False # Datos de entrada inválidos
+        
+    origen_norm = normalize_station_name(origen_name)
+    destino_norm = normalize_station_name(destino_name)
+    linea_name_norm = linea_name.strip().upper()
+
+    # 2. Formatear los nombres de los nodos del grafo (ej. "REPUBLICA L1")
+    nodo_origen = f"{origen_norm} {linea_name_norm}"
+    nodo_destino = f"{destino_norm} {linea_name_norm}"
+
+    # 3. Verificar que ambos nodos existan en el grafo
+    #    (Ahora "REPUBLICA L1" coincidirá con el nodo del grafo)
+    if nodo_origen not in graph or nodo_destino not in graph:
+        return False
+    
+    # 4. Crear un subgrafo temporal que contenga SOLO esa línea
+    nodes_on_line = [n for n in graph.nodes() if n.endswith(f" {linea_name_norm}")]
+    G_linea = graph.subgraph(nodes_on_line).copy()
+    
+    # 5. Eliminar aristas que no sean de 'travel'
+    edges_to_remove = []
+    for u, v, data in G_linea.edges(data=True):
+        if data.get('type') != 'travel':
+            edges_to_remove.append((u, v))
+            
+    G_linea.remove_edges_from(edges_to_remove)
+
+    # 6. Verificar si existe un camino en este subgrafo de línea única
+    return nx.has_path(G_linea, nodo_origen, nodo_destino)
+
+print("✅ Función de validación `is_direct_path_valid` (ESTANDARIZADA) definida.")
+```
+
+## Validación Cruzada de Nombres de Estaciones
+```{python}
+#|label: run-name-validation
+import polars as pl
+
+if 'lf_data_original' in locals() and lf_data_original is not None and G_metro is not None:
+    print("--- Iniciando Validación Cruzada de Nombres de Estaciones ---")
+
+    # --- 1. Obtener Estaciones del Grafo (Set 1) ---
+    print("   Paso 1: Extrayendo nombres de estaciones del Grafo...")
+    # Los nodos ya están normalizados + línea (ej. "SAN PABLO L1")
+    # Aplicamos la función para quitar la línea (ej. "SAN PABLO")
+    graph_station_names = {normalize_station_name(n) for n in G_metro.nodes()}
+    graph_station_names.discard("") # Eliminar strings vacíos si los hay
+    print(f"      Encontradas {len(graph_station_names)} estaciones únicas normalizadas en el Grafo.")
+
+    # --- 2. Obtener Estaciones de los Datos de Viaje (Set 2) ---
+    print("   Paso 2: Extrayendo nombres de paraderos de Metro de los datos de viaje...")
+    
+    # Lista para guardar los LazyFrames de cada columna de paradero
+    lf_stops_list = []
+    
+    # Iterar por las 4 etapas
+    for i in range(1, 5):
+        tipo_col = f"tipo_transporte_{i}"
+        subida_col = f"paradero_subida_{i}"
+        bajada_col = f"paradero_bajada_{i}"
+        
+        # Filtrar solo etapas que sean Metro (2)
+        lf_etapa = lf_data_original.filter(
+            pl.col(tipo_col).cast(pl.Utf8).is_in(['2'])
+        )
+        
+        # Añadir paraderos de subida y bajada de esas etapas
+        lf_stops_list.append(lf_etapa.select(pl.col(subida_col).alias("paradero")))
+        lf_stops_list.append(lf_etapa.select(pl.col(bajada_col).alias("paradero")))
+
+    # Concatenar todos los paraderos de Metro
+    lf_all_stops = pl.concat(lf_stops_list, how="vertical")
+    
+    # Obtener los nombres únicos
+    df_unique_stops_raw = lf_all_stops.unique().filter(
+        pl.col("paradero").is_not_null()
+    ).collect()
+    
+    # Normalizar los nombres extraídos de los datos de viaje
+    travel_data_station_names = {normalize_station_name(name) for name in df_unique_stops_raw["paradero"]}
+    travel_data_station_names.discard("") # Eliminar strings vacíos
+    
+    print(f"      Encontrados {len(travel_data_station_names)} paraderos únicos normalizados en los datos de viaje.")
+
+    # --- 3. Comparar los dos Sets ---
+    print("\n   Paso 3: Comparando los dos conjuntos de nombres...")
+    
+    # Nombres en los datos de viaje que NO están en el grafo
+    data_not_in_graph = travel_data_station_names - graph_station_names
+    
+    # Nombres en el grafo que NO están en los datos de viaje
+    graph_not_in_data = graph_station_names - travel_data_station_names
+
+    # --- 4. Reporte Final ---
+    print(f"\n   --- 📈 Reporte de Validación de Nombres ({PARTITION_LABEL}) ---")
+    
+    if not data_not_in_graph and not graph_not_in_data:
+        print("✅ ¡Validación Exitosa! Todos los nombres de estaciones coinciden perfectamente.")
+    else:
+        if data_not_in_graph:
+            print(f"❌ ¡ERROR! Se encontraron {len(data_not_in_graph)} nombres en los datos de viaje que NO están en el grafo:")
+            print(f"   {data_not_in_graph}")
+            print("   (Esto causará que los viajes sean marcados como 'inválidos'. Revisa la función de normalización o los nombres en el grafo.)")
+        
+        if graph_not_in_data:
+            print(f"⚠️ ADVERTENCIA: Se encontraron {len(graph_not_in_data)} estaciones en el grafo que NUNCA aparecieron en los datos de esta partición:")
+            print(f"   {graph_not_in_data}")
+            print("   (Esto es normal si son estaciones poco frecuentes o si la partición es pequeña.)")
+
+else:
+    print("❌ No se pudo ejecutar la validación. Carga el grafo y los datos primero.")
+```
+
+## Exploración/Marcado de Viajes Inválidos
+```{python}
+#|label: extract-validate-count-mark
+import pandas as pd
+from tqdm.auto import tqdm # Importar tqdm para notebooks
+import threading
+
+# --- CONFIGURACIÓN DEL SWITCH ---
+# True:  Añade la columna 'transbordo_interno_no_tratado' al lf_data.
+# False: Solo explora y printea el conteo de viajes inválidos.
+MARCAR_VIAJES_INVALIDOS = True 
+# --------------------------------
+
+# Inicializar tqdm y el lock de impresión
+tqdm.pandas(desc="Validando etapas únicas")
+print_lock = threading.Lock()
+
+def validate_and_print_realtime(row, graph):
+    # (Función wrapper sin cambios)
+    is_valid = is_direct_path_valid(
+        graph, 
+        row['paradero_subida'], 
+        row['paradero_bajada'], 
+        row['linea_srv']
+    )
+    if not is_valid:
+        with print_lock:
+            print(f"\r   [!] Transbordo NO TRATADO detectado: {row['paradero_subida']} -> {row['paradero_bajada']} (Línea: {row['linea_srv']})")
+    return is_valid
+
+
+if 'lf_data_original' in globals() and lf_data_original is not None and G_metro is not None:
+    print(f"--- Iniciando Exploración/Marcado (Modo: {'MARCAR' if MARCAR_VIAJES_INVALIDOS else 'EXPLORAR'}) ---")
+    
+    # --- PASO 0: SIN PREFILTRO (analizar todos los viajes) ---
+    lf_data = lf_data_original
+    total_viajes_a_analizar = total_viajes_original
+    print(f"   Paso 0: Sin prefiltrado. Analizando todos los viajes: {total_viajes_a_analizar:,}")
+    
+    # --- Pasos 1, 2, 3 (Lógica de extracción de etapas) ---
+    print("   Paso 1-3: Extrayendo y recopilando etapas de Metro (tipo 2) únicas...")
+    lf_etapas = []
+    for i in range(1, 5):
+        etapa_cols = ["pk_viaje", f"tipo_transporte_{i}", f"paradero_subida_{i}", f"paradero_bajada_{i}", f"srv_{i}"]
+        rename_map = {
+            f"tipo_transporte_{i}": "tipo_transporte",
+            f"paradero_subida_{i}": "paradero_subida",
+            f"paradero_bajada_{i}": "paradero_bajada",
+            f"srv_{i}": "linea_srv"
+        }
+        lf_etapas.append(
+            lf_data.select(etapa_cols).rename(rename_map).with_columns(
+                pl.lit(i, dtype=pl.Int8).alias("num_etapa")
+            )
+        )
+    lf_all_etapas = pl.concat(lf_etapas)
+    
+    # --- CORRECCIÓN ---
+    # Filtrar solo etapas de Metro (tipo 2), excluyendo MetroTren (tipo 4)
+    lf_metro_etapas = lf_all_etapas.filter(
+        (pl.col("tipo_transporte").cast(pl.Utf8) == '2') & # Solo Metro (tipo 2)
+        pl.col("paradero_subida").is_not_null() &
+        pl.col("paradero_bajada").is_not_null() &
+        pl.col("linea_srv").is_not_null()
+    )
+
+    df_unique_metro_etapas = lf_metro_etapas.select(
+        "paradero_subida", "paradero_bajada", "linea_srv"
+    ).unique().collect()
+    print(f"      Se encontraron {len(df_unique_metro_etapas):,} combinaciones únicas de etapas de Metro (tipo 2).")
+
+    # --- Paso 4 (Validación) ---
+    print("\n   Paso 4: Validando cada etapa única contra el grafo (con progreso)...")
+    pd_unique_etapas = df_unique_metro_etapas.to_pandas()
+    
+    pd_unique_etapas['es_camino_valido'] = pd_unique_etapas.progress_apply(
+        validate_and_print_realtime, 
+        graph=G_metro,
+        axis=1
+    )
+    
+    # --- Paso 5 (Unir validación a todas las etapas de metro) ---
+    print("\n   Paso 5: Uniendo resultados de validación a todas las etapas...")
+    df_validation_lookup = pl.from_pandas(pd_unique_etapas)
+    
+    lf_metro_etapas_validated = lf_metro_etapas.join(
+        df_validation_lookup.lazy(), # Unir como LazyFrame
+        on=["paradero_subida", "paradero_bajada", "linea_srv"],
+        how="left"
+    )
+    
+    # --- Paso 6 (Identificar pk_viaje con error) ---
+    lf_viajes_con_error = lf_metro_etapas_validated.filter(
+        pl.col("es_camino_valido") == False
+    )
+    
+    # Obtener la lista de IDs de viajes únicos con error
+    lf_invalid_pks = lf_viajes_con_error.select("pk_viaje").unique()
+
+    # --- Paso 7 (Lógica del Switch: Explorar o Marcar) ---
+    
+    if MARCAR_VIAJES_INVALIDOS:
+        # --- MODO MARCADO ---
+        print("\n   Modo Marcado: Creando nueva columna 'transbordo_interno_no_tratado'...")
+        
+        # 1. Crear un 'lookup table' de pks inválidos
+        lf_invalid_lookup = lf_invalid_pks.with_columns(
+            pl.lit(True).alias("transbordo_interno_no_tratado")
+        )
+        
+        # 2. Unir (join) esta tabla al LazyFrame original (lf_data_original)
+        #    Queremos marcar el dataset original, no el pre-filtrado
+        lf_data_marcado = lf_data_original.join(
+            lf_invalid_lookup,
+            on="pk_viaje",
+            how="left"
+        ).with_columns(
+            # Llenar con 'False' los viajes que NO estaban en la lista de inválidos
+            pl.col("transbordo_interno_no_tratado").fill_null(False)
+        )
+        
+        # 3. Reportar y preparar para la siguiente celda
+        conteo_viajes_marcados = lf_invalid_lookup.collect().height
+        print(f"   Se marcaron {conteo_viajes_marcados:,} viajes como 'True'.")
+        # Reemplazar referencias de trabajo para que la nueva columna esté disponible
+        lf_data = lf_data_marcado
+        lf_data_original = lf_data_marcado
+        # Chequeo rápido de esquema
+        print("   Columnas actuales (post-marcado):", lf_data.columns)
+        
+    else:
+        # --- MODO EXPLORACIÓN ---
+        print("\n   Modo Exploración: Solo se identificarán y contabilizarán los viajes.")
+        
+        conteo_viajes_con_error = lf_invalid_pks.collect().height
+    
+        print(f"\n   --- 📈 Resultados Finales de la Exploración ({PARTITION_LABEL}) ---")
+        print(f"   Total de viajes en la partición:   {total_viajes_original:,}")
+        print(f"   Viajes a analizar (sin prefiltrado): {total_viajes_a_analizar:,}")
+        print(f"   Viajes con al menos 1 etapa de Metro (tipo 2): {lf_metro_etapas.select('pk_viaje').unique().count().collect().item():,}")
+        print(f"   Viajes con transbordo interno NO TRATADO: {conteo_viajes_con_error:,}")
+        print(f"   Porcentaje de viajes con error (sobre analizados):    {(conteo_viajes_con_error / total_viajes_a_analizar * 100):.2f}%")
+        print(f"   Porcentaje de viajes con error (sobre total):    {(conteo_viajes_con_error / total_viajes_original * 100):.2f}%")
+        
+        # Opcional: mostrar ejemplos
+        etapas_invalidas_df = lf_viajes_con_error.select(
+            "paradero_subida", "paradero_bajada", "linea_srv"
+        ).unique().collect()
+        if len(etapas_invalidas_df) > 0:
+            print("\n   Ejemplos de Etapas Inválidas (potenciales transbordos no tratados):")
+            print(etapas_invalidas_df.head())
+
+else:
+    print("❌ No se pudo ejecutar la exploración. Carga el grafo y los datos primero.")
+```
+
+
+```{python}
+#|label: validate-te0-stats
+import polars as pl
+import polars.selectors as cs
+
+# --- Definiciones de constantes (por si se reinició el kernel) ---
+HORAS_PUNTA_MANANA = [7, 8]
+HORAS_PUNTA_TARDE = [18, 19]
+HORAS_VALLE = [9, 10, 11, 12, 13, 14, 15, 16, 17, 20]
+HORAS_BAJO = [6, 21, 22, 23] # Período nocturno/madrugada
+# --------------------------------------------------
+
+if 'lf_data_original' in locals() and 'df_validation_lookup' in locals():
+    print("--- Iniciando Validación de te0 (Tiempo de Espera Inicial) por Período ---")
+
+    # 1. Asegurarse de que el lookup table esté en formato Polars LazyFrame
+    if isinstance(df_validation_lookup, pl.LazyFrame):
+        lf_validation_lookup = df_validation_lookup
+    elif isinstance(df_validation_lookup, pl.DataFrame):
+        lf_validation_lookup = df_validation_lookup.lazy()
+    else:
+        try:
+            import pandas as pd  # type: ignore
+        except Exception:
+            pd = None
+        if pd is not None and isinstance(df_validation_lookup, pd.DataFrame):
+            lf_validation_lookup = pl.from_pandas(df_validation_lookup).lazy()
+        else:
+            raise TypeError(f"df_validation_lookup debe ser Polars (DataFrame/LazyFrame) o pandas DataFrame, no: {type(df_validation_lookup)}")
+
+    # 2. Filtrar el lookup table para obtener solo etapas VÁLIDAS
+    lf_etapas_validas = lf_validation_lookup.filter(pl.col("es_camino_valido") == True)
+    
+    # 3. Preparar el LazyFrame de datos de viaje
+    lf_viajes = lf_data_original.select([
+        "n_etapas", "te0", "tiempo_inicio_viaje", "tipodia",
+        "tipo_transporte_1", "paradero_subida_1", "paradero_bajada_1", "srv_1"
+    ])
+    
+    # 4. Aislar viajes "Solo Metro" de 1 etapa VERÍDICOS
+    print("   Paso 1: Aislando viajes 'Solo Metro' de 1 etapa (verídicos)...")
+    lf_viajes_metro_veridicos = lf_viajes.filter(
+        (pl.col("n_etapas") == 1) &
+        (pl.col("tipo_transporte_1").cast(pl.Utf8).is_in(['2'])) # 2=Metro
+    ).join(
+        lf_etapas_validas,
+        left_on=["paradero_subida_1", "paradero_bajada_1", "srv_1"],
+        right_on=["paradero_subida", "paradero_bajada", "linea_srv"],
+        how="inner" 
+    )
+    
+    # 5. Crear la columna 'periodo_dia' (Punta, Valle, Fin de Semana)
+    print("   Paso 2: Creando dummies de período...")
+    lf_viajes_con_periodo = lf_viajes_metro_veridicos.with_columns([
+        pl.col("tiempo_inicio_viaje").dt.hour().alias("hora"),
+        (pl.col("tipodia").cast(pl.Utf8).cast(pl.Int8, strict=False) == 0).alias("is_laboral")
+    ]).with_columns([
+        (pl.col("hora").is_in(HORAS_PUNTA_MANANA) & pl.col("is_laboral")).alias("es_punta_manana"),
+        (pl.col("hora").is_in(HORAS_PUNTA_TARDE) & pl.col("is_laboral")).alias("es_punta_tarde"),
+    ]).with_columns(
+        pl.when(pl.col("es_punta_manana") | pl.col("es_punta_tarde"))
+          .then(pl.lit("Punta"))
+          .when(pl.col("is_laboral"))
+          .then(pl.lit("Valle"))
+          .otherwise(pl.lit("Fin de Semana"))
+          .alias("periodo_dia")
+    )
+    
+    # 6. Calcular las estadísticas de te0 (promedio y robustez)
+    print("   Paso 3: Calculando estadísticas de te0 por período...")
+    df_te0_stats = lf_viajes_con_periodo.group_by("periodo_dia").agg(
+        pl.col("te0").mean().alias("te0_promedio_seg"),
+        pl.count().alias("n_viajes_veridicos"),
+        pl.col("te0").std().alias("te0_std_dev_seg"),
+        pl.col("te0").min().alias("te0_min_seg"),
+        pl.col("te0").quantile(0.25).alias("te0_p25_seg"),
+        pl.col("te0").median().alias("te0_median_seg"),
+        pl.col("te0").quantile(0.75).alias("te0_p75_seg"),
+        pl.col("te0").max().alias("te0_max_seg")
+    ).collect().sort("periodo_dia")
+    
+    print(f"\n   --- 📈 Estadísticas de te0 para viajes 'Solo Metro' verídicos ({PARTITION_LABEL}) ---")
+    # Mostrar todas las filas/columnas sin truncar
+    pl.Config.set_tbl_rows(-1)
+    pl.Config.set_tbl_cols(-1)
+    pl.Config.set_tbl_width_chars(2000)
+    pl.Config.set_tbl_hide_column_data_types(True)
+    print(df_te0_stats)
+
+    print("\n   (te0_promedio_seg: Promedio / n_viajes_veridicos: Conteo / te0_std_dev_seg: Desv. Estándar)")
+
+else:
+    print("❌ No se pudo ejecutar la validación. Carga el grafo ('G_metro') y los datos ('lf_data_original' y 'df_validation_lookup') primero.")
+```
+
+
+```{python}
+#|label: validate-te0-by-line-and-period
+import polars as pl
+import polars.selectors as cs
+
+# --- 1. Definición de Períodos (Más Granular) ---
+# (Puedes ajustar estas horas si es necesario)
+HORAS_PUNTA_MANANA = [7, 8]
+HORAS_PUNTA_TARDE = [18, 19]
+HORAS_VALLE = [9, 10, 11, 12, 13, 14, 15, 16, 17, 20]
+HORAS_BAJO = [6, 21, 22, 23] # Período nocturno/madrugada
+
+# Crear una columna de mapeo para ordenar los períodos
+periodo_order = pl.DataFrame({
+    'periodo_dia': ["Punta Mañana", "Valle", "Punta Tarde", "Bajo", "Fin de Semana"],
+    'periodo_sort_order': [1, 2, 3, 4, 5]
+})
+
+if 'lf_data_original' in locals() and 'df_validation_lookup' in locals():
+    print("--- Iniciando Validación de te0 por Línea y Período ---")
+
+    # 2. Asegurarse de que el lookup table esté en formato Polars LazyFrame
+    if isinstance(df_validation_lookup, pl.LazyFrame):
+        lf_validation_lookup = df_validation_lookup
+    elif isinstance(df_validation_lookup, pl.DataFrame):
+        lf_validation_lookup = df_validation_lookup.lazy()
+    else:
+        try:
+            import pandas as pd  # type: ignore
+        except Exception:
+            pd = None
+        if pd is not None and isinstance(df_validation_lookup, pd.DataFrame):
+            lf_validation_lookup = pl.from_pandas(df_validation_lookup).lazy()
+        else:
+            raise TypeError(f"df_validation_lookup debe ser Polars (DataFrame/LazyFrame) o pandas DataFrame, no: {type(df_validation_lookup)}")
+
+    # 3. Filtrar el lookup table para obtener solo etapas VÁLIDAS
+    lf_etapas_validas = lf_validation_lookup.filter(pl.col("es_camino_valido") == True)
+    
+    # 4. Aislar viajes "Solo Metro" de 1 etapa VERÍDICOS
+    print("   Paso 1: Aislando viajes 'Solo Metro' de 1 etapa (verídicos)...")
+    lf_viajes_metro_veridicos = lf_data_original.filter(
+        (pl.col("n_etapas") == 1) &
+        (pl.col("tipo_transporte_1").cast(pl.Utf8).is_in(['2', '4'])) # 2=Metro, 4=MTren
+    ).join(
+        lf_etapas_validas,
+        left_on=["paradero_subida_1", "paradero_bajada_1", "srv_1"],
+        right_on=["paradero_subida", "paradero_bajada", "linea_srv"],
+        how="inner" # "inner" join se queda SOLO con los viajes que están en la lista de válidos
+    )
+    
+    # 5. Crear la columna 'periodo_dia' (Punta, Valle, Fin de Semana)
+    print("   Paso 2: Creando columna 'periodo_dia' granular...")
+    lf_viajes_con_periodo = lf_viajes_metro_veridicos.with_columns([
+        pl.col("tiempo_inicio_viaje").dt.hour().alias("hora"),
+        (pl.col("tipodia").cast(pl.Utf8).cast(pl.Int8, strict=False) == 0).alias("is_laboral")
+    ]).with_columns(
+        # Definir el Período del día con 5 categorías
+        pl.when(~pl.col("is_laboral"))
+          .then(pl.lit("Fin de Semana"))
+          .when(pl.col("hora").is_in(HORAS_PUNTA_MANANA))
+          .then(pl.lit("Punta Mañana"))
+          .when(pl.col("hora").is_in(HORAS_PUNTA_TARDE))
+          .then(pl.lit("Punta Tarde"))
+          .when(pl.col("hora").is_in(HORAS_VALLE))
+          .then(pl.lit("Valle"))
+          .when(pl.col("hora").is_in(HORAS_BAJO))
+          .then(pl.lit("Bajo"))
+          .otherwise(pl.lit("Otro")) # Capturar horas no mapeadas
+          .alias("periodo_dia")
+    )
+    
+    # 6. Calcular las estadísticas de te0 (agrupando por linea y periodo)
+    print("   Paso 3: Calculando estadísticas de te0 por Línea y Período...")
+    df_te0_stats_granular = lf_viajes_con_periodo.group_by(
+        pl.col("srv_1").alias("linea"),
+        pl.col("periodo_dia")
+    ).agg(
+        pl.col("te0").mean().alias("te0_promedio_seg"),
+        pl.count().alias("n_viajes_veridicos"),
+        pl.col("te0").std().alias("te0_std_dev_seg"),
+        pl.col("te0").median().alias("te0_median_seg"),
+        pl.col("te0").min().alias("te0_min_seg"),
+        pl.col("te0").max().alias("te0_max_seg")
+    ).collect()
+    
+    # Unir con el orden de períodos y ordenar
+    df_te0_stats_final = df_te0_stats_granular.join(
+        periodo_order, on="periodo_dia", how="left"
+    ).sort(["linea", "periodo_sort_order"])
+    
+    # 7. Imprimir los resultados con formato completo
+    print(f"\n   --- 📈 Estadísticas de te0 por Línea y Período ({PARTITION_LABEL}) ---")
+    
+    # Configurar impresión completa
+    pl.Config.set_tbl_rows(-1)
+    pl.Config.set_tbl_cols(-1)
+    pl.Config.set_tbl_width_chars(2000)
+    pl.Config.set_tbl_hide_column_data_types(True)
+    print(df_te0_stats_final.drop("periodo_sort_order")) # Ocultar la columna de orden
+
+else:
+    print("❌ No se pudo ejecutar la validación. Carga el grafo ('G_metro') y los datos ('lf_data_original' y 'df_validation_lookup') primero.")
+```
+
+
+```{python}
+#|label: setup-te0-consolidation
+import polars as pl
+import pandas as pd
+import gc
+import time
+import os
+
+# --- 1. CONFIGURACIÓN DE LA EJECUCIÓN ---
+# Define aquí TODAS las particiones que quieres procesar
+PARTICIONES_A_VALIDAR = [
+    (2025, 16),
+    (2025, 17),
+    (2025, 18)
+    # Añade más aquí, ej:
+    # (2024, 14),
+    # (2024, 15),
+    # (2024, 16),
+]
+
+# --- 2. Definición de Períodos (Más Granular) ---
+HORAS_PUNTA_MANANA = [7, 8]
+HORAS_PUNTA_TARDE = [18, 19]
+HORAS_VALLE = [9, 10, 11, 12, 13, 14, 15, 16, 17, 20]
+HORAS_BAJO = [6, 21, 22, 23] # Período nocturno/madrugada
+
+# Mapeo para ordenar los períodos
+periodo_order = pl.DataFrame({
+    'periodo_dia': ["Punta Mañana", "Valle", "Punta Tarde", "Bajo", "Fin de Semana"],
+    'periodo_sort_order': [1, 2, 3, 4, 5]
+})
+
+# Lista para guardar los resultados de cada partición
+lista_de_stats_te0 = []
+
+print(f"--- Configuración de Validación Lista ---")
+print(f"Se procesarán {len(PARTICIONES_A_VALIDAR)} particiones.")
+```
+
+
+```{python}
+#|label: run-te0-consolidation-loop
+#|eval: false # Quitar para ejecutar
+
+from tqdm.auto import tqdm
+import threading
+import pandas as pd
+import polars as pl
+import gc
+import time
+import os
+
+# (Initialize tqdm, print_lock, and validation functions...)
+tqdm.pandas(desc="Validando etapas únicas")
+print_lock = threading.Lock()
+
+def validate_and_print_realtime(row, graph):
+    is_valid = is_direct_path_valid(
+        graph, 
+        row['paradero_subida'], 
+        row['paradero_bajada'], 
+        row['linea_srv']
+    )
+    if not is_valid:
+        with print_lock:
+            print(f"\r   [!] Transbordo NO TRATADO detectado: {row['paradero_subida']} -> {row['paradero_bajada']} (Línea: {row['linea_srv']})")
+    return is_valid
+
+# --- Configuración del Logger ---
+logger = blog.get_screen_logger(level=blog.INFO)
+
+if 'G_metro' not in locals():
+    print("❌ Error: Grafo 'G_metro' no está en memoria. Ejecuta la celda de creación del grafo primero.")
+else:
+    print("--- Iniciando Bucle de Validación de te0 ---")
+    
+    for year, week in PARTICIONES_A_VALIDAR:
+        partition_label = f"{year}-W{week}"
+        print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} ---\n{'='*60}")
+        
+        # Definir variables para limpieza
+        lf_data_original, lf_data, lf_etapas_validas = (None,) * 3
+        lf_viajes_metro_veridicos, lf_viajes_con_periodo = (None,) * 2
+        df_unique_metro_etapas, pd_unique_etapas = (None,) * 2 # Add these
+        
+        try:
+            # 1. Cargar datos
+            partition_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+            lf_data_original = pl.scan_parquet(partition_path_glob)
+            total_viajes_original = lf_data_original.select(pl.len()).collect().item()
+            print(f"   Partición cargada: {total_viajes_original:,} viajes totales.")
+
+            # 2. Pre-filtrado (Modo Exploración)
+            lf_data = lf_data_original.filter(
+                ~pl.col("modos").cast(pl.Utf8).is_in(['1', '5'])
+            )
+            
+            # 3. Extraer y Validar Etapas de Metro (tipo 2)
+            print("   Validando etapas de Metro (tipo 2)...")
+            lf_etapas = []
+            for i in range(1, 5):
+                etapa_cols = ["pk_viaje", f"tipo_transporte_{i}", f"paradero_subida_{i}", f"paradero_bajada_{i}", f"srv_{i}"]
+                rename_map = {f"tipo_transporte_{i}": "tipo_transporte", f"paradero_subida_{i}": "paradero_subida", f"paradero_bajada_{i}": "paradero_bajada", f"srv_{i}": "linea_srv"}
+                lf_etapas.append(lf_data.select(etapa_cols).rename(rename_map))
+            
+            lf_all_etapas = pl.concat(lf_etapas)
+            
+            # --- ¡CORRECCIÓN! Añadir paréntesis () a CADA condición del filtro ---
+            lf_metro_etapas = lf_all_etapas.filter(
+                (pl.col("tipo_transporte").cast(pl.Utf8) == '2') & 
+                (pl.col("paradero_subida").is_not_null()) &
+                (pl.col("paradero_bajada").is_not_null()) &
+                (pl.col("linea_srv").is_not_null())
+            )
+            # -------------------------------------------------------------
+
+            df_unique_metro_etapas = lf_metro_etapas.select("paradero_subida", "paradero_bajada", "linea_srv").unique().collect()
+            print(f"      Se encontraron {len(df_unique_metro_etapas):,} etapas únicas.")
+
+            pd_unique_etapas = df_unique_metro_etapas.to_pandas()
+            pd_unique_etapas['es_camino_valido'] = pd_unique_etapas.progress_apply(
+                validate_and_print_realtime, graph=G_metro, axis=1
+            )
+            
+            # 4. Aislar viajes verídicos
+            lf_validation_lookup = pl.from_pandas(pd_unique_etapas).lazy()
+            lf_etapas_validas = lf_validation_lookup.filter(pl.col("es_camino_valido") == True)
+
+            lf_viajes_metro_veridicos = lf_data_original.filter(
+                (pl.col("n_etapas") == 1) &
+                (pl.col("tipo_transporte_1").cast(pl.Utf8).is_in(['2', '4']))
+            ).join(
+                lf_etapas_validas,
+                left_on=["paradero_subida_1", "paradero_bajada_1", "srv_1"],
+                right_on=["paradero_subida", "paradero_bajada", "linea_srv"],
+                how="inner"
+            )
+
+            # 5. Crear períodos
+            lf_viajes_con_periodo = lf_viajes_metro_veridicos.with_columns([
+                pl.col("tiempo_inicio_viaje").dt.hour().alias("hora"),
+                (pl.col("tipodia").cast(pl.Utf8).cast(pl.Int8, strict=False) == 0).alias("is_laboral")
+            ]).with_columns(
+                pl.when(~pl.col("is_laboral")).then(pl.lit("Fin de Semana"))
+                  .when(pl.col("hora").is_in(HORAS_PUNTA_MANANA)).then(pl.lit("Punta Mañana"))
+                  .when(pl.col("hora").is_in(HORAS_PUNTA_TARDE)).then(pl.lit("Punta Tarde"))
+                  .when(pl.col("hora").is_in(HORAS_VALLE)).then(pl.lit("Valle"))
+                  .when(pl.col("hora").is_in(HORAS_BAJO)).then(pl.lit("Bajo"))
+                  .otherwise(pl.lit("Otro")).alias("periodo_dia")
+            )
+
+            # 6. Calcular estadísticas para ESTA partición
+            df_te0_stats_partition = lf_viajes_con_periodo.group_by(
+                pl.col("srv_1").alias("linea"),
+                pl.col("periodo_dia")
+            ).agg(
+                pl.col("te0").mean().alias("te0_promedio_seg"),
+                pl.count().alias("n_viajes_veridicos"),
+                pl.col("te0").std().alias("te0_std_dev_seg"),
+                pl.col("te0").median().alias("te0_median_seg"),
+                pl.col("te0").min().alias("te0_min_seg"),
+                pl.col("te0").max().alias("te0_max_seg")
+            ).collect()
+            
+            # 7. Guardar el resultado en la lista
+            lista_de_stats_te0.append(df_te0_stats_partition)
+            print(f"   ✅ Estadísticas de te0 para {partition_label} calculadas y guardadas.")
+
+        except Exception as e:
+            print(f"   ❌ ERROR procesando {partition_label}: {e}")
+            
+        finally:
+            # h. Limpieza de memoria explícita
+            print("   Limpiando memoria de la partición...")
+            # Use 'del' only if the variable exists
+            if 'lf_data_original' in locals(): del lf_data_original
+            if 'lf_data' in locals(): del lf_data
+            if 'lf_etapas_validas' in locals(): del lf_etapas_validas
+            if 'lf_viajes_metro_veridicos' in locals(): del lf_viajes_metro_veridicos
+            if 'lf_viajes_con_periodo' in locals(): del lf_viajes_con_periodo
+            if 'pd_unique_etapas' in locals(): del pd_unique_etapas
+            if 'df_unique_metro_etapas' in locals(): del df_unique_metro_etapas
+            gc.collect()
+            time.sleep(1)
+
+    print(f"\n{'='*60}\n--- Bucle de Validación Finalizado ---\n{'='*60}")
+    print(f"Se procesaron {len(lista_de_stats_te0)} particiones exitosamente.")
+```
+
+
+```{python}
+#|label: aggregate-te0-results
+
+if 'lista_de_stats_te0' in locals() and lista_de_stats_te0:
+    print("--- Consolidando todos los resultados de te0 ---")
+    
+    # 1. Concatenar todos los DataFrames de la lista
+    df_consolidado_te0 = pl.concat(lista_de_stats_te0)
+    
+    print(f"   Total de filas (Lineas x Periodos x Particiones): {len(df_consolidado_te0)}")
+
+    # 2. Calcular el promedio ponderado consolidado
+    # Agrupamos por línea y período a través de todas las semanas
+    df_te0_final = df_consolidado_te0.group_by(
+        pl.col("linea"),
+        pl.col("periodo_dia")
+    ).agg(
+        # Promedio Ponderado: sum(promedio_semanal * n_viajes_semanal) / sum(n_viajes_semanal)
+        (pl.col("te0_promedio_seg") * pl.col("n_viajes_veridicos")).sum().alias("sum_te0_ponderado"),
+        pl.col("n_viajes_veridicos").sum().alias("n_viajes_total"),
+        # También podemos promediar las medianas (no ponderado, solo para referencia)
+        pl.col("te0_median_seg").mean().alias("te0_mediana_promedio"),
+        pl.col("te0_std_dev_seg").mean().alias("te0_std_dev_promedio")
+    ).with_columns(
+        # Calcular el promedio ponderado final
+        (pl.col("sum_te0_ponderado") / pl.col("n_viajes_total")).alias("te0_promedio_consolidado_seg")
+    )
+    
+    # 3. Unir con el orden de períodos y ordenar
+    # (Asegúrate de que 'periodo_order' esté definido en la celda anterior o añádelo aquí)
+    if 'periodo_order' not in locals():
+        periodo_order = pl.DataFrame({
+            'periodo_dia': ["Punta Mañana", "Valle", "Punta Tarde", "Bajo", "Fin de Semana"],
+            'periodo_sort_order': [1, 2, 3, 4, 5]
+        })
+        
+    df_te0_final_sorted = df_te0_final.join(
+        periodo_order, on="periodo_dia", how="left"
+    ).sort(["linea", "periodo_sort_order"])
+
+    # 4. Imprimir los resultados finales
+    print(f"\n   --- 📈 Estadísticas Consolidadas de te0 (Todas las Particiones) ---")
+    
+    # Mostrar todas las filas/columnas sin truncar
+    pl.Config.set_tbl_rows(-1)
+    pl.Config.set_tbl_cols(-1)
+    pl.Config.set_tbl_width_chars(2000)
+    pl.Config.set_tbl_hide_column_data_types(True)
+    print(df_te0_final_sorted.select(
+        "linea", "periodo_dia", "te0_promedio_consolidado_seg", "n_viajes_total",
+        "te0_mediana_promedio", "te0_std_dev_promedio"
+    ))
+
+else:
+    print("❌ No se encontraron resultados para consolidar ('lista_de_stats_te0' está vacía). Ejecuta la celda anterior.")
+```
