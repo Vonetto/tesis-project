@@ -1,0 +1,1013 @@
+---
+
+title: "Comparación de Modelos ML (Logit vs. Random Forest) para Adopción QR"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: auto
+---
+
+# 1. Objetivo y Configuración
+
+Este notebook entrena modelos de Machine Learning (Regresión Logística y Random Forest) para predecir la elección de pago (QR vs. Bip!).
+El objetivo es comparar su rendimiento predictivo y la importancia de sus variables (vía SHAP) contra los modelos econométricos Logit tradicionales.
+
+**METODOLOGÍA DE VALIDACIÓN:** Se utiliza un **Split Temporal por Partición Completa**.
+* **Train:** 100% de los datos de las semanas especificadas en `TRAIN_PARTITIONS`.
+* **Test:** 100% de los datos de la semana especificada en `TEST_PARTITION`.
+
+Esto evita la fuga de datos y valida el modelo en un escenario real (predecir el futuro).
+
+## 1.1. Configuración de Ejecución
+ 
+```{python}
+#| label: config
+import os
+import sys
+
+# --- Parámetros de Partición ---
+# (Modificación) Ahora podemos usar múltiples semanas para entrenar
+TRAIN_PARTITIONS = [
+    (2025, 16)
+]
+TEST_PARTITION = (2025, 17)
+
+# --- Parámetros de Muestreo ---
+# 1.0 = Usar la partición completa.
+SAMPLE_FRACTION = 1.0
+SEED = 42
+
+# --- Constantes del Modelo ---
+HORAS_PUNTA_MANANA = [7, 8]
+HORAS_PUNTA_TARDE = [18, 19]
+
+# --- Parámetros de GCS ---
+GCS_BUCKET = "tesis-vonetto-datalake"
+SILVER_PATH = f"gs://{GCS_BUCKET}/lake/silver"
+INPUT_DATASET_PATH = f"{SILVER_PATH}/viajes_filtrados"
+
+# Etiquetas para los logs
+TRAIN_LABELS = ", ".join([f"{y}-W{w:02d}" for y, w in TRAIN_PARTITIONS])
+TEST_LABEL = f"{TEST_PARTITION[0]}-W{TEST_PARTITION[1]:02d}"
+
+print(f"--- Configuración del Análisis ---")
+print(f"Set de Entrenamiento: Particiones {TRAIN_LABELS}")
+print(f"Set de Prueba: Partición {TEST_LABEL}")
+if SAMPLE_FRACTION < 1.0:
+    print(f"Fracción de Muestreo (por partición): {SAMPLE_FRACTION * 100:.0f}%")
+else:
+    print(f"Fracción de Muestreo: 100% (Dataset Completo por Partición)")
+print(f"Dataset: {INPUT_DATASET_PATH}")
+```
+
+## 1.2. Setup de Librerías y Conexión
+
+```{python}
+#| label: setup-libs
+import polars as pl
+import gcsfs
+import pyarrow.fs as pafs
+import pyarrow.dataset as ds
+from datetime import date
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+import shap
+import sklearn
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+
+# --- Autenticación GCS ---
+def enable_adc_crossplatform():
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"): return
+    if sys.platform.startswith("win"):
+        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
+    else:
+        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+    if not os.path.exists(adc_path):
+        raise FileNotFoundError(f"No se encontró ADC. Ejecuta: gcloud auth application-default login")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
+
+try:
+    enable_adc_crossplatform()
+    gfs = gcsfs.GCSFileSystem(token="google_default")
+    print("✅ Conexión con GCS establecida.")
+    print(f"   Scikit-learn: {sklearn.__version__}")
+    print(f"   SHAP: {shap.__version__}")
+    print(f"   Polars: {pl.__version__}")
+except FileNotFoundError as e:
+    print(f"❌ Error de autenticación: {e}")
+```
+
+## 1.3. Funciones de Preparación de Datos
+
+```{python}
+#| label: helper-functions
+#| include: true
+
+# --- Función de Muestreo ---
+def get_stratified_sample(df, fraction, seed):
+    """Copia de 03_models/binary_logit_qr_adoption.qmd"""
+    # Si la fracción es 1.0, devolver el dataframe completo
+    if fraction >= 1.0:
+        return df
+        
+    total_rows = len(df)
+    target_rows = int(total_rows * fraction)
+    counts = df.group_by("choice").agg(pl.len().alias("count")).sort("choice")
+    bip_count_row = counts.filter(pl.col("choice") == 0)
+    qr_count_row = counts.filter(pl.col("choice") == 1)
+    bip_count = bip_count_row["count"][0] if len(bip_count_row) > 0 else 0
+    qr_count = qr_count_row["count"][0] if len(qr_count_row) > 0 else 0
+    total_original = bip_count + qr_count
+    if total_original == 0: return df.clear()
+    bip_proportion = bip_count / total_original
+    qr_proportion = qr_count / total_original
+    target_bip = int(target_rows * bip_proportion)
+    target_qr = int(target_rows * qr_proportion)
+    actual_total = target_bip + target_qr
+    if actual_total < target_rows:
+        if qr_count > 0: target_qr += (target_rows - actual_total)
+        elif bip_count > 0: target_bip += (target_rows - actual_total)
+    samples = []
+    if target_bip > 0 and bip_count > 0:
+        samples.append(df.filter(pl.col("choice") == 0).sample(n=min(target_bip, bip_count), shuffle=True, seed=seed))
+    if target_qr > 0 and qr_count > 0:
+        samples.append(df.filter(pl.col("choice") == 1).sample(n=min(target_qr, qr_count), shuffle=True, seed=seed))
+    if samples:
+        return pl.concat(samples).sample(fraction=1.0, shuffle=True, seed=seed)
+    else:
+        return df.clear()
+
+# --- Función de Features BASE (NUEVA LÓGICA) ---
+def prepare_features_base(lazy_frame):
+    """
+    Prepara features base usando una estrategia de "bloques horarios" 
+    mutuamente excluyentes para mejorar la interpretabilidad en modelos de ML.
+    """
+    # 1. Crear columnas de tiempo intermedias
+    lf_with_time = lazy_frame.select(
+        "is_qr", "tiempo_inicio_viaje", "tipodia"
+    ).with_columns([
+        pl.col("is_qr").cast(pl.Int8).alias("choice"),
+        pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
+    ]).with_columns([
+        pl.col("ts_local").dt.hour().alias("hora"),
+        (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+    ]).with_columns([
+        pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+    ])
+
+    # 2. Crear las Dummies mutuamente excluyentes de forma manual
+    lf_with_dummies = lf_with_time.with_columns([
+        (pl.col("is_laboral") & pl.col("punta_manana")).cast(pl.Int8).alias("DUMMY_WD_PM"),
+        (pl.col("is_laboral") & pl.col("punta_tarde")).cast(pl.Int8).alias("DUMMY_WD_PT"),
+        (pl.col("is_laboral") & ~pl.col("punta_manana") & ~pl.col("punta_tarde")).cast(pl.Int8).alias("DUMMY_WD_OFFPEAK"),
+    ])
+
+    # 3. Seleccionar columnas finales (Weekend es la categoría de referencia implícita)
+    cols_modelo = ["choice", "DUMMY_WD_PM", "DUMMY_WD_PT", "DUMMY_WD_OFFPEAK"]
+    
+    return lf_with_dummies.select(cols_modelo)
+
+# --- Función de Features EXTENDIDAS (NUEVA LÓGICA) ---
+def prepare_features_extended(lazy_frame):
+    """
+    Prepara features extendidas usando la estrategia de "bloques horarios"
+    y añadiendo las variables de viaje.
+    """
+    cols_necesarias = [
+         "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
+         "tiempo_vehiculo_seg", "te0", "tc1", "tc2", "tc3",
+         "te1", "te2", "te3",
+         "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
+     ]
+    schema = lazy_frame.collect_schema()
+    cols_presentes = [c for c in cols_necesarias if c in schema]
+    
+    lf_prep = lazy_frame.select(cols_presentes)
+
+    # Crear columnas de tiempo intermedias
+    lf_with_time = lf_prep.with_columns([
+        pl.col("is_qr").cast(pl.Int8).alias("choice"),
+        pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
+    ]).with_columns([
+        pl.col("ts_local").dt.hour().alias("hora"),
+        (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+    ]).with_columns([
+        pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+    ])
+
+    # Crear las Dummies de "bloque horario"
+    lf_with_time_dummies = lf_with_time.with_columns([
+        (pl.col("is_laboral") & pl.col("punta_manana")).cast(pl.Int8).alias("DUMMY_WD_PM"),
+        (pl.col("is_laboral") & pl.col("punta_tarde")).cast(pl.Int8).alias("DUMMY_WD_PT"),
+        (pl.col("is_laboral") & ~pl.col("punta_manana") & ~pl.col("punta_tarde")).cast(pl.Int8).alias("DUMMY_WD_OFFPEAK"),
+    ])
+
+    # Re-crear las variables de viaje del modelo extendido original
+    lf_with_vars = lf_with_time_dummies.with_columns([
+         (pl.col("tiempo_vehiculo_seg") / 60).alias("VAR_T_VEHICULO_MIN"),
+        (pl.col("n_etapas") - 1).alias("VAR_N_TRASBORDOS"),
+        ((pl.col("tc1").fill_null(0) + pl.col("tc2").fill_null(0) + pl.col("tc3").fill_null(0)) / 60).alias("VAR_T_CAMINATA_MIN"),
+        ((pl.col("te1").fill_null(0) + pl.col("te2").fill_null(0) + pl.col("te3").fill_null(0)) / 60).alias("VAR_T_ESPERA_TRASBORDO_MIN"),
+        (pl.col("te0") / 60).alias("VAR_T_ESPERA_INICIAL_MIN"),
+    ])
+    
+    cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
+    lf_with_modes = lf_with_vars
+    for col in cols_modos:
+        lf_with_modes = lf_with_modes.with_columns([
+            pl.when(pl.col(col).cast(pl.Utf8) == '4').then(pl.lit('2'))
+              .when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))
+              .otherwise(pl.col(col).cast(pl.Utf8))
+              .alias(col)
+        ])
+    
+    lf_with_modes = lf_with_modes.with_columns([
+        pl.any_horizontal([pl.col(c) == '1' for c in cols_modos]).alias("usa_bus"),
+        pl.any_horizontal([pl.col(c) == '2' for c in cols_modos]).alias("usa_metro"),
+    ]).with_columns([
+         (pl.col("usa_metro") & ~pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+        (pl.col("usa_metro") & pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+    ])
+
+    # Seleccionar columnas finales
+    cols_modelo_ext = [
+        "choice", 
+        "DUMMY_WD_PM", "DUMMY_WD_PT", "DUMMY_WD_OFFPEAK",
+        "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS", "VAR_T_CAMINATA_MIN",
+        "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN",
+        "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS"
+    ]
+    
+    final_cols = [c for c in cols_modelo_ext if c in lf_with_modes.collect_schema()]
+    return lf_with_modes.select(final_cols).fill_null(0)
+
+print("✅ Funciones de preparación (NUEVA LÓGICA DE BLOQUES HORARIOS) y muestreo listas.")
+```   
+
+
+
+## 1.4. Carga y Preparación de Datos (Train y Test)
+
+Cargamos y procesamos todas las particiones de entrenamiento y prueba.
+
+```{python}
+#| label: load-and-prep-partitions
+import gc
+import pandas as pd
+
+# --- Función Auxiliar para Cargar y Preparar una Partición ---
+def load_and_prep_partition(year, week, sample_fraction, seed):
+    print(f"\n--- Procesando Partición: {year}-W{week:02d} ---")
+    partition_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+    try:
+        lf_data = pl.scan_parquet(partition_path_glob)
+        n_rows_total = lf_data.select(pl.len()).collect().item()
+        print(f"Partición cargada (LazyFrame): {n_rows_total:,} filas.")
+    except Exception as e:
+        print(f"❌ Error al cargar la partición {year}-W{week}: {e}")
+        return None, None
+
+    # --- Preparar datos (BASE y EXTENDIDO) ---
+    print(f"Preparando features para {year}-W{week}...")
+    df_base_full = prepare_features_base(lf_data).collect()
+    df_ext_full = prepare_features_extended(lf_data).collect()
+    
+    # --- Aplicar Muestreo ---
+    if sample_fraction < 1.0:
+        print(f"Aplicando muestreo estratificado ({sample_fraction*100:.0f}%)...")
+        df_base_sample = get_stratified_sample(df_base_full, sample_fraction, seed)
+        df_ext_sample = get_stratified_sample(df_ext_full, sample_fraction, seed)
+    else:
+        print("Usando 100% de los datos (sin muestreo).")
+        df_base_sample = df_base_full
+        df_ext_sample = df_ext_full
+
+    print(f"Muestra Base lista: {len(df_base_sample):,} filas.")
+    print(f"Muestra Extendida lista: {len(df_ext_sample):,} filas.")
+    
+    del lf_data, df_base_full, df_ext_full
+    gc.collect()
+    
+    return df_base_sample.to_pandas(), df_ext_sample.to_pandas()
+
+# --- Cargar y Preparar Train (Múltiples Semanas) ---
+train_base_list = []
+train_ext_list = []
+print(f"\n--- 1. Cargando {len(TRAIN_PARTITIONS)} Partición(es) de ENTRENAMIENTO ---")
+for year, week in TRAIN_PARTITIONS:
+    base_data, ext_data = load_and_prep_partition(year, week, SAMPLE_FRACTION, SEED)
+    if base_data is not None:
+        train_base_list.append(base_data)
+    if ext_data is not None:
+        train_ext_list.append(ext_data)
+
+# Concatenar todos los dataframes de entrenamiento
+df_base_train = pd.concat(train_base_list, ignore_index=True)
+df_ext_train = pd.concat(train_ext_list, ignore_index=True)
+
+del train_base_list, train_ext_list
+gc.collect()
+
+print(f"\n--- 2. Cargando Partición de PRUEBA ---")
+df_base_test, df_ext_test = load_and_prep_partition(TEST_PARTITION[0], TEST_PARTITION[1], SAMPLE_FRACTION, SEED)
+
+print("\n--- 3. Resumen de Carga ---")
+print(f"Total filas Train (Base):     {len(df_base_train):,}")
+print(f"Total filas Train (Extendido): {len(df_ext_train):,}")
+print(f"Total filas Test (Base):      {len(df_base_test):,}")
+print(f"Total filas Test (Extendido):  {len(df_ext_test):,}")
+```
+
+-----
+
+# 1.5. Análisis Exploratorio de Datos (EDA) - Modelo Base
+
+Esta sección analiza las distribuciones y características de los features del modelo base (variables temporales dummy) tanto en el conjunto de entrenamiento como en el de prueba.
+
+## 1.5.1. Análisis de Features Base - Train Set
+
+```{python}
+#| label: eda-features-base-train
+print("--- 1.5.1. Análisis de Features Base - Train Set ---")
+
+if df_base_train is not None and not df_base_train.empty:
+    print(f"\n📊 Shape del Dataset Base (Train): {df_base_train.shape}")
+    print(f"Columnas: {df_base_train.columns.tolist()}")
+    
+    # Estadísticas descriptivas
+    print("\n📈 Estadísticas Descriptivas (Train Set):")
+    display(df_base_train.describe())
+    
+    # Distribución de la variable objetivo
+    print("\n🎯 Distribución de la Variable Objetivo (choice) - Train Set:")
+    choice_dist_train = df_base_train['choice'].value_counts().sort_index()
+    choice_pct_train = df_base_train['choice'].value_counts(normalize=True).sort_index() * 100
+    
+    choice_summary_train = pd.DataFrame({
+        'Frecuencia': choice_dist_train.values,
+        'Porcentaje (%)': choice_pct_train.values
+    }, index=['Bip! (0)', 'QR (1)'])
+    display(choice_summary_train)
+    
+    # Análisis de features dummy
+    print("\n📊 Distribución de Features Dummy - Train Set:")
+    dummy_features = ['DUMMY_PM_LAB', 'DUMMY_PT_LAB', 'DUMMY_LJ_LAB', 'DUMMY_VIE_LAB']
+    
+    dummy_summary_train = []
+    for feat in dummy_features:
+        if feat in df_base_train.columns:
+            counts = df_base_train[feat].value_counts().sort_index()
+            pcts = df_base_train[feat].value_counts(normalize=True).sort_index() * 100
+            dummy_summary_train.append({
+                'Feature': feat,
+                'Valor 0': f"{counts.get(0, 0):,} ({pcts.get(0, 0):.2f}%)",
+                'Valor 1': f"{counts.get(1, 0):,} ({pcts.get(1, 0):.2f}%)"
+            })
+    
+    display(pd.DataFrame(dummy_summary_train))
+    
+    # Tablas de contingencia: choice vs features dummy
+    print("\n📊 Tablas de Contingencia: Choice vs Features Dummy - Train Set:")
+    for feat in dummy_features:
+        if feat in df_base_train.columns:
+            crosstab = pd.crosstab(df_base_train['choice'], df_base_train[feat], 
+                                   margins=True, margins_name='Total')
+            crosstab_pct = pd.crosstab(df_base_train['choice'], df_base_train[feat], 
+                                       normalize='index') * 100
+            
+            print(f"\n{feat}:")
+            print("Frecuencias:")
+            display(crosstab)
+            print("Porcentajes por fila (Choice):")
+            display(crosstab_pct.round(2))
+    
+else:
+    print("⚠️ No hay datos Base disponibles para análisis.")
+```
+
+## 1.5.2. Análisis de Features Base - Test Set
+
+```{python}
+#| label: eda-features-base-test
+print("--- 1.5.2. Análisis de Features Base - Test Set ---")
+
+if df_base_test is not None and not df_base_test.empty:
+    print(f"\n📊 Shape del Dataset Base (Test): {df_base_test.shape}")
+    
+    # Estadísticas descriptivas
+    print("\n📈 Estadísticas Descriptivas (Test Set):")
+    display(df_base_test.describe())
+    
+    # Distribución de la variable objetivo
+    print("\n🎯 Distribución de la Variable Objetivo (choice) - Test Set:")
+    choice_dist_test = df_base_test['choice'].value_counts().sort_index()
+    choice_pct_test = df_base_test['choice'].value_counts(normalize=True).sort_index() * 100
+    
+    choice_summary_test = pd.DataFrame({
+        'Frecuencia': choice_dist_test.values,
+        'Porcentaje (%)': choice_pct_test.values
+    }, index=['Bip! (0)', 'QR (1)'])
+    display(choice_summary_test)
+    
+    # Análisis de features dummy
+    print("\n📊 Distribución de Features Dummy - Test Set:")
+    dummy_features = ['DUMMY_PM_LAB', 'DUMMY_PT_LAB', 'DUMMY_LJ_LAB', 'DUMMY_VIE_LAB']
+    
+    dummy_summary_test = []
+    for feat in dummy_features:
+        if feat in df_base_test.columns:
+            counts = df_base_test[feat].value_counts().sort_index()
+            pcts = df_base_test[feat].value_counts(normalize=True).sort_index() * 100
+            dummy_summary_test.append({
+                'Feature': feat,
+                'Valor 0': f"{counts.get(0, 0):,} ({pcts.get(0, 0):.2f}%)",
+                'Valor 1': f"{counts.get(1, 0):,} ({pcts.get(1, 0):.2f}%)"
+            })
+    
+    display(pd.DataFrame(dummy_summary_test))
+    
+    # Tablas de contingencia: choice vs features dummy
+    print("\n📊 Tablas de Contingencia: Choice vs Features Dummy - Test Set:")
+    for feat in dummy_features:
+        if feat in df_base_test.columns:
+            crosstab = pd.crosstab(df_base_test['choice'], df_base_test[feat], 
+                                   margins=True, margins_name='Total')
+            crosstab_pct = pd.crosstab(df_base_test['choice'], df_base_test[feat], 
+                                       normalize='index') * 100
+            
+            print(f"\n{feat}:")
+            print("Frecuencias:")
+            display(crosstab)
+            print("Porcentajes por fila (Choice):")
+            display(crosstab_pct.round(2))
+    
+else:
+    print("⚠️ No hay datos Base (Test) disponibles para análisis.")
+```
+
+## 1.5.3. Comparación Train vs Test
+
+```{python}
+#| label: eda-train-test-comparison
+print("--- 1.5.3. Comparación Train vs Test ---")
+
+if df_base_train is not None and df_base_test is not None:
+    # Comparación de distribución de choice
+    print("\n🎯 Comparación de Distribución de Choice (Train vs Test):")
+    train_choice_counts = df_base_train['choice'].value_counts().sort_index()
+    train_choice_pcts = df_base_train['choice'].value_counts(normalize=True).sort_index() * 100
+    test_choice_counts = df_base_test['choice'].value_counts().sort_index()
+    test_choice_pcts = df_base_test['choice'].value_counts(normalize=True).sort_index() * 100
+    
+    choice_comparison = pd.DataFrame({
+        'Train': [
+            train_choice_counts.get(0, 0),
+            train_choice_counts.get(1, 0),
+            train_choice_pcts.get(0, 0),
+            train_choice_pcts.get(1, 0)
+        ],
+        'Test': [
+            test_choice_counts.get(0, 0),
+            test_choice_counts.get(1, 0),
+            test_choice_pcts.get(0, 0),
+            test_choice_pcts.get(1, 0)
+        ]
+    }, index=['Bip! (0) - Frecuencia', 'QR (1) - Frecuencia', 
+              'Bip! (0) - Porcentaje (%)', 'QR (1) - Porcentaje (%)'])
+    
+    choice_comparison['Diferencia'] = choice_comparison['Test'] - choice_comparison['Train']
+    display(choice_comparison.round(2))
+    
+    # Comparación de distribuciones de features dummy
+    print("\n📊 Comparación de Distribuciones de Features Dummy (Train vs Test):")
+    dummy_features = ['DUMMY_PM_LAB', 'DUMMY_PT_LAB', 'DUMMY_LJ_LAB', 'DUMMY_VIE_LAB']
+    
+    for feat in dummy_features:
+        if feat in df_base_train.columns and feat in df_base_test.columns:
+            train_counts = df_base_train[feat].value_counts().sort_index()
+            train_pcts = df_base_train[feat].value_counts(normalize=True).sort_index() * 100
+            test_counts = df_base_test[feat].value_counts().sort_index()
+            test_pcts = df_base_test[feat].value_counts(normalize=True).sort_index() * 100
+            
+            print(f"\n{feat}:")
+            comparison = pd.DataFrame({
+                'Train - Valor 0': [
+                    train_counts.get(0, 0),
+                    train_pcts.get(0, 0)
+                ],
+                'Train - Valor 1': [
+                    train_counts.get(1, 0),
+                    train_pcts.get(1, 0)
+                ],
+                'Test - Valor 0': [
+                    test_counts.get(0, 0),
+                    test_pcts.get(0, 0)
+                ],
+                'Test - Valor 1': [
+                    test_counts.get(1, 0),
+                    test_pcts.get(1, 0)
+                ]
+            }, index=['Frecuencia', 'Porcentaje (%)'])
+            display(comparison.round(2))
+    
+else:
+    print("⚠️ No hay datos suficientes para comparación.")
+```
+
+## 1.5.4. Análisis de Distribución de Días de la Semana
+
+```{python}
+#| label: eda-days-distribution
+print("--- 1.5.4. Análisis de Distribución de Días de la Semana ---")
+
+# Función para cargar y analizar días de una partición
+def analyze_days_distribution(year, week):
+    """Carga una muestra de una partición y analiza la distribución de días."""
+    partition_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+    try:
+        lf_data = pl.scan_parquet(partition_path_glob)
+        # Cargar solo las columnas necesarias para análisis rápido
+        df_sample = lf_data.select([
+            "tiempo_inicio_viaje"
+        ]).with_columns([
+            pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
+        ]).with_columns([
+            pl.col("ts_local").dt.weekday().alias("dia_semana"),
+            pl.col("ts_local").dt.date().alias("fecha"),
+        ]).collect().to_pandas()
+        
+        # Mapear números de día a nombres
+        dia_nombres = {1: 'Lunes', 2: 'Martes', 3: 'Miércoles', 4: 'Jueves', 
+                      5: 'Viernes', 6: 'Sábado', 7: 'Domingo'}
+        df_sample['dia_nombre'] = df_sample['dia_semana'].map(dia_nombres)
+        
+        return df_sample
+    except Exception as e:
+        print(f"❌ Error al cargar partición {year}-W{week:02d}: {e}")
+        return None
+
+# Analizar días en particiones de entrenamiento
+print("\n📅 Análisis de Días - Particiones de Entrenamiento:")
+train_days_data = []
+
+for year, week in TRAIN_PARTITIONS:
+    print(f"\n--- Partición {year}-W{week:02d} ---")
+    df_partition = analyze_days_distribution(year, week)
+    
+    if df_partition is not None and not df_partition.empty:
+        # Distribución de días de la semana
+        days_dist = df_partition['dia_semana'].value_counts().sort_index()
+        days_pct = df_partition['dia_semana'].value_counts(normalize=True).sort_index() * 100
+        
+        # Crear resumen
+        dia_nombres = {1: 'Lunes', 2: 'Martes', 3: 'Miércoles', 4: 'Jueves', 
+                      5: 'Viernes', 6: 'Sábado', 7: 'Domingo'}
+        
+        summary = pd.DataFrame({
+            'Día': [dia_nombres.get(i, f'Día {i}') for i in sorted(days_dist.index)],
+            'Frecuencia': days_dist.values,
+            'Porcentaje (%)': days_pct.values
+        })
+        
+        print(f"Total de registros: {len(df_partition):,}")
+        print("\nDistribución de días:")
+        display(summary)
+        
+        # Días faltantes
+        dias_presentes = set(days_dist.index)
+        todos_los_dias = set(range(1, 8))
+        dias_faltantes = todos_los_dias - dias_presentes
+        
+        if dias_faltantes:
+            print(f"\n⚠️ Días FALTANTES en {year}-W{week:02d}: {[dia_nombres.get(d, f'Día {d}') for d in sorted(dias_faltantes)]}")
+        else:
+            print(f"\n✅ Todos los días están presentes en {year}-W{week:02d}")
+        
+        # Rango de fechas
+        print(f"\nRango de fechas: {df_partition['fecha'].min()} a {df_partition['fecha'].max()}")
+        
+        train_days_data.append({
+            'Partition': f"{year}-W{week:02d}",
+            'Dias_Presentes': len(dias_presentes),
+            'Dias_Faltantes': len(dias_faltantes),
+            'Total_Registros': len(df_partition)
+        })
+
+# Resumen de particiones de entrenamiento
+if train_days_data:
+    print("\n📊 Resumen de Particiones de Entrenamiento:")
+    display(pd.DataFrame(train_days_data))
+
+# Analizar días en partición de prueba
+print("\n📅 Análisis de Días - Partición de Prueba:")
+print(f"\n--- Partición {TEST_PARTITION[0]}-W{TEST_PARTITION[1]:02d} ---")
+df_test_partition = analyze_days_distribution(TEST_PARTITION[0], TEST_PARTITION[1])
+
+if df_test_partition is not None and not df_test_partition.empty:
+    # Distribución de días de la semana
+    days_dist_test = df_test_partition['dia_semana'].value_counts().sort_index()
+    days_pct_test = df_test_partition['dia_semana'].value_counts(normalize=True).sort_index() * 100
+    
+    # Crear resumen
+    dia_nombres = {1: 'Lunes', 2: 'Martes', 3: 'Miércoles', 4: 'Jueves', 
+                  5: 'Viernes', 6: 'Sábado', 7: 'Domingo'}
+    
+    summary_test = pd.DataFrame({
+        'Día': [dia_nombres.get(i, f'Día {i}') for i in sorted(days_dist_test.index)],
+        'Frecuencia': days_dist_test.values,
+        'Porcentaje (%)': days_pct_test.values
+    })
+    
+    print(f"Total de registros: {len(df_test_partition):,}")
+    print("\nDistribución de días:")
+    display(summary_test)
+    
+    # Días faltantes
+    dias_presentes_test = set(days_dist_test.index)
+    todos_los_dias = set(range(1, 8))
+    dias_faltantes_test = todos_los_dias - dias_presentes_test
+    
+    if dias_faltantes_test:
+        print(f"\n⚠️ Días FALTANTES en {TEST_PARTITION[0]}-W{TEST_PARTITION[1]:02d}: {[dia_nombres.get(d, f'Día {d}') for d in sorted(dias_faltantes_test)]}")
+    else:
+        print(f"\n✅ Todos los días están presentes en {TEST_PARTITION[0]}-W{TEST_PARTITION[1]:02d}")
+    
+    # Rango de fechas
+    print(f"\nRango de fechas: {df_test_partition['fecha'].min()} a {df_test_partition['fecha'].max()}")
+
+# Comparación de distribución de días entre Train y Test
+print("\n📊 Comparación de Distribución de Días - Train vs Test:")
+
+if train_days_data and df_test_partition is not None:
+    # Agregar todos los días de train
+    all_train_days = []
+    for year, week in TRAIN_PARTITIONS:
+        df_part = analyze_days_distribution(year, week)
+        if df_part is not None:
+            all_train_days.append(df_part)
+    
+    if all_train_days:
+        df_all_train = pd.concat(all_train_days, ignore_index=True)
+        train_days_dist = df_all_train['dia_semana'].value_counts().sort_index()
+        train_days_pct = df_all_train['dia_semana'].value_counts(normalize=True).sort_index() * 100
+        
+        test_days_dist = df_test_partition['dia_semana'].value_counts().sort_index()
+        test_days_pct = df_test_partition['dia_semana'].value_counts(normalize=True).sort_index() * 100
+        
+        # Crear tabla comparativa
+        dia_nombres = {1: 'Lunes', 2: 'Martes', 3: 'Miércoles', 4: 'Jueves', 
+                      5: 'Viernes', 6: 'Sábado', 7: 'Domingo'}
+        
+        todos_los_dias = sorted(set(range(1, 8)))
+        comparison_data = []
+        
+        for dia in todos_los_dias:
+            comparison_data.append({
+                'Día': dia_nombres.get(dia, f'Día {dia}'),
+                'Train - Frecuencia': train_days_dist.get(dia, 0),
+                'Train - Porcentaje (%)': train_days_pct.get(dia, 0),
+                'Test - Frecuencia': test_days_dist.get(dia, 0),
+                'Test - Porcentaje (%)': test_days_pct.get(dia, 0)
+            })
+        
+        comparison_df = pd.DataFrame(comparison_data)
+        comparison_df['Diferencia Frecuencia'] = comparison_df['Test - Frecuencia'] - comparison_df['Train - Frecuencia']
+        comparison_df['Diferencia Porcentaje (%)'] = comparison_df['Test - Porcentaje (%)'] - comparison_df['Train - Porcentaje (%)']
+        
+        display(comparison_df.round(2))
+        
+        # Verificar días faltantes en cada conjunto
+        train_dias_presentes = set(train_days_dist.index)
+        test_dias_presentes = set(test_days_dist.index)
+        todos_los_dias_set = set(range(1, 8))
+        
+        train_faltantes = todos_los_dias_set - train_dias_presentes
+        test_faltantes = todos_los_dias_set - test_dias_presentes
+        
+        print("\n🔍 Verificación de Días Faltantes:")
+        if train_faltantes:
+            print(f"⚠️ Train: Días faltantes: {[dia_nombres.get(d, f'Día {d}') for d in sorted(train_faltantes)]}")
+        else:
+            print("✅ Train: Todos los días están presentes")
+            
+        if test_faltantes:
+            print(f"⚠️ Test: Días faltantes: {[dia_nombres.get(d, f'Día {d}') for d in sorted(test_faltantes)]}")
+        else:
+            print("✅ Test: Todos los días están presentes")
+```
+
+-----
+
+# 2\. Modelo Base (Variables Temporales)
+
+Comparamos `LogisticRegression` (Pura y ML) y `RandomForestClassifier` usando solo las 4 variables temporales DUMMY.
+
+## 2.1. Entrenamiento (Base)
+
+```{python}
+#| label: train-base
+if df_base_train is not None and not df_base_train.empty:
+    print("--- 2.1. Entrenamiento (Base) ---")
+    
+    X_train_b = df_base_train.drop("choice", axis=1)
+    y_train_b = df_base_train["choice"]
+    X_test_b = df_base_test.drop("choice", axis=1)
+    y_test_b = df_base_test["choice"]
+    feature_names_base = X_train_b.columns.tolist()
+
+    print(f"Modelo Base - Train set ({TRAIN_LABELS}): {X_train_b.shape[0]} filas")
+    print(f"Modelo Base - Test set ({TEST_LABEL}): {X_test_b.shape[0]} filas")
+
+    print("--- Diagnóstico de Features (Base) ---")
+    print("Suma de cada columna de features de entrenamiento:")
+    print("Si las sumas de las columnas DUMMY son cero, hemos encontrado el problema.")
+    display(X_train_b.sum())
+
+    #--- Diagnóstico de Features (Test Set - Base) ---
+    print("--- Diagnóstico de Features (Test Set - Base) ---")
+    print("Suma de cada columna de features del set de prueba:")
+    print(f"Si estas sumas son cero, el problema está en los datos de {TEST_LABEL}.")
+    display(X_test_b.sum())
+
+    # --- Modelos ---
+    print("Entrenando LogReg (Puro, sin regularización)...")
+    log_reg_base_puro = LogisticRegression(max_iter=1000, random_state=SEED, solver='lbfgs', class_weight='balanced')
+    log_reg_base_puro.fit(X_train_b, y_train_b)
+
+    print("Entrenando LogReg (ML, con regularización L2)...")
+    log_reg_base_ml = LogisticRegression(penalty='l2', max_iter=1000, random_state=SEED, solver='lbfgs', class_weight='balanced')
+    log_reg_base_ml.fit(X_train_b, y_train_b)
+
+    print("Entrenando RandomForestClassifier (Base)...")
+    rf_base = RandomForestClassifier(n_estimators=100, random_state=SEED, n_jobs=-1, max_depth=10, class_weight='balanced')
+    rf_base.fit(X_train_b, y_train_b)
+    print("✅ Entrenamiento Base completado.")
+else:
+    print("⚠️ No hay datos 'Base' para entrenar. Revisa el paso 1.4.")
+```
+
+## 2.2. Evaluación (Base)
+
+```{python}
+#| label: evaluate-base
+if 'log_reg_base_puro' in locals():
+    print("--- 2.2. Evaluación (Base) ---")
+    
+    # Predicciones
+    y_pred_lr_b_puro = log_reg_base_puro.predict(X_test_b)
+    y_prob_lr_b_puro = log_reg_base_puro.predict_proba(X_test_b)[:, 1]
+    y_pred_lr_b_ml = log_reg_base_ml.predict(X_test_b)
+    y_prob_lr_b_ml = log_reg_base_ml.predict_proba(X_test_b)[:, 1]
+    y_pred_rf_b = rf_base.predict(X_test_b)
+    y_prob_rf_b = rf_base.predict_proba(X_test_b)[:, 1]
+
+    print("\n--- Reporte: LogReg (Puro, sin regularización) (Base) ---")
+    print(classification_report(y_test_b, y_pred_lr_b_puro))
+    print(f"ROC-AUC: {roc_auc_score(y_test_b, y_prob_lr_b_puro):.4f}")
+
+    print("\n--- Reporte: LogReg (ML, con regularización L2) (Base) ---")
+    print(classification_report(y_test_b, y_pred_lr_b_ml))
+    print(f"ROC-AUC: {roc_auc_score(y_test_b, y_prob_lr_b_ml):.4f}")
+
+    print("\n--- Reporte: RandomForestClassifier (Base) ---")
+    print(classification_report(y_test_b, y_pred_rf_b))
+    print(f"ROC-AUC: {roc_auc_score(y_test_b, y_prob_rf_b):.4f}")
+else:
+    print("⚠️ Modelos 'Base' no entrenados.")
+```
+
+## 2.3. Interpretabilidad SHAP (Base)
+
+```{python}
+#| label: shap-base
+if 'rf_base' in locals():
+    print("--- 2.3. SHAP (Base) ---")
+    print("Calculando valores SHAP para el modelo Base (Random Forest)...")
+    
+    # Usar un subconjunto del Test Set para SHAP (para velocidad)
+    X_test_sample_b = X_test_b.sample(min(2000, len(X_test_b)), random_state=SEED)
+    
+    explainer_base = shap.TreeExplainer(rf_base)
+    shap_values_base = explainer_base.shap_values(X_test_sample_b)
+    
+    # Handle different return formats from TreeExplainer
+    # For binary classification, it can return a list [shap_values_class_0, shap_values_class_1]
+    # or sometimes just a single array
+    if isinstance(shap_values_base, list):
+        # Use class 1 (QR) values
+        shap_vals_plot = shap_values_base[1]
+    else:
+        # Single array case
+        shap_vals_plot = shap_values_base
+    
+    # If SHAP returns a 3D array (samples, features, classes), select class 1 (QR)
+    if hasattr(shap_vals_plot, "ndim") and shap_vals_plot.ndim == 3:
+        class_idx = 1 if shap_vals_plot.shape[2] > 1 else 0
+        shap_vals_plot = shap_vals_plot[:, :, class_idx]
+    
+    # Check if SHAP values have an extra column (bias term) and remove it if needed
+    if shap_vals_plot.shape[1] != X_test_sample_b.shape[1]:
+        if shap_vals_plot.shape[1] == X_test_sample_b.shape[1] + 1:
+            # Remove the last column (bias term)
+            shap_vals_plot = shap_vals_plot[:, :-1]
+            print(f"⚠️ Removida columna adicional (bias) de SHAP values. Shape ajustado: {shap_vals_plot.shape}")
+        else:
+            raise ValueError(f"Shape mismatch: SHAP values {shap_vals_plot.shape} vs X_test {X_test_sample_b.shape}")
+    
+    print(f"SHAP values shape: {shap_vals_plot.shape}, X_test shape: {X_test_sample_b.shape}")
+    
+    # Imprimir valores SHAP (primeras filas) y resumen por feature
+    try:
+        df_shap_base = pd.DataFrame(shap_vals_plot, columns=feature_names_base)
+        print("\nSHAP values - primeras 5 filas (Base):")
+        display(df_shap_base.head())
+        
+        shap_mean_abs = df_shap_base.abs().mean().sort_values(ascending=False)
+        print("\nImportancia media absoluta de SHAP por feature (Base):")
+        display(shap_mean_abs.to_frame(name='mean(|SHAP|)'))
+    except Exception as e:
+        print(f"⚠️ No se pudieron tabular los SHAP values: {e}")
+    
+    print("Generando gráfico SHAP (Base)...")
+    plt.figure()
+    shap.summary_plot(shap_vals_plot, X_test_sample_b, feature_names=feature_names_base, show=False)
+    plt.title(f"SHAP Summary (Base Model - RF) - Test on {TEST_LABEL}")
+    plt.savefig("shap_summary_base.png", bbox_inches='tight')
+    plt.close()
+    print("✅ Gráfico 'shap_summary_base.png' guardado.")
+else:
+    print("⚠️ Modelo 'rf_base' no entrenado.")
+```
+
+-----
+
+# 3\. Modelo Extendido (Variables Temporales + Atributos de Viaje)
+
+Comparamos los modelos usando el set completo de 11-12 variables.
+
+## 3.1. Entrenamiento (Extendido)
+
+```{python}
+#| label: train-extended
+if df_ext_train is not None and not df_ext_train.empty:
+    print("--- 3.1. Entrenamiento (Extendido) ---")
+    
+    X_train_e = df_ext_train.drop("choice", axis=1)
+    y_train_e = df_ext_train["choice"]
+    X_test_e = df_ext_test.drop("choice", axis=1)
+    y_test_e = df_ext_test["choice"]
+    feature_names_ext = X_train_e.columns.tolist()
+
+    print(f"Modelo Extendido - Train set ({TRAIN_LABELS}): {X_train_e.shape[0]} filas")
+    print(f"Modelo Extendido - Test set ({TEST_LABEL}): {X_test_e.shape[0]} filas")
+    
+    # --- Estandarizar datos para Regresión Logística ---
+    print("Estandarizando features para Regresión Logística...")
+    scaler = StandardScaler()
+    X_train_e_scaled = scaler.fit_transform(X_train_e)
+    X_test_e_scaled = scaler.transform(X_test_e)
+
+    # --- Modelos ---
+    print("Entrenando LogReg (Puro, sin regularización) (Extendido)...")
+    log_reg_ext_puro = LogisticRegression(max_iter=1000, random_state=SEED, solver='lbfgs')
+    log_reg_ext_puro.fit(X_train_e_scaled, y_train_e)
+
+    print("Entrenando LogReg (ML, con regularización L2) (Extendido)...")
+    log_reg_ext_ml = LogisticRegression(penalty='l2', max_iter=1000, random_state=SEED, solver='lbfgs')
+    log_reg_ext_ml.fit(X_train_e_scaled, y_train_e)
+
+    print("Entrenando RandomForestClassifier (Extendido)...")
+    rf_ext = RandomForestClassifier(n_estimators=100, random_state=SEED, n_jobs=-1, max_depth=10)
+    rf_ext.fit(X_train_e, y_train_e) # RF usa los datos sin escalar
+    print("✅ Entrenamiento Extendido completado.")
+else:
+    print("⚠️ No hay datos 'Extendidos' para entrenar. Revisa el paso 1.4.")
+```
+
+## 3.2. Evaluación (Extendido)
+
+```{python}
+#| label: evaluate-extended
+if 'log_reg_ext_puro' in locals():
+    print("--- 3.2. Evaluación (Extendido) ---")
+    
+    y_pred_lr_e_puro = log_reg_ext_puro.predict(X_test_e_scaled)
+    y_prob_lr_e_puro = log_reg_ext_puro.predict_proba(X_test_e_scaled)[:, 1]
+    y_pred_lr_e_ml = log_reg_ext_ml.predict(X_test_e_scaled)
+    y_prob_lr_e_ml = log_reg_ext_ml.predict_proba(X_test_e_scaled)[:, 1]
+    y_pred_rf_e = rf_ext.predict(X_test_e)
+    y_prob_rf_e = rf_ext.predict_proba(X_test_e)[:, 1]
+
+    print("\n--- Reporte: LogReg (Puro, sin regularización) (Extendido) ---")
+    print(classification_report(y_test_e, y_pred_lr_e_puro))
+    print(f"ROC-AUC: {roc_auc_score(y_test_e, y_prob_lr_e_puro):.4f}")
+
+    print("\n--- Reporte: LogReg (ML, con regularización L2) (Extendido) ---")
+    print(classification_report(y_test_e, y_pred_lr_e_ml))
+    print(f"ROC-AUC: {roc_auc_score(y_test_e, y_prob_lr_e_ml):.4f}")
+
+    print("\n--- Reporte: RandomForestClassifier (Extendido) ---")
+    print(classification_report(y_test_e, y_pred_rf_e))
+    print(f"ROC-AUC: {roc_auc_score(y_test_e, y_prob_rf_e):.4f}")
+else:
+    print("⚠️ Modelos 'Extendidos' no entrenados.")
+```
+
+## 3.3. Interpretabilidad SHAP (Extendido)
+
+```{python}
+#| label: shap-extended
+if 'rf_ext' in locals():
+    print("--- 3.3. SHAP (Extendido) ---")
+    print("Calculando valores SHAP para el modelo Extendido (Random Forest)...")
+    
+    # Usar un subconjunto del Test Set para SHAP (para velocidad)
+    X_test_sample_e = X_test_e.sample(min(2000, len(X_test_e)), random_state=SEED)
+    
+    explainer_ext = shap.TreeExplainer(rf_ext)
+    shap_values_ext = explainer_ext.shap_values(X_test_sample_e)
+    
+    # Handle different return formats from TreeExplainer
+    # For binary classification, it can return a list [shap_values_class_0, shap_values_class_1]
+    # or sometimes just a single array
+    if isinstance(shap_values_ext, list):
+        # Use class 1 (QR) values
+        shap_vals_plot = shap_values_ext[1]
+    else:
+        # Single array case
+        shap_vals_plot = shap_values_ext
+    
+    # If SHAP returns a 3D array (samples, features, classes), select class 1 (QR)
+    if hasattr(shap_vals_plot, "ndim") and shap_vals_plot.ndim == 3:
+        class_idx = 1 if shap_vals_plot.shape[2] > 1 else 0
+        shap_vals_plot = shap_vals_plot[:, :, class_idx]
+    
+    # Check if SHAP values have an extra column (bias term) and remove it if needed
+    if shap_vals_plot.shape[1] != X_test_sample_e.shape[1]:
+        if shap_vals_plot.shape[1] == X_test_sample_e.shape[1] + 1:
+            # Remove the last column (bias term)
+            shap_vals_plot = shap_vals_plot[:, :-1]
+            print(f"⚠️ Removida columna adicional (bias) de SHAP values. Shape ajustado: {shap_vals_plot.shape}")
+        else:
+            raise ValueError(f"Shape mismatch: SHAP values {shap_vals_plot.shape} vs X_test {X_test_sample_e.shape}")
+    
+    print(f"SHAP values shape: {shap_vals_plot.shape}, X_test shape: {X_test_sample_e.shape}")
+    
+    print("Generando gráfico SHAP (Extendido)...")
+    plt.figure()
+    shap.summary_plot(shap_vals_plot, X_test_sample_e, feature_names=feature_names_ext, show=False)
+    plt.title(f"SHAP Summary (Extended Model - RF) - Test on {TEST_LABEL}")
+    plt.savefig("shap_summary_extended.png", bbox_inches='tight')
+    plt.close()
+    print("✅ Gráfico 'shap_summary_extended.png' guardado.")
+else:
+    print("⚠️ Modelo 'rf_ext' no entrenado.")
+```
+
+-----
+
+# 4\. Resumen de Coeficientes (Comparación Logit)
+
+```{python}
+#| label: coef-summary
+if 'log_reg_base_puro' in locals() and 'log_reg_ext_puro' in locals():
+    print("--- 4. Resumen de Coeficientes (LogisticRegression Pura, sin regularización) ---")
+    
+    # Coeficientes del Modelo Base (No escalado)
+    coefs_base = pd.DataFrame(
+        log_reg_base_puro.coef_[0],
+        index=feature_names_base,
+        columns=['Coef_Base (unidades originales)']
+    )
+    coefs_base.loc['ASC_QR'] = log_reg_base_puro.intercept_[0]
+    
+    # Coeficientes del Modelo Extendido (Escalado)
+    coefs_ext = pd.DataFrame(
+        log_reg_ext_puro.coef_[0],
+        index=feature_names_ext,
+        columns=['Coef_Extendido (estandarizado)']
+    )
+    coefs_ext.loc['ASC_QR'] = log_reg_ext_puro.intercept_[0]
+    
+    # Unir para comparar
+    df_coef_comparison = coefs_base.join(coefs_ext, how='outer')
+    
+    print("\n--- Comparación de Coeficientes (LogReg Puro vs. Extendido) ---")
+    print(df_coef_comparison.sort_values('Coef_Extendido (estandarizado)', ascending=False).to_markdown(floatfmt=".4f"))
+
+else:
+    print("⚠️ Modelos de Regresión Logística no entrenados.")
+```
