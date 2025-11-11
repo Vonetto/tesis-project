@@ -48,6 +48,20 @@ import pyarrow.dataset as ds
 from datetime import date
 import matplotlib.pyplot as plt
 import seaborn as sns
+from pathlib import Path
+
+# Asegurar que el paquete 'config' sea importable
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró el directorio raíz con el paquete 'config'.")
+
+from config import HORAS_PUNTA_MANANA, HORAS_PUNTA_TARDE
 
 # Importar biogeme
 import biogeme.database as db
@@ -99,10 +113,6 @@ print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
 ```{python}
 #|label: helper-functions
 #|include: false
-
-# --- Constantes del Modelo ---
-HORAS_PUNTA_MANANA = [7, 8]
-HORAS_PUNTA_TARDE = [18, 19]
 
 # --- Helper para Feature Engineering (Modelo Simple) ---
 
@@ -398,12 +408,6 @@ Vemos que tipodia puede tomar 3 valores, donde 0: Laboral, 1: Sábado, 2: Doming
 if lf_data is not None:
     print("🔧 Preparando variables para el modelo Biogeme...")
 
-    # Definir rangos horarios para puntas (ajusta si es necesario)
-
-    # Ejemplo: 7:00-8:59 AM y 18:00-19:59 PM
-    HORAS_PUNTA_MANANA = [7, 8]
-    HORAS_PUNTA_TARDE = [18, 19]
-    
     # 1. Seleccionar columnas iniciales y crear variable 'choice'
     lf_prep = lf_data.select([
         "is_qr", "tiempo_inicio_viaje", "tipodia"

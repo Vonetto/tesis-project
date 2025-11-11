@@ -17,7 +17,32 @@ Este notebook tiene como objetivo:
 
 ---
 
-```{python} 
+```{python}
+#| label: config
+#| echo: false
+import sys
+from pathlib import Path
+
+# Asegurar que el directorio raíz del proyecto esté en sys.path
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se pudo localizar el directorio raíz con el paquete 'config'.")
+
+from config import (
+    HORAS_PUNTA_MANANA,
+    HORAS_PUNTA_TARDE,
+    HORAS_VALLE,
+    HORAS_BAJO,
+)
+```
+
+```{python}
 
 #|label: build-metro-graph
 import networkx as nx 
@@ -691,10 +716,12 @@ else:
 import polars as pl
 import polars.selectors as cs
 
-# --- Definiciones de constantes (por si se reinició el kernel) ---
-HORAS_PUNTA_MANANA = [7, 8]
-HORAS_PUNTA_TARDE = [18, 19]
-HORAS_VALLE = [9, 10, 11, 12, 13, 14, 15, 16, 17, 20]
-HORAS_BAJO = [6, 21, 22, 23] # Período nocturno/madrugada
+# --- Definiciones de constantes centralizadas ---
+from config import (
+    HORAS_PUNTA_MANANA,
+    HORAS_PUNTA_TARDE,
+    HORAS_VALLE,
+    HORAS_BAJO,
+)
 
 ```

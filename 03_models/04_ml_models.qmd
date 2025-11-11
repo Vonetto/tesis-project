@@ -25,8 +25,28 @@ Esto evita la fuga de datos y valida el modelo en un escenario real (predecir el
  
 ```{python}
 #| label: config
+#| echo: false
 import os
 import sys
+from pathlib import Path
+
+# Asegurar que el paquete 'config' sea importable
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró el directorio raíz con el paquete 'config'.")
+
+from config import (
+    HORAS_PUNTA_MANANA,
+    HORAS_PUNTA_TARDE,
+    HORAS_VALLE,
+    HORAS_BAJO,
+)
 
 # --- Parámetros de Partición ---
 # (Modificación) Ahora podemos usar múltiples semanas para entrenar
@@ -39,10 +59,6 @@ TEST_PARTITION = (2025, 17)
 # 1.0 = Usar la partición completa.
 SAMPLE_FRACTION = 1.0
 SEED = 42
-
-# --- Constantes del Modelo ---
-HORAS_PUNTA_MANANA = [7, 8]
-HORAS_PUNTA_TARDE = [18, 19]
 
 # --- Parámetros de GCS ---
 GCS_BUCKET = "tesis-vonetto-datalake"
