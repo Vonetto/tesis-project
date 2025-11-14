@@ -29,10 +29,19 @@ from tqdm import tqdm
 # CONFIGURACIÓN
 # ============================================================================
 
-GCS_BUCKET = "tesis-vonetto-datalake"
-SILVER_PATH = f"{GCS_BUCKET}/lake/silver"
-INPUT_PATH = f"{SILVER_PATH}/viajes_enriquecidos"
-OUTPUT_PATH = f"{SILVER_PATH}/viajes_limpios"
+from config.constants import USE_LOCAL_PATHS, LOCAL_SILVER_PATH, GCS_SILVER_PATH
+
+# ============================================================================
+# CONFIGURACIÓN
+# ============================================================================
+
+if USE_LOCAL_PATHS:
+    SILVER_BASE_PATH = LOCAL_SILVER_PATH
+else:
+    SILVER_BASE_PATH = GCS_SILVER_PATH
+
+INPUT_PATH = f"{SILVER_BASE_PATH}/viajes_enriquecidos"
+OUTPUT_PATH = f"{SILVER_BASE_PATH}/viajes_limpios"
 
 NUM_WORKERS = 1  # CRÍTICO: Con 2+ workers crashea por memoria en particiones grandes
 FORCE_REPROCESS = False  # False = solo procesa las que faltan (idempotente)
@@ -45,6 +54,8 @@ VERBOSE = True  # Mostrar detalles de cada partición procesada
 
 def enable_adc_crossplatform():
     """Configura credenciales de Google Cloud para acceso a GCS"""
+    if USE_LOCAL_PATHS:
+        return # ADC not needed for local paths
     if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
         return
     if sys.platform.startswith("win"):
@@ -101,9 +112,38 @@ def aplicar_filtros(df: pl.DataFrame) -> Tuple[pl.DataFrame, Dict]:
     n_despues_paraderos = len(df)
     n_filtrados_paraderos = n_despues_tiempo - n_despues_paraderos
     
-    # C) Filtro por distancias deshabilitado según solicitud.
-    n_final = n_despues_paraderos
-    n_filtrados_dist = 0
+    # C) Imputación y Filtrado por Distancias
+    # Imputar dveh_eucfinal si es null
+    df = df.with_columns([
+        pl.when(pl.col("dveh_eucfinal").is_null())
+          .then(pl.col("d_vehiculo_eucl_total_m"))
+          .otherwise(pl.col("dveh_eucfinal"))
+          .alias("dveh_eucfinal_imputado"),
+    ])
+    
+    # Convertir columnas a Float64 para poder comparar
+    df = df.with_columns([
+        pl.col("distancia_ruta").cast(pl.Float64, strict=False).alias("distancia_ruta_float"),
+        pl.col("distancia_eucl").cast(pl.Float64, strict=False).alias("distancia_eucl_float"),
+    ])
+    
+    # Filtrar distancias inválidas (null o ≤ 0)
+    df = df.filter(
+        pl.col("distancia_ruta_float").is_not_null() &
+        (pl.col("distancia_ruta_float") > 0) &
+        pl.col("distancia_eucl_float").is_not_null() &
+        (pl.col("distancia_eucl_float") > 0) &
+        pl.col("dveh_eucfinal_imputado").is_not_null() &
+        (pl.col("dveh_eucfinal_imputado") > 0)
+    )
+    
+    # Reemplazar columna original con la imputada y eliminar temporales
+    df = df.with_columns([
+        pl.col("dveh_eucfinal_imputado").alias("dveh_eucfinal"),
+    ]).drop(["distancia_ruta_float", "distancia_eucl_float", "dveh_eucfinal_imputado"])
+
+    n_final = len(df)
+    n_filtrados_dist = n_despues_paraderos - n_final
     
     stats = {
         'n_inicial': n_inicial,
@@ -130,29 +170,40 @@ def procesar_particion(particion: Dict, force_reprocess: bool = False, verbose: 
     week = particion['week']
     input_file = particion['path']
     
-    # Inicializar GCS en cada worker (necesario para multiprocessing)
-    try:
-        enable_adc_crossplatform()
-        gfs = gcsfs.GCSFileSystem(token="google_default")
-        fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
-    except Exception as e:
-        return {
-            'status': 'error',
-            'year': year,
-            'week': week,
-            'error': f"Error de autenticación GCS: {e}"
-        }
+    gfs = None # Initialize gfs
+    fs_arrow = None # Initialize fs_arrow
+
+    if not USE_LOCAL_PATHS:
+        try:
+            enable_adc_crossplatform()
+            gfs = gcsfs.GCSFileSystem(token="google_default")
+            fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
+        except Exception as e:
+            return {
+                'status': 'error',
+                'year': year,
+                'week': week,
+                'error': f"Error de autenticación GCS: {e}"
+            }
     
     # Verificar si ya existe
     output_partition = f"{OUTPUT_PATH}/iso_year={year}/iso_week={week}"
     output_file = f"{output_partition}/data-0.parquet"
     
-    if gfs.exists(output_file) and not force_reprocess:
-        return {
-            'status': 'skipped',
-            'year': year,
-            'week': week
-        }
+    if USE_LOCAL_PATHS:
+        if pathlib.Path(output_file).exists() and not force_reprocess:
+            return {
+                'status': 'skipped',
+                'year': year,
+                'week': week
+            }
+    else:
+        if gfs.exists(output_file) and not force_reprocess:
+            return {
+                'status': 'skipped',
+                'year': year,
+                'week': week
+            }
     
     df = None
     df_filtrado = None
@@ -163,9 +214,14 @@ def procesar_particion(particion: Dict, force_reprocess: bool = False, verbose: 
             print(f"\n📖 Leyendo {year}-W{week}...")
         
         # Leer partición
-        with fs_arrow.open_input_file(input_file) as f:
-            tabla = pq.read_table(f)
-        df = pl.from_arrow(tabla)
+        if USE_LOCAL_PATHS:
+            with open(input_file, 'rb') as f:
+                tabla = pq.read_table(f)
+            df = pl.from_arrow(tabla)
+        else:
+            with fs_arrow.open_input_file(input_file) as f:
+                tabla = pq.read_table(f)
+            df = pl.from_arrow(tabla)
         
         n_rows = len(df)
         if verbose:
@@ -194,10 +250,13 @@ def procesar_particion(particion: Dict, force_reprocess: bool = False, verbose: 
             print(f"   💾 Guardando...")
         
         # Guardar partición filtrada
-        gfs.makedirs(output_partition, exist_ok=True)
-        
-        with gfs.open(output_file, 'wb') as f:
-            df_filtrado.write_parquet(f, compression='snappy')
+        if USE_LOCAL_PATHS:
+            pathlib.Path(output_partition).mkdir(parents=True, exist_ok=True)
+            df_filtrado.write_parquet(output_file, compression='snappy')
+        else:
+            gfs.makedirs(output_partition, exist_ok=True)
+            with gfs.open(output_file, 'wb') as f:
+                df_filtrado.write_parquet(f, compression='snappy')
         
         if verbose:
             print(f"   ✓ Guardado en {output_file}")
@@ -256,34 +315,52 @@ def main():
         print(f"\n💡 Nota: Usando 1 worker (secuencial) para evitar problemas de memoria.")
         print(f"   Si no tienes crashes, puedes aumentar NUM_WORKERS a 2-3 para mayor velocidad.")
     
-    # Autenticación GCS
-    try:
-        enable_adc_crossplatform()
-        gfs = gcsfs.GCSFileSystem(token="google_default")
-        print("\n✅ Conexión con GCS establecida")
-    except Exception as e:
-        print(f"\n❌ Error de autenticación: {e}")
-        return 1
+    gfs = None # Initialize gfs
+    if not USE_LOCAL_PATHS:
+        try:
+            enable_adc_crossplatform()
+            gfs = gcsfs.GCSFileSystem(token="google_default")
+            print("\n✅ Conexión con GCS establecida")
+        except Exception as e:
+            print(f"\n❌ Error de autenticación: {e}")
+            return 1
+    else:
+        print("\n✅ Usando rutas locales.")
     
     # Listar todas las particiones disponibles
     print("\n🔍 Buscando particiones disponibles...")
     try:
-        years_dirs = [d for d in gfs.ls(INPUT_PATH) if 'iso_year=' in d]
-        
         particiones = []
-        for year_dir in years_dirs:
-            year = int(year_dir.split('iso_year=')[1])
-            weeks_dirs = [d for d in gfs.ls(year_dir) if 'iso_week=' in d]
+        if USE_LOCAL_PATHS:
+            # Local file system glob
+            for year_dir in Path(INPUT_PATH).glob("iso_year=*"):
+                year = int(str(year_dir).split('iso_year=')[1])
+                for week_dir in year_dir.glob("iso_week=*"):
+                    week = int(str(week_dir).split('iso_week=')[1])
+                    data_file = f"{week_dir}/data-0.parquet"
+                    if Path(data_file).exists():
+                        particiones.append({
+                            'year': year,
+                            'week': week,
+                            'path': data_file
+                        })
+        else:
+            # GCS glob
+            years_dirs = [d for d in gfs.ls(INPUT_PATH) if 'iso_year=' in d]
             
-            for week_dir in weeks_dirs:
-                week = int(week_dir.split('iso_week=')[1])
-                data_file = f"{week_dir}/data-0.parquet"
-                if gfs.exists(data_file):
-                    particiones.append({
-                        'year': year,
-                        'week': week,
-                        'path': data_file
-                    })
+            for year_dir in years_dirs:
+                year = int(year_dir.split('iso_year=')[1])
+                weeks_dirs = [d for d in gfs.ls(year_dir) if 'iso_week=' in d]
+                
+                for week_dir in weeks_dirs:
+                    week = int(week_dir.split('iso_week=')[1])
+                    data_file = f"{week_dir}/data-0.parquet"
+                    if gfs.exists(data_file):
+                        particiones.append({
+                            'year': year,
+                            'week': week,
+                            'path': data_file
+                        })
         
         print(f"✅ Se encontraron {len(particiones)} particiones")
         print(f"   Años: {sorted(set(p['year'] for p in particiones))}")
