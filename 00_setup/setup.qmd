@@ -31,14 +31,30 @@ import sys
 import polars as pl
 import gcsfs
 from tqdm import tqdm
+from pathlib import Path # Importar Path
+
+# --- FIX: Añadir el root del proyecto al sys.path ---
+# Esto es necesario para que Python encuentre el módulo 'config'
+# cuando se ejecuta este notebook desde la subcarpeta '00_setup'.
+project_root = os.path.abspath(os.path.join(os.getcwd(), '..'))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+# Importar constantes desde config
+from config.constants import USE_LOCAL_PATHS, LOCAL_BRONZE_PATH, GCS_BRONZE_PATH, LOCAL_RAW_PATH, GCS_RAW_PATH
 
 # --- Parámetros ---
-GCS_BUCKET = "tesis-vonetto-datalake"
-BRONZE_VIAJES_PATH = f"gs://{GCS_BUCKET}/lake/bronze/viajes"
-RAW_PATH = f"gs://{GCS_BUCKET}/raw"
+if USE_LOCAL_PATHS:
+    BRONZE_VIAJES_PATH = f"{LOCAL_BRONZE_PATH}/viajes"
+    RAW_PATH = LOCAL_RAW_PATH
+else:
+    BRONZE_VIAJES_PATH = f"{GCS_BRONZE_PATH}/viajes"
+    RAW_PATH = GCS_RAW_PATH
 
 # --- Conexión ---
 def enable_adc_crossplatform():
+    if USE_LOCAL_PATHS:
+        return # ADC not needed for local paths
     if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
         return
     if sys.platform.startswith("win"):
@@ -49,12 +65,16 @@ def enable_adc_crossplatform():
         raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
 
-try:
-    enable_adc_crossplatform()
-    gfs = gcsfs.GCSFileSystem(token="google_default")
-    print("✅ Conexión con GCS establecida.")
-except FileNotFoundError as e:
-    print(f"❌ Error de autenticación: {e}")
+gfs = None # Initialize gfs
+if not USE_LOCAL_PATHS:
+    try:
+        enable_adc_crossplatform()
+        gfs = gcsfs.GCSFileSystem(token="google_default")
+        print("✅ Conexión con GCS establecida.")
+    except FileNotFoundError as e:
+        print(f"❌ Error de autenticación: {e}")
+else:
+    print("✅ Usando rutas locales.")
 
 ```
 
@@ -66,7 +86,13 @@ Primero, escaneamos la capa Bronze para ver qué particiones (`semana_iso`) exis
 def scan_bronze_viajes() -> pl.LazyFrame:
     """Escanea el directorio de viajes en la capa Bronze."""
     try:
-        return pl.scan_parquet(f"{BRONZE_VIAJES_PATH}/**/*.parquet")
+        if USE_LOCAL_PATHS:
+            return pl.scan_parquet(f"{BRONZE_VIAJES_PATH}/**/*.parquet")
+        else:
+            return pl.scan_parquet(f"{BRONZE_VIAJES_PATH}/**/*.parquet", storage_options={
+                "google_cloud_storage": True,
+                "service_account": os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            })
     except Exception as e:
         print(f"No se pudo escanear la ruta {BRONZE_VIAJES_PATH}. ¿Ejecutaste la ingesta?", file=sys.stderr)
         print(f"Error: {e}", file=sys.stderr)
@@ -104,8 +130,13 @@ Esta es la validación más robusta. Compara el total de filas en la capa Bronze
 def get_csv_row_count(file_path: str, separator: str) -> int:
     """Cuenta las filas de un CSV de forma eficiente en memoria."""
     try:
-        # scan_csv es mucho más eficiente en memoria que read_csv
-        return pl.scan_csv(file_path, separator=separator, has_header=True).select(pl.len()).collect().item()
+        if USE_LOCAL_PATHS:
+            return pl.scan_csv(file_path, separator=separator, has_header=True).select(pl.len()).collect().item()
+        else:
+            return pl.scan_csv(file_path, separator=separator, has_header=True, storage_options={
+                "google_cloud_storage": True,
+                "service_account": os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            }).select(pl.len()).collect().item()
     except Exception as e:
         print(f"Error contando filas en {os.path.basename(file_path)}: {e}")
         return 0
@@ -122,11 +153,16 @@ if lf_viajes_bronze.columns:
     print("\nContando filas en los CSV originales... Esto puede tardar varios minutos.")
     viajes_glob = "raw_csv/source=drive/ingest_date=2025-10-01/*viajes.csv"
     try:
-        csv_files = gfs.glob(f"{RAW_PATH}/{viajes_glob}")
+        if USE_LOCAL_PATHS:
+            csv_files = [str(p) for p in Path(RAW_PATH).glob(viajes_glob)]
+        else:
+            csv_files = gfs.glob(f"{RAW_PATH.replace('gs://', '').strip('/')}/{viajes_glob}")
+            csv_files = [f"gs://{p}" for p in csv_files] # Add gs:// scheme back for Polars
+        
         total_csv_rows = 0
         for file in tqdm(csv_files, desc="Escaneando CSVs"):
             # Asumimos el separador por defecto, se podría detectar si fuera necesario
-            total_csv_rows += get_csv_row_count(f"gs://{file}", separator=";")
+            total_csv_rows += get_csv_row_count(file, separator=";")
         
         print(f"Total de filas en CSVs: {total_csv_rows:,}")
 

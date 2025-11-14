@@ -19,11 +19,21 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, Tuple
 
 import polars as pl
+
+# Habilitar StringCache globalmente para optimizar el uso de memoria en columnas
+# de tipo string. Esto ayuda a prevenir errores con strings muy grandes o
+# con una alta cardinalidad, que es la causa probable del error de Rust.
+pl.enable_string_cache()
+
 import pyarrow.parquet as pq
 import gcsfs
 import pyarrow.fs as pafs
 from tqdm import tqdm
+import pathlib
 
+project_root = os.path.abspath(os.path.join(os.getcwd(), '..'))
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
 # ============================================================================
 # CONFIGURACIÓN
@@ -44,7 +54,7 @@ INPUT_PATH = f"{SILVER_BASE_PATH}/viajes_enriquecidos"
 OUTPUT_PATH = f"{SILVER_BASE_PATH}/viajes_limpios"
 
 NUM_WORKERS = 1  # CRÍTICO: Con 2+ workers crashea por memoria en particiones grandes
-FORCE_REPROCESS = False  # False = solo procesa las que faltan (idempotente)
+FORCE_REPROCESS = True  # False = solo procesa las que faltan (idempotente)
 VERBOSE = True  # Mostrar detalles de cada partición procesada
 
 
@@ -246,17 +256,47 @@ def procesar_particion(particion: Dict, force_reprocess: bool = False, verbose: 
         df = None
         gc.collect()
         
+        # --- Optimización de Tipos de Datos ---
+        if verbose: print(f"   ⚙️  Optimizando tipos de datos antes de guardar...")
+        
+        dtype_optimizations = {
+            # --- MANTENEMOS OPTIMIZACIONES NUMÉRICAS ---
+            # Enteros
+            "dtfinal": pl.Int16, "dveh_euc1": pl.Int16, "dveh_euc2": pl.Int16, "dveh_euc3": pl.Int16,
+            "dveh_euc4": pl.Int16, "egreso": pl.Int16, "entrada": pl.Int16, "id_viaje": pl.Int8,
+            "tc1": pl.Int16, "tc2": pl.Int16, "tc3": pl.Int16, "te0": pl.Int16, "te1": pl.Int16,
+            "te2": pl.Int16, "te3": pl.Int16, "tv1": pl.Int16, "tv2": pl.Int16, "tv3": pl.Int16,
+            "tv4": pl.Int16, "tviaje2": pl.Int16, "dveh_eucfinal": pl.Int32, "dveh_ruta1": pl.Int32,
+            "dveh_ruta2": pl.Int32, "dveh_ruta3": pl.Int32, "dveh_ruta4": pl.Int32, "dveh_rutafinal": pl.Int32,
+            "d_vehiculo_eucl_total_m": pl.Int32, "n_etapas": pl.Int8, "iso_year": pl.Int16,
+            
+            # Los tiempos calculados son ahora Ints, no Floats
+            "t_vehiculo_total_seg": pl.Int32, "t_total_calculado_seg": pl.Int32,
+        }
+        
+        # --- ELIMINAMOS EL CAST A CATEGORICAL ---
+        # Dejamos que el motor de Parquet aplique su propia codificación de diccionario,
+        # que es más eficiente para el almacenamiento en disco.
+        
+        cast_expressions = [
+            pl.col(col).cast(dtype)
+            for col, dtype in dtype_optimizations.items()
+            if col in df_filtrado.columns
+        ]
+        if cast_expressions:
+            df_filtrado = df_filtrado.with_columns(cast_expressions)
+
         if verbose:
             print(f"   💾 Guardando...")
         
-        # Guardar partición filtrada
+        # Guardar partición filtrada con mejor compresión
         if USE_LOCAL_PATHS:
             pathlib.Path(output_partition).mkdir(parents=True, exist_ok=True)
-            df_filtrado.write_parquet(output_file, compression='snappy')
+            df_filtrado.write_parquet(output_file, compression='zstd')
         else:
             gfs.makedirs(output_partition, exist_ok=True)
             with gfs.open(output_file, 'wb') as f:
-                df_filtrado.write_parquet(f, compression='snappy')
+                df_filtrado.write_parquet(f, compression='zstd')
         
         if verbose:
             print(f"   ✓ Guardado en {output_file}")

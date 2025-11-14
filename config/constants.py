@@ -37,11 +37,12 @@ GCS_GOLD_PATH: Final[str] = f"gs://{GCS_BUCKET_NAME}/{GCS_GOLD_PREFIX}"
 # Configuración de Rutas Locales
 # ---------------------------------------------------------------------------
 # Cambiar a True para usar rutas locales en lugar de GCS
-USE_LOCAL_PATHS: Final[bool] = False
+USE_LOCAL_PATHS: Final[bool] = True
+
 
 # Ruta base del proyecto local (ej. "D:/tesis-project" en Windows, "/Users/user/tesis-project" en Mac/Linux)
 # ¡IMPORTANTE: AJUSTAR ESTA RUTA EN EL PC CON WINDOWS!
-BASE_LOCAL_PATH: Final[str] = "/Volumes/TOSHIBA EXT/Vicente/tesis-project"
+BASE_LOCAL_PATH: Final[str] = "/Volumes/KINGSTON/tesis-project"
 
 # Rutas locales para el Data Lake
 LOCAL_RAW_PATH: Final[str] = f"{BASE_LOCAL_PATH}/raw"

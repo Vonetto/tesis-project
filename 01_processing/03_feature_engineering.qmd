@@ -39,6 +39,13 @@ import pyarrow.parquet as pq
 import gcsfs
 from tqdm import tqdm
 
+import pathlib
+# Esto es necesario para que Python encuentre el módulo 'config'
+
+project_root = os.path.abspath(os.path.join(os.getcwd(), '..'))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 # Importar constantes desde config
 from config.constants import GCS_BUCKET_NAME, GCS_SILVER_PREFIX, USE_LOCAL_PATHS, LOCAL_SILVER_PATH, GCS_SILVER_PATH
 
