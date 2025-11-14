@@ -66,7 +66,7 @@ while PROJECT_ROOT != PROJECT_ROOT.parent:
 else:
     raise RuntimeError("No se encontró el directorio raíz con el paquete 'config'.")
 
-from config import HORAS_PUNTA_MANANA, HORAS_PUNTA_TARDE
+from config import HORAS_PUNTA_MANANA, HORAS_PUNTA_TARDE, GCS_BUCKET_NAME, GCS_SILVER_PATH, USE_LOCAL_PATHS, LOCAL_SILVER_PATH
 
 # Importar biogeme
 from biogeme.version import get_text as biogeme_version_text
@@ -90,6 +90,8 @@ logger.info(biogeme_version_text())
 # --- Autenticación GCS ---
 def enable_adc_crossplatform():
     """Configura credenciales de Google Cloud para acceso a GCS"""
+    if USE_LOCAL_PATHS:
+        return # ADC not needed for local paths
     if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"): return
     if sys.platform.startswith("win"):
         adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
@@ -99,17 +101,23 @@ def enable_adc_crossplatform():
         raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
 
-try:
-    enable_adc_crossplatform()
-    gfs = gcsfs.GCSFileSystem(token="google_default")
-    print("✅ Conexión con GCS establecida.")
-except FileNotFoundError as e:
-    print(f"❌ Error de autenticación: {e}")
+gfs = None # Initialize gfs
+if not USE_LOCAL_PATHS:
+    try:
+        enable_adc_crossplatform()
+        gfs = gcsfs.GCSFileSystem(token="google_default")
+        print("✅ Conexión con GCS establecida.")
+    except FileNotFoundError as e:
+        print(f"❌ Error de autenticación: {e}")
+else:
+    print("✅ Usando rutas locales.")
 
 # --- Parámetros Generales ---
-GCS_BUCKET = "tesis-vonetto-datalake"
-SILVER_PATH = f"gs://{GCS_BUCKET}/lake/silver"
-INPUT_DATASET_PATH = f"{SILVER_PATH}/viajes_filtrados" # Usar datos filtrados
+if USE_LOCAL_PATHS:
+    SILVER_BASE_PATH = LOCAL_SILVER_PATH
+else:
+    SILVER_BASE_PATH = GCS_SILVER_PATH
+INPUT_DATASET_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados" # Usar datos filtrados
 
 # --- Parámetros del Modelo Anidado ---
 
@@ -434,7 +442,13 @@ for year, week in PARTICIONES_A_PROCESAR:
     try:
         # b. Cargar datos
         input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
-        lf_data = pl.scan_parquet(input_path_glob)
+        if USE_LOCAL_PATHS:
+            lf_data = pl.scan_parquet(input_path_glob)
+        else:
+            lf_data = pl.scan_parquet(input_path_glob, storage_options={
+                "google_cloud_storage": True,
+                "service_account": os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            })
         print(f"    Cargando datos desde: {input_path_glob}")
 
         # c. Preparar features (usando la función helper anidada base)

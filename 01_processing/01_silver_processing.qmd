@@ -35,14 +35,23 @@ import pyogrio
 import tempfile
 from pathlib import Path
 
+# Importar constantes desde config
+from config.constants import GCS_BUCKET_NAME, GCS_BRONZE_PATH, GCS_SILVER_PATH, GCS_RAW_PATH, USE_LOCAL_PATHS, LOCAL_BRONZE_PATH, LOCAL_SILVER_PATH, LOCAL_RAW_PATH
+
 # --- Parámetros ---
-GCS_BUCKET = "tesis-vonetto-datalake"
-BRONZE_PATH = f"gs://{GCS_BUCKET}/lake/bronze"
-SILVER_PATH = f"gs://{GCS_BUCKET}/lake/silver"
-RAW_PATH = f"gs://{GCS_BUCKET}/raw"
+if USE_LOCAL_PATHS:
+    BRONZE_PATH = LOCAL_BRONZE_PATH
+    SILVER_PATH = LOCAL_SILVER_PATH
+    RAW_PATH = LOCAL_RAW_PATH
+else:
+    BRONZE_PATH = GCS_BRONZE_PATH
+    SILVER_PATH = GCS_SILVER_PATH
+    RAW_PATH = GCS_RAW_PATH
 
 # --- Conexión ---
 def enable_adc_crossplatform():
+    if USE_LOCAL_PATHS:
+        return # ADC not needed for local paths
     if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
         return
     if sys.platform.startswith("win"):
@@ -53,12 +62,16 @@ def enable_adc_crossplatform():
         raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
 
-try:
-    enable_adc_crossplatform()
-    gfs = gcsfs.GCSFileSystem(token="google_default")
-    print("✅ Conexión con GCS establecida.")
-except FileNotFoundError as e:
-    print(f"❌ Error de autenticación: {e}")
+gfs = None # Initialize gfs
+if not USE_LOCAL_PATHS:
+    try:
+        enable_adc_crossplatform()
+        gfs = gcsfs.GCSFileSystem(token="google_default")
+        print("✅ Conexión con GCS establecida.")
+    except FileNotFoundError as e:
+        print(f"❌ Error de autenticación: {e}")
+else:
+    print("✅ Usando rutas locales.")
 
 ```
 
@@ -73,7 +86,14 @@ def scan_bronze_dataset(dataset_name: str) -> pl.LazyFrame:
     """Escanea un dataset completo en la capa Bronze."""
     path = f"{BRONZE_PATH}/{dataset_name}"
     try:
-        return pl.scan_parquet(f"{path}/**/*.parquet")
+        if USE_LOCAL_PATHS:
+            return pl.scan_parquet(f"{path}/**/*.parquet")
+        else:
+            # For GCS, use storage_options
+            return pl.scan_parquet(f"{path}/**/*.parquet", storage_options={
+                "google_cloud_storage": True,
+                "service_account": os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            })
     except Exception as e:
         print(f"No se pudo escanear la ruta {path}.", file=sys.stderr)
         raise e
@@ -91,48 +111,72 @@ Cargamos los diccionarios y shapefiles que usaremos para enriquecer los datos de
 
 ```{python}
 # Carga del diccionario de zonas y paraderos (DIC_777.csv)
-def read_gcs_csv(path: str, sep=";") -> pl.DataFrame:
-    with gfs.open(path, "rb") as fh:
-        return pl.read_csv(fh, separator=sep, infer_schema_length=10000, ignore_errors=True)
+def read_csv_portable(path: str, sep=";") -> pl.DataFrame:
+    if USE_LOCAL_PATHS:
+        with open(path, "rb") as fh:
+            return pl.read_csv(fh, separator=sep, infer_schema_length=10000, ignore_errors=True)
+    else:
+        path_no_scheme = path.replace("gs://", "").strip("/")
+        with gfs.open(path_no_scheme, "rb") as fh:
+            return pl.read_csv(fh, separator=sep, infer_schema_length=10000, ignore_errors=True)
 
-df_zonas_777 = read_gcs_csv(f"{RAW_PATH}/DIC_777.csv")
+df_zonas_777 = read_csv_portable(f"{RAW_PATH}/DIC_777.csv")
 print("Diccionario Zonas 777 (df_zonas_777):", df_zonas_777.shape)
 
 # --- Escritura a Silver ---
 SILVER_DICCIONARIO_ZONAS_PATH = f"{SILVER_PATH}/diccionario_zonas_777/data.parquet"
-df_zonas_777.write_parquet(SILVER_DICCIONARIO_ZONAS_PATH, pyarrow_options={"filesystem": gfs})
+if USE_LOCAL_PATHS:
+    pathlib.Path(SILVER_PATH).mkdir(parents=True, exist_ok=True) # Ensure parent dir exists
+    df_zonas_777.write_parquet(SILVER_DICCIONARIO_ZONAS_PATH)
+else:
+    df_zonas_777.write_parquet(SILVER_DICCIONARIO_ZONAS_PATH, pyarrow_options={"filesystem": gfs})
 print(f"✅ Diccionario de zonas guardado en: {SILVER_DICCIONARIO_ZONAS_PATH}")
 
 
 # Carga del shapefile de Zonas 777
-def read_gcs_shapefile(shape_folder_path: str) -> gpd.GeoDataFrame:
-    """Descarga un shapefile de GCS a un directorio temporal y lo lee con pyogrio."""
-    paths = gfs.ls(shape_folder_path)
-    shp_remote = next((p for p in paths if p.lower().endswith(".shp")), None)
-    if not shp_remote:
-        raise FileNotFoundError(f"No se encontró archivo .shp en {shape_folder_path}")
-    
-    base_stem = Path(shp_remote).stem
-    need_exts = [".shp", ".shx", ".dbf", ".prj", ".cpg"]
-    
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for ext in need_exts:
-            remote_file = next((p for p in paths if Path(p).stem == base_stem and Path(p).suffix.lower() == ext), None)
-            if remote_file:
-                local_path = os.path.join(tmpdir, f"{base_stem}{ext}")
-                gfs.get(remote_file, local_path)
-        
-        gdf = pyogrio.read_dataframe(os.path.join(tmpdir, f"{base_stem}.shp"))
+def read_shapefile_portable(shape_folder_path: str) -> gpd.GeoDataFrame:
+    """Descarga un shapefile de GCS a un directorio temporal y lo lee con pyogrio, o lo lee directamente si es local."""
+    if USE_LOCAL_PATHS:
+        # For local paths, assume shapefile is directly accessible
+        shp_local = pathlib.Path(shape_folder_path) / "Zonas777.shp" # Assuming a fixed name
+        if not shp_local.exists():
+            raise FileNotFoundError(f"No se encontró archivo .shp en {shape_folder_path}")
+        gdf = pyogrio.read_dataframe(str(shp_local))
         if gdf.crs is None:
             gdf = gdf.set_crs(4326, allow_override=True)
         return gdf
+    else:
+        # GCS logic
+        paths = gfs.ls(shape_folder_path)
+        shp_remote = next((p for p in paths if p.lower().endswith(".shp")), None)
+        if not shp_remote:
+            raise FileNotFoundError(f"No se encontró archivo .shp en {shape_folder_path}")
+        
+        base_stem = Path(shp_remote).stem
+        need_exts = [".shp", ".shx", ".dbf", ".prj", ".cpg"]
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for ext in need_exts:
+                remote_file = next((p for p in paths if Path(p).stem == base_stem and Path(p).suffix.lower() == ext), None)
+                if remote_file:
+                    local_path = os.path.join(tmpdir, f"{base_stem}{ext}")
+                    gfs.get(remote_file, local_path)
+            
+            gdf = pyogrio.read_dataframe(os.path.join(tmpdir, f"{base_stem}.shp"))
+            if gdf.crs is None:
+                gdf = gdf.set_crs(4326, allow_override=True)
+            return gdf
 
-gdf_zonas777_geo = read_gcs_shapefile(f"{RAW_PATH}/Zonas777-2014/Shape")
+gdf_zonas777_geo = read_shapefile_portable(f"{RAW_PATH}/Zonas777-2014/Shape")
 print("GeoDataFrame Zonas 777 (gdf_zonas777_geo):", gdf_zonas777_geo.shape, gdf_zonas777_geo.crs)
 
 # --- Escritura a Silver (GeoParquet) ---
-SILVER_GEOMETRIA_ZONAS_PATH = f"gs://{GCS_BUCKET}/lake/silver/geometria_zonas_777/data.geoparquet"
-gdf_zonas777_geo.to_parquet(SILVER_GEOMETRIA_ZONAS_PATH)
+SILVER_GEOMETRIA_ZONAS_PATH = f"{SILVER_PATH}/geometria_zonas_777/data.geoparquet"
+if USE_LOCAL_PATHS:
+    pathlib.Path(SILVER_PATH).mkdir(parents=True, exist_ok=True) # Ensure parent dir exists
+    gdf_zonas777_geo.to_parquet(SILVER_GEOMETRIA_ZONAS_PATH)
+else:
+    gdf_zonas777_geo.to_parquet(SILVER_GEOMETRIA_ZONAS_PATH, pyarrow_options={"filesystem": gfs})
 print(f"✅ Geometría de zonas guardada en: {SILVER_GEOMETRIA_ZONAS_PATH}")
 
 ```
@@ -225,19 +269,23 @@ for part in tqdm(partitions_df.iter_rows(named=True), total=len(partitions_df), 
         (pl.col("iso_year") == year) & (pl.col("iso_week") == week)
     )
 
-    # Creamos el directorio de la partición en GCS
+    # Creamos el directorio de la partición
     partition_dir = os.path.join(SILVER_VIAJES_PATH, f"iso_year={year}", f"iso_week={week}")
-    gfs.mkdirs(partition_dir, exist_ok=True)
-    
-    # Definimos el path final del archivo parquet
     output_file_path = os.path.join(partition_dir, "data-0.parquet")
 
-    # Usamos sink_parquet para ejecutar la consulta y guardar el resultado de forma eficiente
-    lf_partition.sink_parquet(
-        path=output_file_path,
-        compression="zstd",
-        # El filesystem se maneja a través del path si gcsfs está instalado y configurado
-    )
+    if USE_LOCAL_PATHS:
+        pathlib.Path(partition_dir).mkdir(parents=True, exist_ok=True)
+        lf_partition.sink_parquet(
+            path=output_file_path,
+            compression="zstd",
+        )
+    else:
+        gfs.mkdirs(partition_dir, exist_ok=True)
+        lf_partition.sink_parquet(
+            path=output_file_path,
+            compression="zstd",
+            # El filesystem se maneja a través del path si gcsfs está instalado y configurado
+        )
 
 print(f"\n✅ Proceso completado. Se han escrito {len(partitions_df)} particiones en la capa Silver.")
 print(f"Puedes verificar los archivos en: {SILVER_VIAJES_PATH}")
@@ -250,7 +298,13 @@ Podemos hacer un `scan` rápido a la nueva tabla en la capa Silver para verifica
 
 ```{python}
 try:
-    lf_silver_check = pl.scan_parquet(f"{SILVER_VIAJES_PATH}/**/*.parquet")
+    if USE_LOCAL_PATHS:
+        lf_silver_check = pl.scan_parquet(f"{SILVER_VIAJES_PATH}/**/*.parquet")
+    else:
+        lf_silver_check = pl.scan_parquet(f"{SILVER_VIAJES_PATH}/**/*.parquet", storage_options={
+            "google_cloud_storage": True,
+            "service_account": os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        })
     
     print("Verificación de la capa Silver:")
     print(f"Schema: {lf_silver_check.collect_schema().names()}")

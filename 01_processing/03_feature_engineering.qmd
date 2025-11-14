@@ -39,9 +39,14 @@ import pyarrow.parquet as pq
 import gcsfs
 from tqdm import tqdm
 
+# Importar constantes desde config
+from config.constants import GCS_BUCKET_NAME, GCS_SILVER_PREFIX, USE_LOCAL_PATHS, LOCAL_SILVER_PATH, GCS_SILVER_PATH
+
 # --- Autenticación GCS ---
 def enable_adc_crossplatform():
     """Configura credenciales de Google Cloud para acceso a GCS"""
+    if USE_LOCAL_PATHS:
+        return # ADC not needed for local paths
     if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
         return
     if sys.platform.startswith("win"):
@@ -52,23 +57,31 @@ def enable_adc_crossplatform():
         raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
 
-try:
-    enable_adc_crossplatform()
-    gfs = gcsfs.GCSFileSystem(token="google_default")
-    # Crear filesystem de PyArrow compatible con GCS
-    fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
-    print("✅ Conexión con GCS establecida.")
-except FileNotFoundError as e:
-    print(f"❌ Error de autenticación: {e}")
+gfs = None # Initialize gfs
+fs_arrow = None # Initialize fs_arrow
+
+if not USE_LOCAL_PATHS:
+    try:
+        enable_adc_crossplatform()
+        gfs = gcsfs.GCSFileSystem(token="google_default")
+        # Crear filesystem de PyArrow compatible con GCS
+        fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
+        print("✅ Conexión con GCS establecida.")
+    except FileNotFoundError as e:
+        print(f"❌ Error de autenticación: {e}")
+else:
+    print("✅ Usando rutas locales.")
 
 # --- Parámetros ---
-GCS_BUCKET = "tesis-vonetto-datalake"
-SILVER_PATH = f"{GCS_BUCKET}/lake/silver"  # Sin gs:// para pyarrow
+if USE_LOCAL_PATHS:
+    SILVER_BASE_PATH = LOCAL_SILVER_PATH
+else:
+    SILVER_BASE_PATH = GCS_SILVER_PATH
 
 # --- Rutas de Entrada y Salida ---
-INPUT_PATH = f"{SILVER_PATH}/viajes_limpios"  # Prerequisito: ejecutar 02_data_quality.qmd
-OUTPUT_INDICADORES_PATH = f"{SILVER_PATH}/viajes_con_indicadores"
-OUTPUT_FILTRADOS_PATH = f"{SILVER_PATH}/viajes_filtrados"
+INPUT_PATH = f"{SILVER_BASE_PATH}/viajes_limpios"  # Prerequisito: ejecutar 02_data_quality.qmd
+OUTPUT_INDICADORES_PATH = f"{SILVER_BASE_PATH}/viajes_con_indicadores"
+OUTPUT_FILTRADOS_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados"
 
 print(f"Ruta de Entrada: {INPUT_PATH}")
 print(f"Ruta de Salida (con indicadores): {OUTPUT_INDICADORES_PATH}")
@@ -87,25 +100,33 @@ Cargamos el dataset `viajes_limpios` (creado en 02_data_quality.qmd) que ya tien
 try:
     # Buscar todos los archivos .parquet (enfoque lazy - no carga todo en memoria)
     print("🔍 Buscando archivos .parquet en Silver...")
-    archivos_parquet = gfs.glob(f"{INPUT_PATH}/**/*.parquet")
+    
+    if USE_LOCAL_PATHS:
+        archivos_parquet = [str(p) for p in pathlib.Path(INPUT_PATH).glob("**/*.parquet")]
+    else:
+        archivos_parquet = gfs.glob(f"{INPUT_PATH.replace('gs://', '').strip('/')}/**/*.parquet")
+        archivos_parquet = [f"gs://{p}" for p in archivos_parquet] # Add gs:// scheme back for Polars
+    
     print(f"   ✅ Encontrados {len(archivos_parquet)} archivos")
     
     if len(archivos_parquet) == 0:
         raise FileNotFoundError(f"No se encontraron archivos .parquet en {INPUT_PATH}")
     
-    # Crear dataset de PyArrow usando el filesystem autenticado
-    # partitioning=None evita problemas con tipos inconsistentes
-    print("📖 Configurando dataset con PyArrow...")
-    dataset = ds.dataset(
-        archivos_parquet,  # Lista de rutas sin gs://
-        filesystem=fs_arrow,  # Usa el filesystem autenticado
-        format="parquet",
-        partitioning=None  # No leer columnas de partición (evita conflictos de tipos)
-    )
-    
     # Convertir a Polars LazyFrame
     print("🔄 Convirtiendo a Polars LazyFrame...")
-    lf_viajes = pl.scan_pyarrow_dataset(dataset)
+    if USE_LOCAL_PATHS:
+        lf_viajes = pl.scan_parquet(archivos_parquet)
+    else:
+        # Crear dataset de PyArrow usando el filesystem autenticado
+        # partitioning=None evita problemas con tipos inconsistentes
+        print("📖 Configurando dataset con PyArrow...")
+        dataset = ds.dataset(
+            [p.replace("gs://", "").strip("/") for p in archivos_parquet],  # Lista de rutas sin gs://
+            filesystem=fs_arrow,  # Usa el filesystem autenticado
+            format="parquet",
+            partitioning=None  # No leer columnas de partición (evita conflictos de tipos)
+        )
+        lf_viajes = pl.scan_pyarrow_dataset(dataset)
     
     print("✅ Lectura de `viajes_limpios` configurada (lazy).")
     print(f"   Columnas: {len(lf_viajes.collect_schema().names())}")
@@ -127,8 +148,8 @@ Leemos los datos de `viajes_limpios` y calculamos directamente los indicadores n
 if lf_viajes is not None:
     lf_with_features = lf_viajes.with_columns([
         # 1. Convertir columnas clave a Float para cálculos
-        pl.col("t_total_calculado_seg").cast(pl.Float64).alias("tiempo_total_seg"),
-        pl.col("t_vehiculo_total_seg").cast(pl.Float64).alias("tiempo_vehiculo_seg"),
+        pl.col("t_total_calculado_seg").cast(pl.Float64), # Ya no es alias
+        pl.col("t_vehiculo_total_seg").cast(pl.Float64), # Ya no es alias
         pl.col("distancia_ruta").cast(pl.Float64).alias("distancia_ruta_m"),
         pl.col("distancia_eucl").cast(pl.Float64).alias("distancia_euc_OD_m"),
     ]).with_columns([
@@ -141,11 +162,11 @@ if lf_viajes is not None:
         
         # 2. Velocidad EN VEHÍCULO (VR) - para filtro de velocidad baja
         # Usa la distancia en ruta y el tiempo solo dentro del vehículo
-        (pl.col("distancia_ruta_m") / 1000 / (pl.col("tiempo_vehiculo_seg") / 3600)).alias("velocidad_vehiculo_kmhr"),
+        (pl.col("distancia_ruta_m") / 1000 / (pl.col("t_vehiculo_total_seg") / 3600)).alias("velocidad_vehiculo_kmhr"),
         
         # 3. Velocidad EUCLIDIANA (VE) - para filtro de velocidad alta
         # Usa la distancia euclidiana (línea recta) y el tiempo en vehículo
-        (pl.col("distancia_euc_OD_m") / 1000 / (pl.col("tiempo_vehiculo_seg") / 3600)).alias("velocidad_eucl_kmhr"),
+        (pl.col("distancia_euc_OD_m") / 1000 / (pl.col("t_vehiculo_total_seg") / 3600)).alias("velocidad_eucl_kmhr"),
     ])
     
     print("✅ Indicadores para filtrado calculados.")
@@ -155,12 +176,12 @@ if lf_viajes is not None:
     # Verificación rápida de los cálculos
     print("\n🔍 Verificando cálculos con una muestra de 5 viajes...")
     muestra = lf_with_features.select([
-        "tiempo_vehiculo_seg", 
+        "t_vehiculo_total_seg", 
         "distancia_ruta_m", "distancia_euc_OD_m",
         "velocidad_vehiculo_kmhr", "velocidad_eucl_kmhr",
         "dr_de", "n_etapas"
     ]).filter(
-        pl.col("tiempo_vehiculo_seg") > 0
+        pl.col("t_vehiculo_total_seg") > 0
     ).limit(5).collect()
     print(muestra)
 
@@ -515,9 +536,12 @@ if 'validos_globales' in globals() and 'total_viajes' in globals():
         print("\n🔍 Escaneando 'viajes_filtrados' (output del script)...")
         
         # Scan the entire partitioned dataset
-        lf_filtrados_real = pl.scan_pyarrow_dataset(
-            ds.dataset(OUTPUT_FILTRADOS_PATH, filesystem=fs_arrow, format="parquet")
-        )
+        if USE_LOCAL_PATHS:
+            lf_filtrados_real = pl.scan_parquet(f"{OUTPUT_FILTRADOS_PATH}/**/*.parquet")
+        else:
+            lf_filtrados_real = pl.scan_pyarrow_dataset(
+                ds.dataset(OUTPUT_FILTRADOS_PATH, filesystem=fs_arrow, format="parquet")
+            )
         
         # Get the total row count
         conteo_real = lf_filtrados_real.select(pl.len()).collect().item()
