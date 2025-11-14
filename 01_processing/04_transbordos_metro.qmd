@@ -51,295 +51,157 @@ import re
 from itertools import combinations
 from collections import defaultdict
 import unicodedata
+from pathlib import Path
+import polars as pl
+import datetime as dt
 
+# --- 1. PARÁMETROS DE COSTOS ---
+# (Basados en la metodología DTPM y valores asumidos)
+PENALIDAD_FIJA_TRANSBORDO = 8
+PENALIDAD_PURA_METRO = 8.0
+PESO_CAMINATA = 2.0
+PESO_ESPERA = 2.0
+T_WALK_SECS_ASUMIDO = 180.0
+
+# --- 2. FUNCIONES AUXILIARES ---
+
+# La función normalize_station_name se mantiene igual que antes.
 def normalize_station_name(name: str) -> str:
-    """
-    Estandariza un nombre de estación de forma robusta:
-    1. Quita ' L1', ' L2', etc. si existen al final.
-    2. Pone en MAYÚSCULAS.
-    3. Quita tildes (ej. "REPÚBLICA" -> "REPUBLICA").
-    4. Realiza reemplazos específicos para inconsistencias conocidas.
-    5. Quita toda la puntuación ('.', '-', '’', "'").
-    6. Normaliza espacios.
-    """
-    if not isinstance(name, str):
-        return ""
-    
-    # 1. Quitar ' L1', ' L2', etc.
-    base_name = re.sub(r" (L\d[A]?)$", "", name.strip())
-    
-    # 2. Quitar tildes y poner en mayúsculas
-    upper_name = base_name.upper()
-    no_tildes = ''.join(
-        c for c in unicodedata.normalize('NFD', upper_name)
-        if unicodedata.category(c) != 'Mn'
-    )
-    
-    # 3. Correcciones ortográficas específicas antes de tratar puntuación
-    text = no_tildes
-    text = text.replace("RONDIZONNI", "RONDIZZONI")
-    text = text.replace("PLAZA MAIPU", "PLAZA DE MAIPU")
-    text = text.replace("UNION LATINO AMERICANA", "U L A")
-    text = text.replace("U.L.A.", "U L A")
-    text = text.replace("PDTE. PEDRO AGUIRRE CERDA", "PDTE PEDRO AGUIRRE CERDA")
-    
-    # 4. Tratar puntuación: guiones como espacio; quitar apóstrofes y puntos
-    text = re.sub(r"-", " ", text)           # '-' -> espacio (p.ej. CHILE-ESPANA)
-    text = re.sub(r"[.'’]", "", text)        # quitar apóstrofes y puntos
-    
-    # 5. Normalizar espacios
+    if not isinstance(name, str): return ""
+    base_name = re.sub(r" (L\d[A]?)$", "", name.strip()).upper()
+    no_tildes = ''.join(c for c in unicodedata.normalize('NFD', base_name) if unicodedata.category(c) != 'Mn')
+    text = no_tildes.replace("RONDIZONNI", "RONDIZZONI").replace("PLAZA MAIPU", "PLAZA DE MAIPU").replace("UNION LATINO AMERICANA", "U L A").replace("U.L.A.", "U L A").replace("PDTE. PEDRO AGUIRRE CERDA", "PDTE PEDRO AGUIRRE CERDA")
+    text = re.sub(r"-", " ", text)
+    text = re.sub(r"[.'’]", "", text)
     text = re.sub(r"\s+", " ", text).strip()
-    
-    # 6. Reglas seguras de aliasado
-    # 6.a CAL Y CANTO: solo anteponer PUENTE si no existe ya
     if re.search(r"\bCAL Y CANTO\b", text) and not re.search(r"\bPUENTE\b", text):
         text = re.sub(r"\bCAL Y CANTO\b", "PUENTE CAL Y CANTO", text)
-    # 6.b Si quedó concatenado CHILEESPANA en alguna etapa, separarlo
     text = re.sub(r"\bCHILEESPANA\b", "CHILE ESPANA", text)
-    
     return text
 
-print("Construyendo el grafo de la red de Metro...")
+def _get_t_veh_lookup(gtfs_dir: Path) -> dict:
+    """Lee stop_times.txt para calcular el tiempo de viaje promedio entre estaciones."""
+    try:
+        df_stop_times = pl.read_csv(
+            gtfs_dir / 'stop_times.txt',
+            schema_overrides={'trip_id': pl.Utf8, 'stop_id': pl.Utf8}
+        ).with_columns(
+            pl.col('arrival_time').str.to_time('%H:%M:%S'),
+            pl.col('departure_time').str.to_time('%H:%M:%S')
+        )
+        
+        df_travel_times = df_stop_times.group_by('trip_id').map_groups(
+            lambda group: group.with_columns(
+                (pl.col('arrival_time').shift(-1) - pl.col('departure_time')).dt.total_seconds().alias('travel_time_secs'),
+                pl.col('stop_id').shift(-1).alias('to_stop_id') # <-- CÁLCULO DENTRO DEL GRUPO
+            )
+        )
+        
+        df_station_pairs = df_travel_times.filter(
+            pl.col('travel_time_secs').is_not_null() # Esto también filtra filas donde 'to_stop_id' es nulo
+        ).with_columns([
+            pl.col('stop_id').map_elements(normalize_station_name, return_dtype=pl.Utf8).alias('from_station'),
+            pl.col('to_stop_id').map_elements(normalize_station_name, return_dtype=pl.Utf8).alias('to_station')
+        ]).filter(
+            (pl.col('from_station') != "") & (pl.col('to_station') != "") # Filtro defensivo
+        ).group_by('from_station', 'to_station').agg(
+            pl.col('travel_time_secs').mean().alias('avg_travel_time_secs')
+        )
+        
+        t_veh_lookup = {}
+        for row in df_station_pairs.to_dicts():
+            key = tuple(sorted((row['from_station'], row['to_station'])))
+            t_veh_lookup[key] = row['avg_travel_time_secs']
+        
+        return t_veh_lookup
+    except Exception as e:
+        print(f"⚠️  Advertencia: No se pudo calcular t_veh desde GTFS. Se usará un fallback. Error: {e}")
+        return {}
 
-# 1. Datos de las líneas (como los proporcionaste)
+# --- 3. DATOS DE LÍNEAS DE METRO ---
 all_lines_raw = {
-    "L1": """San Pablo L1
-Neptuno
-Pajaritos
-Las rejas
-Ecuador
-San Alberto Hurtado
-Universidad de Santiago
-Estación Central
-U.L.A.
-República
-Los Héroes L1
-La Moneda
-Universidad de Chile L1
-Santa Lucía
-Universidad Católica
-Baquedano L1
-Salvador
-Manuel Montt
-Pedro de Valdivia
-Los Leones L1
-Tobalaba L1
-El Golf
-Alcántara
-Escuela Militar
-Manquehue
-Hernando de Magallanes
-Los Dominicos""",
-    
-    "L2": """Hospital El Pino
-Copa Lo Martinez
-Observatorio
-El Bosque
-La cisterna L2
-El Parrón
-Lo Ovalle
-Ciudad del Niño
-Departamental
-Lo Vial
-San Miguel
-El Llano
-Franklin L2
-Rondizzoni
-Parque O’Higgins
-Toesca
-Los Héroes L2
-Santa Ana L2
-Puente Cal y Canto L2
-Patronato
-Cerro Blanco
-Cementerios
-Einstein
-Dorsal
-Zapadores
-Vespucio Norte""",
-    
-    "L3": """Plaza Quilicura
-Lo Cruzat
-Ferrocarril    
-Los Libertadores
-Cardenal Caro
-Vivaceta
-Conchalí
-Plaza Chacabuco
-Hospitales
-Puente Cal y Canto L3
-Plaza de Armas L3
-Universidad de Chile L3
-Parque Almagro
-Matta
-Irarrázaval L3
-Monseñor Eyzaguirre
-Ñuñoa L3
-Chile-España
-Villa Frei
-Plaza Egaña L3
-Fernando Castillo Velasco""",
-    
-    "L4": """Tobalaba L4
-Cristóbal Colón
-Francisco Bilbao
-Principe de Gales
-Simón Bolivar
-Plaza Egaña L4
-Los Orientales
-Grecia
-Los Presidentes
-Quilín
-Las Torres
-Macul
-Vicuña Mackenna L4
-Vicente Valdés L4
-Rojas Magallanes
-Trinidad
-San José de la Estrella
-Los Quillayes
-Elisa Correa
-Hospital Sótero del Rio
-Protectora de la Infancia
-Las Mercedes
-Plaza de Puente Alto""",
-    
-    "L4A": """Vicuña Mackenna L4A
-Santa Julia
-La Granja
-Santa Rosa
-San Ramón
-La Cisterna L4A""",
-    
-    "L5": """Plaza de Maipú
-Santiago Bueras
-Del Sol
-Monte Tabor
-Las Parcelas
-Laguna Sur
-Barrancas
-Pudahuel
-San Pablo L5
-Lo Prado
-Blanqueado
-Gruta de Lourdes
-Quinta Normal
-Cumming
-Santa Ana L5
-Plaza de Armas L5
-Bellas Artes
-Baquedano L5
-Parque Bustamante
-Santa Isabel
-Irarrázaval L5
-Ñuble L5
-Rodrigo de Araya
-Carlos Valdovinos
-Camino Agrícola
-San Joaquín
-Pedrero
-Mirador
-Bellavista de La Florida
-Vicente Valdés L5""",
-    
-    "L6": """Cerrillos
-Lo Valledor
-Pdte. Pedro Aguirre Cerda
-Franklin L6
-Bío Bío
-Ñuble L6
-Estadio Nacional
-Ñuñoa L6
-Inés de Suárez
-Los Leones L6"""
+    "L1": "San Pablo L1\nNeptuno\nPajaritos\nLas rejas\nEcuador\nSan Alberto Hurtado\nUniversidad de Santiago\nEstación Central\nU.L.A.\nRepública\nLos Héroes L1\nLa Moneda\nUniversidad de Chile L1\nSanta Lucía\nUniversidad Católica\nBaquedano L1\nSalvador\nManuel Montt\nPedro de Valdivia\nLos Leones L1\nTobalaba L1\nEl Golf\nAlcántara\nEscuela Militar\nManquehue\nHernando de Magallanes\nLos Dominicos",
+    "L2": "Vespucio Norte\nZapadores\nDorsal\nEinstein\nCementerios\nCerro Blanco\nPatronato\nPuente Cal y Canto L2\nSanta Ana L2\nLos Héroes L2\nToesca\nParque O’Higgins\nRondizzoni\nFranklin L2\nEl Llano\nSan Miguel\nLo Vial\nDepartamental\nCiudad del Niño\nLo Ovalle\nEl Parrón\nLa Cisterna L2\nEl Bosque\nObservatorio\nCopa Lo Martinez\nHospital El Pino",
+    "L3": "Plaza Quilicura\nLo Cruzat\nFerrocarril\nLos Libertadores\nCardenal Caro\nVivaceta\nConchalí\nPlaza Chacabuco\nHospitales\nPuente Cal y Canto L3\nPlaza de Armas L3\nUniversidad de Chile L3\nParque Almagro\nMatta\nIrarrázaval L3\nMonseñor Eyzaguirre\nÑuñoa L3\nChile-España\nVilla Frei\nPlaza Egaña L3\nFernando Castillo Velasco",
+    "L4": "Tobalaba L4\nCristóbal Colón\nFrancisco Bilbao\nPrincipe de Gales\nSimón Bolivar\nPlaza Egaña L4\nLos Orientales\nGrecia\nLos Presidentes\nQuilín\nLas Torres\nMacul\nVicuña Mackenna L4\nVicente Valdés L4\nRojas Magallanes\nTrinidad\nSan José de la Estrella\nLos Quillayes\nElisa Correa\nHospital Sótero del Rio\nProtectora de la Infancia\nLas Mercedes\nPlaza de Puente Alto",
+    "L4A": "La Cisterna L4A\nSan Ramón\nSanta Rosa\nLa Granja\nSanta Julia\nVicuña Mackenna L4A",
+    "L5": "Plaza de Maipú\nSantiago Bueras\nDel Sol\nMonte Tabor\nLas Parcelas\nLaguna Sur\nBarrancas\nPudahuel\nSan Pablo L5\nLo Prado\nBlanqueado\nGruta de Lourdes\nQuinta Normal\nCumming\nSanta Ana L5\nPlaza de Armas L5\nBellas Artes\nBaquedano L5\nParque Bustamante\nSanta Isabel\nIrarrázaval L5\nÑuble L5\nRodrigo de Araya\nCarlos Valdovinos\nCamino Agrícola\nSan Joaquín\nPedrero\nMirador\nBellavista de La Florida\nVicente Valdés L5",
+    "L6": "Cerrillos\nLo Valledor\nPdte. Pedro Aguirre Cerda\nFranklin L6\nBío Bío\nÑuble L6\nEstadio Nacional\nÑuñoa L6\nInés de Suárez\nLos Leones L6"
 }
 
-# 2. Crear el objeto Grafo
-G = nx.Graph()
 
-# 3. Procesar datos y añadir nodos/aristas
+# --- 4. LÓGICA DE CONSTRUCCIÓN ---
+print("--- Iniciando Construcción de Grafos de la Red de Metro ---")
+
+# Cargar datos externos para costos
+project_root = Path().resolve()
+# Retroceder hasta encontrar la carpeta 'config'
+while not (project_root / "config").is_dir() and project_root != project_root.parent:
+    project_root = project_root.parent
+if not (project_root / "config").is_dir():
+    raise FileNotFoundError("No se pudo encontrar el directorio 'config' en la jerarquía del proyecto.")
+
+gtfs_dir = project_root / "config" / "GTFS"
+headways_path = gtfs_dir / "metro_headways_master.parquet"
+
+t_veh_lookup = _get_t_veh_lookup(next(gtfs_dir.glob("GTFS_*"), None))
+df_headways = pl.read_parquet(headways_path) if headways_path.exists() else None
+
+# Crear los 3 grafos
+G_base, G_penalizacion_fija, G_costo_generalizado = nx.Graph(), nx.Graph(), nx.Graph()
+graphs = [G_base, G_penalizacion_fija, G_costo_generalizado]
 transfer_station_nodes = defaultdict(list)
-all_edges = []
-all_nodes = []
 
-# Expresión regular para separar nombre base y línea (ej. "Los Héroes L1")
-station_regex = re.compile(r"^(.*?) (L\d[A]?)$")
-
-print("Procesando líneas y encontrando nodos...")
+# Añadir nodos y aristas de viaje
 for line_name, line_string in all_lines_raw.items():
-    stations_on_this_line = []
-    
-    # Limpiar nombres de estación y encontrar nodos
-    for station_name in line_string.strip().split('\n'):
-        
-        # --- LÓGICA DE NORMALIZACIÓN APLICADA ---
-        base_name_normalized = normalize_station_name(station_name)
-        node_name_normalized = f"{base_name_normalized} {line_name}" # ej. "REPUBLICA L1"
-        # --- FIN DE LÓGICA ---
-        
-        stations_on_this_line.append(node_name_normalized)
-        all_nodes.append(node_name_normalized)
-        
-        if node_name_normalized not in transfer_station_nodes[base_name_normalized]:
-            transfer_station_nodes[base_name_normalized].append(node_name_normalized)
+    stations_on_this_line = [f"{normalize_station_name(s)} {line_name}" for s in line_string.strip().split('\n')]
+    for node in stations_on_this_line:
+        base_name = normalize_station_name(node)
+        if node not in transfer_station_nodes[base_name]:
+            transfer_station_nodes[base_name].append(node)
+    for g in graphs:
+        nx.add_path(g, stations_on_this_line, type='travel', line=line_name)
 
-    # Añadir aristas de VIAJE
-    for i in range(len(stations_on_this_line) - 1):
-        node_a = stations_on_this_line[i]
-        node_b = stations_on_this_line[i+1]
-        G.add_edge(node_a, node_b, type='travel', line=line_name)
-
-G.add_nodes_from(set(all_nodes))
-
-print("Añadiendo aristas de TRANSBORDO...")
-# Añadir aristas de TRANSBORDO (entre líneas en la misma estación)
-transfer_count = 0
+# Añadir aristas de transbordo
 for base_name, nodes in transfer_station_nodes.items():
-    if len(nodes) > 1: # Es una estación de transbordo
-        transfer_count += 1
-        # Añadir aristas entre todas las combinaciones de líneas en esa estación
+    if len(nodes) > 1:
         for node_a, node_b in combinations(nodes, 2):
-            G.add_edge(node_a, node_b, type='transfer', name=base_name)
+            for g in graphs:
+                g.add_edge(node_a, node_b, type='transfer', name=base_name)
 
-print(f"\n✅ Grafo construido exitosamente.")
-print(f"   - Nodos Totales (Estación-Línea): {G.number_of_nodes()}")
-print(f"   - Aristas Totales: {G.number_of_edges()}")
-print(f"   - Estaciones de Transbordo: {transfer_count}")
+# --- 5. ASIGNAR PESOS A LOS GRAFOS ---
+print("Asignando pesos a los grafos ponderados...")
 
-# 4. Verificar resultados (Ejemplos)
-print("\n--- Ejemplos de Vecinos ---")
+# Headway promedio para el grafo de costo generalizado (fallback si no se puede calcular por hora)
+avg_headway_secs = df_headways['headway_secs'].mean() if df_headways is not None else 240 # Fallback 4 mins
+espera_esperada_secs = avg_headway_secs / 2
 
-# Ejemplo 1: Estación de Transbordo (Los Héroes L1)
-try:
-    nodo = f"{normalize_station_name('Los Héroes')} L1"
-    lh1_neighbors = list(G.neighbors(nodo))
-    print(f"Vecinos de '{nodo}': {lh1_neighbors}")
-except nx.NetworkXError:
-    print("Error: Nodo 'Los Héroes L1' no encontrado. Verifica los nombres.")
+for g in [G_penalizacion_fija, G_costo_generalizado]:
+    for u, v, data in g.edges(data=True):
+        if data['type'] == 'travel':
+            if g is G_penalizacion_fija:
+                g[u][v]['weight'] = 1
+            else: # G_costo_generalizado
+                key = tuple(sorted((normalize_station_name(u), normalize_station_name(v))))
+                t_veh_secs = t_veh_lookup.get(key, 120) # Fallback 2 mins
+                g[u][v]['weight'] = t_veh_secs / 60.0 # Costo en minutos
+        else: # transfer
+            if g is G_penalizacion_fija:
+                g[u][v]['weight'] = PENALIDAD_FIJA_TRANSBORDO
+            else: # G_costo_generalizado
+                costo = PENALIDAD_PURA_METRO + (PESO_CAMINATA * T_WALK_SECS_ASUMIDO / 60.0) + (PESO_ESPERA * espera_esperada_secs / 60.0)
+                g[u][v]['weight'] = costo
 
-# Ejemplo 2: Estación Simple (Neptuno L1)
-try:
-    nodo = f"{normalize_station_name('Neptuno')} L1"
-    neptuno_neighbors = list(G.neighbors(nodo))
-    print(f"Vecinos de '{nodo}': {neptuno_neighbors}")
-except nx.NetworkXError:
-    print("Error: Nodo 'Neptuno L1' no encontrado. Verifica los nombres.")
+# --- 6. GUARDAR GRAFOS ---
+output_dir = Path() # Guardar en el directorio actual del notebook
+with open(output_dir / "metro_graph_base.gpickle", "wb") as f: pickle.dump(G_base, f)
+with open(output_dir / "metro_graph_penalizacion_fija.gpickle", "wb") as f: pickle.dump(G_penalizacion_fija, f)
+with open(output_dir / "metro_graph_costo_generalizado.gpickle", "wb") as f: pickle.dump(G_costo_generalizado, f)
 
-# Ejemplo 3: Estación de Transbordo Compleja (Universidad de Chile L1)
-try:
-    nodo = f"{normalize_station_name('Universidad de Chile')} L1"
-    uchile_neighbors = list(G.neighbors(nodo))
-    print(f"Vecinos de '{nodo}': {uchile_neighbors}")
-except nx.NetworkXError:
-    print("Error: Nodo 'Universidad de Chile L1' no encontrado.")
-
-
-#5. Guardar el grafo
-with open("metro_santiago_graph.gpickle", "wb") as _f:
-    pickle.dump(G, _f)
-    nx.write_graphml(G, "metro_santiago_graph.graphml")
-with open("metro_santiago_graph.gpickle", "rb") as _f:
-    G = pickle.load(_f)
+print(f"\n✅ 3 Grafos construidos y guardados en '{output_dir.resolve()}':")
+print(f"   - metro_graph_base.gpickle ({G_base.number_of_nodes()} nodos)")
+print(f"   - metro_graph_penalizacion_fija.gpickle")
+print(f"   - metro_graph_costo_generalizado.gpickle")
 
 ```
 
@@ -723,5 +585,4 @@ from config import (
     HORAS_VALLE,
     HORAS_BAJO,
 )
-
 ```
