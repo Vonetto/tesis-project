@@ -12,10 +12,16 @@ import pyarrow.fs as pafs
 import gcsfs
 from tqdm import tqdm
 
+# Importar constantes desde config
+from config.constants import GCS_BUCKET_NAME, GCS_RAW_PREFIX, GCS_BRONZE_PREFIX, USE_LOCAL_PATHS, LOCAL_RAW_PATH, LOCAL_BRONZE_PATH
+
 # --- Parámetros Configurables ---
-GCS_BUCKET = os.getenv("GCS_BUCKET", "tesis-vonetto-datalake")
-RAW_PREFIX = os.getenv("RAW_PREFIX", "raw")
-BRONZE_PREFIX = os.getenv("BRONZE_PREFIX", "lake/bronze")
+if USE_LOCAL_PATHS:
+    RAW_BASE_PATH = LOCAL_RAW_PATH
+    BRONZE_BASE_PATH = LOCAL_BRONZE_PATH
+else:
+    RAW_BASE_PATH = GCS_RAW_PATH
+    BRONZE_BASE_PATH = GCS_BRONZE_PATH
 CSV_SEP_DEF = os.getenv("CSV_SEP_DEFAULT", ";")
 
 # --- Definición de Esquema Estricto ---
@@ -28,22 +34,15 @@ CSV_DTYPES = {
     'dveh_euc4': pl.Int64, 'dveh_eucfinal': pl.Int64, 'dveh_ruta1': pl.Int64,
     'dveh_ruta2': pl.Int64, 'dveh_ruta3': pl.Int64, 'dveh_ruta4': pl.Int64,
     'dveh_rutafinal': pl.Int64, 'egreso': pl.Int64, 'entrada': pl.Int64,
-    'factor_expansion': pl.Float64, 'id_tarjeta': pl.Utf8, 'id_viaje': pl.Int64,
-    'mediahora_bajada_1': pl.Utf8, 'mediahora_bajada_2': pl.Utf8,
-    'mediahora_bajada_3': pl.Utf8, 'mediahora_bajada_4': pl.Utf8,
-    'mediahora_fin_viaje': pl.Utf8, 'mediahora_fin_viaje_hora': pl.Utf8,
-    'mediahora_inicio_viaje': pl.Utf8, 'mediahora_inicio_viaje_hora': pl.Utf8,
-    'modos': pl.Utf8, 'n_etapas': pl.Int32, 'netapassinbajada': pl.Int64,
+    'id_tarjeta': pl.Utf8, 'id_viaje': pl.Int64,
+    'modos': pl.Utf8, 'n_etapas': pl.Int32,
     'op_1era_etapa': pl.Utf8, 'op_2da_etapa': pl.Utf8, 'op_3era_etapa': pl.Utf8,
     'op_4ta_etapa': pl.Utf8, 'paradero_bajada_1': pl.Utf8,
     'paradero_bajada_2': pl.Utf8, 'paradero_bajada_3': pl.Utf8,
     'paradero_bajada_4': pl.Utf8, 'paradero_fin_viaje': pl.Utf8,
     'paradero_inicio_viaje': pl.Utf8, 'paradero_subida_1': pl.Utf8,
     'paradero_subida_2': pl.Utf8, 'paradero_subida_3': pl.Utf8,
-    'paradero_subida_4': pl.Utf8, 'periodo_bajada_1': pl.Utf8,
-    'periodo_bajada_2': pl.Utf8, 'periodo_bajada_3': pl.Utf8,
-    'periodo_bajada_4': pl.Utf8, 'periodo_fin_viaje': pl.Utf8,
-    'periodo_inicio_viaje': pl.Utf8, 'proposito': pl.Utf8, 'srv_1': pl.Utf8,
+    'paradero_subida_4': pl.Utf8, 'srv_1': pl.Utf8,
     'srv_2': pl.Utf8, 'srv_3': pl.Utf8, 'srv_4': pl.Utf8, 'tc1': pl.Int64,
     'tc2': pl.Int64, 'tc3': pl.Int64, 'te0': pl.Int64, 'te1': pl.Int64,
     'te2': pl.Int64, 'te3': pl.Int64, 'tiempo_bajada_1': pl.Utf8,
@@ -51,12 +50,12 @@ CSV_DTYPES = {
     'tiempo_bajada_4': pl.Utf8, 'tiempo_fin_viaje': pl.Utf8,
     'tiempo_inicio_viaje': pl.Utf8, 'tiempo_subida_1': pl.Utf8,
     'tiempo_subida_2': pl.Utf8, 'tiempo_subida_3': pl.Utf8,
-    'tiempo_subida_4': pl.Utf8, 'tipo_corte_etapa_viaje': pl.Utf8,
+    'tiempo_subida_4': pl.Utf8,
     'tipo_transporte_1': pl.Utf8, 'tipo_transporte_2': pl.Utf8,
     'tipo_transporte_3': pl.Utf8, 'tipo_transporte_4': pl.Utf8,
     'tipodia': pl.Utf8, 'tv1': pl.Int64, 'tv2': pl.Int64, 'tv3': pl.Int64,
-    'tv4': pl.Int64, 'tviaje': pl.Utf8, 'tviaje2': pl.Int64,
-    'ultimaetapaconbajada': pl.Int64, 'zona_bajada_1': pl.Utf8,
+    'tv4': pl.Int64, 'tviaje2': pl.Int64,
+    'zona_bajada_1': pl.Utf8,
     'zona_bajada_2': pl.Utf8, 'zona_bajada_3': pl.Utf8,
     'zona_bajada_4': pl.Utf8, 'zona_fin_viaje': pl.Utf8,
     'zona_inicio_viaje': pl.Utf8, 'zona_subida_1': pl.Utf8,
@@ -87,9 +86,14 @@ def gsjoin(*parts: str) -> str:
     return "gs://" + "/".join(s.strip("/").replace("gs://", "") for s in parts)
 
 # --- Funciones de Lectura y Parseo de CSV ---
-def _detect_sep_from_fullpath(gfs: gcsfs.GCSFileSystem, gcs_path_no_scheme: str, default=";") -> str:
-    with gfs.open(gcs_path_no_scheme, "rb") as fh:
-        head = fh.readline().decode("utf-8", errors="ignore")
+def _detect_sep_from_fullpath(fs, path: str, default=";") -> str:
+    if USE_LOCAL_PATHS:
+        with open(path, "rb") as fh:
+            head = fh.readline().decode("utf-8", errors="ignore")
+    else:
+        path_no_scheme = path.replace("gs://", "").strip("/")
+        with fs.open(path_no_scheme, "rb") as fh:
+            head = fh.readline().decode("utf-8", errors="ignore")
     candidates = [",", ";", "|", "\t"]
     counts = {c: head.count(c) for c in candidates}
     sep = max(counts, key=counts.get)
@@ -109,27 +113,47 @@ def _fix_ddmmyy_to_iso(expr: pl.Expr) -> pl.Expr:
     tries = [s.str.strptime(pl.Datetime, format=f, strict=False, exact=False) for f in formats]
     return pl.coalesce(tries)
 
-def _read_csv_polars_gcs(gfs: gcsfs.GCSFileSystem, gcs_path_no_scheme: str, sep: str) -> pl.DataFrame:
+def _read_csv_polars(fs, path: str, sep: str) -> pl.DataFrame:
     decimal_comma_flag = (sep == ";")
-    with gfs.open(gcs_path_no_scheme, "rb") as fh:
-        return pl.read_csv(
-            fh, separator=sep, dtypes=CSV_DTYPES, try_parse_dates=False,
-            null_values=NULL_TOKENS, ignore_errors=False, low_memory=True, 
-            decimal_comma=decimal_comma_flag
-        )
+    if USE_LOCAL_PATHS:
+        with open(path, "rb") as fh:
+            return pl.read_csv(
+                fh, separator=sep, dtypes=CSV_DTYPES, try_parse_dates=False,
+                null_values=NULL_TOKENS, ignore_errors=False, low_memory=True, 
+                decimal_comma=decimal_comma_flag
+            )
+    else:
+        path_no_scheme = path.replace("gs://", "").strip("/")
+        with fs.open(path_no_scheme, "rb") as fh:
+            return pl.read_csv(
+                fh, separator=sep, dtypes=CSV_DTYPES, try_parse_dates=False,
+                null_values=NULL_TOKENS, ignore_errors=False, low_memory=True, 
+                decimal_comma=decimal_comma_flag
+            )
 
 # --- Lógica de Ingesta ---
-def _glob_raw(gfs: gcsfs.GCSFileSystem, patterns: str | list[str]):
+def _glob_raw(fs, base_path: str, patterns: str | list[str]):
     if isinstance(patterns, str):
         patterns = [patterns]
-    base = f"{GCS_BUCKET}/{RAW_PREFIX}".strip("/")
+    
     hits = []
-    for pat in patterns:
-        hits += gfs.glob(f"{base}/{pat}")
+    if USE_LOCAL_PATHS:
+        # Local file system
+        base_path_obj = pathlib.Path(base_path)
+        for pat in patterns:
+            # Use glob from pathlib for local files
+            hits.extend(str(p) for p in base_path_obj.glob(pat))
+        print(f"[Local] {len(hits)} archivos encontrados para patrones: {patterns}")
+    else:
+        # GCS file system
+        base_path_no_scheme = base_path.replace("gs://", "").strip("/")
+        for pat in patterns:
+            hits.extend(fs.glob(f"{base_path_no_scheme}/{pat}"))
+        print(f"[GCS] {len(hits)} archivos encontrados para patrones: {patterns}")
+    
     hits = sorted(set(hits))
-    print(f"[GCS] {len(hits)} archivos encontrados para patrones: {patterns}")
     if not hits:
-        raise FileNotFoundError(f"No se encontraron CSV bajo gs://{base} con patrones {patterns}")
+        raise FileNotFoundError(f"No se encontraron archivos bajo {base_path} con patrones {patterns}")
     return hits
 
 def _week_from_path(gcs_path_no_scheme: str) -> str | None:
@@ -168,18 +192,19 @@ def _sanitize_before_write(dfw: pl.DataFrame, sem_key) -> tuple[pl.DataFrame, st
     dfw = dfw.with_columns(pl.lit(sem).cast(pl.Utf8).alias("semana_iso"))
     return dfw, sem
 
-def _partition_exists(gfs: gcsfs.GCSFileSystem, base_no_scheme: str, sem: str) -> bool:
-    normal = f"{base_no_scheme}/semana_iso={sem}".rstrip("/")
-    return gfs.exists(normal)
+def _partition_exists(fs, base_path: str, sem: str) -> bool:
+    normal = f"{base_path}/semana_iso={sem}".rstrip("/")
+    if USE_LOCAL_PATHS:
+        return pathlib.Path(normal).exists()
+    else:
+        return fs.exists(normal.replace("gs://", "").strip("/"))
 
-def _ingest_viajes_files_by_week(gfs: gcsfs.GCSFileSystem, week_map: dict[str, list[str]]):
-    out_base = gsjoin(GCS_BUCKET, BRONZE_PREFIX, "viajes").replace("gs://", "")
-    fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
+def _ingest_viajes_files_by_week(raw_fs, bronze_fs, raw_base_path: str, bronze_base_path: str, week_map: dict[str, list[str]]):
     wrote, skipped, errored = [], [], []
 
     print(f"\n⚙️  Iniciando procesamiento de {len(week_map)} semanas para VIAJES...")
     for week, files_in_week in tqdm(week_map.items(), desc="Procesando semanas (viajes)", unit="semana"):
-        if _partition_exists(gfs, out_base, week):
+        if _partition_exists(bronze_fs, bronze_base_path, week):
             skipped.append(week)
             continue
         
@@ -187,10 +212,10 @@ def _ingest_viajes_files_by_week(gfs: gcsfs.GCSFileSystem, week_map: dict[str, l
             print(f"\n  [Semana {week}] Encontrados {len(files_in_week)} archivos. Iniciando lectura...")
             list_of_dfs = []
             for file_path in tqdm(files_in_week, desc=f"    Leyendo archivos sem {week}", leave=False, unit="file"):
-                sep = _detect_sep_from_fullpath(gfs, file_path, default=CSV_SEP_DEF)
-                df = _read_csv_polars_gcs(gfs, file_path, sep)
+                sep = _detect_sep_from_fullpath(raw_fs, file_path, default=CSV_SEP_DEF)
+                df = _read_csv_polars(raw_fs, file_path, sep)
                 
-                time_col = next((c for c in ["tiempo_inicio_viaje", "tiempo_subida_1", "mediahora_inicio_viaje"] if c in df.columns), None)
+                time_col = next((c for c in ["tiempo_inicio_viaje", "tiempo_subida_1"] if c in df.columns), None)
                 if not time_col:
                     print(f"      ⚠️  No se encontró columna temporal en {os.path.basename(file_path)}. Se omite archivo.")
                     continue
@@ -217,14 +242,22 @@ def _ingest_viajes_files_by_week(gfs: gcsfs.GCSFileSystem, week_map: dict[str, l
                     pl.col("contrato").cast(pl.Utf8, strict=False).str.strip_chars().is_in(["171", "102"]).alias("is_qr")
                 )
             
-            target_dir = f"{out_base}/semana_iso={week_norm}"
-            print(f"    - Escribiendo partición en GCS en: {target_dir}")
-            ds.write_dataset(
-                data=df_week.to_arrow(), base_dir=target_dir, filesystem=fs_arrow, format="parquet",
-                existing_data_behavior="overwrite_or_ignore",
-                file_options=ds.ParquetFileFormat().make_write_options(compression="zstd"),
-                basename_template="part-{i}.parquet",
-            )
+            target_dir = f"{bronze_base_path}/semana_iso={week_norm}"
+            print(f"    - Escribiendo partición en {'Local' if USE_LOCAL_PATHS else 'GCS'} en: {target_dir}")
+            
+            if USE_LOCAL_PATHS:
+                # For local, use Polars' native write_parquet
+                pathlib.Path(target_dir).mkdir(parents=True, exist_ok=True)
+                df_week.write_parquet(f"{target_dir}/part-0.parquet", compression="zstd")
+            else:
+                # For GCS, use pyarrow.dataset
+                fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(bronze_fs))
+                ds.write_dataset(
+                    data=df_week.to_arrow(), base_dir=target_dir, filesystem=fs_arrow, format="parquet",
+                    existing_data_behavior="overwrite_or_ignore",
+                    file_options=ds.ParquetFileFormat().make_write_options(compression="zstd"),
+                    basename_template="part-{i}.parquet",
+                )
             print(f"    - ✅ Semana {week} escrita exitosamente.")
             wrote.append(week)
 
@@ -237,7 +270,7 @@ def _ingest_viajes_files_by_week(gfs: gcsfs.GCSFileSystem, week_map: dict[str, l
     print(f"\n✅ Resumen VIAJES → Nuevas: {len(wrote)}, Omitidas: {len(skipped)}, Errores: {len(errored)}")
     return {"dataset": "viajes", "written": sorted(wrote), "skipped": sorted(skipped), "errored": sorted(errored)}
 
-def ingest_new_to_bronze(gfs: gcsfs.GCSFileSystem, viajes_glob: str | None = None, etapas_glob: str | None = None):
+def ingest_new_to_bronze(raw_fs, bronze_fs, raw_base_path: str, bronze_base_path: str, viajes_glob: str | None = None, etapas_glob: str | None = None):
     print("="*50)
     print("⏳ Iniciando ingesta RAW -> BRONZE (Estrategia: Semana por Semana con Esquema Estricto)")
     print("="*50)
@@ -247,15 +280,15 @@ def ingest_new_to_bronze(gfs: gcsfs.GCSFileSystem, viajes_glob: str | None = Non
 
     results = {}
     try:
-        files_v = _glob_raw(gfs, viajes_glob)
+        files_v = _glob_raw(raw_fs, raw_base_path, viajes_glob)
         week_map_v = _group_files_by_week(files_v)
-        results["viajes"] = _ingest_viajes_files_by_week(gfs, week_map_v)
+        results["viajes"] = _ingest_viajes_files_by_week(raw_fs, bronze_fs, raw_base_path, bronze_base_path, week_map_v)
     except FileNotFoundError as e:
         print(f"⚠️ No se procesaron VIAJES: {e}")
         results["viajes"] = None
 
     try:
-        _glob_raw(gfs, etapas_glob)
+        _glob_raw(raw_fs, raw_base_path, etapas_glob)
         print("\nℹ️ El procesamiento de ETAPAS está actualmente desactivado en el script.")
         results["etapas"] = None
     except FileNotFoundError:
@@ -268,15 +301,28 @@ def ingest_new_to_bronze(gfs: gcsfs.GCSFileSystem, viajes_glob: str | None = Non
 # --- Punto de Entrada ---
 
 if __name__ == "__main__":
-    print("Activando credenciales de Google Cloud...")
-    try:
-        gcs_fs = get_gcs_filesystem()
-        print("✅ Filesystem de GCS inicializado.")
-    except FileNotFoundError as e:
-        print(f"❌ Error de autenticación: {e}", file=sys.stderr)
-        sys.exit(1)
+    if USE_LOCAL_PATHS:
+        print("✅ Usando rutas locales.")
+        raw_fs = None # Not needed for local open()
+        bronze_fs = None # Not needed for local write_parquet
+        raw_base_path = RAW_BASE_PATH
+        bronze_base_path = BRONZE_BASE_PATH
+        # Ensure local directories exist
+        pathlib.Path(raw_base_path).mkdir(parents=True, exist_ok=True)
+        pathlib.Path(bronze_base_path).mkdir(parents=True, exist_ok=True)
+    else:
+        print("Activando credenciales de Google Cloud...")
+        try:
+            raw_fs = get_gcs_filesystem()
+            bronze_fs = raw_fs # Same FS for read and write
+            print("✅ Filesystem de GCS inicializado.")
+        except FileNotFoundError as e:
+            print(f"❌ Error de autenticación: {e}", file=sys.stderr)
+            sys.exit(1)
+        raw_base_path = RAW_BASE_PATH
+        bronze_base_path = BRONZE_BASE_PATH
 
     viajes_pattern = sys.argv[1] if len(sys.argv) > 1 else None
     etapas_pattern = sys.argv[2] if len(sys.argv) > 2 else None
 
-    ingest_new_to_bronze(gfs=gcs_fs, viajes_glob=viajes_pattern, etapas_glob=etapas_pattern)
+    ingest_new_to_bronze(raw_fs=raw_fs, bronze_fs=bronze_fs, raw_base_path=raw_base_path, bronze_base_path=bronze_base_path, viajes_glob=viajes_pattern, etapas_glob=etapas_pattern)

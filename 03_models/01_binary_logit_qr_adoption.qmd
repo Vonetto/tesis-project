@@ -42,26 +42,34 @@ Para desarrollar y validar el modelo de forma controlada, este análisis se cent
 import os
 import sys
 import polars as pl
-import gcsfs
-import pyarrow.fs as pafs
-import pyarrow.dataset as ds
+import pandas as pd
 from datetime import date
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 
-# Asegurar que el paquete 'config' sea importable
+# Asegurar que el paquete 'config' y 'lib' sean importables
+# Se busca el directorio raíz del proyecto (que contiene 'config/' y 'lib/') y se añade a sys.path
 PROJECT_ROOT = Path().resolve()
 while PROJECT_ROOT != PROJECT_ROOT.parent:
-    if (PROJECT_ROOT / "config").is_dir():
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
         if str(PROJECT_ROOT) not in sys.path:
             sys.path.append(str(PROJECT_ROOT))
         break
     PROJECT_ROOT = PROJECT_ROOT.parent
 else:
-    raise RuntimeError("No se encontró el directorio raíz con el paquete 'config'.")
+    # Este 'else' se ejecuta si el bucle termina sin 'break', lo que significa que no se encontró el directorio.
+    # Se añade una comprobación extra por si el notebook se ejecuta desde el propio directorio raíz.
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+    else:
+        raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
 
-from config import HORAS_PUNTA_MANANA, HORAS_PUNTA_TARDE
+# Importar funciones de acceso a datos centralizadas
+from lib.datalake import read_parquet_portable
+
+from config import HORAS_PUNTA_MANANA, HORAS_PUNTA_TARDE, USE_LOCAL_PATHS, LOCAL_SILVER_PATH, GCS_SILVER_PATH
 
 # Importar biogeme
 import biogeme.database as db
@@ -70,33 +78,15 @@ from biogeme import models
 from biogeme.expressions import Beta, Variable
 
 
-# --- Autenticación GCS ---
-# (Puedes copiar tu función enable_adc_crossplatform aquí o importarla si está en lib)
-def enable_adc_crossplatform():
-    """Configura credenciales de Google Cloud para acceso a GCS"""
-    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        return
-    if sys.platform.startswith("win"):
-        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
-    else:
-        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
-    if not os.path.exists(adc_path):
-        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
 
-try:
-    enable_adc_crossplatform()
-    gfs = gcsfs.GCSFileSystem(token="google_default")
-    fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
-    print("✅ Conexión con GCS establecida.")
-except FileNotFoundError as e:
-    print(f"❌ Error de autenticación: {e}")
 
 # --- Parámetros ---
-GCS_BUCKET = "tesis-vonetto-datalake"
-SILVER_PATH = f"gs://{GCS_BUCKET}/lake/silver"
+if USE_LOCAL_PATHS:
+    SILVER_BASE_PATH = LOCAL_SILVER_PATH
+else:
+    SILVER_BASE_PATH = GCS_SILVER_PATH
 # Usaremos 'viajes_limpios' como base, ya que contiene todos los viajes válidos
-INPUT_DATASET_PATH = f"{SILVER_PATH}/viajes_filtrados"
+INPUT_DATASET_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados"
 
 # --- Partición para Análisis Inicial ---
 # Elige una partición representativa
@@ -128,7 +118,7 @@ def prepare_features(lazy_frame):
         (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
     ]).with_columns([
         pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
-        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+        pl.col("hora").is_in(HORAS_Punta_TARDE).alias("punta_tarde"),
         (pl.col("dia_semana") == 5).alias("es_viernes"),
         pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
     ]).with_columns([
@@ -199,7 +189,7 @@ def prepare_features_extended(lazy_frame):
             (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
         ]).with_columns([
             pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
-            pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+            pl.col("hora").is_in(HORAS_Punta_TARDE).alias("punta_tarde"),
             (pl.col("dia_semana") == 5).alias("es_viernes"),
             pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
         ]).with_columns([
@@ -260,8 +250,8 @@ print(f"Cargando partición {PARTITION_LABEL} desde {INPUT_DATASET_PATH}...")
 partition_path_glob = f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
 
 try:
-    # Usamos scan_parquet para cargar de forma perezosa (LazyFrame)
-    lf_data = pl.scan_parquet(partition_path_glob)
+    # Usamos read_parquet_portable para cargar de forma perezosa (LazyFrame)
+    lf_data = read_parquet_portable(partition_path_glob)
 
     # Verificamos el esquema y contamos filas (esto sí ejecuta parte de la query)
     schema = lf_data.collect_schema()
@@ -426,7 +416,7 @@ if lf_data is not None:
     # 3. Crear variables intermedias para dummies
     lf_prep = lf_prep.with_columns([
         pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
-        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+        pl.col("hora").is_in(HORAS_Punta_TARDE).alias("punta_tarde"),
         (pl.col("dia_semana") == 5).alias("es_viernes"), # Viernes=5
         pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue") # Lunes=1 a Jueves=4
     ])
@@ -731,7 +721,7 @@ for year, week in PARTICIONES_A_PROCESAR:
     try:
         # b. Cargar datos
         input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
-        lf_data = pl.scan_parquet(input_path_glob)
+        lf_data = read_parquet_portable(input_path_glob)
         print(f"   Cargando datos desde: {input_path_glob}")
 
         # c. Preparar features (usando la función helper del modelo simple)
