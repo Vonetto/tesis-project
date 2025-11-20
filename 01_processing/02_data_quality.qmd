@@ -48,53 +48,37 @@ import os
 import sys
 import gc
 import polars as pl
-import pyarrow as pa
-import pyarrow.dataset as ds
-import pyarrow.fs as pafs
-import pyarrow.parquet as pq
-import gcsfs
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 
 import pathlib
 
-# Esto es necesario para que Python encuentre el módulo 'config'
+# Asegurar que el paquete 'config' y 'lib' sean importables
+# Se busca el directorio raíz del proyecto (que contiene 'config/' y 'lib/') y se añade a sys.path
+from pathlib import Path
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    # Este 'else' se ejecuta si el bucle termina sin 'break', lo que significa que no se encontró el directorio.
+    # Se añade una comprobación extra por si el notebook se ejecuta desde el propio directorio raíz.
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+    else:
+        raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
 
-project_root = os.path.abspath(os.path.join(os.getcwd(), '..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+# Importar funciones de acceso a datos centralizadas
+from lib.datalake import read_parquet_portable, get_filesystem
+
 # Importar constantes desde config
 from config.constants import GCS_BUCKET_NAME, GCS_SILVER_PREFIX, USE_LOCAL_PATHS, LOCAL_SILVER_PATH, GCS_SILVER_PATH
 
-# --- Autenticación GCS ---
-def enable_adc_crossplatform():
-    """Configura credenciales de Google Cloud para acceso a GCS"""
-    if USE_LOCAL_PATHS:
-        return # ADC not needed for local paths
-    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        return
-    if sys.platform.startswith("win"):
-        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
-    else:
-        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
-    if not os.path.exists(adc_path):
-        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
-
-gfs = None # Initialize gfs
-fs_arrow = None # Initialize fs_arrow
-
-if not USE_LOCAL_PATHS:
-    try:
-        enable_adc_crossplatform()
-        gfs = gcsfs.GCSFileSystem(token="google_default")
-        fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
-        print("✅ Conexión con GCS establecida.")
-    except FileNotFoundError as e:
-        print(f"❌ Error de autenticación: {e}")
-else:
-    print("✅ Usando rutas locales.")
 
 # --- Parámetros ---
 if USE_LOCAL_PATHS:
@@ -123,92 +107,15 @@ Cargamos SOLO la partición 2024-W14 para hacer análisis exploratorio rápido.
 
 ```{python}
 try:
-    # Buscar el archivo de la partición específica
-    print(f"🔍 Buscando archivo de partición {YEAR_ANALISIS}-W{WEEK_ANALISIS}...")
-    
     # Construir la ruta de la partición
     particion_path = f"{INPUT_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/"
-    print(f"📁 Explorando directorio: {particion_path}")
+    full_glob_path = f"{particion_path}*.parquet"
+    print(f"📁 Buscando archivos en: {full_glob_path}")
     
-    archivos_parquet = []
-    if USE_LOCAL_PATHS:
-        # Local file system
-        path_obj = pathlib.Path(particion_path)
-        if path_obj.exists():
-            archivos_parquet = [str(f) for f in path_obj.glob("*.parquet")]
-        else:
-            print(f"❌ Directorio local no encontrado: {particion_path}")
-    else:
-        # GCS file system
-        try:
-            archivos_disponibles = gfs.ls(particion_path)
-            archivos_parquet = [f for f in archivos_disponibles if f.endswith('.parquet')]
-        except Exception as e:
-            print(f"❌ Error al listar archivos en GCS: {e}")
-    
-    if not archivos_parquet:
-        print("❌ No se encontraron archivos .parquet en esta partición")
-        print(f"\n🔍 Explorando otras particiones disponibles...")
-        
-        # Listar años disponibles (condicional)
-        if USE_LOCAL_PATHS:
-            base_path_obj = pathlib.Path(INPUT_PATH)
-            if base_path_obj.exists():
-                años_disponibles = [str(d) for d in base_path_obj.glob("iso_year=*")]
-                años_con_datos = [año for año in años_disponibles if 'iso_year=' in año]
-                print(f"📅 Años disponibles (local): {años_con_datos}")
-            else:
-                print(f"❌ Directorio base local no encontrado: {INPUT_PATH}")
-        else:
-            try:
-                años_disponibles = gfs.ls(INPUT_PATH)
-                años_con_datos = [año for año in años_disponibles if 'iso_year=' in año]
-                print(f"📅 Años disponibles (GCS): {años_con_datos}")
-            except Exception as e:
-                print(f"❌ Error al explorar particiones en GCS: {e}")
-        
-        df_lazy = None
-        df_sample = None
-    else:
-        # Usar el primer archivo parquet encontrado
-        archivo_target = archivos_parquet[0]
-        print(f"✅ Usando archivo: {archivo_target}")
-        
-        if USE_LOCAL_PATHS:
-            df_lazy = pl.scan_parquet(archivo_target)
-            print("✅ LazyFrame creado exitosamente (Local)")
-        else:
-            # Crear LazyFrame usando el filesystem de GCS
-            try:
-                df_lazy = pl.scan_parquet(archivo_target, storage_options={
-                    "google_cloud_storage": True,
-                    "service_account": os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-                })
-                print("✅ LazyFrame creado exitosamente con GCS")
-            except Exception as scan_error:
-                print(f"❌ Error al crear LazyFrame con GCS: {scan_error}")
-                print("🔄 Intentando método alternativo (PyArrow + GCS)...")
-                
-                # Método alternativo: usar PyArrow con GCS
-                try:
-                    import pyarrow.parquet as pq
-                    import pyarrow.fs as fs
-                    
-                    # Crear filesystem de GCS
-                    gcs_fs = fs.GcsFileSystem()
-                    
-                    # Leer metadata del archivo
-                    with gcs_fs.open_input_file(archivo_target) as f:
-                        tabla = pq.read_table(f)
-                    
-                    # Convertir a LazyFrame
-                    df_lazy = pl.from_arrow(tabla).lazy()
-                    print("✅ LazyFrame creado usando PyArrow + GCS")
-                    
-                except Exception as arrow_error:
-                    print(f"❌ Error con método alternativo (PyArrow + GCS): {arrow_error}")
-                    df_lazy = None
-    
+    # Usar read_parquet_portable para cargar el LazyFrame
+    df_lazy = read_parquet_portable(full_glob_path)
+    print("✅ LazyFrame creado exitosamente")
+
     # Solo proceder si el LazyFrame se creó exitosamente
     if df_lazy is not None:
         # Obtener solo el conteo y esquema sin cargar todos los datos
@@ -1554,11 +1461,13 @@ if 'df_dist' in locals() and df_dist is not None:
         # Asegurar que el directorio existe y guardar
         if USE_LOCAL_PATHS:
             pathlib.Path(output_partition).mkdir(parents=True, exist_ok=True)
-            df_para_guardar.write_parquet(output_file, compression='snappy')
         else:
-            gfs.makedirs(output_partition, exist_ok=True)
-            with gfs.open(output_file, 'wb') as f:
-                df_para_guardar.write_parquet(f, compression='snappy')
+            # Polars' sink_parquet can directly handle GCS paths if gcsfs is installed
+            # We still need to ensure the directory exists for GCS
+            fs = get_filesystem()
+            fs.makedirs(output_partition.replace("gs://", "").strip("/"), exist_ok=True)
+            
+        df_para_guardar.sink_parquet(output_file, compression='snappy')
         
         print(f"✅ Datos guardados exitosamente: {len(df_para_guardar):,} viajes")
         print(f"   Columnas guardadas: {len(df_para_guardar.columns)}")
@@ -1741,23 +1650,27 @@ def aplicar_filtros(df):
 # Listar todas las particiones disponibles
 print("\n🔍 Buscando particiones disponibles...")
 try:
-    # Listar años
-    years_dirs = [d for d in gfs.ls(INPUT_PATH) if 'iso_year=' in d]
-    
     particiones = []
-    for year_dir in years_dirs:
-        year = int(year_dir.split('iso_year=')[1])
-        weeks_dirs = [d for d in gfs.ls(year_dir) if 'iso_week=' in d]
-        
-        for week_dir in weeks_dirs:
-            week = int(week_dir.split('iso_week=')[1])
-            # Verificar que existe el archivo de datos
-            data_file = f"{week_dir}/data-0.parquet"
-            if gfs.exists(data_file):
+    if USE_LOCAL_PATHS:
+        for year_dir in pathlib.Path(INPUT_PATH).glob("iso_year=*"):
+            year = int(str(year_dir).split('iso_year=')[1])
+            for week_dir in year_dir.glob("iso_week=*"):
+                week = int(str(week_dir).split('iso_week=')[1])
                 particiones.append({
                     'year': year,
                     'week': week,
-                    'path': data_file
+                    'path': str(week_dir / "data-0.parquet") # Assuming fixed filename
+                })
+    else:
+        fs = get_filesystem()
+        for year_dir in fs.glob(f"{INPUT_PATH.replace('gs://', '').strip('/')}/iso_year=*"):
+            year = int(year_dir.split('iso_year=')[1])
+            for week_dir in fs.glob(f"{year_dir}/iso_week=*"):
+                week = int(week_dir.split('iso_week=')[1])
+                particiones.append({
+                    'year': year,
+                    'week': week,
+                    'path': f"gs://{week_dir}/data-0.parquet"
                 })
     
     print(f"✅ Se encontraron {len(particiones)} particiones para procesar")
@@ -1783,10 +1696,17 @@ if particiones:
     
     for p in particiones:
         output_file = f"{OUTPUT_PATH}/iso_year={p['year']}/iso_week={p['week']}/data-0.parquet"
-        if gfs.exists(output_file) and not FORCE_REPROCESS:
-            particiones_existentes += 1
+        if USE_LOCAL_PATHS:
+            if pathlib.Path(output_file).exists() and not FORCE_REPROCESS:
+                particiones_existentes += 1
+            else:
+                particiones_pendientes.append(p)
         else:
-            particiones_pendientes.append(p)
+            fs = get_filesystem()
+            if fs.exists(output_file.replace("gs://", "").strip("/")) and not FORCE_REPROCESS:
+                particiones_existentes += 1
+            else:
+                particiones_pendientes.append(p)
     
     print(f"\n📊 Estado de particiones:")
     print(f"   - Total disponibles: {len(particiones)}")
@@ -1820,12 +1740,7 @@ if particiones:
             input_file = particion['path']
             
             # Leer partición
-            with fs_arrow.open_input_file(input_file) as f:
-                tabla = pq.read_table(f)
-            df = pl.from_arrow(tabla)
-            
-            # Liberar tabla de Arrow inmediatamente
-            del tabla
+            df = read_parquet_portable(input_file).collect()
             
             # Aplicar filtros
             df_filtrado, stats = aplicar_filtros(df)
@@ -1844,11 +1759,13 @@ if particiones:
             output_partition = f"{OUTPUT_PATH}/iso_year={year}/iso_week={week}"
             output_file = f"{output_partition}/data-0.parquet"
             
-            gfs.makedirs(output_partition, exist_ok=True)
+            if USE_LOCAL_PATHS:
+                pathlib.Path(output_partition).mkdir(parents=True, exist_ok=True)
+            else:
+                fs = get_filesystem()
+                fs.makedirs(output_partition.replace("gs://", "").strip("/"), exist_ok=True)
             
-            # Usar Polars directamente (más eficiente en memoria)
-            with gfs.open(output_file, 'wb') as f:
-                df_filtrado.write_parquet(f, compression='snappy')
+            df_filtrado.write_parquet(output_file, compression='snappy')
             
             # Liberar DataFrame filtrado
             del df_filtrado
@@ -1982,22 +1899,42 @@ print("="*80)
 
 # Listar particiones de entrada
 input_partitions = set()
-years_dirs = [d for d in gfs.ls(INPUT_PATH) if 'iso_year=' in d]
-for year_dir in years_dirs:
-    year = int(year_dir.split('iso_year=')[1])
-    weeks_dirs = [d for d in gfs.ls(year_dir) if 'iso_week=' in d]
-    for week_dir in weeks_dirs:
-        week = int(week_dir.split('iso_week=')[1])
-        data_file = f"{week_dir}/data-0.parquet"
-        if gfs.exists(data_file):
-            input_partitions.add((year, week))
+if USE_LOCAL_PATHS:
+    for year_dir in pathlib.Path(INPUT_PATH).glob("iso_year=*"):
+        year = int(str(year_dir).split('iso_year=')[1])
+        for week_dir in year_dir.glob("iso_week=*"):
+            week = int(str(week_dir).split('iso_week=')[1])
+            if (week_dir / "data-0.parquet").exists():
+                input_partitions.add((year, week))
+else:
+    fs = get_filesystem()
+    for year_dir in fs.glob(f"{INPUT_PATH.replace('gs://', '').strip('/')}/iso_year=*"):
+        year = int(year_dir.split('iso_year=')[1])
+        for week_dir in fs.glob(f"{year_dir}/iso_week=*"):
+            week = int(week_dir.split('iso_week=')[1])
+            if fs.exists(f"{week_dir}/data-0.parquet"):
+                input_partitions.add((year, week))
 
 # Listar particiones de salida
 output_partitions = set()
-if gfs.exists(OUTPUT_PATH):
-    years_dirs = [d for d in gfs.ls(OUTPUT_PATH) if 'iso_year=' in d]
-    for year_dir in years_dirs:
-        year = int(year_dir.split('iso_year=')[1])
+if USE_LOCAL_PATHS:
+    if pathlib.Path(OUTPUT_PATH).exists():
+        for year_dir in pathlib.Path(OUTPUT_PATH).glob("iso_year=*"):
+            year = int(str(year_dir).split('iso_year=')[1])
+            for week_dir in year_dir.glob("iso_week=*"):
+                week = int(str(week_dir).split('iso_week=')[1])
+                if (week_dir / "data-0.parquet").exists():
+                    output_partitions.add((year, week))
+else:
+    fs = get_filesystem()
+    if fs.exists(OUTPUT_PATH.replace("gs://", "").strip("/")):
+        for year_dir in fs.glob(f"{OUTPUT_PATH.replace('gs://', '').strip('/')}/iso_year=*"):
+            year = int(year_dir.split('iso_year=')[1])
+            for week_dir in fs.glob(f"{year_dir}/iso_week=*"):
+                week = int(week_dir.split('iso_week=')[1])
+                if fs.exists(f"{week_dir}/data-0.parquet"):
+                    output_partitions.add((year, week))
+
         weeks_dirs = [d for d in gfs.ls(year_dir) if 'iso_week=' in d]
         for week_dir in weeks_dirs:
             week = int(week_dir.split('iso_week=')[1])

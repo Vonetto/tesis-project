@@ -19,21 +19,20 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, Tuple
 
 import polars as pl
-import pyarrow.parquet as pq
-import gcsfs
-import pyarrow.fs as pafs
-import pyarrow.dataset as ds
 from tqdm import tqdm
 
 # Habilitar StringCache globalmente para optimizar el uso de memoria
 pl.enable_string_cache()
 
 import pathlib
+from collections import defaultdict # Added for main function
 
 project_root = os.path.abspath(os.path.join(os.getcwd(), '..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
+# Importar funciones de acceso a datos centralizadas
+from lib.datalake import read_parquet_portable, get_filesystem
 
 # Importar constantes desde config
 from config.constants import GCS_BUCKET_NAME, GCS_SILVER_PREFIX, USE_LOCAL_PATHS, LOCAL_SILVER_PATH, GCS_SILVER_PATH
@@ -69,28 +68,9 @@ FORCE_REPROCESS = True  # False = solo procesa las que faltan (idempotente)
 VERBOSE = True  # Mostrar detalles de cada partición procesada
 
 
-# ============================================================================
-# AUTENTICACIÓN GCS
-# ============================================================================
-
-def enable_adc_crossplatform():
-    """Configura credenciales de Google Cloud para acceso a GCS"""
-    if USE_LOCAL_PATHS:
-        return # ADC not needed for local paths
-    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        return
-    if sys.platform.startswith("win"):
-        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
-    else:
-        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
-    if not os.path.exists(adc_path):
-        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
-
-
-# ============================================================================
+# ============================================================================ 
 # FUNCIÓN DE PROCESAMIENTO
-# ============================================================================
+# ============================================================================ 
 
 def crear_columnas_de_calidad(df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -184,9 +164,9 @@ def generar_features_y_anomalias(df: pl.DataFrame) -> Tuple[pl.DataFrame, Dict]:
     return df_final, stats
 
 
-# ============================================================================
+# ============================================================================ 
 # PROCESAMIENTO DE PARTICIÓN
-# ============================================================================
+# ============================================================================ 
 
 def procesar_particion(particion: Dict, force_reprocess: bool = False, verbose: bool = False) -> Dict:
     """
@@ -200,17 +180,6 @@ def procesar_particion(particion: Dict, force_reprocess: bool = False, verbose: 
     if isinstance(input_files, str):
         input_files = [input_files]
     
-    fs = None # Initialize fs
-    fs_arrow = None # Initialize fs_arrow
-
-    if not USE_LOCAL_PATHS:
-        try:
-            enable_adc_crossplatform()
-            fs = gcsfs.GCSFileSystem(token="google_default")
-            fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(fs))
-        except Exception as e:
-            return {'status': 'error', 'year': year, 'week': week, 'error': f"Error de autenticación GCS: {e}"}
-    
     # --- Idempotency check on the FINAL output ---
     output_partition_filtrados = f"{OUTPUT_FILTRADOS_PATH}/iso_year={year}/iso_week={week}"
     output_file_filtrados = f"{output_partition_filtrados}/data-0.parquet"
@@ -219,26 +188,27 @@ def procesar_particion(particion: Dict, force_reprocess: bool = False, verbose: 
         if pathlib.Path(output_file_filtrados).exists() and not force_reprocess:
             return {'status': 'skipped', 'year': year, 'week': week}
     else:
+        fs = get_filesystem()
         if fs.exists(output_file_filtrados.replace("gs://", "").strip("/")) and not force_reprocess:
             return {'status': 'skipped', 'year': year, 'week': week}
     
     df = None
     df_final = None
-    tabla = None
     
     try:
         if verbose: 
             print(f"\n📖 Leyendo {year}-W{week} ({len(input_files)} archivo{'s' if len(input_files) > 1 else ''})...")
         
-        # --- FIX: Comprobar si los archivos están vacíos antes de leer ---
+        # --- Comprobar si los archivos están vacíos antes de leer ---
         non_empty_files = []
         if USE_LOCAL_PATHS:
             for f in input_files:
-                if Path(f).stat().st_size > 0:
+                if pathlib.Path(f).stat().st_size > 0:
                     non_empty_files.append(f)
         else:
+            fs = get_filesystem()
             for f in input_files:
-                if fs.info(f)['size'] > 0:
+                if fs.info(f.replace("gs://", "").strip('/'))['size'] > 0:
                     non_empty_files.append(f)
         
         if not non_empty_files:
@@ -248,17 +218,8 @@ def procesar_particion(particion: Dict, force_reprocess: bool = False, verbose: 
                 'week': week,
             }
 
-        # --- FIX: Leer cada archivo por separado y concatenar con Polars ---
-        # Este método es más robusto ante inconsistencias de schema entre archivos
-        # que usar la unificación de pyarrow.dataset.
-        lista_dfs = []
-        for file in non_empty_files:
-            if USE_LOCAL_PATHS:
-                df_part = pl.read_parquet(file)
-            else:
-                # Polars puede leer directamente desde GCS si gcsfs está instalado
-                df_part = pl.read_parquet(file)
-            lista_dfs.append(df_part)
+        # --- Leer cada archivo por separado y concatenar con Polars ---
+        lista_dfs = [read_parquet_portable(file).collect() for file in non_empty_files]
 
         if not lista_dfs:
              return {
@@ -269,7 +230,6 @@ def procesar_particion(particion: Dict, force_reprocess: bool = False, verbose: 
             }
         
         df_viajes = pl.concat(lista_dfs) if len(lista_dfs) > 1 else lista_dfs[0]
-        n_rows = len(df_viajes)
         
         # --- Si se corre sobre 'enriquecidos', solo crear columnas necesarias, no filtrar ---
         if RUN_ON_ENRIQUECIDOS:
@@ -326,11 +286,11 @@ def procesar_particion(particion: Dict, force_reprocess: bool = False, verbose: 
   
         if USE_LOCAL_PATHS:
             pathlib.Path(output_partition_filtrados).mkdir(parents=True, exist_ok=True)
-            df_filtrado.write_parquet(output_file_filtrados, compression='zstd')
         else:
+            fs = get_filesystem()
             fs.makedirs(output_partition_filtrados.replace("gs://", "").strip("/"), exist_ok=True)
-            with fs.open(output_file_filtrados.replace("gs://", "").strip("/"), 'wb') as f:
-                df_filtrado.write_parquet(f, compression='zstd')
+            
+        df_filtrado.write_parquet(output_file_filtrados, compression='zstd')
             
         if verbose: print(f"   ✓ Partición {year}-W{week} guardada exitosamente.")
         
@@ -345,9 +305,9 @@ def procesar_particion(particion: Dict, force_reprocess: bool = False, verbose: 
         return {'status': 'error', 'year': year, 'week': week, 'error': f"{str(e)}\n{error_detail}"}
 
 
-# ============================================================================
+# ============================================================================ 
 # MAIN
-# ============================================================================
+# ============================================================================ 
 
 def main():
     print("="*80)
@@ -361,11 +321,11 @@ def main():
     print(f"   - Input:  {INPUT_PATH}")
     print(f"   - Output: {OUTPUT_FILTRADOS_PATH}")
     
-    fs = None # Initialize fs
+    # Initialize GCS filesystem once if needed
     if not USE_LOCAL_PATHS:
+        # This will call get_filesystem() and potentially authenticate
         try:
-            enable_adc_crossplatform()
-            fs = gcsfs.GCSFileSystem(token="google_default")
+            get_filesystem()
             print("\n✅ Conexión con GCS establecida")
         except Exception as e:
             print(f"\n❌ Error de autenticación: {e}"); return 1
@@ -387,8 +347,11 @@ def main():
                         for p in week_dir.glob("*.parquet") if not p.name.startswith('._')
                     ])
         else:
+            fs = get_filesystem()
             # GCS glob
-            for year_dir in fs.glob(f"{INPUT_PATH.replace('gs://', '').strip('/')}/iso_year=*"):
+            # Ensure INPUT_PATH is treated as a GCS path for globbing
+            gcs_input_path = INPUT_PATH.replace("gs://", "").strip('/')
+            for year_dir in fs.glob(f"{gcs_input_path}/iso_year=*"):
                 year = int(year_dir.split('iso_year=')[1])
                 for week_dir in fs.glob(f"{year_dir}/iso_week=*"):
                     week = int(week_dir.split('iso_week=')[1])
@@ -416,14 +379,55 @@ def main():
     print("\n" + "="*80); print("🚀 INICIANDO PROCESAMIENTO"); print("="*80)
     start_time = time.time()
     
-    stats_globales = defaultdict(int)
+    # Verificar cuántas particiones ya existen
+    particiones_pendientes = []
+    particiones_existentes = 0
+    
+    for p in particiones_final:
+        output_partition = f"{OUTPUT_FILTRADOS_PATH}/iso_year={p['year']}/iso_week={p['week']}"
+        output_file = f"{output_partition}/data-0.parquet"
+        
+        if USE_LOCAL_PATHS:
+            if pathlib.Path(output_file).exists() and not FORCE_REPROCESS:
+                particiones_existentes += 1
+            else:
+                particiones_pendientes.append(p)
+        else:
+            fs = get_filesystem()
+            if fs.exists(output_file.replace("gs://", "").strip("/")) and not FORCE_REPROCESS:
+                particiones_existentes += 1
+            else:
+                particiones_pendientes.append(p)
+
+    print(f"\n📊 Estado de particiones:")
+    print(f"   - Total disponibles: {len(particiones_final)}")
+    print(f"   - Ya procesadas (skip): {particiones_existentes}")
+    print(f"   - Pendientes de procesar: {len(particiones_pendientes)}")
+    
+    if len(particiones_pendientes) == 0:
+        print("\n✅ Todas las particiones ya fueron procesadas!")
+        print("   Para reprocesar, cambia FORCE_REPROCESS = True")
+    else:
+        print(f"\n⏱️  Tiempo estimado: ~{len(particiones_pendientes) * 0.5:.1f} - {len(particiones_pendientes) * 2:.1f} minutos")
+        print("💾 Memoria: Se libera explícitamente después de cada partición")
+    
+    stats_globales = {
+        'n_inicial': 0,
+        'n_filtrados_tiempo': 0,
+        'n_filtrados_paraderos': 0,
+        'n_filtrados_dist': 0,
+        'n_final': 0,
+        'particiones_procesadas': 0,
+        'particiones_skipped': particiones_existentes,
+        'particiones_fallidas': 0
+    }
     
     with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        futures = {executor.submit(procesar_particion, p, FORCE_REPROCESS, VERBOSE): p for p in particiones_final}
+        futures = {executor.submit(procesar_particion, p, FORCE_REPROCESS, VERBOSE): p for p in particiones_pendientes} # Changed from particiones_final to particiones_pendientes
         
         iterable = as_completed(futures)
         if not VERBOSE:
-            iterable = tqdm(iterable, total=len(particiones_final), desc="Procesando")
+            iterable = tqdm(iterable, total=len(particiones_pendientes), desc="Procesando") # Changed from particiones_final to particiones_pendientes
 
         for future in iterable:
             try:
@@ -470,7 +474,7 @@ def main():
             "c1_vr_baja", "c2_ve_alta", "c3_vr_alta_dr_corto", "c4_vr_alta_dr_largo"
         ]
         
-        print(f"{'Causa de Anomalia':<30} {'Conteos':>15} {'%':>8}")
+        print(f"{ 'Causa de Anomalia':<30} {'Conteos':>15} {'%':>8}")
         print(f"{'-'*30} {'-'*15} {'-'*8}")
 
         for key in anomaly_keys:
@@ -482,7 +486,7 @@ def main():
         
         total_anomalos = stats_globales['n_anomalos']
         total_anomalos_pct = (total_anomalos / stats_globales['n_inicial'] * 100) if stats_globales['n_inicial'] > 0 else 0
-        print(f"{'TOTAL ANÓMALOS (al menos una causa)':<30} {total_anomalos:>15,} {total_anomalos_pct:>7.2f}%")
+        print(f"{ 'TOTAL ANÓMALOS (al menos una causa)':<30} {total_anomalos:>15,} {total_anomalos_pct:>7.2f}%")
     
     print("\n" + "="*80)
     if stats_globales['error'] == 0:

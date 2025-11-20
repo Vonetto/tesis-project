@@ -32,52 +32,35 @@ El proceso es el siguiente:
 import os
 import sys
 import polars as pl
-import pyarrow as pa
-import pyarrow.dataset as ds
-import pyarrow.fs as pafs
-import pyarrow.parquet as pq
-import gcsfs
 from tqdm import tqdm
 
 import pathlib
-# Esto es necesario para que Python encuentre el módulo 'config'
+from pathlib import Path
 
-project_root = os.path.abspath(os.path.join(os.getcwd(), '..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+# Asegurar que el paquete 'config' y 'lib' sean importables
+# Se busca el directorio raíz del proyecto (que contiene 'config/' y 'lib/') y se añade a sys.path
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    # Este 'else' se ejecuta si el bucle termina sin 'break', lo que significa que no se encontró el directorio.
+    # Se añade una comprobación extra por si el notebook se ejecuta desde el propio directorio raíz.
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+    else:
+        raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
+
+# Importar funciones de acceso a datos centralizadas
+from lib.datalake import read_parquet_portable, get_filesystem
 
 # Importar constantes desde config
 from config.constants import GCS_BUCKET_NAME, GCS_SILVER_PREFIX, USE_LOCAL_PATHS, LOCAL_SILVER_PATH, GCS_SILVER_PATH
 
-# --- Autenticación GCS ---
-def enable_adc_crossplatform():
-    """Configura credenciales de Google Cloud para acceso a GCS"""
-    if USE_LOCAL_PATHS:
-        return # ADC not needed for local paths
-    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        return
-    if sys.platform.startswith("win"):
-        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
-    else:
-        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
-    if not os.path.exists(adc_path):
-        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
-
-gfs = None # Initialize gfs
-fs_arrow = None # Initialize fs_arrow
-
-if not USE_LOCAL_PATHS:
-    try:
-        enable_adc_crossplatform()
-        gfs = gcsfs.GCSFileSystem(token="google_default")
-        # Crear filesystem de PyArrow compatible con GCS
-        fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
-        print("✅ Conexión con GCS establecida.")
-    except FileNotFoundError as e:
-        print(f"❌ Error de autenticación: {e}")
-else:
-    print("✅ Usando rutas locales.")
 
 # --- Parámetros ---
 if USE_LOCAL_PATHS:
@@ -105,35 +88,8 @@ Cargamos el dataset `viajes_limpios` (creado en 02_data_quality.qmd) que ya tien
 
 ```{python}
 try:
-    # Buscar todos los archivos .parquet (enfoque lazy - no carga todo en memoria)
-    print("🔍 Buscando archivos .parquet en Silver...")
-    
-    if USE_LOCAL_PATHS:
-        archivos_parquet = [str(p) for p in pathlib.Path(INPUT_PATH).glob("**/*.parquet")]
-    else:
-        archivos_parquet = gfs.glob(f"{INPUT_PATH.replace('gs://', '').strip('/')}/**/*.parquet")
-        archivos_parquet = [f"gs://{p}" for p in archivos_parquet] # Add gs:// scheme back for Polars
-    
-    print(f"   ✅ Encontrados {len(archivos_parquet)} archivos")
-    
-    if len(archivos_parquet) == 0:
-        raise FileNotFoundError(f"No se encontraron archivos .parquet en {INPUT_PATH}")
-    
-    # Convertir a Polars LazyFrame
-    print("🔄 Convirtiendo a Polars LazyFrame...")
-    if USE_LOCAL_PATHS:
-        lf_viajes = pl.scan_parquet(archivos_parquet)
-    else:
-        # Crear dataset de PyArrow usando el filesystem autenticado
-        # partitioning=None evita problemas con tipos inconsistentes
-        print("📖 Configurando dataset con PyArrow...")
-        dataset = ds.dataset(
-            [p.replace("gs://", "").strip("/") for p in archivos_parquet],  # Lista de rutas sin gs://
-            filesystem=fs_arrow,  # Usa el filesystem autenticado
-            format="parquet",
-            partitioning=None  # No leer columnas de partición (evita conflictos de tipos)
-        )
-        lf_viajes = pl.scan_pyarrow_dataset(dataset)
+    # Usar read_parquet_portable para cargar el LazyFrame
+    lf_viajes = read_parquet_portable(f"{INPUT_PATH}/**/*.parquet")
     
     print("✅ Lectura de `viajes_limpios` configurada (lazy).")
     print(f"   Columnas: {len(lf_viajes.collect_schema().names())}")
@@ -543,12 +499,7 @@ if 'validos_globales' in globals() and 'total_viajes' in globals():
         print("\n🔍 Escaneando 'viajes_filtrados' (output del script)...")
         
         # Scan the entire partitioned dataset
-        if USE_LOCAL_PATHS:
-            lf_filtrados_real = pl.scan_parquet(f"{OUTPUT_FILTRADOS_PATH}/**/*.parquet")
-        else:
-            lf_filtrados_real = pl.scan_pyarrow_dataset(
-                ds.dataset(OUTPUT_FILTRADOS_PATH, filesystem=fs_arrow, format="parquet")
-            )
+        lf_filtrados_real = read_parquet_portable(f"{OUTPUT_FILTRADOS_PATH}/**/*.parquet")
         
         # Get the total row count
         conteo_real = lf_filtrados_real.select(pl.len()).collect().item()

@@ -23,16 +23,23 @@ Este notebook tiene como objetivo:
 import sys
 from pathlib import Path
 
-# Asegurar que el directorio raíz del proyecto esté en sys.path
+# Asegurar que el paquete 'config' y 'lib' sean importables
+# Se busca el directorio raíz del proyecto (que contiene 'config/' y 'lib/') y se añade a sys.path
 PROJECT_ROOT = Path().resolve()
 while PROJECT_ROOT != PROJECT_ROOT.parent:
-    if (PROJECT_ROOT / "config").is_dir():
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
         if str(PROJECT_ROOT) not in sys.path:
             sys.path.append(str(PROJECT_ROOT))
         break
     PROJECT_ROOT = PROJECT_ROOT.parent
 else:
-    raise RuntimeError("No se pudo localizar el directorio raíz con el paquete 'config'.")
+    # Este 'else' se ejecuta si el bucle termina sin 'break', lo que significa que no se encontró el directorio.
+    # Se añade una comprobación extra por si el notebook se ejecuta desde el propio directorio raíz.
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+    else:
+        raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
 
 from config import (
     HORAS_PUNTA_MANANA,
