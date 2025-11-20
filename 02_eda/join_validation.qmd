@@ -12,41 +12,53 @@ En este bloque, importamos librerías, definimos la conexión a GCS y las funcio
 import polars as pl
 import os
 import sys
-import gcsfs
-import pyarrow.dataset as ds
-import pyarrow.fs as pafs
 import re
 from datetime import datetime
+from pathlib import Path
+
+# Asegurar que el paquete 'config' y 'lib' sean importables
+# Se busca el directorio raíz del proyecto (que contiene 'config/' y 'lib/') y se añade a sys.path
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    # Este 'else' se ejecuta si el bucle termina sin 'break', lo que significa que no se encontró el directorio.
+    # Se añade una comprobación extra por si el notebook se ejecuta desde el propio directorio raíz.
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+    else:
+        raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
+
+# Importar funciones de acceso a datos centralizadas
+from lib.datalake import read_parquet_portable
+
+# Importar constantes desde config
+from config.constants import USE_LOCAL_PATHS, LOCAL_BRONZE_PATH, GCS_BRONZE_PATH
 
 # Configuraciones de visualización
 pl.Config.set_tbl_rows(20)
 pl.Config.set_tbl_cols(50)
 
 # --- Setup de Conexión y Funciones ---
-GCS_BUCKET = os.getenv("GCS_BUCKET", "tesis-vonetto-datalake")
-BRONZE_PREFIX = os.getenv("BRONZE_PREFIX", "lake/bronze")
-gfs = gcsfs.GCSFileSystem(token="google_default")
-fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(gfs))
-
-def gsjoin(*parts: str) -> str:
-    return "gs://" + "/".join(s.strip("/") for s in parts)
+if USE_LOCAL_PATHS:
+    BRONZE_BASE_PATH = LOCAL_BRONZE_PATH
+else:
+    BRONZE_BASE_PATH = GCS_BRONZE_PATH
 
 def scan_bronze(dataset: str, semana_iso: str | None = None) -> pl.LazyFrame:
-    base_gs = gsjoin(GCS_BUCKET, BRONZE_PREFIX, dataset).rstrip("/")
+    base_path = f"{BRONZE_BASE_PATH}/{dataset}"
     if semana_iso:
-        part_norm  = f"{base_gs}/semana_iso={semana_iso}/*.parquet"
-        part_tuple = f"{base_gs}/semana_iso=('{semana_iso}',)/*.parquet"
-        try:
-            return pl.scan_parquet(part_norm)
-        except Exception:
-            try:
-                return pl.scan_parquet(part_tuple)
-            except Exception as e:
-                raise e
+        part_norm  = f"{base_path}/semana_iso={semana_iso}/*.parquet"
+        return read_parquet_portable(part_norm)
     else:
-        base_no_scheme = base_gs.replace("gs://", "", 1)
-        dset = ds.dataset(base_no_scheme, filesystem=fs_arrow, format="parquet")
-        return pl.scan_pyarrow_dataset(dset)
+        # If no specific week, scan the entire dataset
+        return read_parquet_portable(f"{base_path}/**/*.parquet")
+
 
 def _fix_ddmmyy_to_iso(expr: pl.Expr) -> pl.Expr:
     s = expr.cast(pl.Utf8).str.strip_chars()

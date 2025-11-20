@@ -48,11 +48,33 @@ import os
 import sys
 import polars as pl
 import pandas as pd
-import gcsfs
-import pyarrow.fs as pafs
 import logging
 import gc
 import time
+from pathlib import Path
+
+# Asegurar que el paquete 'config' y 'lib' sean importables
+# Se busca el directorio raíz del proyecto (que contiene 'config/' y 'lib/') y se añade a sys.path
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    # Este 'else' se ejecuta si el bucle termina sin 'break', lo que significa que no se encontró el directorio.
+    # Se añade una comprobación extra por si el notebook se ejecuta desde el propio directorio raíz.
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+    else:
+        raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
+
+# Importar funciones de acceso a datos centralizadas
+from lib.datalake import read_parquet_portable
+
+from config import HORAS_PUNTA_MANANA, HORAS_PUNTA_TARDE, GCS_BUCKET_NAME, GCS_SILVER_PATH, USE_LOCAL_PATHS, LOCAL_SILVER_PATH
 
 # Importar biogeme
 from biogeme.version import get_text as biogeme_version_text
@@ -73,29 +95,14 @@ from biogeme.expressions import Beta, Variable
 logger = blog.get_screen_logger(level=blog.INFO)
 logger.info(biogeme_version_text())
 
-# --- Autenticación GCS ---
-def enable_adc_crossplatform():
-    """Configura credenciales de Google Cloud para acceso a GCS"""
-    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"): return
-    if sys.platform.startswith("win"):
-        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
-    else:
-        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
-    if not os.path.exists(adc_path):
-        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
 
-try:
-    enable_adc_crossplatform()
-    gfs = gcsfs.GCSFileSystem(token="google_default")
-    print("✅ Conexión con GCS establecida.")
-except FileNotFoundError as e:
-    print(f"❌ Error de autenticación: {e}")
 
 # --- Parámetros Generales ---
-GCS_BUCKET = "tesis-vonetto-datalake"
-SILVER_PATH = f"gs://{GCS_BUCKET}/lake/silver"
-INPUT_DATASET_PATH = f"{SILVER_PATH}/viajes_filtrados" # Usar datos filtrados
+if USE_LOCAL_PATHS:
+    SILVER_BASE_PATH = LOCAL_SILVER_PATH
+else:
+    SILVER_BASE_PATH = GCS_SILVER_PATH
+INPUT_DATASET_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados" # Usar datos filtrados
 
 # --- Parámetros del Modelo Anidado ---
 
@@ -105,10 +112,6 @@ CONTRATO_IDS_RED = [29]
 CHOICE_BIP = 0
 CHOICE_QR_RED = 1
 CHOICE_QR_OTHER = 2
-
-# --- Constantes Temporales ---
-HORAS_PUNTA_MANANA = [7, 8]
-HORAS_PUNTA_TARDE = [18, 19]
 
 # --- Parámetros de Ejecución Secuencial ---
 
@@ -424,7 +427,7 @@ for year, week in PARTICIONES_A_PROCESAR:
     try:
         # b. Cargar datos
         input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
-        lf_data = pl.scan_parquet(input_path_glob)
+        lf_data = read_parquet_portable(input_path_glob)
         print(f"    Cargando datos desde: {input_path_glob}")
 
         # c. Preparar features (usando la función helper anidada base)
@@ -622,7 +625,7 @@ for year, week in PARTICIONES_A_PROCESAR_NL_EXT:
     try:
         # b. Cargar datos
         input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
-        lf_data = pl.scan_parquet(input_path_glob)
+        lf_data = read_parquet_portable(input_path_glob)
         print(f"    Cargando datos desde: {input_path_glob}")
 
         # c. Preparar features (usando la función helper EXTENDIDA)

@@ -29,32 +29,41 @@ El flujo de trabajo es:
 import os
 import sys
 import polars as pl
-import gcsfs
 from tqdm import tqdm
+from pathlib import Path
+
+# Asegurar que el paquete 'config' y 'lib' sean importables
+# Se busca el directorio raíz del proyecto (que contiene 'config/' y 'lib/') y se añade a sys.path
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    # Este 'else' se ejecuta si el bucle termina sin 'break', lo que significa que no se encontró el directorio.
+    # Se añade una comprobación extra por si el notebook se ejecuta desde el propio directorio raíz.
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+    else:
+        raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
+
+# Importar funciones de acceso a datos centralizadas
+from lib.datalake import read_parquet_portable, scan_csv_portable, get_filesystem
+
+# Importar constantes desde config
+from config.constants import USE_LOCAL_PATHS, LOCAL_BRONZE_PATH, GCS_BRONZE_PATH, LOCAL_RAW_PATH, GCS_RAW_PATH
 
 # --- Parámetros ---
-GCS_BUCKET = "tesis-vonetto-datalake"
-BRONZE_VIAJES_PATH = f"gs://{GCS_BUCKET}/lake/bronze/viajes"
-RAW_PATH = f"gs://{GCS_BUCKET}/raw"
+if USE_LOCAL_PATHS:
+    BRONZE_VIAJES_PATH = f"{LOCAL_BRONZE_PATH}/viajes"
+    RAW_PATH = LOCAL_RAW_PATH
+else:
+    BRONZE_VIAJES_PATH = f"{GCS_BRONZE_PATH}/viajes"
+    RAW_PATH = GCS_RAW_PATH
 
-# --- Conexión ---
-def enable_adc_crossplatform():
-    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        return
-    if sys.platform.startswith("win"):
-        adc_path = os.path.join(os.environ["APPDATA"], "gcloud", "application_default_credentials.json")
-    else:
-        adc_path = os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
-    if not os.path.exists(adc_path):
-        raise FileNotFoundError(f"No se encontró ADC en {adc_path}. Ejecuta: gcloud auth application-default login")
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = adc_path
-
-try:
-    enable_adc_crossplatform()
-    gfs = gcsfs.GCSFileSystem(token="google_default")
-    print("✅ Conexión con GCS establecida.")
-except FileNotFoundError as e:
-    print(f"❌ Error de autenticación: {e}")
 
 ```
 
@@ -63,16 +72,7 @@ except FileNotFoundError as e:
 Primero, escaneamos la capa Bronze para ver qué particiones (`semana_iso`) existen y cuántos registros tiene cada una. Esto nos da una vista general rápida del estado del Data Lake.
 
 ```{python}
-def scan_bronze_viajes() -> pl.LazyFrame:
-    """Escanea el directorio de viajes en la capa Bronze."""
-    try:
-        return pl.scan_parquet(f"{BRONZE_VIAJES_PATH}/**/*.parquet")
-    except Exception as e:
-        print(f"No se pudo escanear la ruta {BRONZE_VIAJES_PATH}. ¿Ejecutaste la ingesta?", file=sys.stderr)
-        print(f"Error: {e}", file=sys.stderr)
-        return pl.LazyFrame([])
-
-lf_viajes_bronze = scan_bronze_viajes()
+lf_viajes_bronze = read_parquet_portable(f"{BRONZE_VIAJES_PATH}/**/*.parquet")
 
 if lf_viajes_bronze.columns:
     print("Escaneando registros por semana en la capa Bronze...")
@@ -101,32 +101,36 @@ Esta es la validación más robusta. Compara el total de filas en la capa Bronze
 **Advertencia:** Esta celda es lenta, ya que necesita escanear todos los archivos CSV originales desde la red.
 
 ```{python}
-def get_csv_row_count(file_path: str, separator: str) -> int:
-    """Cuenta las filas de un CSV de forma eficiente en memoria."""
-    try:
-        # scan_csv es mucho más eficiente en memoria que read_csv
-        return pl.scan_csv(file_path, separator=separator, has_header=True).select(pl.len()).collect().item()
-    except Exception as e:
-        print(f"Error contando filas en {os.path.basename(file_path)}: {e}")
-        return 0
-
 if lf_viajes_bronze.columns:
     print("--- Validación de Conteo de Filas ---")
     
     # 1. Contar filas en Parquet (rápido)
     print("Contando filas en la capa Bronze (Parquet)... Esto es rápido.")
-    total_parquet_rows = lf_viajes_bronze.select(pl.len()).collect().item()
+    try:
+        total_parquet_rows = lf_viajes_bronze.select(pl.len()).collect().item()
+    except Exception as e:
+        print(f"❌ Error al contar filas en Parquet: {e}", file=sys.stderr)
+        total_parquet_rows = 0
     print(f"Total de filas en Parquet: {total_parquet_rows:,}")
 
     # 2. Contar filas en CSVs (lento)
     print("\nContando filas en los CSV originales... Esto puede tardar varios minutos.")
     viajes_glob = "raw_csv/source=drive/ingest_date=2025-10-01/*viajes.csv"
     try:
-        csv_files = gfs.glob(f"{RAW_PATH}/{viajes_glob}")
+        csv_files = []
+        if USE_LOCAL_PATHS:
+            csv_files = [str(p) for p in Path(RAW_PATH).glob(viajes_glob)]
+        else:
+            fs = get_filesystem()
+            # The glob pattern should not contain "gs://" for fs.glob
+            gcs_pattern = f"{RAW_PATH.replace('gs://', '').strip('/')}/{viajes_glob}"
+            csv_files = [f"gs://{p}" for p in fs.glob(gcs_pattern)]
+
         total_csv_rows = 0
         for file in tqdm(csv_files, desc="Escaneando CSVs"):
             # Asumimos el separador por defecto, se podría detectar si fuera necesario
-            total_csv_rows += get_csv_row_count(f"gs://{file}", separator=";")
+            # Usamos scan_csv_portable
+            total_csv_rows += scan_csv_portable(file, separator=";", has_header=True).select(pl.len()).collect().item()
         
         print(f"Total de filas en CSVs: {total_csv_rows:,}")
 
@@ -141,7 +145,7 @@ if lf_viajes_bronze.columns:
             print(f"   - Diferencia:       {abs(total_parquet_rows - total_csv_rows):,}")
 
     except Exception as e:
-        print(f"Ocurrió un error al intentar listar los archivos CSV: {e}")
+        print(f"Ocurrió un error al intentar listar o procesar los archivos CSV: {e}", file=sys.stderr)
 else:
     print("No hay datos para validar el conteo de filas.")
 
