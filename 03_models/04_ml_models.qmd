@@ -238,18 +238,21 @@ def prepare_features_extended(lazy_frame):
     lf_with_modes = lf_with_vars
     for col in cols_modos:
         lf_with_modes = lf_with_modes.with_columns([
-            pl.when(pl.col(col).cast(pl.Utf8) == '4').then(pl.lit('2'))
-              .when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))
+            pl.when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))
               .otherwise(pl.col(col).cast(pl.Utf8))
               .alias(col)
         ])
     
+    bus_flags = [pl.col(c).fill_null("0") == "1" for c in cols_modos]
+    metro_flags = [pl.col(c).fill_null("0") == "2" for c in cols_modos]
+    metrotren_flags = [pl.col(c).fill_null("0") == "4" for c in cols_modos]
     lf_with_modes = lf_with_modes.with_columns([
-        pl.any_horizontal([pl.col(c) == '1' for c in cols_modos]).alias("usa_bus"),
-        pl.any_horizontal([pl.col(c) == '2' for c in cols_modos]).alias("usa_metro"),
+        pl.any_horizontal(bus_flags).alias("usa_bus"),
+        pl.any_horizontal(metro_flags).alias("usa_metro"),
+        pl.any_horizontal(metrotren_flags).alias("usa_metrotren"),
     ]).with_columns([
-         (pl.col("usa_metro") & ~pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
-        (pl.col("usa_metro") & pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+         (pl.col("usa_metro") & ~pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+        (pl.col("usa_metro") & pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
     ])
 
     # Seleccionar columnas finales

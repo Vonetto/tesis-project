@@ -48,6 +48,7 @@ import os
 import sys
 import polars as pl
 import pandas as pd
+import numpy as np
 import logging
 import gc
 import time
@@ -74,7 +75,7 @@ else:
 # Importar funciones de acceso a datos centralizadas
 from lib.datalake import read_parquet_portable
 
-from config import HORAS_PUNTA_MANANA, HORAS_PUNTA_TARDE, GCS_BUCKET_NAME, GCS_SILVER_PATH, USE_LOCAL_PATHS, LOCAL_SILVER_PATH
+from config import HORAS_PUNTA_MANANA, HORAS_PUNTA_TARDE, GCS_BUCKET_NAME, GCS_SILVER_PATH, USE_LOCAL_PATHS, LOCAL_SILVER_PATH, LOCAL_RAW_PATH, GCS_RAW_PATH
 
 # Importar biogeme
 from biogeme.version import get_text as biogeme_version_text
@@ -88,6 +89,7 @@ import biogeme.database as db
 import biogeme.biogeme as bio
 from biogeme import models
 from biogeme.expressions import Beta, Variable
+from biogeme import nests
 
 
 # --- Configuración Logging Biogeme ---
@@ -104,9 +106,39 @@ else:
     SILVER_BASE_PATH = GCS_SILVER_PATH
 INPUT_DATASET_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados" # Usar datos filtrados
 
-# --- Parámetros del Modelo Anidado ---
+# --- Ruta de Tabla de Caracterización ---
+# Tabla 1: caracterización qr_202504.csv (tiene tipo_app: 'APP RED' o 'OTRA APP')
+if USE_LOCAL_PATHS:
+    RAW_BASE_PATH = LOCAL_RAW_PATH
+    CARACTERIZACION_PATH = "/Volumes/KINGSTON/tesis-project/raw/caracterizacion/caracterización qr_202504.csv"
+else:
+    RAW_BASE_PATH = GCS_RAW_PATH
+    CARACTERIZACION_PATH = f"{RAW_BASE_PATH}/caracterizacion/caracterización qr_202504.csv"
 
-CONTRATO_IDS_RED = [29]
+# Cargar tabla de caracterización una vez (se reutilizará en las funciones)
+print(f"\n📂 Cargando tabla de caracterización...")
+try:
+    df_caracterizacion = pl.read_csv(
+        CARACTERIZACION_PATH,
+        separator=";",
+        try_parse_dates=False
+    )
+    # Convertir id_interno a string para hacer join con id_tarjeta
+    df_caracterizacion = df_caracterizacion.with_columns(
+        pl.col("id_interno").cast(pl.Utf8).alias("id_tarjeta_str")
+    ).select(["id_tarjeta_str", "tipo_app"]).unique()
+    
+    print(f"   ✅ Caracterización cargada: {len(df_caracterizacion):,} usuarios únicos")
+    print(f"   ✅ Distribución tipo_app:")
+    dist_tipo_app = df_caracterizacion['tipo_app'].value_counts()
+    for row in dist_tipo_app.iter_rows(named=True):
+        print(f"      - {row['tipo_app']}: {row['count']:,} usuarios")
+except Exception as e:
+    print(f"   ⚠️ Error cargando caracterización: {e}")
+    df_caracterizacion = None
+
+# --- Parámetros del Modelo Anidado ---
+# Ya no usamos CONTRATO_IDS_RED, ahora usamos tipo_app de la tabla de caracterización
 
 # Códigos para la variable 'choice_nested'
 CHOICE_BIP = 0
@@ -116,21 +148,25 @@ CHOICE_QR_OTHER = 2
 # --- Parámetros de Ejecución Secuencial ---
 
 PARTICIONES_A_PROCESAR = [
-    (2025, 17),
-    (2025, 18)
+    (2025, 15),
+
 ]
 
 APPLY_SAMPLING = False # Cambiar a False para usar partición completa (riesgo OOM)
-SAMPLE_FRACTION = 0.20 # 20% estratificado por la nueva elección anidada
+SAMPLE_FRACTION = 0.50 # 20% estratificado por la nueva elección anidada
 SEED = 42
 BASE_OUTPUT_DIR = "model_outputs_nl_base" # Directorio específico para este modelo
+
+# Especificaciones a ejecutar para el modelo base (generic = betas compartidos, specific = betas por alternativa QR)
+SPECIFICATIONS_TO_RUN = [ "specific"]
 
 
 print(f"\n Dataset de entrada: {INPUT_DATASET_PATH}")
 print(f" Códigos elección: BIP={CHOICE_BIP}, QR_RED={CHOICE_QR_RED}, QR_OTHER={CHOICE_QR_OTHER}")
-print(f" IDs Contrato App Red: {CONTRATO_IDS_RED}")
+print(f" Identificación APP RED: usando tabla de caracterización (tipo_app='APP RED')")
 print(f" Aplicar muestreo: {APPLY_SAMPLING} (Fracción: {SAMPLE_FRACTION if APPLY_SAMPLING else 'N/A'})")
 print(f" Directorio base de salida: {BASE_OUTPUT_DIR}")
+print(f" Especificaciones a estimar: {', '.join(SPECIFICATIONS_TO_RUN)}")
 
 # --- Paralelismo ---
 N_THREADS = max(1, (os.cpu_count() or 2) // 2)  # usa ~50% de CPUs por seguridad
@@ -223,22 +259,54 @@ def get_stratified_sample_nested(df: pl.DataFrame, fraction: float, seed: int) -
         return df.clear() # Devuelve DataFrame vacío si no se pudo muestrear
 
 # --- Helper para Feature Engineering (Modelo Anidado Base) ---
-def prepare_nested_base_features(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
-    """Prepara las features para el modelo anidado base (solo temporales)."""
-    # Columnas necesarias mínimas
-    cols_necesarias = ["is_qr", "contrato", "tiempo_inicio_viaje", "tipodia"]
+def prepare_nested_base_features(lazy_frame: pl.LazyFrame, df_caract: pl.DataFrame = None) -> pl.LazyFrame:
+    """
+    Prepara las features para el modelo anidado base (solo temporales).
     
-    # Verificar si 'contrato' existe, si no, asignar un valor default para que no falle
+    Args:
+        lazy_frame: LazyFrame con datos de viajes
+        df_caract: DataFrame con tabla de caracterización (tipo_app). Si es None, usa la global.
+    """
+    # Usar la tabla de caracterización global si no se proporciona una
+    if df_caract is None:
+        df_caract = globals().get('df_caracterizacion', None)
+    
+    # Columnas necesarias mínimas
+    cols_necesarias = ["is_qr", "id_tarjeta", "tiempo_inicio_viaje", "tipodia"]
+    
+    # Verificar columnas necesarias
     schema = lazy_frame.collect_schema()
-    if 'contrato' not in schema:
-        print("      Advertencia: Columna 'contrato' no encontrada. Asumiendo todos los QR como 'OTHER'.")
-        lazy_frame = lazy_frame.with_columns(pl.lit(None).alias('contrato')) # Añadir columna nula
-
-    lf_prep = lazy_frame.select(cols_necesarias).with_columns([
+    missing_cols = [col for col in cols_necesarias if col not in schema]
+    if missing_cols:
+        raise ValueError(f"Columnas faltantes en datos: {missing_cols}")
+    
+    # Preparar datos para join: convertir id_tarjeta a string
+    lf_prep = lazy_frame.select(cols_necesarias).with_columns(
+        pl.col("id_tarjeta").cast(pl.Utf8).alias("id_tarjeta_str")
+    )
+    
+    # Hacer join con tabla de caracterización si está disponible
+    if df_caract is not None:
+        # Convertir df_caract a LazyFrame para el join
+        lf_caract = df_caract.lazy()
+        lf_prep = lf_prep.join(
+            lf_caract,
+            on="id_tarjeta_str",
+            how="left"
+        )
+        print("      ✅ Join con tabla de caracterización realizado")
+    else:
+        # Si no hay tabla de caracterización, crear columna tipo_app como None
+        lf_prep = lf_prep.with_columns(pl.lit(None).cast(pl.Utf8).alias("tipo_app"))
+        print("      ⚠️ Tabla de caracterización no disponible, todos los QR serán clasificados como 'OTHER'")
+    
+    # Crear choice_nested usando tipo_app
+    lf_prep = lf_prep.with_columns([
         # Crear choice_nested (0=BIP, 1=QR_RED, 2=QR_OTHER)
         pl.when(pl.col("is_qr") == False).then(pl.lit(CHOICE_BIP))
-          .when(pl.col("contrato").cast(pl.Int64, strict=False).is_in(CONTRATO_IDS_RED)).then(pl.lit(CHOICE_QR_RED))
-          .otherwise(pl.lit(CHOICE_QR_OTHER)) # Asume qr=True y no RED es OTHER
+          .when((pl.col("is_qr") == True) & (pl.col("tipo_app") == "APP RED")).then(pl.lit(CHOICE_QR_RED))
+          .when(pl.col("is_qr") == True).then(pl.lit(CHOICE_QR_OTHER))  # QR pero no APP RED
+          .otherwise(pl.lit(CHOICE_BIP))  # Fallback (no debería ocurrir)
           .cast(pl.Int8)
           .alias("choice_nested"),
         pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
@@ -268,33 +336,60 @@ print("✅ Funciones de ayuda `prepare_nested_base_features` y `get_stratified_s
 
 
 # --- Helper para Feature Engineering (Modelo Extendido - CORREGIDO y ROBUSTO) ---
-def prepare_features_extended(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
+def prepare_features_extended(lazy_frame: pl.LazyFrame, df_caract: pl.DataFrame = None) -> pl.LazyFrame:
     """
     Prepara las features para el modelo anidado extendido,
     incluyendo variables temporales y de atributos de viaje.
+    
+    Args:
+        lazy_frame: LazyFrame con datos de viajes
+        df_caract: DataFrame con tabla de caracterización (tipo_app). Si es None, usa la global.
     """
+    # Usar la tabla de caracterización global si no se proporciona una
+    if df_caract is None:
+        df_caract = globals().get('df_caracterizacion', None)
+    
     # Columnas necesarias mínimas + base para cálculos
     cols_necesarias = [
-        "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
-        "tiempo_vehiculo_seg", "te0",
+        "is_qr", "id_tarjeta", "tiempo_inicio_viaje", "tipodia", "n_etapas",
+        "t_vehiculo_total_seg", "te0",
         "tc1", "tc2", "tc3",
         "te1", "te2", "te3",
-        "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4",
-        "contrato" # Necesario para choice_nested
+        "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
     ]
 
-    # Verificar si 'contrato' existe, si no, asignar un valor default
+    # Verificar columnas necesarias
     schema = lazy_frame.collect_schema()
-    if 'contrato' not in schema:
-        print("      Advertencia: Columna 'contrato' no encontrada. Asumiendo todos los QR como 'OTHER'.")
-        lazy_frame = lazy_frame.with_columns(pl.lit(None).alias('contrato'))
+    missing_cols = [col for col in cols_necesarias if col not in schema]
+    if missing_cols:
+        raise ValueError(f"Columnas faltantes en datos: {missing_cols}")
+
+    # Preparar datos para join: convertir id_tarjeta a string
+    lf_prep_ext = lazy_frame.select(cols_necesarias).with_columns(
+        pl.col("id_tarjeta").cast(pl.Utf8).alias("id_tarjeta_str")
+    )
+    
+    # Hacer join con tabla de caracterización si está disponible
+    if df_caract is not None:
+        # Convertir df_caract a LazyFrame para el join
+        lf_caract = df_caract.lazy()
+        lf_prep_ext = lf_prep_ext.join(
+            lf_caract,
+            on="id_tarjeta_str",
+            how="left"
+        )
+        print("      ✅ Join con tabla de caracterización realizado (extendido)")
+    else:
+        # Si no hay tabla de caracterización, crear columna tipo_app como None
+        lf_prep_ext = lf_prep_ext.with_columns(pl.lit(None).cast(pl.Utf8).alias("tipo_app"))
+        print("      ⚠️ Tabla de caracterización no disponible, todos los QR serán clasificados como 'OTHER' (extendido)")
 
     # Seleccionar y pre-procesar columnas base (con fill_null temprano)
-    lf_prep_ext = lazy_frame.select(cols_necesarias).with_columns([
+    lf_prep_ext = lf_prep_ext.with_columns([
         pl.col("is_qr").cast(pl.Int8).alias("choice_raw"), # Usar nombre intermedio
         pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
         pl.col("n_etapas").fill_null(1).cast(pl.Int8), # Asumir 1 etapa si es nulo
-        pl.col("tiempo_vehiculo_seg").fill_null(0).cast(pl.Float64),
+        pl.col("t_vehiculo_total_seg").fill_null(0).cast(pl.Float64),
         pl.col("te0").fill_null(0).cast(pl.Float64),
         pl.col("tc1").fill_null(0).cast(pl.Float64),
         pl.col("tc2").fill_null(0).cast(pl.Float64),
@@ -304,13 +399,14 @@ def prepare_features_extended(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
         pl.col("te3").fill_null(0).cast(pl.Float64),
         # Convertir tipodia robustamente
         (pl.col("tipodia").cast(pl.Utf8).cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
-        # Crear choice_nested (0=BIP, 1=QR_RED, 2=QR_OTHER)
+        # Crear choice_nested usando tipo_app (0=BIP, 1=QR_RED, 2=QR_OTHER)
         pl.when(pl.col("is_qr") == False).then(pl.lit(CHOICE_BIP))
-          .when(pl.col("contrato").cast(pl.Int64, strict=False).is_in(CONTRATO_IDS_RED)).then(pl.lit(CHOICE_QR_RED))
-          .otherwise(pl.lit(CHOICE_QR_OTHER)) # Asume qr=True y no RED es OTHER
+          .when((pl.col("is_qr") == True) & (pl.col("tipo_app") == "APP RED")).then(pl.lit(CHOICE_QR_RED))
+          .when(pl.col("is_qr") == True).then(pl.lit(CHOICE_QR_OTHER))  # QR pero no APP RED
+          .otherwise(pl.lit(CHOICE_BIP))  # Fallback (no debería ocurrir)
           .cast(pl.Int8)
           .alias("choice_nested"),
-    ]).drop("is_qr", "contrato") # Eliminar columnas originales si ya no se necesitan
+    ]).drop("is_qr") # Eliminar columna original si ya no se necesita
 
     # 1. Dummies temporales
     lf_prep_ext = lf_prep_ext.with_columns([
@@ -330,7 +426,7 @@ def prepare_features_extended(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
 
     # 2. Variables de atributos de viaje
     lf_prep_ext = lf_prep_ext.with_columns([
-        (pl.col("tiempo_vehiculo_seg") / 60.0).alias("VAR_T_VEHICULO_MIN"),
+        (pl.col("t_vehiculo_total_seg") / 60.0).alias("VAR_T_VEHICULO_MIN"),
         (pl.col("n_etapas") - 1).alias("VAR_N_TRASBORDOS"), # Ya es Int8
         ((pl.col("tc1") + pl.col("tc2") + pl.col("tc3")) / 60.0).alias("VAR_T_CAMINATA_MIN"),
         # --- CORRECCIÓN AQUÍ ---
@@ -346,8 +442,7 @@ def prepare_features_extended(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
     cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
     for col in cols_modos:
         lf_prep_ext = lf_prep_ext.with_columns([
-            pl.when(pl.col(col).cast(pl.Utf8) == '4').then(pl.lit('2')) # MetroTren -> Metro
-              .when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1')) # ZonaPaga -> Bus
+            pl.when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1')) # ZonaPaga -> Bus
               .otherwise(pl.col(col).cast(pl.Utf8)) # Mantener 1, 2, u otros/nulos
               .alias(col)
         ])
@@ -363,9 +458,14 @@ def prepare_features_extended(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
             pl.when(pl.col("n_etapas") >= i).then(pl.col(f"tipo_transporte_{i}") == '2').otherwise(False)
             for i in range(1, 5)
         ]).alias("usa_metro"),
+        # Verifica si algún tipo de transporte relevante (1 a n_etapas) fue MetroTren ('4')
+        pl.any_horizontal([
+            pl.when(pl.col("n_etapas") >= i).then(pl.col(f"tipo_transporte_{i}") == '4').otherwise(False)
+            for i in range(1, 5)
+        ]).alias("usa_metrotren"),
     ]).with_columns([
-        (pl.col("usa_metro") & ~pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
-        (pl.col("usa_metro") & pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+        (pl.col("usa_metro") & ~pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+        (pl.col("usa_metro") & pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
     ])
 
     # 4. Seleccionar columnas finales y rellenar nulos residuales
@@ -408,171 +508,211 @@ for year, week in PARTICIONES_A_PROCESAR:
     partition_label = f"{year}-W{week}"
     print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} ---\n{'='*60}")
 
-    # --- CORRECCIÓN DE NOMBRE DE CARPETA ---
-    # a. Definir y crear directorio de salida único
-    if APPLY_SAMPLING:
-        sample_label = f"sample{int(SAMPLE_FRACTION*100)}pct"
-    else:
-        sample_label = "full"
-    
-    output_dir_partition = os.path.join(BASE_OUTPUT_DIR, f"W{week}-nested-base-{sample_label}")
-    # ------------------------------------
+    for spec_label in SPECIFICATIONS_TO_RUN:
+        print(f"\n>>> Especificación: {spec_label.upper()} <<<")
 
-    os.makedirs(output_dir_partition, exist_ok=True)
-    print(f"    Resultados se guardarán en: {output_dir_partition}")
-
-    # Definir variables para limpieza en el bloque finally
-    lf_data, df_model_data, df_for_pandas, pandas_df, biodb, biogeme_model, results = (None,) * 7
-
-    try:
-        # b. Cargar datos
-        input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
-        lf_data = read_parquet_portable(input_path_glob)
-        print(f"    Cargando datos desde: {input_path_glob}")
-
-        # c. Preparar features (usando la función helper anidada base)
-        lf_model_ready = prepare_nested_base_features(lf_data)
-        df_model_data = lf_model_ready.collect()
-        print(f"    Variables calculadas. Filas antes de muestreo: {len(df_model_data):,}")
-        
-        # Verificar distribución antes de muestrear
-        print("      Distribución choice_nested (antes):")
-        print(df_model_data['choice_nested'].value_counts().sort('choice_nested'))
-
-
-        # d. Muestreo condicional
+        # --- CORRECCIÓN DE NOMBRE DE CARPETA ---
         if APPLY_SAMPLING:
-            print(f"    Aplicando muestreo estratificado por 'choice_nested' ({SAMPLE_FRACTION*100:.0f}%)...")
-            df_for_pandas = get_stratified_sample_nested(df_model_data, SAMPLE_FRACTION, SEED)
-            print(f"    Filas después del muestreo: {len(df_for_pandas):,}")
-            # Verificar distribución después de muestrear
-            if len(df_for_pandas) > 0:
-                 print("      Distribución choice_nested (después):")
-                 print(df_for_pandas['choice_nested'].value_counts().sort('choice_nested'))
-            else:
-                 print("      Muestra vacía después del muestreo.")
-                 continue # Saltar a la siguiente partición si la muestra es vacía
+            sample_label = f"sample{int(SAMPLE_FRACTION*100)}pct"
         else:
-            print("    Usando el dataset completo (sin muestreo).")
-            df_for_pandas = df_model_data
-            
-        if len(df_for_pandas) == 0:
-             print("      Dataset vacío para procesar. Saltando partición.")
-             continue
+            sample_label = "full"
 
-        pandas_df = df_for_pandas.to_pandas()
-        
-        # Limpieza intermedia
-        del df_model_data, df_for_pandas
-        gc.collect()
-
-        # e. Setup Biogeme (Definición del Modelo NESTED LOGIT BASE)
-        #    Se define DENTRO del bucle con nombres únicos.
-        print("    Definiendo especificación del modelo (Betas, Variables, Nidos)...")
-
-        # (1) Definir Betas
-        B_PM_LAB = Beta(f'B_PM_LAB_{partition_label}', 0, None, None, 0)
-        B_PT_LAB = Beta(f'B_PT_LAB_{partition_label}', 0, None, None, 0)
-        B_LJ_LAB = Beta(f'B_LJ_LAB_{partition_label}', 0, None, None, 0)
-        B_VIE_LAB = Beta(f'B_VIE_LAB_{partition_label}', 0, None, None, 0)
-        ASC_QR_RED = Beta(f'ASC_QR_RED_{partition_label}', 0, None, None, 0) 
-        MU_QR = Beta(f'MU_QR_{partition_label}', 1, 1, None, 0) # Mu >= 1
-
-        # (2) Definir Variables
-        PM_LAB = Variable('DUMMY_PM_LAB')
-        PT_LAB = Variable('DUMMY_PT_LAB')
-        LJ_LAB = Variable('DUMMY_LJ_LAB')
-        VIE_LAB = Variable('DUMMY_VIE_LAB')
-        CHOICE_NESTED = Variable('choice_nested')
-
-        # (3) Definir Funciones de Utilidad (V)
-        V_BIP = 0 # Base general
-        V_QR_RED = (ASC_QR_RED + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + 
-                    B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB)
-        V_QR_OTHER = (0 + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + # Base dentro del nido QR
-                      B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB)
-
-        V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
-
-        # (4) Definir Disponibilidad (av) - Todas disponibles
-        av = {CHOICE_BIP: 1, CHOICE_QR_RED: 1, CHOICE_QR_OTHER: 1}
-
-        # (5) Definir Nidos (μ y alternativas en cada nido)
-        nests = (
-             (1.0, [CHOICE_BIP]), 
-             (MU_QR, [CHOICE_QR_RED, CHOICE_QR_OTHER])
+        output_dir_partition = os.path.join(
+            BASE_OUTPUT_DIR,
+            f"W{week}-nested-base-{spec_label}-{sample_label}"
         )
 
-        # (6) Definir Log-Probabilidad
-        logprob = models.lognested(V, av, nests, CHOICE_NESTED)
-        
-        print("    Especificación del Modelo Nested Logit definida.")
+        os.makedirs(output_dir_partition, exist_ok=True)
+        print(f"    Resultados se guardarán en: {output_dir_partition}")
 
-        # f. Estimar el modelo
-        biodb = db.Database(f'db_nl_base_{partition_label}', pandas_df)
-        model_name = f'nested_logit_base_{partition_label}'
-        biogeme_model = bio.BIOGEME(biodb, logprob)
-        biogeme_model.model_name = model_name
+        # Definir variables para limpieza en el bloque finally
+        lf_data, df_model_data, df_for_pandas, pandas_df, biodb, biogeme_model, results = (None,) * 7
 
-        original_cwd = os.getcwd()
-        os.chdir(output_dir_partition)
-        
-        print(f"    Estimando el modelo para {partition_label}...")
-        results = biogeme_model.estimate()
-        print("    ✅ Estimación completada!")
+        try:
+            # b. Cargar datos
+            input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+            lf_data = read_parquet_portable(input_path_glob)
+            print(f"    Cargando datos desde: {input_path_glob}")
 
-        # g. Guardar resultados en CSV
-        params_df = br.get_pandas_estimated_parameters(estimation_results=results)
-        stats_dict = results.get_general_statistics()
-        params_df.to_csv(f'params_{model_name}.csv')
-        pd.DataFrame([stats_dict]).to_csv(f'stats_{model_name}.csv', index=False)
-        print(f"    📁 Resultados guardados en formato CSV y HTML.")
+            # c. Preparar features (usando la función helper anidada base)
+            lf_model_ready = prepare_nested_base_features(lf_data)
+            df_model_data = lf_model_ready.collect()
+            print(f"    Variables calculadas. Filas antes de muestreo: {len(df_model_data):,}")
+            
+            # Verificar distribución antes de muestrear
+            print("      Distribución choice_nested (antes):")
+            print(df_model_data['choice_nested'].value_counts().sort('choice_nested'))
 
-        # (Guardar resumen para comparación final - Opcional)
-        # ...
 
-        os.chdir(original_cwd)
+            # d. Muestreo condicional
+            if APPLY_SAMPLING:
+                print(f"    Aplicando muestreo estratificado por 'choice_nested' ({SAMPLE_FRACTION*100:.0f}%)...")
+                df_for_pandas = get_stratified_sample_nested(df_model_data, SAMPLE_FRACTION, SEED)
+                print(f"    Filas después del muestreo: {len(df_for_pandas):,}")
+                # Verificar distribución después de muestrear
+                if len(df_for_pandas) > 0:
+                     print("      Distribución choice_nested (después):")
+                     print(df_for_pandas['choice_nested'].value_counts().sort('choice_nested'))
+                else:
+                     print("      Muestra vacía después del muestreo.")
+                     continue # Saltar a la siguiente partición si la muestra es vacía
+            else:
+                print("    Usando el dataset completo (sin muestreo).")
+                df_for_pandas = df_model_data
+                
+            if len(df_for_pandas) == 0:
+                 print("      Dataset vacío para procesar. Saltando partición.")
+                 continue
 
-    except Exception as e:
-        print(f"    ❌ ERROR procesando {partition_label}: {e}")
-        # Asegurarse de volver al directorio original en caso de error
-        if 'original_cwd' in locals() and os.getcwd() != original_cwd:
+            pandas_df = df_for_pandas.to_pandas()
+            
+            # Limpieza intermedia
+            del df_model_data, df_for_pandas
+            gc.collect()
+
+            # e. Setup Biogeme (Definición del Modelo NESTED LOGIT BASE)
+            #    Se define DENTRO del bucle con nombres únicos.
+            print(f"    Definiendo especificación del modelo ({spec_label})...")
+
+            # (1) Definir Betas
+            ASC_QR_RED = Beta(f'ASC_QR_RED_{spec_label}_{partition_label}', 0, None, None, 0) 
+            ASC_QR_OTHER = Beta(f'ASC_QR_OTHER_{spec_label}_{partition_label}', 0, None, None, 0)
+            MU_QR = Beta(f'MU_QR_{spec_label}_{partition_label}', 1, 1, None, 0) # Mu >= 1
+
+            if spec_label == "generic":
+                B_PM_LAB = Beta(f'B_QR_PM_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+                B_PT_LAB = Beta(f'B_QR_PT_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+                B_LJ_LAB = Beta(f'B_QR_LJ_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+                B_VIE_LAB = Beta(f'B_QR_VIE_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+            else:
+                B_QR_RED_PM_LAB = Beta(f'B_QR_RED_PM_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+                B_QR_OTHER_PM_LAB = Beta(f'B_QR_OTHER_PM_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+                B_QR_RED_PT_LAB = Beta(f'B_QR_RED_PT_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+                B_QR_OTHER_PT_LAB = Beta(f'B_QR_OTHER_PT_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+                B_QR_RED_LJ_LAB = Beta(f'B_QR_RED_LJ_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+                B_QR_OTHER_LJ_LAB = Beta(f'B_QR_OTHER_LJ_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+                B_QR_RED_VIE_LAB = Beta(f'B_QR_RED_VIE_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+                B_QR_OTHER_VIE_LAB = Beta(f'B_QR_OTHER_VIE_LAB_{spec_label}_{partition_label}', 0, None, None, 0)
+
+            # (2) Definir Variables
+            PM_LAB = Variable('DUMMY_PM_LAB')
+            PT_LAB = Variable('DUMMY_PT_LAB')
+            LJ_LAB = Variable('DUMMY_LJ_LAB')
+            VIE_LAB = Variable('DUMMY_VIE_LAB')
+            CHOICE_NESTED = Variable('choice_nested')
+
+            # (3) Definir Funciones de Utilidad (V)
+            V_BIP = 0 # Base general
+            if spec_label == "generic":
+                V_QR_RED = (ASC_QR_RED + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + 
+                            B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB)
+                V_QR_OTHER = (ASC_QR_OTHER + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB +
+                              B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB)
+            else:
+                V_QR_RED = (ASC_QR_RED + B_QR_RED_PM_LAB * PM_LAB + B_QR_RED_PT_LAB * PT_LAB + 
+                            B_QR_RED_LJ_LAB * LJ_LAB + B_QR_RED_VIE_LAB * VIE_LAB)
+                V_QR_OTHER = (ASC_QR_OTHER + B_QR_OTHER_PM_LAB * PM_LAB + B_QR_OTHER_PT_LAB * PT_LAB +
+                              B_QR_OTHER_LJ_LAB * LJ_LAB + B_QR_OTHER_VIE_LAB * VIE_LAB)
+
+            V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+
+            # (4) Definir Disponibilidad (av) - Todas disponibles
+            av = {CHOICE_BIP: 1, CHOICE_QR_RED: 1, CHOICE_QR_OTHER: 1}
+
+            # (5) Definir Nidos (μ y alternativas en cada nido) - Usando biogeme.nests
+            # Nido BIP con mu=1.0 (fijo)
+            nest_bip = nests.OneNestForNestedLogit(
+                nest_param=1.0,
+                list_of_alternatives=[CHOICE_BIP],
+                name='BIP'
+            )
+            # Nido QR con mu=MU_QR (a estimar, >= 1)
+            nest_qr = nests.OneNestForNestedLogit(
+                nest_param=MU_QR,
+                list_of_alternatives=[CHOICE_QR_RED, CHOICE_QR_OTHER],
+                name='QR'
+            )
+            # Combinar ambos nidos
+            nests_structure = nests.NestsForNestedLogit(
+                choice_set=list(V.keys()),
+                tuple_of_nests=(nest_bip, nest_qr)
+            )
+
+            # (6) Definir Log-Probabilidad
+            logprob = models.lognested(V, av, nests_structure, CHOICE_NESTED)
+            
+            print("    Especificación del Modelo Nested Logit definida.")
+
+            # f. Estimar el modelo
+            biodb = db.Database(f'db_nl_base_{spec_label}_{partition_label}', pandas_df)
+            model_name = f'nested_logit_base_{spec_label}_{partition_label}'
+            biogeme_model = bio.BIOGEME(biodb, logprob)
+            biogeme_model.model_name = model_name
+
+            original_cwd = os.getcwd()
+            os.chdir(output_dir_partition)
+            
+            print(f"    Estimando el modelo {spec_label} para {partition_label}...")
+            results = biogeme_model.estimate()
+            print("    ✅ Estimación completada!")
+
+            # g. Guardar resultados en CSV
+            params_df = br.get_pandas_estimated_parameters(estimation_results=results)
+            stats_dict = results.get_general_statistics()
+            params_df.to_csv(f'params_{model_name}.csv')
+            pd.DataFrame([stats_dict]).to_csv(f'stats_{model_name}.csv', index=False)
+            print(f"    📁 Resultados guardados en formato CSV y HTML.")
+
+            # (Guardar resumen para comparación final - Opcional)
+            # ...
+
             os.chdir(original_cwd)
 
-    finally:
-        # h. Limpieza de memoria explícita
-        print("    Limpiando memoria de la partición...")
-        try:
-            del pandas_df, biodb, biogeme_model, results
-        except NameError:
-            pass
-        try:
-            del V, av, nests, logprob  # Limpiar especificaciones del modelo
-        except NameError:
-            pass
-        gc.collect()
-        time.sleep(2) # Pequeña pausa
+        except Exception as e:
+            print(f"    ❌ ERROR procesando {partition_label} ({spec_label}): {e}")
+            # Asegurarse de volver al directorio original en caso de error
+            if 'original_cwd' in locals() and os.getcwd() != original_cwd:
+                os.chdir(original_cwd)
+
+        finally:
+            # h. Limpieza de memoria explícita
+            print("    Limpiando memoria de la partición / especificación...")
+            try:
+                del pandas_df, biodb, biogeme_model, results
+            except NameError:
+                pass
+            try:
+                del V, av, logprob  # Limpiar especificaciones del modelo
+            except NameError:
+                pass
+            gc.collect()
+            time.sleep(2) # Pequeña pausa
 
 print(f"\n{'='*60}\n--- Proceso Finalizado (Nested Logit Base) ---\n{'='*60}")
 ```
+
+
+
+
+
 
 ## Modelo Nested Logit Extendido
 
 ### 1) Setup y Conexión
 ```{python}
-#|label: setup-sequential-run-nl-extended
+p#|label: setup-sequential-run-nl-extended
 
 
 # --- 1. CONFIGURACIÓN DE LA EJECUCIÓN ---
 # Define aquí las particiones que quieres procesar
 PARTICIONES_A_PROCESAR_NL_EXT = [
     (2025, 17),
-    (2025, 18)
+
 ]
 
 # Define si quieres aplicar muestreo o usar el dataset completo
 APPLY_SAMPLING_NL_EXT = True # <-- MUY RECOMENDADO para el modelo extendido
-SAMPLE_FRACTION_NL_EXT = 0.50 # 20% (ajusta si es necesario, ej. 0.1)
+SAMPLE_FRACTION_NL_EXT = 0.20 # 20% (ajusta si es necesario, ej. 0.1)
 SEED = 42               # Para reproducibilidad del muestreo
 
 # Directorio base para los resultados (distinto al base simple)
@@ -659,6 +799,30 @@ for year, week in PARTICIONES_A_PROCESAR_NL_EXT:
 
         pandas_df = df_for_pandas.to_pandas()
 
+        # Validación de datos antes de estimar
+        print("    Validando datos antes de estimar...")
+        # Verificar distribución de choice_nested
+        choice_dist = pandas_df['choice_nested'].value_counts().sort_index()
+        print(f"      Distribución choice_nested: {dict(choice_dist)}")
+        
+        # Verificar que haya al menos algunas observaciones de cada alternativa
+        if len(choice_dist) < 3:
+            print(f"      ⚠️ ADVERTENCIA: Solo {len(choice_dist)} alternativas tienen observaciones. El modelo puede no identificarse correctamente.")
+        
+        # Verificar valores infinitos o NaN en variables numéricas
+        numeric_cols = pandas_df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            if pandas_df[col].isna().any():
+                n_nan = pandas_df[col].isna().sum()
+                print(f"      ⚠️ ADVERTENCIA: Columna {col} tiene {n_nan} valores NaN. Rellenando con 0.")
+                pandas_df[col] = pandas_df[col].fillna(0)
+            if np.isinf(pandas_df[col]).any():
+                n_inf = np.isinf(pandas_df[col]).sum()
+                print(f"      ⚠️ ADVERTENCIA: Columna {col} tiene {n_inf} valores infinitos. Reemplazando con valores grandes.")
+                pandas_df[col] = pandas_df[col].replace([np.inf, -np.inf], [1e6, -1e6])
+        
+        print("    ✅ Validación de datos completada.")
+
         # Limpieza intermedia
         del df_model_data, df_for_pandas
         gc.collect()
@@ -719,49 +883,134 @@ for year, week in PARTICIONES_A_PROCESAR_NL_EXT:
         # (4) Definir Disponibilidad (av) - Todas disponibles
         av = {CHOICE_BIP: 1, CHOICE_QR_RED: 1, CHOICE_QR_OTHER: 1}
 
-        # (5) Definir Nidos (μ y alternativas en cada nido) - Igual que en el base
-        nests = (
-             (1.0, [CHOICE_BIP]),
-             (MU_QR, [CHOICE_QR_RED, CHOICE_QR_OTHER])
+        # (5) Definir Nidos (μ y alternativas en cada nido) - Usando biogeme.nests
+        # Nido BIP con mu=1.0 (fijo)
+        nest_bip = nests.OneNestForNestedLogit(
+            nest_param=1.0,
+            list_of_alternatives=[CHOICE_BIP],
+            name='BIP'
+        )
+        # Nido QR con mu=MU_QR (a estimar, >= 1)
+        nest_qr = nests.OneNestForNestedLogit(
+            nest_param=MU_QR,
+            list_of_alternatives=[CHOICE_QR_RED, CHOICE_QR_OTHER],
+            name='QR'
+        )
+        # Combinar ambos nidos
+        nests_structure = nests.NestsForNestedLogit(
+            choice_set=list(V.keys()),
+            tuple_of_nests=(nest_bip, nest_qr)
         )
 
         # (6) Definir Log-Probabilidad
-        logprob = models.lognested(V, av, nests, CHOICE_NESTED)
+        logprob = models.lognested(V, av, nests_structure, CHOICE_NESTED)
 
         print("    Especificación del Modelo Nested Logit Extendido definida.")
 
         # f. Estimar el modelo
         biodb = db.Database(f'db_nl_ext_{partition_label}', pandas_df)
         model_name = f'nested_logit_ext_{partition_label}' # Nombre base del archivo
-        biogeme_model = bio.BIOGEME(biodb, logprob)
+        
+        # Configurar parámetros de optimización en el constructor
+        # Aumentar número máximo de iteraciones y ajustar tolerancia
+        biogeme_model = bio.BIOGEME(
+            biodb, 
+            logprob,
+            algorithm_name='simple_bounds',  # Usar algoritmo con bounds simples
+            maxiter=2000,  # Aumentar máximo de iteraciones
+            tolerance=1e-6  # Tolerancia para convergencia
+        )
         biogeme_model.model_name = model_name
 
         original_cwd = os.getcwd()
         os.chdir(output_dir_partition)
 
         print(f"    Estimando el modelo extendido para {partition_label}...")
-        results = biogeme_model.estimate()
-        print("    ✅ Estimación completada!")
+        print(f"    Configuración: algoritmo={biogeme_model.algorithm_name}, max_iter={biogeme_model.maxiter}")
+        try:
+            results = biogeme_model.estimate()
+            
+            # Verificar si convergió
+            if not results.data.convergence:
+                print(f"    ⚠️ ADVERTENCIA: El modelo NO convergió después de {results.data.numberOfIterations} iteraciones")
+                print(f"    Los resultados pueden no ser confiables. Revisar especificación del modelo.")
+            
+            print("    ✅ Estimación completada!")
 
-        # g. Guardar resultados en CSV
-        params_df = br.get_pandas_estimated_parameters(estimation_results=results)
-        stats_dict = results.get_general_statistics()
-        params_df.to_csv(f'params_{model_name}.csv')
-        pd.DataFrame([stats_dict]).to_csv(f'stats_{model_name}.csv', index=False)
-        print(f"    📁 Resultados guardados en formato CSV y HTML.")
+            # g. Guardar resultados en CSV (con manejo de errores)
+            try:
+                params_df = br.get_pandas_estimated_parameters(estimation_results=results)
+                stats_dict = results.get_general_statistics()
+                
+                if params_df is not None and len(params_df) > 0:
+                    params_df.to_csv(f'params_{model_name}.csv')
+                    print(f"    📁 Parámetros guardados en CSV.")
+                else:
+                    print(f"    ⚠️ No se pudieron extraer parámetros del modelo.")
+                
+                if stats_dict is not None and len(stats_dict) > 0:
+                    pd.DataFrame([stats_dict]).to_csv(f'stats_{model_name}.csv', index=False)
+                    print(f"    📁 Estadísticas guardadas en CSV.")
+                else:
+                    print(f"    ⚠️ No se pudieron extraer estadísticas del modelo.")
+                    
+            except Exception as e:
+                print(f"    ⚠️ Error al guardar resultados en CSV: {e}")
+                print(f"    Intentando guardar información básica...")
+                # Intentar guardar al menos información básica
+                try:
+                    basic_stats = {
+                        'converged': results.data.convergence if hasattr(results.data, 'convergence') else False,
+                        'iterations': results.data.numberOfIterations if hasattr(results.data, 'numberOfIterations') else None,
+                        'log_likelihood': results.data.logLike if hasattr(results.data, 'logLike') else None,
+                    }
+                    pd.DataFrame([basic_stats]).to_csv(f'stats_{model_name}_basic.csv', index=False)
+                except:
+                    pass
 
-        # Guardar resumen
-        stats = results.get_general_statistics()
-        def g(k, alt_keys=()):
-             for key in (k, *alt_keys):
-                 if key in stats: return stats[key]
-             return None
-        results_summary_ext[partition_label] = {
-            'LL_Final': g('Final log likelihood'),
-            'Rho_Adj': g('Rho-square-bar', ('Adj. rho-square', 'Rho-square-bar for the null model','Rho-square-bar for the init. model')),
-            'N_Obs': g('Number of observations', ('Sample size',)),
-            'Params': params_df.set_index('Name')['Value'].to_dict()
-        }
+            # Guardar resumen (con manejo de errores)
+            try:
+                stats = results.get_general_statistics()
+                def g(k, alt_keys=()):
+                     for key in (k, *alt_keys):
+                         if key in stats: return stats[key]
+                     return None
+                
+                # Intentar obtener parámetros de forma segura
+                try:
+                    params_dict = params_df.set_index('Name')['Value'].to_dict() if params_df is not None and len(params_df) > 0 else {}
+                except:
+                    params_dict = {}
+                
+                results_summary_ext[partition_label] = {
+                    'LL_Final': g('Final log likelihood'),
+                    'Rho_Adj': g('Rho-square-bar', ('Adj. rho-square', 'Rho-square-bar for the null model','Rho-square-bar for the init. model')),
+                    'N_Obs': g('Number of observations', ('Sample size',)),
+                    'Params': params_dict,
+                    'Converged': results.data.convergence if hasattr(results.data, 'convergence') else False
+                }
+            except Exception as e:
+                print(f"    ⚠️ Error al guardar resumen: {e}")
+                # Guardar al menos información básica
+                results_summary_ext[partition_label] = {
+                    'LL_Final': None,
+                    'Rho_Adj': None,
+                    'N_Obs': len(pandas_df) if pandas_df is not None else None,
+                    'Params': {},
+                    'Converged': False,
+                    'Error': str(e)
+                }
+                
+        except Exception as e:
+            print(f"    ❌ ERROR durante la estimación: {e}")
+            import traceback
+            print(f"    Traceback completo:")
+            traceback.print_exc()
+            # No guardar resumen si falló la estimación
+            results_summary_ext[partition_label] = {
+                'Error': str(e),
+                'Converged': False
+            }
 
         os.chdir(original_cwd)
 
@@ -778,7 +1027,7 @@ for year, week in PARTICIONES_A_PROCESAR_NL_EXT:
         except NameError:
             pass
         try:
-            del V, av, nests, logprob # Limpiar especificaciones
+            del V, av, logprob # Limpiar especificaciones
         except NameError:
             pass
         gc.collect()

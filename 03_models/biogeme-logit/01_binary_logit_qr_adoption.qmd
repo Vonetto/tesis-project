@@ -118,7 +118,7 @@ def prepare_features(lazy_frame):
         (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
     ]).with_columns([
         pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
-        pl.col("hora").is_in(HORAS_Punta_TARDE).alias("punta_tarde"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
         (pl.col("dia_semana") == 5).alias("es_viernes"),
         pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
     ]).with_columns([
@@ -189,7 +189,7 @@ def prepare_features_extended(lazy_frame):
             (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
         ]).with_columns([
             pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
-            pl.col("hora").is_in(HORAS_Punta_TARDE).alias("punta_tarde"),
+            pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
             (pl.col("dia_semana") == 5).alias("es_viernes"),
             pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
         ]).with_columns([
@@ -214,18 +214,21 @@ def prepare_features_extended(lazy_frame):
         cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
         for col in cols_modos:
             lf_prep_ext = lf_prep_ext.with_columns([
-                pl.when(pl.col(col).cast(pl.Utf8) == '4').then(pl.lit('2'))
-                  .when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))
+                pl.when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))
                   .otherwise(pl.col(col).cast(pl.Utf8))
                   .alias(col)
             ])
         
+        bus_flags = [pl.col(c).fill_null("0") == "1" for c in cols_modos]
+        metro_flags = [pl.col(c).fill_null("0") == "2" for c in cols_modos]
+        metrotren_flags = [pl.col(c).fill_null("0") == "4" for c in cols_modos]
         lf_prep_ext = lf_prep_ext.with_columns([
-            pl.any_horizontal([pl.col(c) == '1' for c in cols_modos]).alias("usa_bus"),
-            pl.any_horizontal([pl.col(c) == '2' for c in cols_modos]).alias("usa_metro"),
+            pl.any_horizontal(bus_flags).alias("usa_bus"),
+            pl.any_horizontal(metro_flags).alias("usa_metro"),
+            pl.any_horizontal(metrotren_flags).alias("usa_metrotren"),
         ]).with_columns([
-            (pl.col("usa_metro") & ~pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
-            (pl.col("usa_metro") & pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+            (pl.col("usa_metro") & ~pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+            (pl.col("usa_metro") & pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
         ])
     
         # 4. Seleccionar columnas finales
@@ -416,7 +419,7 @@ if lf_data is not None:
     # 3. Crear variables intermedias para dummies
     lf_prep = lf_prep.with_columns([
         pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
-        pl.col("hora").is_in(HORAS_Punta_TARDE).alias("punta_tarde"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
         (pl.col("dia_semana") == 5).alias("es_viernes"), # Viernes=5
         pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue") # Lunes=1 a Jueves=4
     ])
@@ -709,6 +712,7 @@ print("--- Iniciando Proceso de Estimación Secuencial ---")
 for year, week in PARTICIONES_A_PROCESAR:
     partition_label = f"{year}-W{week}"
     print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} ---\n{'='*60}")
+    run_start_time = time.perf_counter()
 
     # a. Definir y crear directorio de salida único
     output_dir_partition = os.path.join(BASE_OUTPUT_DIR, f"W{week}-baseline")
@@ -771,10 +775,13 @@ for year, week in PARTICIONES_A_PROCESAR:
         print("   Estimando el modelo...")
         results = biogeme_model.estimate()
         print("   ✅ Estimación completada!")
+        elapsed_seconds = time.perf_counter() - run_start_time
+        print(f"   ⏱️ Tiempo total partición {partition_label}: {elapsed_seconds:.1f} s")
 
         # g. Guardar resultados en CSV
         params_df = get_pandas_estimated_parameters(estimation_results=results)
         stats_dict = results.get_general_statistics()
+        stats_dict["Wall-clock seconds"] = elapsed_seconds
         params_df.to_csv(f'params_{partition_label}.csv')
         pd.DataFrame([stats_dict]).to_csv(f'stats_{partition_label}.csv', index=False)
         print(f"   📁 Resultados guardados en formato CSV y HTML.")

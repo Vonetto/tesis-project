@@ -63,6 +63,45 @@ CSV_DTYPES = {
     'zona_subida_4': pl.Utf8
 }
 
+# --- Definición de Esquema para ETAPAS ---
+ETAPAS_DTYPES = {
+    'operador': pl.Utf8,
+    'id_etapa': pl.Int64,
+    'correlativo_viajes': pl.Int64,
+    'correlativo_etapas': pl.Int64,
+    'tipo_dia': pl.Utf8,
+    'tipo_transporte': pl.Utf8,
+    'fExpansionServicioPeriodoTS': pl.Float64,
+    'tiene_bajada': pl.Int64,
+    'tiempo2': pl.Utf8,
+    'tiempo_subida': pl.Utf8,
+    'tiempo_bajada': pl.Utf8,
+    'tiempo_etapa': pl.Int64,
+    'media_hora_subida': pl.Utf8,
+    'media_hora_bajada': pl.Utf8,
+    'x_subida': pl.Float64,
+    'y_subida': pl.Float64,
+    'x_bajada': pl.Float64,
+    'y_bajada': pl.Float64,
+    'dist_ruta_paraderos': pl.Float64,
+    'dist_eucl_paraderos': pl.Float64,
+    'servicio_subida': pl.Utf8,
+    'servicio_bajada': pl.Utf8,
+    'parada_subida': pl.Utf8,
+    'parada_bajada': pl.Utf8,
+    'comuna_subida': pl.Utf8,
+    'comuna_bajada': pl.Utf8,
+    'zona_subida': pl.Utf8,
+    'zona_bajada': pl.Utf8,
+    'sitio_subida': pl.Utf8,
+    'fExpansionZonaPeriodoTS': pl.Float64,
+    'tEsperaMediaIntervalo': pl.Float64,
+    'periodoSubida': pl.Utf8,
+    'periodoBajada': pl.Utf8,
+    'tiempoIniExpedicion': pl.Utf8,
+    'contrato': pl.Utf8
+}
+
 NULL_TOKENS = ["", "-", "NA", "N/A", "null", "NULL"]
 
 # --- Autenticación y Setup de FS ---
@@ -113,12 +152,14 @@ def _fix_ddmmyy_to_iso(expr: pl.Expr) -> pl.Expr:
     tries = [s.str.strptime(pl.Datetime, format=f, strict=False, exact=False) for f in formats]
     return pl.coalesce(tries)
 
-def _read_csv_polars(fs, path: str, sep: str) -> pl.DataFrame:
+def _read_csv_polars(fs, path: str, sep: str, dtypes: dict = None) -> pl.DataFrame:
+    if dtypes is None:
+        dtypes = CSV_DTYPES
     decimal_comma_flag = (sep == ";")
     if USE_LOCAL_PATHS:
         with open(path, "rb") as fh:
             return pl.read_csv(
-                fh, separator=sep, dtypes=CSV_DTYPES, try_parse_dates=False,
+                fh, separator=sep, dtypes=dtypes, try_parse_dates=False,
                 null_values=NULL_TOKENS, ignore_errors=False, low_memory=True, 
                 decimal_comma=decimal_comma_flag
             )
@@ -126,7 +167,7 @@ def _read_csv_polars(fs, path: str, sep: str) -> pl.DataFrame:
         path_no_scheme = path.replace("gs://", "").strip("/")
         with fs.open(path_no_scheme, "rb") as fh:
             return pl.read_csv(
-                fh, separator=sep, dtypes=CSV_DTYPES, try_parse_dates=False,
+                fh, separator=sep, dtypes=dtypes, try_parse_dates=False,
                 null_values=NULL_TOKENS, ignore_errors=False, low_memory=True, 
                 decimal_comma=decimal_comma_flag
             )
@@ -192,8 +233,11 @@ def _sanitize_before_write(dfw: pl.DataFrame, sem_key) -> tuple[pl.DataFrame, st
     dfw = dfw.with_columns(pl.lit(sem).cast(pl.Utf8).alias("semana_iso"))
     return dfw, sem
 
-def _partition_exists(fs, base_path: str, sem: str) -> bool:
-    normal = f"{base_path}/semana_iso={sem}".rstrip("/")
+def _partition_exists(fs, base_path: str, sem: str, dataset: str = "viajes") -> bool:
+    if dataset == "etapas":
+        normal = f"{base_path}/etapas/semana_iso={sem}".rstrip("/")
+    else:
+        normal = f"{base_path}/semana_iso={sem}".rstrip("/")
     if USE_LOCAL_PATHS:
         return pathlib.Path(normal).exists()
     else:
@@ -270,6 +314,74 @@ def _ingest_viajes_files_by_week(raw_fs, bronze_fs, raw_base_path: str, bronze_b
     print(f"\n✅ Resumen VIAJES → Nuevas: {len(wrote)}, Omitidas: {len(skipped)}, Errores: {len(errored)}")
     return {"dataset": "viajes", "written": sorted(wrote), "skipped": sorted(skipped), "errored": sorted(errored)}
 
+def _ingest_etapas_files_by_week(raw_fs, bronze_fs, raw_base_path: str, bronze_base_path: str, week_map: dict[str, list[str]]):
+    wrote, skipped, errored = [], [], []
+
+    print(f"\n⚙️  Iniciando procesamiento de {len(week_map)} semanas para ETAPAS...")
+    for week, files_in_week in tqdm(week_map.items(), desc="Procesando semanas (etapas)", unit="semana"):
+        if _partition_exists(bronze_fs, bronze_base_path, week, dataset="etapas"):
+            skipped.append(week)
+            continue
+        
+        try:
+            print(f"\n  [Semana {week}] Encontrados {len(files_in_week)} archivos. Iniciando lectura...")
+            list_of_dfs = []
+            for file_path in tqdm(files_in_week, desc=f"    Leyendo archivos sem {week}", leave=False, unit="file"):
+                # Los archivos de etapas usan pipe (|) como separador
+                sep = "|"
+                df = _read_csv_polars(raw_fs, file_path, sep, dtypes=ETAPAS_DTYPES)
+                
+                # Buscar columna temporal (puede ser tiempo_subida, tiempo2, o tiempoIniExpedicion)
+                time_col = next((c for c in ["tiempo_subida", "tiempo2", "tiempoIniExpedicion"] if c in df.columns), None)
+                if not time_col:
+                    print(f"      ⚠️  No se encontró columna temporal en {os.path.basename(file_path)}. Se omite archivo.")
+                    continue
+                
+                df = df.with_columns(_fix_ddmmyy_to_iso(pl.col(time_col)).alias(time_col))
+                df = df.with_columns([
+                    pl.col(time_col).dt.date().alias("fecha"),
+                    pl.col(time_col).dt.iso_year().alias("iso_year"),
+                    pl.col(time_col).dt.week().alias("iso_week"),
+                ])
+                list_of_dfs.append(df)
+
+            if not list_of_dfs:
+                print(f"  ⚠️ No se pudo leer ningún archivo para la semana {week}, omitiendo.")
+                errored.append(week)
+                continue
+
+            print(f"    - Concatenando {len(list_of_dfs)} dataframes para la semana {week}...")
+            df_week = pl.concat(list_of_dfs, how="vertical_relaxed").rechunk()
+            df_week, week_norm = _sanitize_before_write(df_week, week)
+            
+            target_dir = f"{bronze_base_path}/etapas/semana_iso={week_norm}"
+            print(f"    - Escribiendo partición en {'Local' if USE_LOCAL_PATHS else 'GCS'} en: {target_dir}")
+            
+            if USE_LOCAL_PATHS:
+                # For local, use Polars' native write_parquet
+                pathlib.Path(target_dir).mkdir(parents=True, exist_ok=True)
+                df_week.write_parquet(f"{target_dir}/part-0.parquet", compression="zstd")
+            else:
+                # For GCS, use pyarrow.dataset
+                fs_arrow = pafs.PyFileSystem(pafs.FSSpecHandler(bronze_fs))
+                ds.write_dataset(
+                    data=df_week.to_arrow(), base_dir=target_dir, filesystem=fs_arrow, format="parquet",
+                    existing_data_behavior="overwrite_or_ignore",
+                    file_options=ds.ParquetFileFormat().make_write_options(compression="zstd"),
+                    basename_template="part-{i}.parquet",
+                )
+            print(f"    - ✅ Semana {week} escrita exitosamente.")
+            wrote.append(week)
+
+        except Exception as e:
+            print(f"  ❌ Error procesando semana {week}: {e}")
+            import traceback
+            traceback.print_exc()
+            errored.append(week)
+
+    print(f"\n✅ Resumen ETAPAS → Nuevas: {len(wrote)}, Omitidas: {len(skipped)}, Errores: {len(errored)}")
+    return {"dataset": "etapas", "written": sorted(wrote), "skipped": sorted(skipped), "errored": sorted(errored)}
+
 def ingest_new_to_bronze(raw_fs, bronze_fs, raw_base_path: str, bronze_base_path: str, viajes_glob: str | None = None, etapas_glob: str | None = None):
     print("="*50)
     print("⏳ Iniciando ingesta RAW -> BRONZE (Estrategia: Semana por Semana con Esquema Estricto)")
@@ -288,11 +400,11 @@ def ingest_new_to_bronze(raw_fs, bronze_fs, raw_base_path: str, bronze_base_path
         results["viajes"] = None
 
     try:
-        _glob_raw(raw_fs, raw_base_path, etapas_glob)
-        print("\nℹ️ El procesamiento de ETAPAS está actualmente desactivado en el script.")
-        results["etapas"] = None
-    except FileNotFoundError:
-        print("\nℹ️ No se encontraron archivos de etapas, se omite su procesamiento.")
+        files_e = _glob_raw(raw_fs, raw_base_path, etapas_glob)
+        week_map_e = _group_files_by_week(files_e)
+        results["etapas"] = _ingest_etapas_files_by_week(raw_fs, bronze_fs, raw_base_path, bronze_base_path, week_map_e)
+    except FileNotFoundError as e:
+        print(f"⚠️ No se procesaron ETAPAS: {e}")
         results["etapas"] = None
         
     print("\n🏁 Ingesta finalizada.")

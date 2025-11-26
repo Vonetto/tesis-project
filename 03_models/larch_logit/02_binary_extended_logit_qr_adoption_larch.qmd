@@ -1,0 +1,1607 @@
+---
+title: "Modelo Logit Binario Extendido - Adopción QR vs Bip (Larch)"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: auto
+---
+
+# Objetivo
+
+Este notebook tiene como objetivo:
+
+1. Estimar un **modelo Logit Binario extendido usando `larch`** que incorpore no solo variables temporales (como en el modelo baseline), sino también **atributos del viaje** (tiempo en vehículo, número de trasbordos, tiempo de caminata, esperas, modos de transporte).
+
+2. Analizar e interpretar los resultados del modelo extendido, comparando diferentes configuraciones de muestreo (20% y 50%) para validar la eficiencia del muestreo estratificado.
+
+3. Extraer conclusiones sobre cómo los atributos del viaje influyen en la elección entre pago con QR y Tarjeta Bip!.
+
+4. Dejar los resultados en un formato compatible con los outputs previos de `biogeme` y `statsmodels` para poder comparar ajustes y parámetros entre herramientas.
+
+---
+
+:::: {.callout-tip}
+# Instalación recomendada
+
+`larch` se distribuye oficialmente vía `conda-forge`. Si aún no tienes listo el entorno, sigue las instrucciones de [Installing Larch — v5.7.0](https://larch.newman.me/v5.7.0/installation.html), idealmente creando un ambiente dedicado (por ejemplo, `conda create -n arboretum -c conda-forge larch`). Esto evita conflictos con otras dependencias y facilita ejecutar todo el notebook dentro del mismo entorno.
+::::
+
+::: {.callout-warning}
+# Alcance del Análisis
+
+Para desarrollar y validar el modelo de forma controlada, este análisis se centra en **semanas representativas (ej. Semana 17 y 18 del año 2025)**. El objetivo es consolidar un modelo robusto en este subconjunto de datos antes de escalar el análisis, utilizando **muestreo estratificado** para integrar eficientemente el resto de las particiones semanales sin incurrir en costos computacionales prohibitivos o problemas de memoria.
+:::
+
+## Setup e Importación de Librerías
+
+```{python}
+#|label: setup-and-imports
+import os
+import sys
+from pathlib import Path
+from datetime import date
+import time
+
+import polars as pl
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import larch as lx
+from larch import Model, P, X
+from larch.dataset import Dataset
+
+# Asegurar que el paquete 'config' y 'lib' sean importables
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+    else:
+        raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
+
+# Importar funciones de acceso a datos centralizadas
+from lib.datalake import read_parquet_portable
+from config import (
+    HORAS_PUNTA_MANANA,
+    HORAS_PUNTA_TARDE,
+    USE_LOCAL_PATHS,
+    LOCAL_SILVER_PATH,
+    GCS_SILVER_PATH,
+)
+
+# --- Parámetros de paths ---
+if USE_LOCAL_PATHS:
+    SILVER_BASE_PATH = LOCAL_SILVER_PATH
+else:
+    SILVER_BASE_PATH = GCS_SILVER_PATH
+
+# Usaremos 'viajes_filtrados' como base, ya que contiene todos los viajes válidos
+INPUT_DATASET_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados"
+
+# --- Partición para Análisis Inicial ---
+YEAR_ANALISIS = 2025
+WEEK_ANALISIS = 17
+PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
+
+# --- Definición de alternativas y features ---
+ALT_MAPPING = {0: "BIP", 1: "QR"}
+FEATURE_COLS_BASE = ["DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+FEATURE_COLS_EXTENDED = FEATURE_COLS_BASE + [
+    "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS", "VAR_T_CAMINATA_MIN",
+    "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN",
+    "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS"
+]
+ALL_FEATURE_COLS = ["ASC_QR"] + FEATURE_COLS_EXTENDED # Para el modelo, incluyendo la constante
+
+# Mapeo de nombres de parámetros a nombres de features (para resultados)
+PARAM_TO_FEATURE = {
+    "ASC_QR": "ASC_QR", # La constante se maneja de forma especial en larch
+    "B_PM_LAB": "DUMMY_PM_LAB",
+    "B_PT_LAB": "DUMMY_PT_LAB",
+    "B_LJ_LAB": "DUMMY_LJ_LAB",
+    "B_VIE_LAB": "DUMMY_VIE_LAB",
+    "B_T_VEHICULO": "VAR_T_VEHICULO_MIN",
+    "B_N_TRASBORDOS": "VAR_N_TRASBORDOS",
+    "B_T_CAMINATA": "VAR_T_CAMINATA_MIN",
+    "B_T_ESPERA_TRASB": "VAR_T_ESPERA_TRASBORDO_MIN",
+    "B_T_ESPERA_INI": "VAR_T_ESPERA_INICIAL_MIN",
+    "B_SOLO_METRO": "DUMMY_SOLO_METRO",
+    "B_METRO_BUS": "DUMMY_METRO_BUS",
+}
+FEATURE_TO_PARAM = {v: k for k, v in PARAM_TO_FEATURE.items()}
+
+
+# Info de entorno
+print(f"🧮 Larch version: {getattr(lx, '__version__', 'dev')}")
+
+print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
+````
+
+## Helpers para Feature Engineering y Muestreo
+
+```{python}
+#|label: helper-functions
+
+def prepare_features_extended(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Construye el dataset para el modelo extendido:
+    choice (1=QR, 0=Bip) + dummies temporales + atributos del viaje.
+    """
+    cols_necesarias = [
+        "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
+        "t_vehiculo_total_seg", "te0", 
+        "tc1", "tc2", "tc3",
+        "te1", "te2", "te3",
+        "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
+    ]
+    
+    # Verificar que todas las columnas necesarias estén disponibles
+    available_cols = lazy_frame.collect_schema().names()
+    missing_cols = [col for col in cols_necesarias if col not in available_cols]
+    if missing_cols:
+        raise ValueError(
+            f"Columnas faltantes en el dataset: {missing_cols}. "
+            f"Columnas disponibles: {available_cols[:20]}..."
+        )
+    
+    # 1. Crear variables base y dummies temporales
+    lf_prep_ext = (
+        lazy_frame
+        .select(cols_necesarias)
+        .with_columns([
+            pl.col("is_qr").cast(pl.Int8).alias("choice"),
+            pl.col("tiempo_inicio_viaje")
+              .dt.replace_time_zone("America/Santiago", ambiguous="earliest")
+              .alias("ts_local"),
+        ])
+        .with_columns([
+            pl.col("ts_local").dt.hour().alias("hora"),
+            pl.col("ts_local").dt.weekday().alias("dia_semana"),
+            (pl.col("tipodia").cast(pl.Utf8).cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+        ])
+        .with_columns([
+            pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+            pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+            (pl.col("dia_semana") == 5).alias("es_viernes"),
+            pl.col("dia_semana").is_between(1, 4, closed="both").alias("es_lun_jue"),
+        ])
+        .with_columns([
+            (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+            (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+            (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+            (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+        ])
+    )
+    
+    # 2. Ingeniería de variables de viaje
+    lf_prep_ext = (
+        lf_prep_ext
+        .with_columns([
+            # Var 1: Tiempo de viaje en vehículo (en minutos)
+            (pl.col("t_vehiculo_total_seg") / 60).alias("VAR_T_VEHICULO_MIN"),
+            
+            # Var 2: Número de trasbordos
+            (pl.col("n_etapas") - 1).alias("VAR_N_TRASBORDOS"),
+            
+            # Var 3: Tiempo de caminata total (en minutos)
+            ((pl.col("tc1").fill_null(0) + pl.col("tc2").fill_null(0) + pl.col("tc3").fill_null(0)) / 60)
+              .alias("VAR_T_CAMINATA_MIN"),
+            
+            # Var 4: Tiempo de espera en trasbordo (en minutos)
+            ((pl.col("te1").fill_null(0) + pl.col("te2").fill_null(0) + pl.col("te3").fill_null(0)) / 60)
+              .alias("VAR_T_ESPERA_TRASBORDO_MIN"),
+            
+            # Var 5: Tiempo de espera inicial (en minutos)
+            (pl.col("te0") / 60).alias("VAR_T_ESPERA_INICIAL_MIN"),
+        ])
+    )
+    
+    # 3. Dummies de modo de transporte
+    cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
+    for col in cols_modos:
+        lf_prep_ext = lf_prep_ext.with_columns([
+            pl.when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))  # ZonaPaga -> Bus
+              .otherwise(pl.col(col).cast(pl.Utf8))
+              .alias(col)
+        ])
+    
+    # Crear flags de modos presentes en el viaje
+    bus_flags = [pl.col(c).fill_null("0") == "1" for c in cols_modos]
+    metro_flags = [pl.col(c).fill_null("0") == "2" for c in cols_modos]
+    metrotren_flags = [pl.col(c).fill_null("0") == "4" for c in cols_modos]
+    lf_prep_ext = (
+        lf_prep_ext
+        .with_columns([
+            pl.any_horizontal(bus_flags).alias("usa_bus"),
+            pl.any_horizontal(metro_flags).alias("usa_metro"),
+            pl.any_horizontal(metrotren_flags).alias("usa_metrotren"),
+        ])
+        .with_columns([
+            # DUMMY_SOLO_METRO: usa metro y NO usa bus
+            (pl.col("usa_metro") & ~pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+            # DUMMY_METRO_BUS: usa metro Y usa bus
+            (pl.col("usa_metro") & pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+        ])
+    )
+    
+    # 4. Seleccionar columnas finales para el modelo extendido
+    cols_modelo_ext = [
+        "choice", 
+        # Dummies temporales
+        "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB",
+        # Nuevas variables de viaje
+        "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS", "VAR_T_CAMINATA_MIN",
+        "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN",
+        "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS"
+    ]
+    
+    return lf_prep_ext.select(cols_modelo_ext).fill_null(0)
+
+
+def get_stratified_sample(df: pl.DataFrame, fraction: float, seed: int) -> pl.DataFrame:
+    """
+    Muestreo estratificado por 'choice' (0=Bip, 1=QR), conservando proporciones.
+    """
+    total_rows = len(df)
+    target_rows = int(total_rows * fraction)
+
+    counts = df.group_by("choice").agg(pl.len().alias("count")).sort("choice")
+    bip_count = counts.filter(pl.col("choice") == 0)["count"][0] if len(
+        counts.filter(pl.col("choice") == 0)
+    ) > 0 else 0
+    qr_count = counts.filter(pl.col("choice") == 1)["count"][0] if len(
+        counts.filter(pl.col("choice") == 1)
+    ) > 0 else 0
+    total_original = bip_count + qr_count
+
+    if total_original == 0:
+        return df
+
+    bip_proportion = bip_count / total_original
+    qr_proportion = qr_count / total_original
+
+    target_bip = int(target_rows * bip_proportion)
+    target_qr = int(target_rows * qr_proportion)
+    actual_total = target_bip + target_qr
+
+    if actual_total < target_rows and qr_count > 0:
+        target_qr += (target_rows - actual_total)
+    elif actual_total < target_rows and bip_count > 0:
+        target_bip += (target_rows - actual_total)
+
+    samples = []
+
+    if target_bip > 0 and bip_count > 0:
+        df_sample_bip = df.filter(pl.col("choice") == 0).sample(
+            n=min(target_bip, bip_count),
+            shuffle=True,
+            seed=seed,
+        )
+        samples.append(df_sample_bip)
+
+    if target_qr > 0 and qr_count > 0:
+        df_sample_qr = df.filter(pl.col("choice") == 1).sample(
+            n=min(target_qr, qr_count),
+            shuffle=True,
+            seed=seed,
+        )
+        samples.append(df_sample_qr)
+
+    if samples:
+        df_model_sample = pl.concat(samples).sample(fraction=1.0, shuffle=True, seed=seed)
+        return df_model_sample
+    else:
+        return df
+
+print("✅ Funciones de ayuda `prepare_features_extended` y `get_stratified_sample` definidas.")
+```
+
+```{python}
+#|label: helper-functions-larch
+
+def build_long_format_for_larch(
+    df_pl: pl.DataFrame,
+    feature_cols: list[str],
+    alt_mapping: dict[int, str] = ALT_MAPPING,
+) -> pd.DataFrame:
+    """
+    Convierte el dataset en formato wide (una fila por viaje)
+    a formato idca requerido por larch (dos filas por viaje, una por alternativa).
+    """
+    df_with_case = (
+        df_pl.with_row_index("case_id")
+        .with_columns(
+            [
+                pl.col("choice").cast(pl.Int8),
+                *[pl.col(col).cast(pl.Float64) for col in feature_cols], # Cast a Float64
+            ]
+        )
+    )
+
+    zero_int = pl.lit(0, dtype=pl.Int8)
+    zero_float = pl.lit(0.0, dtype=pl.Float64)
+    one = pl.lit(1, dtype=pl.Int8)
+
+    bip_frame = df_with_case.select(
+        [
+            pl.col("case_id"),
+            zero_int.alias("alt_id"),
+            (pl.col("choice") == 0).cast(pl.Int8).alias("choice_ind"),
+            zero_int.alias("ASC_QR"), # La constante solo aplica a QR
+            *[zero_float.alias(col) for col in feature_cols], # Features continuas son Float64
+        ]
+    )
+
+    qr_frame = df_with_case.select(
+        [
+            pl.col("case_id"),
+            one.alias("alt_id"),
+            (pl.col("choice") == 1).cast(pl.Int8).alias("choice_ind"),
+            one.alias("ASC_QR"), # La constante solo aplica a QR
+            *[pl.col(col) for col in feature_cols],
+        ]
+    )
+
+    df_long = pl.concat([bip_frame, qr_frame]).sort(["case_id", "alt_id"])
+
+    columns = ["case_id", "alt_id", "choice_ind", "ASC_QR"] + feature_cols
+    df_idca = df_long.select(columns).to_pandas()
+    df_idca.set_index(["case_id", "alt_id"], inplace=True)
+    df_idca.index.names = ["case_id", "alt_id"]
+    return df_idca
+
+
+def create_larch_dataset(
+    df_pl: pl.DataFrame,
+    feature_cols: list[str],
+    alt_mapping: dict[int, str] = ALT_MAPPING,
+) -> Dataset:
+    if isinstance(df_pl, pd.DataFrame):
+        df_pl = pl.from_pandas(df_pl)
+    df_idca = build_long_format_for_larch(df_pl, feature_cols, alt_mapping)
+    dataset = Dataset.construct.from_idca(df_idca)
+    dataset = dataset.dc.set_altnames(pd.Series(alt_mapping))
+    return dataset
+
+
+MODEL_ALL_PARAMS = list(PARAM_TO_FEATURE.keys())
+
+
+def detect_separated_dummies(
+    df_pl: pl.DataFrame,
+    y_col: str,
+    dummy_cols: list[str],
+) -> dict[str, dict]:
+    """
+    Detecta, para cada dummy, si hay:
+    - all_zero   : siempre 0
+    - perfect_1  : cada vez que dummy=1, y=1 (separación perfecta a favor de 1)
+    - perfect_0  : cada vez que dummy=1, y=0 (separación perfecta a favor de 0)
+    - none       : nada raro
+    """
+    info = {}
+    y = df_pl[y_col].cast(pl.Int8).to_numpy()
+    n_total = len(y)
+
+    for col in dummy_cols:
+        if col not in df_pl.columns:
+            info[col] = {"type": "none", "n_1": 0, "n_total": 0, "p_1": 0.0}
+            continue
+            
+        x = df_pl[col].cast(pl.Int8).to_numpy()
+        n_1 = int(x.sum())
+
+        if n_total == 0:
+            info[col] = {"type": "none", "n_1": 0, "n_total": 0, "p_1": 0.0}
+            continue
+
+        if n_1 == 0:
+            info[col] = {
+                "type": "all_zero",
+                "n_1": n_1,
+                "n_total": n_total,
+                "p_1": 0.0,
+            }
+            continue
+
+        y_when_1 = y[x == 1]
+        unique_y = np.unique(y_when_1)
+
+        if len(unique_y) == 1:
+            sep_type = "perfect_1" if unique_y[0] == 1 else "perfect_0"
+        else:
+            sep_type = "none"
+
+        info[col] = {
+            "type": sep_type,
+            "n_1": n_1,
+            "n_total": n_total,
+            "p_1": n_1 / n_total,
+        }
+
+    return info
+
+
+def detect_active_features(df_pl: pl.DataFrame, current_feature_cols: list[str], choice_col: str = "choice") -> tuple[list[str], dict[str, str], dict[str, dict]]:
+    """
+    Detecta features activas (sin problemas de variación o separación perfecta).
+    Ahora también detecta separación perfecta en dummies.
+    
+    Returns:
+        active: lista de features activas
+        inactive_reason: dict con razón de inactividad por feature
+        sep_info: dict con información detallada de separación perfecta para dummies
+    """
+    active = []
+    inactive_reason = {}
+    sep_info = {}
+    
+    # Identificar dummies (variables binarias 0/1)
+    dummy_cols = []
+    continuous_cols = []
+    for col in current_feature_cols:
+        if col not in df_pl.columns:
+            inactive_reason[col] = "missing_column"
+            continue
+            
+        # Check for non-numeric types first
+        if df_pl[col].dtype not in [pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64]:
+            inactive_reason[col] = "non_numeric_type"
+            continue
+        
+        # Verificar si es dummy (solo valores 0 y 1)
+        stats = df_pl.select(
+            [
+                pl.col(col).n_unique().alias("n_unique"),
+                pl.col(col).min().alias("min_val"),
+                pl.col(col).max().alias("max_val"),
+            ]
+        ).row(0)
+        n_unique, min_val, max_val = stats
+        
+        if n_unique <= 1:
+            if min_val == 0 and max_val == 0:
+                reason = "all_zero"
+            else:
+                reason = "no_variation"
+            inactive_reason[col] = reason
+        elif min_val == 0 and max_val == 1 and n_unique == 2:
+            # Es una dummy, verificar separación perfecta
+            dummy_cols.append(col)
+        else:
+            # Variable continua
+            continuous_cols.append(col)
+    
+    # Detectar separación perfecta en dummies
+    if dummy_cols:
+        sep_info = detect_separated_dummies(df_pl, choice_col, dummy_cols)
+        for col, meta in sep_info.items():
+            if meta["type"] != "none":
+                inactive_reason[col] = meta["type"]
+            else:
+                active.append(col)
+    
+    # Las variables continuas se agregan directamente si tienen variación
+    for col in continuous_cols:
+        active.append(col)
+    
+    return active, inactive_reason, sep_info
+
+
+def estimate_logit_larch(
+    df_pl: pl.DataFrame,
+    partition_label: str,
+    output_dir: str,
+    alt_mapping: dict[int, str] = ALT_MAPPING,
+    model_params_to_report: list[str] = MODEL_ALL_PARAMS,
+    current_feature_cols: list[str] = FEATURE_COLS_EXTENDED
+) -> tuple[Model, pd.DataFrame, pd.DataFrame]:
+    """
+    Estima el modelo logit binario usando larch y genera outputs compatibles.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    start_time = time.perf_counter()
+
+    # Detectar features activas para esta partición (incluye detección de separación perfecta)
+    active_features, inactive_feature_reason, sep_info = detect_active_features(df_pl, current_feature_cols, choice_col="choice")
+
+    if inactive_feature_reason:
+        print(f"   🔎 Revisión de separación perfecta y variables inactivas (partition={partition_label}):")
+        # Mostrar información detallada de separación perfecta
+        for col, meta in sep_info.items():
+            if meta["type"] != "none":
+                print(
+                    f"      - {col}: type={meta['type']}, "
+                    f"n_1={meta['n_1']:,}, total={meta['n_total']:,}, "
+                    f"p_1={meta['p_1']:.4f}"
+                )
+        # Mostrar otras variables inactivas (no dummies o dummies sin separación perfecta)
+        for col, reason in inactive_feature_reason.items():
+            if col not in sep_info or sep_info.get(col, {}).get("type") == "none":
+                print(f"      - {col}: {reason}")
+
+    # Preparar el dataset de larch
+    dataset = create_larch_dataset(df_pl.select(["choice"] + current_feature_cols), active_features, alt_mapping)
+    model = Model(dataset)
+    model.title = f"logit_larch_extended_{partition_label}"
+    model.compute_engine = "numba"
+    model.choice_ca_var = "choice_ind" # La columna que indica la elección real
+
+    # Construir la expresión de utilidad
+    utility_expr = P("ASC_QR") * X("ASC_QR") # La constante ASC_QR
+    for feat in active_features:
+        param_name = FEATURE_TO_PARAM.get(feat, feat) # Usar el mapeo si existe, sino el nombre del feature
+        utility_expr += P(param_name) * X(feat)
+    
+    model.utility_ca = utility_expr
+
+    # Maximizar la verosimilitud
+    print(f"   Estimando modelo para {partition_label}...")
+    result = model.maximize_loglike()
+    model.calculate_parameter_covariance()
+
+    # --- Parámetros ---
+    # Acceder directamente a los parámetros del modelo para máxima precisión
+    # en lugar de usar parameter_summary() que puede redondear los valores
+    pvalues_dict = {}
+    pstderr_dict = {}
+    
+    # Acceder a los parámetros directamente desde model.pf (parameter frame)
+    # que contiene los valores con precisión completa
+    try:
+        # model.pf es un DataFrame con los parámetros
+        pf_df = model.pf
+        for idx, row in pf_df.iterrows():
+            param_name = row.name if hasattr(row, 'name') else idx
+            # Obtener el valor estimado directamente (sin formateo)
+            param_value = row.get('value', row.get('Value', np.nan))
+            if param_value is not None and not pd.isna(param_value):
+                pvalues_dict[param_name] = float(param_value)
+            else:
+                pvalues_dict[param_name] = np.nan
+            
+            # Obtener el error estándar
+            se = row.get('stderr', row.get('Std Err', row.get('std_err', np.nan)))
+            if se is not None and not pd.isna(se):
+                pstderr_dict[param_name] = float(se)
+            else:
+                pstderr_dict[param_name] = np.nan
+    except (AttributeError, TypeError):
+        # Si model.pf no está disponible, usar parameter_summary() como fallback
+        # pero extraer los valores numéricos directamente
+        summary_df = (
+            model.parameter_summary()
+            .data.rename_axis("Parameter")
+            .reset_index()
+            .set_index("Parameter")
+        )
+        for param_name in summary_df.index:
+            val = summary_df.loc[param_name, "Value"]
+            pvalues_dict[param_name] = pd.to_numeric(val, errors='coerce')
+            se = summary_df.loc[param_name, "Std Err"]
+            pstderr_dict[param_name] = pd.to_numeric(se, errors='coerce')
+    
+    # También obtenemos el summary para los t-stats (puede tener strings como "BIG")
+    summary_df = (
+        model.parameter_summary()
+        .data.rename_axis("Parameter")
+        .reset_index()
+        .set_index("Parameter")
+    )
+
+    def _safe_float(x):
+        if isinstance(x, (float, int, np.floating, np.integer)):
+            return float(x)
+        if isinstance(x, str):
+            token = x.strip().upper()
+            if token in {"BIG", "+BIG"}:
+                return np.inf
+            if token == "-BIG":
+                return -np.inf
+        return float(x)
+
+    rows = []
+    t_max = float(np.finfo(float).max)
+    
+    # Crear un diccionario para mapear nombres de parámetros sin sufijo a nombres completos
+    # Los nombres en pvalues_dict pueden tener el sufijo de partición
+    param_name_mapping = {}
+    for full_name in pvalues_dict.keys():
+        clean_name = full_name.replace(f"_{partition_label}", "")
+        param_name_mapping[clean_name] = full_name
+    
+    for param in model_params_to_report:
+        # Buscar el nombre completo del parámetro en el modelo
+        matching_full_name = param_name_mapping.get(param)
+        
+        # Si no encontramos exacto, buscar por coincidencia parcial
+        if not matching_full_name:
+            for clean_name, full_name in param_name_mapping.items():
+                if param in clean_name:
+                    matching_full_name = full_name
+                    break
+
+        if matching_full_name and matching_full_name in pvalues_dict:
+            # Usar valores directos del modelo para máxima precisión
+            value = float(pvalues_dict[matching_full_name])
+            se = float(pstderr_dict.get(matching_full_name, np.nan))
+            
+            # Para t-stat, usar el summary (puede tener strings especiales)
+            # El summary puede tener el nombre con o sin sufijo
+            summary_key = matching_full_name if matching_full_name in summary_df.index else param
+            if summary_key in summary_df.index:
+                t_stat = _safe_float(summary_df.loc[summary_key].get("t Stat", np.nan))
+            else:
+                # Calcular t-stat manualmente si no está en el summary
+                t_stat = value / se if se > 0 and not np.isnan(se) else np.nan
+        else:
+            # Si el parámetro no fue estimado por larch (ej. por inactividad o separación perfecta)
+            value = 0.0
+            
+            # Intentar encontrar la razón de inactividad
+            feat_name_for_param = PARAM_TO_FEATURE.get(param)
+            reason = inactive_feature_reason.get(feat_name_for_param, "inactive")
+
+            if reason in {"all_zero", "no_variation", "perfect_1", "perfect_0"}:
+                # Variables con separación perfecta o sin variación se reportan como en statsmodels:
+                # value=0.0, se=0.0, t_stat=t_max (infinito)
+                se = 0.0
+                t_stat = t_max # Emular t-stat muy alto para variables fijas o con separación perfecta
+            else:
+                se = np.nan
+                t_stat = np.nan # No se pudo estimar o no aplica
+        rows.append(
+            {
+                "Name": f"{param}_{partition_label}",
+                "Value": value,
+                "Robust std err.": se,
+                "Robust t-stat.": t_stat,
+            }
+        )
+    params_df = pd.DataFrame(rows)
+
+    # --- Estadísticas ---
+    nobs = model.n_cases
+    ll_final = float(result["loglike"])
+    ll_init = nobs * np.log(0.5) # Asume 50/50 probabilidad inicial
+    k_params = len(model.parameters) # Número de parámetros estimados por el modelo
+    rho_sq = 1.0 - ll_final / ll_init
+    rho_sq_bar = 1.0 - (ll_final - k_params) / ll_init
+
+    try:
+        grad = model.d_loglike()
+        grad_norm = float(np.linalg.norm(grad))
+    except Exception:
+        grad_norm = np.nan
+
+    elapsed_seconds = time.perf_counter() - start_time
+    print(f"   ⏱️ Tiempo total partición {partition_label}: {elapsed_seconds:.1f} s")
+
+    stats_df = pd.DataFrame(
+        [
+            {
+                "Number of estimated parameters": k_params,
+                "Sample size": nobs,
+                "Excluded observations": 0,
+                "Init log likelihood": ll_init,
+                "Final log likelihood": ll_final,
+                "Likelihood ratio test for the init. model": -2 * (ll_init - ll_final),
+                "Rho-square for the init. model": rho_sq,
+                "Rho-square-bar for the init. model": rho_sq_bar,
+                "Akaike Information Criterion": -2 * ll_final + 2 * k_params,
+                "Bayesian Information Criterion": -2 * ll_final + k_params * np.log(nobs),
+                "Final gradient norm": grad_norm,
+                "Bootstrapping time": None,
+                "Wall-clock seconds": elapsed_seconds,
+            }
+        ]
+    )
+
+    params_path = os.path.join(output_dir, f"params_ext_{partition_label}.csv")
+    stats_path = os.path.join(output_dir, f"stats_ext_{partition_label}.csv")
+    # Guardar con máxima precisión numérica
+    params_df.to_csv(params_path, index=False, float_format='%.15g')
+    stats_df.to_csv(stats_path, index=False, float_format='%.15g')
+
+    print(f"📁 Parámetros (larch) guardados en: {params_path}")
+    print(f"📁 Estadísticas (larch) guardadas en: {stats_path}")
+    print(f"   ✅ Rho-cuadrado ajustado (Biogeme-style): {rho_sq_bar:.3f}")
+
+    return model, params_df, stats_df
+```
+
+## Carga de Datos (Una Partición para Análisis)
+
+```{python}
+#|label: load-data
+print(f"Cargando partición {PARTITION_LABEL} desde {INPUT_DATASET_PATH}...")
+
+partition_path_glob = (
+    f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
+)
+
+try:
+    lf_data = read_parquet_portable(partition_path_glob)
+
+    schema = lf_data.collect_schema()
+    n_rows = lf_data.select(pl.len()).collect().item()
+
+    print(f"✅ Partición cargada (LazyFrame): {n_rows:,} filas.")
+    print(f"   Columnas disponibles: {len(schema.names())}")
+    
+    # Verificar columnas necesarias para el modelo extendido
+    cols_necesarias_check = [
+        "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
+        "t_vehiculo_total_seg", "te0", 
+        "tc1", "tc2", "tc3",
+        "te1", "te2", "te3",
+        "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
+    ]
+    available_cols_check = schema.names()
+    missing_cols_check = [col for col in cols_necesarias_check if col not in available_cols_check]
+    
+    if missing_cols_check:
+        print(f"❌ Columnas faltantes para el modelo extendido: {missing_cols_check}")
+    else:
+        print(f"✅ Todas las columnas necesarias para el modelo extendido están disponibles")
+        relevant_cols_display = ["is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas", "t_vehiculo_total_seg"]
+        print(f"   Columnas clave presentes: {[c for c in relevant_cols_display if c in available_cols_check]}")
+        
+except Exception as e:
+    print(f"❌ Error al cargar la partición: {e}")
+    print(f"   Verifica que la ruta y partición existan: {partition_path_glob}")
+    lf_data = None
+```
+
+## Exploración de las Variables Relevantes
+
+```{python}
+#|label: explore-variables
+
+if lf_data is not None:
+    print("\n🔍 Exploramos las variables relevantes para el modelo extendido")
+
+    print(f"\n📊 Información del dataset:")
+    print(f"   - Filas: {lf_data.select(pl.len()).collect().item():,}")
+    print(f"   - Columnas: {len(lf_data.collect_schema().names())}")
+
+    print(f"\n🎯 Variables clave para el modelo Logit Extendido:")
+
+    if "is_qr" in lf_data.collect_schema().names():
+        qr_stats = lf_data.select([
+            pl.col("is_qr").sum().alias("qr_count"),
+            pl.len().alias("total_count"),
+            (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage"),
+        ]).collect()
+
+        print(f"   📱 Adopción QR:")
+        print(f"      - Viajes con QR: {qr_stats['qr_count'][0]:,}")
+        print(f"      - Total viajes: {qr_stats['total_count'][0]:,}")
+        print(f"      - % QR: {qr_stats['qr_percentage'][0]:.2f}%")
+
+    # Estadísticas de variables temporales
+    if "tipodia" in lf_data.collect_schema().names():
+        tipodia_stats = (
+            lf_data
+            .group_by("tipodia")
+            .agg([
+                pl.len().alias("count"),
+                pl.col("is_qr").sum().alias("qr_count"),
+                (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage"),
+            ])
+            .sort("count", descending=True)
+            .collect()
+        )
+
+        tipodia_labels = {0: "Laboral", 1: "Sábado", 2: "Domingo"}
+        print(f"\n   📅 Distribución por tipo de día:")
+        for row in tipodia_stats.iter_rows(named=True):
+            tipo_label = tipodia_labels.get(row["tipodia"], f"Tipo {row['tipodia']}")
+            print(
+                f"      - {tipo_label}: {row['count']:,} viajes "
+                f"({row['qr_percentage']:.1f}% QR)"
+            )
+
+    # Estadísticas de variables de viaje
+    print(f"\n   🚌 Atributos del viaje:")
+    
+    if "n_etapas" in lf_data.collect_schema().names():
+        etapas_stats = (
+            lf_data
+            .with_columns([
+                (pl.col("n_etapas") - 1).alias("n_trasbordos")
+            ])
+            .select([
+                pl.col("n_trasbordos").mean().alias("mean_trasbordos"),
+                pl.col("n_trasbordos").median().alias("median_trasbordos"),
+                pl.col("n_trasbordos").max().alias("max_trasbordos"),
+            ])
+            .collect()
+        )
+        print(f"      - Trasbordos: media={etapas_stats['mean_trasbordos'][0]:.2f}, "
+              f"mediana={etapas_stats['median_trasbordos'][0]:.1f}, "
+              f"máx={etapas_stats['max_trasbordos'][0]}")
+    
+    if "t_vehiculo_total_seg" in lf_data.collect_schema().names():
+        tiempo_veh_stats = (
+            lf_data
+            .with_columns([
+                (pl.col("t_vehiculo_total_seg") / 60).alias("tiempo_veh_min")
+            ])
+            .select([
+                pl.col("tiempo_veh_min").mean().alias("mean_min"),
+                pl.col("tiempo_veh_min").median().alias("median_min"),
+            ])
+            .collect()
+        )
+        print(f"      - Tiempo en vehículo: media={tiempo_veh_stats['mean_min'][0]:.1f} min, "
+              f"mediana={tiempo_veh_stats['median_min'][0]:.1f} min")
+
+    print(f"\n📋 Muestra de datos (primeras 5 filas de columnas clave):")
+    sample_cols = ["is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas", "t_vehiculo_total_seg"]
+    available_sample_cols = [
+        col for col in sample_cols if col in lf_data.collect_schema().names()
+    ]
+
+    if available_sample_cols:
+        sample_data = lf_data.select(available_sample_cols).head(5).collect()
+        print(sample_data)
+    else:
+        print("   No se encontraron las columnas esperadas para la muestra")
+
+else:
+    print("⚠️ No hay datos cargados (`lf_data`) para explorar.")
+```
+
+## Preparación de Datos para el Modelo Logit Extendido (Larch)
+
+```{python}
+#|label: prepare-extended-model-data-larch
+
+if lf_data is not None:
+    print("🔧 Preparando variables para el MODELO EXTENDIDO (larch)...")
+
+    # Usar la función extendida de helpers
+    lf_model_ready_ext = prepare_features_extended(lf_data)
+
+    print(
+        f"⚙️  Calculando variables y cargando datos en memoria "
+        f"para la partición {PARTITION_LABEL}..."
+    )
+    try:
+        df_model_data_ext = lf_model_ready_ext.collect()
+        print(
+            f"✅ Datos listos: {len(df_model_data_ext):,} filas, "
+            f"{len(df_model_data_ext.columns)} columnas."
+        )
+
+        pandas_df_ext = df_model_data_ext.to_pandas()
+        print("✅ DataFrame de pandas listo para inspección.")
+
+        print("\nMuestra de datos para el modelo (primeras 10 filas):")
+        print(pandas_df_ext.head(10))
+
+    except Exception as e:
+        print(f"❌ Error durante la preparación de datos extendidos: {e}")
+        pandas_df_ext = None
+else:
+    print("⚠️ No hay datos cargados (`lf_data`) para preparar.")
+    pandas_df_ext = None
+```
+
+## Definición del Modelo Logit Extendido con `larch`
+
+La especificación del modelo extendido con `larch` se construye de la misma manera que el modelo base, pero incluyendo todas las variables de `FEATURE_COLS_EXTENDED` además de la constante `ASC_QR`.
+
+Los helpers (`build_long_format_for_larch`, `create_larch_dataset` y `estimate_logit_larch`) se encargan de:
+
+* Convertir el dataset wide a formato `idca` requerido por Larch.
+* Construir el objeto `Model` con `choice_ca_var = "choice_ind"` y la `utility_ca` extendida.
+* Ejecutar `maximize_loglike`, calcular la covarianza y persistir los resultados en CSV compatibles.
+
+## Estimación del Modelo Extendido (Semana 2025-W17)
+
+```{python}
+#|label: estimate-extended-2025W17-larch
+
+BASE_OUTPUT_DIR_LARCH = "model_outputs_larch"
+
+if pandas_df_ext is not None:
+    print(f"🚀 Estimando modelo Logit Extendido (larch) para {PARTITION_LABEL}...")
+
+    APPLY_SAMPLING = False # Generalmente se usa muestreo para modelos extendidos
+    SAMPLE_FRACTION = 0.20 # O 0.50, según la necesidad de la partición única
+    SEED = 42
+
+    # Construir nombre del directorio según muestreo
+    if APPLY_SAMPLING:
+        sample_label_str = f"sample{int(SAMPLE_FRACTION*100)}pct"
+        results_folder_larch_ext = os.path.join(BASE_OUTPUT_DIR_LARCH, f"W{WEEK_ANALISIS}-extended-{sample_label_str}")
+    else:
+        results_folder_larch_ext = os.path.join(BASE_OUTPUT_DIR_LARCH, f"W{WEEK_ANALISIS}-extended")
+
+    df_for_model_ext = df_model_data_ext # Usamos directamente el df_model_data_ext de Polars
+
+    if APPLY_SAMPLING:
+        print(f"   Aplicando muestreo estratificado ({SAMPLE_FRACTION*100:.0f}%)...")
+        df_sample_ext = get_stratified_sample(df_for_model_ext, SAMPLE_FRACTION, SEED)
+        df_for_model_ext = df_sample_ext
+        print(f"   Filas después del muestreo: {len(df_for_model_ext):,}")
+    else:
+        print("   Usando el dataset completo (sin muestreo).")
+
+
+    model_larch_ext, params_df_larch_ext, stats_df_larch_ext = estimate_logit_larch(
+        df_pl=df_for_model_ext,
+        partition_label=PARTITION_LABEL,
+        output_dir=results_folder_larch_ext,
+        alt_mapping=ALT_MAPPING,
+        model_params_to_report=MODEL_ALL_PARAMS,
+        current_feature_cols=FEATURE_COLS_EXTENDED
+    )
+
+    print("\n✅ Estimación extendida completada (larch).")
+
+    print("\n📊 Resumen rápido de parámetros:")
+    display(
+        params_df_larch_ext[["Name", "Value", "Robust t-stat."]]
+        .set_index("Name")
+        .style.format({"Value": "{:.4f}", "Robust t-stat.": "{:.1f}"})
+    )
+
+    print("\n📊 Estadísticas generales:")
+    display(
+        stats_df_larch_ext[
+            [
+                "Sample size",
+                "Final log likelihood",
+                "Rho-square for the init. model",
+                "Rho-square-bar for the init. model",
+            ]
+        ].style.format(
+            {
+                "Sample size": "{:.0f}",
+                "Final log likelihood": "{:.2f}",
+                "Rho-square for the init. model": "{:.3f}",
+                "Rho-square-bar for the init. model": "{:.3f}",
+            }
+        )
+    )
+else:
+    print("⚠️ No hay `pandas_df_ext` disponible. Revisa la celda de preparación de datos.")
+```
+
+## Configuración para Ejecución Secuencial (larch extendido)
+
+```{python}
+#|label: setup-sequential-run-larch-extended
+
+BASE_OUTPUT_DIR_LARCH = "model_outputs_larch"
+PARTICIONES_A_PROCESAR_EXT = [(2025, 17), (2025, 18)]  # puedes extender esta lista
+APPLY_SAMPLING_EXT = True
+SAMPLE_FRACTION_EXT_20 = 0.20 # Muestreo 20%
+SAMPLE_FRACTION_EXT_50 = 0.50 # Muestreo 50%
+SEED = 42
+
+print("✅ Configuración de ejecución secuencial extendida lista.")
+print(f"   Particiones a procesar: {PARTICIONES_A_PROCESAR_EXT}")
+print(f"   Aplicar muestreo: {APPLY_SAMPLING_EXT}")
+if APPLY_SAMPLING_EXT:
+    print(f"   Fracción de muestreo 20%: {SAMPLE_FRACTION_EXT_20*100:.0f}%")
+    print(f"   Fracción de muestreo 50%: {SAMPLE_FRACTION_EXT_50*100:.0f}%")
+```
+
+## Estimación Secuencial del Modelo Extendido (larch)
+
+```{python}
+#|label: sequential-estimation-larch-extended
+#|eval: false
+
+import gc
+import time
+import traceback
+
+print("\n--- Iniciando Proceso de Estimación Secuencial (larch - Modelo Extendido) ---")
+
+# Lista para almacenar los resultados de cada partición y muestreo
+all_results = []
+
+for year, week in PARTICIONES_A_PROCESAR_EXT:
+    partition_label = f"{year}-W{week}"
+    print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} (Extendido) ---\n{'='*60}")
+
+    input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+    
+    # Cargar datos una vez por partición
+    lf_data_seq = None
+    df_model_data_seq = None
+    try:
+        lf_data_seq = read_parquet_portable(input_path_glob)
+        lf_model_ready_seq = prepare_features_extended(lf_data_seq)
+        df_model_data_seq = lf_model_ready_seq.collect()
+        print(f"   Datos preparados: {len(df_model_data_seq):,} filas")
+    except Exception as e:
+        print(f"   ❌ ERROR al cargar/preparar datos para {partition_label}: {e}")
+        traceback.print_exc()
+        continue # Saltar a la siguiente partición
+
+    # Determinar qué fracciones procesar según APPLY_SAMPLING_EXT
+    if APPLY_SAMPLING_EXT:
+        # Si hay muestreo, iterar sobre las fracciones
+        sample_fractions_to_process = [SAMPLE_FRACTION_EXT_20, SAMPLE_FRACTION_EXT_50]
+    else:
+        # Si no hay muestreo, procesar solo una vez (sin fracción)
+        sample_fractions_to_process = [None]
+
+    # Iterar sobre las fracciones de muestreo (o una vez si no hay muestreo)
+    for sample_fraction_val in sample_fractions_to_process:
+        if APPLY_SAMPLING_EXT:
+            sample_label_str = f"sample{int(sample_fraction_val*100)}pct"
+            output_dir_partition = os.path.join(BASE_OUTPUT_DIR_LARCH, f"W{week}-extended-{sample_label_str}")
+        else:
+            sample_label_str = ""  # Sin sufijo cuando no hay muestreo
+            output_dir_partition = os.path.join(BASE_OUTPUT_DIR_LARCH, f"W{week}-extended")
+        
+        os.makedirs(output_dir_partition, exist_ok=True)
+        if APPLY_SAMPLING_EXT:
+            print(f"\n   -> Procesando con {sample_label_str}. Resultados en: {output_dir_partition}")
+        else:
+            print(f"\n   -> Procesando sin muestreo. Resultados en: {output_dir_partition}")
+
+        df_for_model_seq = None
+        try:
+            if APPLY_SAMPLING_EXT:
+                print(f"      Aplicando muestreo estratificado ({sample_fraction_val*100:.0f}%)...")
+                df_sample_seq = get_stratified_sample(df_model_data_seq, sample_fraction_val, SEED)
+                df_for_model_seq = df_sample_seq
+                print(f"      Filas después del muestreo: {len(df_for_model_seq):,}")
+            else:
+                print("      Usando dataset completo (sin muestreo).")
+                df_for_model_seq = df_model_data_seq
+
+            if len(df_for_model_seq) == 0:
+                if APPLY_SAMPLING_EXT:
+                    print(f"      ⚠️ Muestra vacía para {partition_label} con {sample_label_str}. Saltando estimación.")
+                else:
+                    print(f"      ⚠️ Dataset vacío para {partition_label}. Saltando estimación.")
+                continue
+
+            # 👉 Estimación con larch (modelo extendido)
+            model_larch, params_df_larch, stats_df_larch = estimate_logit_larch(
+                df_pl=df_for_model_seq,
+                partition_label=partition_label,
+                output_dir=output_dir_partition,
+                alt_mapping=ALT_MAPPING,
+                model_params_to_report=MODEL_ALL_PARAMS,
+                current_feature_cols=FEATURE_COLS_EXTENDED
+            )
+            if APPLY_SAMPLING_EXT:
+                print(f"   ✅ Estimación completada para {partition_label} ({sample_label_str}).")
+            else:
+                print(f"   ✅ Estimación completada para {partition_label} (sin muestreo).")
+
+            # Almacenar un resumen para la comparación final
+            all_results.append({
+                'Partition': partition_label,
+                'Sample': sample_label_str if APPLY_SAMPLING_EXT else "full",
+                'Params': params_df_larch.set_index('Name').T,
+                'Stats': stats_df_larch.T
+            })
+
+        except Exception as e:
+            if APPLY_SAMPLING_EXT:
+                print(f"   ❌ ERROR procesando {partition_label} ({sample_label_str}): {e}")
+            else:
+                print(f"   ❌ ERROR procesando {partition_label} (sin muestreo): {e}")
+            traceback.print_exc()
+        finally:
+            # Limpiar variables específicas de la muestra
+            if 'df_for_model_seq' in locals():
+                del df_for_model_seq
+            gc.collect()
+            time.sleep(1) # Pequeña pausa
+
+    # Limpiar variables específicas de la partición
+    if 'lf_data_seq' in locals():
+        del lf_data_seq
+    if 'df_model_data_seq' in locals():
+        del df_model_data_seq
+    gc.collect()
+    time.sleep(2)
+
+print("\n" + "="*60 + "\n--- Proceso Finalizado (larch - Modelo Extendido) ---\n" + "="*60)
+
+# Opcional: Imprimir un resumen consolidado de los resultados
+if all_results:
+    print("\n--- Resumen Consolidado de Resultados (Larch Extendido) ---")
+    summary_dfs = []
+    for res in all_results:
+        part_name = res['Partition']
+        sample_name = res['Sample']
+        # Extraer parámetros clave y estadísticas
+        params = res['Params']
+        stats = res['Stats']
+        
+        row_data = {
+            'Partition': part_name,
+            'Sample': sample_name,
+            'Rho-square-bar': stats.loc['Rho-square-bar for the init. model'][0]
+        }
+        for p_name in MODEL_ALL_PARAMS:
+            col_name_in_params_df = f"{p_name}_{part_name}"
+            # Asegurarse de manejar los casos donde el parámetro no existe en el resultado
+            if col_name_in_params_df in params.columns:
+                row_data[p_name] = params[col_name_in_params_df]['Value']
+            else:
+                row_data[p_name] = np.nan # o 0.0 si es un beta no estimado
+        summary_dfs.append(pd.DataFrame([row_data]))
+    
+    if summary_dfs:
+        final_summary_df = pd.concat(summary_dfs, ignore_index=True)
+        display(final_summary_df)
+else:
+    print("\nNo se generaron resultados para resumir.")
+```
+
+## Resultados del Modelo Extendido (Larch)
+
+A continuación se presentan y analizan los resultados del modelo logit extendido estimado con `larch` sobre muestras estratificadas de las semanas 17 y 18 del año 2025.
+
+### Carga de Resultados
+
+Primero, cargamos los resultados previamente calculados.
+
+```{python}
+#| label: load-extended-results-larch
+import pandas as pd
+import numpy as np
+import os
+
+# --- Configuración ---
+BASE_RESULTS_DIR_LARCH = "model_outputs_larch"
+
+# Semanas y configuraciones de muestreo
+PARTITIONS = ["2025-W17", "2025-W18"]
+SAMPLE_CONFIGS = {
+    "20%": "extended-sample20pct",
+    "50%": "extended-sample50pct"
+}
+
+# Diccionario para almacenar los resultados
+results_data_larch = {}
+
+for partition in PARTITIONS:
+    year, week = partition.split("-W")
+    week_num = week
+    
+    results_data_larch[partition] = {}
+    
+    for sample_label, folder_suffix in SAMPLE_CONFIGS.items():
+        folder_name = f"W{week_num}-{folder_suffix}"
+        results_folder = os.path.join(BASE_RESULTS_DIR_LARCH, folder_name)
+        
+        params_file = os.path.join(results_folder, f"params_ext_{partition}.csv")
+        stats_file = os.path.join(results_folder, f"stats_ext_{partition}.csv")
+        
+        try:
+            df_params = pd.read_csv(params_file)
+            df_stats = pd.read_csv(stats_file)
+            
+            # Limpiar nombres de parámetros (remover sufijos de partición)
+            df_params['Name_clean'] = df_params['Name'].str.replace(f'_{partition}', '', regex=False)
+            df_params.set_index('Name_clean', inplace=True) # Usar Name_clean como índice
+            
+            results_data_larch[partition][sample_label] = {
+                'params': df_params,
+                'stats': df_stats
+            }
+            
+            print(f"✅ Larch {partition} ({sample_label}): Cargado desde {results_folder}")
+            
+        except FileNotFoundError:
+            print(f"⚠️  Larch {partition} ({sample_label}): No se encontraron archivos en {results_folder}")
+            results_data_larch[partition][sample_label] = None
+        except Exception as e:
+            print(f"❌ Larch {partition} ({sample_label}): Error al cargar - {e}")
+            results_data_larch[partition][sample_label] = None
+
+print(f"\n✅ Carga de resultados Larch completada.")
+```
+
+### Análisis de la Estimación
+
+#### Bondad de Ajuste
+
+La tabla siguiente resume las métricas de calidad del modelo extendido para ambas semanas y configuraciones de muestreo.
+
+```{python}
+#| label: display-extended-stats-larch
+if 'results_data_larch' in locals():
+    # Crear tabla consolidada de estadísticas
+    stats_rows = []
+    
+    for partition in PARTITIONS:
+        for sample_label in SAMPLE_CONFIGS.keys():
+            if results_data_larch[partition][sample_label] is not None:
+                df_stats = results_data_larch[partition][sample_label]['stats']
+                stats_row = {
+                    'Partición': partition,
+                    'Muestra': sample_label,
+                    'Observaciones': df_stats.iloc[0]['Sample size'] if 'Sample size' in df_stats.columns else None,
+                    'Log-Likelihood Final': df_stats.iloc[0]['Final log likelihood'] if 'Final log likelihood' in df_stats.columns else None,
+                    'Rho-cuadrado': df_stats.iloc[0]['Rho-square for the init. model'] if 'Rho-square for the init. model' in df_stats.columns else None,
+                    'Rho-cuadrado Ajustado': df_stats.iloc[0]['Rho-square-bar for the init. model'] if 'Rho-square-bar for the init. model' in df_stats.columns else None
+                }
+                stats_rows.append(stats_row)
+    
+    if stats_rows:
+        df_stats_display = pd.DataFrame(stats_rows)
+        
+        # Formatear valores
+        if 'Observaciones' in df_stats_display.columns:
+            df_stats_display['Observaciones'] = df_stats_display['Observaciones'].apply(
+                lambda x: f"{int(x):,}" if pd.notna(x) else "N/A"
+            )
+        if 'Log-Likelihood Final' in df_stats_display.columns:
+            df_stats_display['Log-Likelihood Final'] = df_stats_display['Log-Likelihood Final'].apply(
+                lambda x: f"{float(x):.2f}" if pd.notna(x) else "N/A"
+            )
+        if 'Rho-cuadrado' in df_stats_display.columns:
+            df_stats_display['Rho-cuadrado'] = df_stats_display['Rho-cuadrado'].apply(
+                lambda x: f"{float(x):.3f}" if pd.notna(x) else "N/A"
+            )
+        if 'Rho-cuadrado Ajustado' in df_stats_display.columns:
+            df_stats_display['Rho-cuadrado Ajustado'] = df_stats_display['Rho-cuadrado Ajustado'].apply(
+                lambda x: f"{float(x):.3f}" if pd.notna(x) else "N/A"
+            )
+        
+        print("Tabla 1: Estadísticas Generales del Modelo Extendido (Larch)")
+        display(df_stats_display)
+    else:
+        print("⚠️ No se encontraron datos de estadísticas para mostrar.")
+else:
+    print("❌ No se han cargado los resultados. Ejecuta la celda anterior primero.")
+```
+
+#### Parámetros Estimados - Semana 2025-W17
+
+La siguiente tabla compara los parámetros estimados para la semana 2025-W17 usando muestras del 20% y 50%.
+
+```{python}
+#| label: display-params-w17-larch
+if 'results_data_larch' in locals() and '2025-W17' in results_data_larch:
+    partition = '2025-W17'
+    
+    # Preparar datos para comparación
+    comparison_data = []
+    
+    if results_data_larch[partition]['20%'] is not None and results_data_larch[partition]['50%'] is not None:
+        params_20 = results_data_larch[partition]['20%']['params']
+        params_50 = results_data_larch[partition]['50%']['params']
+        
+        # Obtener nombres de parámetros únicos
+        all_params = sorted(list(set(params_20.index.tolist() + params_50.index.tolist())))
+        
+        # Función helper para normalizar t-stats infinitos o muy grandes
+        def format_tstat(tstat_val):
+            if pd.isna(tstat_val) or tstat_val is None:
+                return None
+            try:
+                tstat_float = float(tstat_val)
+                # Si es muy grande (mayor a 1e10) o infinito, mostrar "N/A" o "Inf"
+                if abs(tstat_float) > 1e10 or not np.isfinite(tstat_float):
+                    return "N/A"
+                return tstat_float
+            except (ValueError, TypeError):
+                return None
+        
+        for param_name in all_params:
+            row = {'Parámetro': param_name}
+            
+            # Valores del 20%
+            if param_name in params_20.index:
+                row['Beta (20%)'] = params_20.loc[param_name, 'Value']
+                row['t-stat (20%)'] = format_tstat(params_20.loc[param_name, 'Robust t-stat.'])
+            else:
+                row['Beta (20%)'] = None
+                row['t-stat (20%)'] = None
+            
+            # Valores del 50%
+            if param_name in params_50.index:
+                row['Beta (50%)'] = params_50.loc[param_name, 'Value']
+                row['t-stat (50%)'] = format_tstat(params_50.loc[param_name, 'Robust t-stat.'])
+            else:
+                row['Beta (50%)'] = None
+                row['t-stat (50%)'] = None
+            
+            comparison_data.append(row)
+        
+        df_comparison_w17 = pd.DataFrame(comparison_data)
+        df_comparison_w17 = df_comparison_w17.set_index('Parámetro')
+        
+        print("Tabla 2: Parámetros Estimados del Modelo Extendido (Larch) - Semana 2025-W17")
+        display(df_comparison_w17.style.format({
+            'Beta (20%)': '{:.4f}',
+            'Beta (50%)': '{:.4f}',
+            't-stat (20%)': lambda x: 'N/A' if x == 'N/A' or pd.isna(x) else f'{float(x):.1f}',
+            't-stat (50%)': lambda x: 'N/A' if x == 'N/A' or pd.isna(x) else f'{float(x):.1f}'
+        }).highlight_null(color='transparent'))
+    else:
+        print("⚠️ No se encontraron datos completos para la comparación de W17.")
+else:
+    print("❌ No se han cargado los resultados. Ejecuta la celda de carga primero.")
+```
+
+#### Parámetros Estimados - Semana 2025-W18
+
+La siguiente tabla compara los parámetros estimados para la semana 2025-W18 usando muestras del 20% y 50%.
+
+```{python}
+#| label: display-params-w18-larch
+if 'results_data_larch' in locals() and '2025-W18' in results_data_larch:
+    partition = '2025-W18'
+    
+    # Preparar datos para comparación
+    comparison_data = []
+    
+    if results_data_larch[partition]['20%'] is not None and results_data_larch[partition]['50%'] is not None:
+        params_20 = results_data_larch[partition]['20%']['params']
+        params_50 = results_data_larch[partition]['50%']['params']
+        
+        # Obtener nombres de parámetros únicos
+        all_params = sorted(list(set(params_20.index.tolist() + params_50.index.tolist())))
+        
+        # Función helper para normalizar t-stats infinitos o muy grandes
+        def format_tstat(tstat_val):
+            if pd.isna(tstat_val) or tstat_val is None:
+                return None
+            try:
+                tstat_float = float(tstat_val)
+                # Si es muy grande (mayor a 1e10) o infinito, mostrar "N/A"
+                if abs(tstat_float) > 1e10 or not np.isfinite(tstat_float):
+                    return "N/A"
+                return tstat_float
+            except (ValueError, TypeError):
+                return None
+        
+        for param_name in all_params:
+            row = {'Parámetro': param_name}
+            
+            # Valores del 20%
+            if param_name in params_20.index:
+                row['Beta (20%)'] = params_20.loc[param_name, 'Value']
+                row['t-stat (20%)'] = format_tstat(params_20.loc[param_name, 'Robust t-stat.'])
+            else:
+                row['Beta (20%)'] = None
+                row['t-stat (20%)'] = None
+            
+            # Valores del 50%
+            if param_name in params_50.index:
+                row['Beta (50%)'] = params_50.loc[param_name, 'Value']
+                row['t-stat (50%)'] = format_tstat(params_50.loc[param_name, 'Robust t-stat.'])
+            else:
+                row['Beta (50%)'] = None
+                row['t-stat (50%)'] = None
+            
+            comparison_data.append(row)
+        
+        df_comparison_w18 = pd.DataFrame(comparison_data)
+        df_comparison_w18 = df_comparison_w18.set_index('Parámetro')
+        
+        print("Tabla 3: Parámetros Estimados del Modelo Extendido (Larch) - Semana 2025-W18")
+        display(df_comparison_w18.style.format({
+            'Beta (20%)': '{:.4f}',
+            'Beta (50%)': '{:.4f}',
+            't-stat (20%)': lambda x: 'N/A' if x == 'N/A' or pd.isna(x) else f'{float(x):.1f}',
+            't-stat (50%)': lambda x: 'N/A' if x == 'N/A' or pd.isna(x) else f'{float(x):.1f}'
+        }).highlight_null(color='transparent'))
+    else:
+        print("⚠️ No se encontraron datos completos para la comparación de W18.")
+else:
+    print("❌ No se han cargado los resultados. Ejecuta la celda de carga primero.")
+```
+
+### Validación de Muestreo Estratificado
+
+Para validar la eficiencia de usar una muestra en lugar del dataset completo, se estimó el mismo modelo extendido sobre muestras estratificadas del **20% y 50%**. El muestreo estratificado garantiza que la proporción de usuarios QR y Bip! en la muestra sea idéntica a la proporción en el dataset completo. Las tablas anteriores permiten comparar los resultados entre ambas configuraciones de muestreo.
+
+**Análisis de la Comparación:**
+
+1.  **Bondad de Ajuste Consistente:** El **Rho-cuadrado ajustado** es prácticamente idéntico entre ambas configuraciones de muestreo para cada semana, demostrando que el muestreo estratificado al 20% captura el poder explicativo del modelo de manera equivalente al 50%.
+
+2.  **Coeficientes Estables:** Los valores de los coeficientes (Betas) son extremadamente similares entre ambos modelos. Las pequeñas diferencias son despreciables y no alteran ninguna de las conclusiones.
+
+3.  **Estadísticos t (Esperados):** Como es de esperar, los estadísticos t tienden a ser ligeramente menores en la muestra del 20% debido al mayor error estándar en muestras más pequeñas. Sin embargo, los valores siguen siendo altamente significativos, validando la robustez de los hallazgos.
+
+### Interpretación y Conclusiones
+
+Los resultados del modelo extendido nos permiten extraer conclusiones más profundas sobre el comportamiento de los usuarios, incorporando tanto factores temporales como atributos del viaje:
+
+#### Variables Temporales (Consistentes con el Modelo Baseline)
+
+1.  **Preferencia Base por la Tarjeta Bip!**: El coeficiente de la constante (`ASC_QR`) es fuertemente negativo en ambas semanas, indicando una preferencia inherente por usar la tarjeta Bip! sobre el código QR en la situación de referencia.
+
+2.  **El Efecto de la Rutina**: Los coeficientes para los días laborales fuera de punta (`B_LJ_LAB` y `B_VIE_LAB`) son negativos, sugiriendo que los viajeros habituales en sus trayectos cotidianos son más propensos a usar la tarjeta Bip!, probablemente por hábito e inercia.
+
+3.  **El QR como Alternativa de Conveniencia**: Los coeficientes para las horas punta (`B_PM_LAB` y `B_PT_LAB`) son positivos y significativos, revelando que durante los períodos de mayor congestión, la probabilidad de usar QR aumenta considerablemente.
+
+#### Atributos del Viaje (Nuevos Hallazgos)
+
+::: {.callout-warning}
+# ⚠️ Interpretación con Precaución
+
+Las siguientes interpretaciones sobre atributos del viaje deben considerarse con precaución debido a la presencia de **transbordos fantasmas internos entre metro** en los datos. Los valores de número de trasbordos, tiempos de caminata y esperas pueden estar sesgados, lo que afecta la interpretación de sus coeficientes.
+:::
+
+4.  **Tiempo en Vehículo (`B_T_VEHICULO`)**: Este coeficiente es positivo y significativo, sugiriendo que a medida que aumenta el tiempo de viaje en vehículo, también lo hace la preferencia por el QR. Esto podría deberse a que el QR agiliza el proceso de pago, lo cual es más valorado en viajes más largos. **Nota:** Esta variable puede verse afectada por el problema de transbordos fantasmas, por lo que su interpretación debe ser cautelosa.
+
+5.  **Complejidad del Viaje (`B_N_TRASBORDOS`, `B_T_CAMINATA`, `B_T_ESPERA_TRASBORD`)**: Estos coeficientes son negativos y significativos. Esto indica que a mayor número de trasbordos, tiempo de caminata y tiempo de espera en trasbordos, menor es la preferencia por el QR. Los usuarios podrían percibir el QR como menos conveniente en viajes complejos, donde la tarjeta Bip! ofrece una experiencia más fluida o familiar. **⚠️ Limitación:** Estos coeficientes pueden estar sesgados debido a transbordos fantasmas internos entre metro que inflan artificialmente el número de trasbordos y los tiempos asociados.
+
+6.  **Tiempo de Espera Inicial (`B_T_ESPERA_INI`)**: Este coeficiente es negativo y significativo, lo que sugiere una menor preferencia por el QR a medida que aumenta el tiempo de espera inicial. Esto podría indicar que los usuarios optan por la tarjeta Bip! si esperan mucho tiempo, quizás por una percepción de mayor inmediatez o porque el QR se asocia a la agilidad al momento del embarque. **Nota:** Esta variable no se ve directamente afectada por transbordos fantasmas, pero podría estar indirectamente relacionada.
+
+7.  **Modos de Transporte (`DUMMY_SOLO_METRO`, `DUMMY_METRO_BUS`)**:
+    *   `DUMMY_SOLO_METRO`: Este coeficiente es negativo y significativo. Sugiere que los viajes que utilizan exclusivamente el metro tienen una menor preferencia por el QR. Esto podría estar relacionado con la eficiencia del pago con tarjeta en el metro o la percepción de que el QR es más útil en modos de transporte más variados.
+    *   `DUMMY_METRO_BUS`: Este coeficiente es negativo y significativo, mostrando que los viajes que combinan Metro y Bus reducen la preferencia por QR. Al igual que con la complejidad del viaje, los usuarios podrían preferir la simplicidad de la tarjeta Bip! en viajes multimodales. **⚠️ Limitación:** La clasificación de modos puede estar incorrecta cuando hay transbordos fantasmas internos entre metro que no se detectan correctamente, lo que afecta la precisión de estas variables dummy.
+
+#### Diferencias entre Semanas
+
+8.  **Evolución Temporal**: La semana W18 muestra una menor magnitud negativa en `ASC_QR` comparada con W17, sugiriendo una mayor preferencia base por QR en la semana más reciente. Esto podría indicar una tendencia de adopción creciente del QR a lo largo del tiempo.
+
+En resumen, el modelo extendido confirma y amplía los hallazgos del modelo baseline: la **tarjeta Bip! domina por hábito** en los viajes regulares y simples, mientras que el **código QR se posiciona como una herramienta de conveniencia** valorada en situaciones de mayor demanda temporal y para viajes más largos, pero menos preferida en viajes complejos que involucran múltiples trasbordos y modos de transporte, o en viajes exclusivos de metro.
+
+### Comparación con Biogeme y Statsmodels (Modelo Extendido)
+
+A continuación, se comparan los resultados de los parámetros y estadísticas del modelo extendido entre `larch`, `biogeme` y `statsmodels`.
+
+```{python}
+#|label: compare-larch-biogeme-statsmodels-extended
+#|eval: false # Quitar para ejecutar esta celda
+import pandas as pd
+import numpy as np
+import os
+
+partition_labels_to_compare = ["2025-W17", "2025-W18"]
+# Opciones: "sample20pct", "sample50pct", o None/"" para muestras completas (sin muestreo)
+sample_config_label = "sample50pct"  # Cambiar a None o "" para comparar muestras completas
+
+model_paths = {
+    "Biogeme": "../biogeme-logit/model_outputs",
+    "Statsmodels": "../statsmodels_logit/model_outputs_sm",
+    "Larch": "model_outputs_larch",
+}
+
+all_params_comparison = []
+all_stats_comparison = []
+
+# Función para limpiar nombres de parámetros
+def clean_param_name(name, partition_label):
+    name = name.replace(f'_{partition_label}', '')
+    name = name.replace('_ext', '')
+    name = name.replace('_EXT', '')
+    return name
+
+for partition_label in partition_labels_to_compare:
+    # Determinar el sufijo de carpeta según si hay muestreo o no
+    if sample_config_label and sample_config_label.strip():
+        folder_suffix = f"W{partition_label.split('-W')[1]}-extended-{sample_config_label}"
+        display_label = sample_config_label
+    else:
+        folder_suffix = f"W{partition_label.split('-W')[1]}-extended"
+        display_label = "full (sin muestreo)"
+    
+    print(f"\n{'='*80}\n--- Comparando Modelos para {partition_label} ({display_label}) ---\n{'='*80}")
+    
+    params_for_partition = {}
+    stats_for_partition = {}
+
+    for model_name, base_folder in model_paths.items():
+        results_folder = os.path.join(base_folder, folder_suffix)
+        
+        params_file = os.path.join(results_folder, f"params_ext_{partition_label}.csv")
+        stats_file = os.path.join(results_folder, f"stats_ext_{partition_label}.csv")
+
+        try:
+            # Leer CSV asegurando máxima precisión numérica
+            df_params = pd.read_csv(params_file)
+            df_stats = pd.read_csv(stats_file)
+            
+            # Asegurar que las columnas numéricas se lean con máxima precisión
+            if "Value" in df_params.columns:
+                df_params["Value"] = pd.to_numeric(df_params["Value"], errors='coerce').astype('float64')
+            if "Robust t-stat." in df_params.columns:
+                df_params["Robust t-stat."] = pd.to_numeric(df_params["Robust t-stat."], errors='coerce').astype('float64')
+
+            if "Name" in df_params.columns:
+                # Limpiar nombres de parámetros antes de establecer el índice
+                df_params['Name_clean'] = df_params['Name'].apply(lambda x: clean_param_name(x, partition_label))
+                df_params.set_index('Name_clean', inplace=True)
+            else:
+                # Biogeme a veces usa la primera columna como índice si se guardó así
+                if 'Unnamed: 0' in df_params.columns:
+                    df_params.set_index('Unnamed: 0', inplace=True)
+                    df_params.index.name = 'Name'
+                df_params['Name_clean'] = df_params.index.map(lambda x: clean_param_name(x, partition_label))
+                df_params.set_index('Name_clean', inplace=True)
+
+            # Seleccionar columnas asegurando que sean float64 para máxima precisión
+            params_subset = df_params[['Value', 'Robust t-stat.']].copy()
+            params_subset['Value'] = params_subset['Value'].astype('float64')
+            params_subset['Robust t-stat.'] = params_subset['Robust t-stat.'].astype('float64')
+            
+            params_for_partition[model_name] = params_subset
+            stats_for_partition[model_name] = df_stats.iloc[0] # Solo la primera fila para stats
+            
+            print(f"✅ Cargados resultados para {model_name} ({partition_label}).")
+
+        except FileNotFoundError:
+            print(f"⚠️  No se encontraron archivos para {model_name} en {results_folder} ({partition_label}).")
+        except Exception as e:
+            print(f"❌ Error al cargar {model_name} ({partition_label}): {e}")
+
+    # --- Consolidar Parámetros para la partición actual ---
+    if params_for_partition:
+        combined_params = pd.DataFrame()
+        for model_name, df_p in params_for_partition.items():
+            combined_params = combined_params.join(
+                df_p.rename(columns={'Value': f'Beta {model_name}', 'Robust t-stat.': f't-stat {model_name}'}),
+                how='outer'
+            )
+        combined_params['Partition'] = partition_label
+        combined_params['Sample Config'] = display_label
+        all_params_comparison.append(combined_params)
+
+    # --- Consolidar Estadísticas para la partición actual ---
+    if stats_for_partition:
+        stats_row = {'Partition': partition_label, 'Sample Config': display_label}
+        for model_name, s in stats_for_partition.items():
+            stats_row[f'LL_Final {model_name}'] = s.get('Final log likelihood')
+            stats_row[f'Rho_Adj {model_name}'] = s.get('Rho-square-bar for the init. model')
+            stats_row[f'Time (s) {model_name}'] = s.get('Wall-clock seconds', np.nan)
+        all_stats_comparison.append(pd.DataFrame([stats_row]))
+
+# --- Mostrar tablas consolidadas ---
+if all_params_comparison:
+    final_params_df = pd.concat(all_params_comparison)
+    print("\n--- Comparación de Parámetros entre Larch, Biogeme y Statsmodels ---")
+    # Mostrar con máxima precisión (sin redondeo automático)
+    pd.set_option('display.float_format', lambda x: f'{x:.10f}' if abs(x) < 1e10 else f'{x:.6e}')
+    display(final_params_df)
+    pd.reset_option('display.float_format')
+else:
+    print("\nNo hay datos de parámetros para comparar.")
+
+if all_stats_comparison:
+    final_stats_df = pd.concat(all_stats_comparison)
+    print("\n--- Comparación de Estadísticas de Ajuste entre Larch, Biogeme y Statsmodels ---")
+    pd.set_option('display.float_format', lambda x: f'{x:.10f}' if abs(x) < 1e10 else f'{x:.6e}')
+    display(final_stats_df)
+    pd.reset_option('display.float_format')
+else:
+    print("\nNo hay datos de estadísticas para comparar.")
+```
+
+### Resumen de la Comparación
+
+Se espera que los resultados entre `larch`, `biogeme` y `statsmodels` sean muy similares en cuanto a coeficientes y significancia. Las diferencias pueden surgir de:
+
+*   **Algoritmos de optimización**: Cada librería puede usar implementaciones ligeramente distintas.
+*   **Criterios de convergencia**: Las tolerancias para determinar la convergencia del algoritmo pueden variar.
+*   **Cálculo de errores estándar**: Especialmente los robustos, pueden tener sutiles diferencias.
+*   **Manejo de valores pequeños/problemas numéricos**: Cómo se abordan singularidades en la matriz de Hesse o separación perfecta.
+
+Sin embargo, los signos y magnitudes relativas de los coeficientes, así como las medidas de bondad de ajuste (`Rho-cuadrado ajustado`), deberían ser consistentes.
+
+
+```

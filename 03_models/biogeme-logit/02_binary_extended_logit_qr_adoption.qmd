@@ -182,7 +182,7 @@ print("✅ Funciones de ayuda `prepare_features` y `get_stratified_sample` defin
 def prepare_features_extended(lazy_frame):
         cols_necesarias = [
              "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
-             "tiempo_vehiculo_seg", "te0", 
+             "t_vehiculo_total_seg", "te0", 
              "tc1", "tc2", "tc3",
              "te1", "te2", "te3",
              "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
@@ -211,7 +211,7 @@ def prepare_features_extended(lazy_frame):
     
         # 2. Ingeniería de variables de viaje
         lf_prep_ext = lf_prep_ext.with_columns([
-            (pl.col("tiempo_vehiculo_seg") / 60).alias("VAR_T_VEHICULO_MIN"),
+            (pl.col("t_vehiculo_total_seg") / 60).alias("VAR_T_VEHICULO_MIN"),
             (pl.col("n_etapas") - 1).alias("VAR_N_TRASBORDOS"),
             ((pl.col("tc1").fill_null(0) + pl.col("tc2").fill_null(0) + pl.col("tc3").fill_null(0)) / 60).alias(
       "VAR_T_CAMINATA_MIN"),
@@ -224,18 +224,21 @@ def prepare_features_extended(lazy_frame):
         cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
         for col in cols_modos:
             lf_prep_ext = lf_prep_ext.with_columns([
-                pl.when(pl.col(col).cast(pl.Utf8) == '4').then(pl.lit('2'))
-                  .when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))
+                pl.when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))
                   .otherwise(pl.col(col).cast(pl.Utf8))
                   .alias(col)
             ])
         
+        bus_flags = [pl.col(c).fill_null("0") == "1" for c in cols_modos]
+        metro_flags = [pl.col(c).fill_null("0") == "2" for c in cols_modos]
+        metrotren_flags = [pl.col(c).fill_null("0") == "4" for c in cols_modos]
         lf_prep_ext = lf_prep_ext.with_columns([
-            pl.any_horizontal([pl.col(c) == '1' for c in cols_modos]).alias("usa_bus"),
-            pl.any_horizontal([pl.col(c) == '2' for c in cols_modos]).alias("usa_metro"),
+            pl.any_horizontal(bus_flags).alias("usa_bus"),
+            pl.any_horizontal(metro_flags).alias("usa_metro"),
+            pl.any_horizontal(metrotren_flags).alias("usa_metrotren"),
         ]).with_columns([
-            (pl.col("usa_metro") & ~pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
-            (pl.col("usa_metro") & pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+            (pl.col("usa_metro") & ~pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+            (pl.col("usa_metro") & pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
         ])
     
         # 4. Seleccionar columnas finales
@@ -359,7 +362,7 @@ if lf_data is not None:
         # Verificar si las columnas necesarias están disponibles
         cols_necesarias = [
             "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
-            "tiempo_vehiculo_seg", "te0", 
+            "t_vehiculo_total_seg", "te0", 
             "tc1", "tc2", "tc3",  # Tiempos de caminata por etapa
             "te1", "te2", "te3",  # Tiempos de espera por etapa
             "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
@@ -411,7 +414,7 @@ if lf_data is not None:
         (pl.col("te1").fill_null(0) + pl.col("te2").fill_null(0) + pl.col("te3").fill_null(0)).alias("t_espera_total_seg"),
     ]).with_columns([
         # Var 1: Tiempo de viaje en vehículo (en minutos)
-        (pl.col("tiempo_vehiculo_seg") / 60).alias("VAR_T_VEHICULO_MIN"),
+        (pl.col("t_vehiculo_total_seg") / 60).alias("VAR_T_VEHICULO_MIN"),
         
         # Var 2: Número de trasbordos
         (pl.col("n_etapas") - 1).alias("VAR_N_TRASBORDOS"),
@@ -438,9 +441,11 @@ if lf_data is not None:
         ])
     
     # Crear flags de modos presentes en el viaje (usando strings)
+    bus_flags = [pl.col(c).fill_null("0") == "1" for c in cols_modos]
+    metro_flags = [pl.col(c).fill_null("0") == "2" for c in cols_modos]
     lf_prep_ext = lf_prep_ext.with_columns([
-        pl.any_horizontal([pl.col(c) == '1' for c in cols_modos]).alias("usa_bus"),
-        pl.any_horizontal([pl.col(c) == '2' for c in cols_modos]).alias("usa_metro"),
+        pl.any_horizontal(bus_flags).alias("usa_bus"),
+        pl.any_horizontal(metro_flags).alias("usa_metro"),
     ]).with_columns([
         # DUMMY_SOLO_METRO: usa metro y NO usa bus
         (pl.col("usa_metro") & ~pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
@@ -492,7 +497,7 @@ En esta sección se documenta el modelo extendido:
   - `DUMMY_LJ_LAB`: 1 si es lunes–jueves y laboral, 0 si no. Se construye como `(es_lun_jue & is_laboral).cast(Int8)`.
   - `DUMMY_VIE_LAB`: 1 si es viernes y laboral, 0 si no. Se construye como `(es_viernes & is_laboral).cast(Int8)`.
 - Atributos del viaje (derivados de tiempos y etapas):
-  - `VAR_T_VEHICULO_MIN`: minutos en vehículo. Se calcula como `tiempo_vehiculo_seg / 60`.
+  - `VAR_T_VEHICULO_MIN`: minutos en vehículo. Se calcula como `t_vehiculo_total_seg / 60`.
   - `VAR_N_TRASBORDOS`: cantidad de trasbordos. Se calcula como `n_etapas - 1`.
   - `VAR_T_CAMINATA_MIN`: minutos totales de caminata. Se calcula como `(tc1 + tc2 + tc3) / 60` (con `fill_null(0)`).
   - `VAR_T_ESPERA_TRASBORDO_MIN`: minutos de espera en trasbordos. Se calcula como `(te1 + te2 + te3) / 60` (con `fill_null(0)`).
@@ -667,7 +672,7 @@ PARTICIONES_A_PROCESAR_EXT = [
     (2025, 18)  
 ]
 APPLY_SAMPLING_EXT = True
-SAMPLE_FRACTION_EXT = 0.5
+SAMPLE_FRACTION_EXT = 0.2
 # Directorio base para los resultados
 BASE_OUTPUT_DIR_EXT = "model_outputs"
 

@@ -1,0 +1,1456 @@
+---
+title: "Modelo Nested Logit - Adopción QR vs Bip (Larch)"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: auto
+---
+
+# Objetivo
+
+Este notebook tiene como objetivo:
+
+1. Preparar los datos para un modelo Logit Anidado (Nested Logit - NL) usando `larch`.
+2. Definir la estructura de un modelo NL base donde la elección superior es entre Bip! y QR, y la elección inferior (dentro de QR) es entre la App Red y Otras Apps.
+3. Estimar este modelo NL base usando distintas variables como predictores.
+4. Implementar una estructura para estimar el modelo secuencialmente sobre múltiples particiones semanales, con opción de muestreo.
+5. Dejar los resultados en un formato compatible con los outputs previos de `biogeme` para poder comparar ajustes y parámetros entre herramientas.
+
+---
+
+:::: {.callout-tip}
+# Instalación recomendada
+
+`larch` se distribuye oficialmente vía `conda-forge`. Si aún no tienes listo el entorno, sigue las instrucciones de [Installing Larch — v5.7.0](https://larch.newman.me/v5.7.0/installation.html), idealmente creando un ambiente dedicado (por ejemplo, `conda create -n arboretum -c conda-forge larch`). Esto evita conflictos con otras dependencias y facilita ejecutar todo el notebook dentro del mismo entorno.
+::::
+
+::: {.callout-warning}
+# ⚠️ Limitación Importante: Transbordos Internos entre Metro
+
+**IMPORTANTE:** Los resultados de este modelo deben interpretarse con precaución debido a la presencia de **transbordos internos entre metro no detectados** en los datos. Estos transbordos no detectados están sesgando las siguientes variables del modelo:
+
+- **Número de trasbordos (`VAR_N_TRASBORDOS`)**: Se está sobreestimando el número real de trasbordos cuando en realidad algunos son transbordos internos dentro de la misma red de Metro.
+
+- **Tiempos de espera en trasbordo (`VAR_T_ESPERA_TRASBORDO_MIN`)**: Los tiempos de espera asociados a estos transbordos fantasmas no reflejan esperas reales entre modos distintos.
+
+- **Tiempos de caminata (`VAR_T_CAMINATA_MIN`)**: Los tiempos de caminata entre etapas que en realidad son transbordos internos están siendo contabilizados incorrectamente.
+
+- **Modos de transporte (`DUMMY_SOLO_METRO`, `DUMMY_METRO_BUS`)**: La clasificación de modos puede estar incorrecta cuando hay transbordos internos no detectados.
+
+Para una interpretación correcta de los resultados, se recomienda:
+1. Revisar los resultados del notebook de corrección de transbordos internos (`04_transbordos_metro.qmd`).
+2. Considerar que los coeficientes de variables relacionadas con trasbordos y tiempos pueden estar subestimados o sobreestimados.
+3. Las variables temporales (horas punta, días laborales) y el parámetro del nido (`MU_QR`) no se ven afectadas por este problema.
+:::
+
+::: {.callout-warning}
+# Alcance del Análisis
+
+Para desarrollar y validar el modelo de forma controlada, este análisis se centra en **semanas representativas (ej. Semana 17 y 18 del año 2025)**. El objetivo es consolidar un modelo robusto en este subconjunto de datos antes de escalar el análisis, utilizando **muestreo estratificado** para integrar eficientemente el resto de las particiones semanales sin incurrir en costos computacionales prohibitivos o problemas de memoria.
+:::
+
+## Setup e Importación de Librerías
+
+````{python}
+#|label: setup-and-imports
+import os
+import sys
+from pathlib import Path
+from datetime import date
+import time
+
+import polars as pl
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import larch as lx
+from larch import Model, P, X
+from larch.dataset import Dataset
+
+# Asegurar que el paquete 'config' y 'lib' sean importables
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+    else:
+        raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
+
+# Importar funciones de acceso a datos centralizadas
+from lib.datalake import read_parquet_portable
+from config import (
+    HORAS_PUNTA_MANANA,
+    HORAS_PUNTA_TARDE,
+    USE_LOCAL_PATHS,
+    LOCAL_SILVER_PATH,
+    GCS_SILVER_PATH,
+    LOCAL_RAW_PATH,
+    GCS_RAW_PATH,
+)
+
+# --- Parámetros de paths ---
+if USE_LOCAL_PATHS:
+    SILVER_BASE_PATH = LOCAL_SILVER_PATH
+else:
+    SILVER_BASE_PATH = GCS_SILVER_PATH
+
+# Usaremos 'viajes_filtrados' como base, ya que contiene todos los viajes válidos
+INPUT_DATASET_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados"
+
+# --- Ruta de Tabla de Caracterización ---
+# Tabla 1: caracterización qr_202504.csv (tiene tipo_app: 'APP RED' o 'OTRA APP')
+if USE_LOCAL_PATHS:
+    RAW_BASE_PATH = LOCAL_RAW_PATH
+    CARACTERIZACION_PATH = "/Volumes/KINGSTON/tesis-project/raw/caracterizacion/caracterización qr_202504.csv"
+else:
+    RAW_BASE_PATH = GCS_RAW_PATH
+    CARACTERIZACION_PATH = f"{RAW_BASE_PATH}/caracterizacion/caracterización qr_202504.csv"
+
+# Cargar tabla de caracterización una vez (se reutilizará en las funciones)
+print(f"\n📂 Cargando tabla de caracterización...")
+try:
+    df_caracterizacion = pl.read_csv(
+        CARACTERIZACION_PATH,
+        separator=";",
+        try_parse_dates=False
+    )
+    # Convertir id_interno a string para hacer join con id_tarjeta
+    df_caracterizacion = df_caracterizacion.with_columns(
+        pl.col("id_interno").cast(pl.Utf8).alias("id_tarjeta_str")
+    ).select(["id_tarjeta_str", "tipo_app"]).unique()
+    
+    print(f"   ✅ Caracterización cargada: {len(df_caracterizacion):,} usuarios únicos")
+    print(f"   ✅ Distribución tipo_app:")
+    dist_tipo_app = df_caracterizacion['tipo_app'].value_counts()
+    for row in dist_tipo_app.iter_rows(named=True):
+        print(f"      - {row['tipo_app']}: {row['count']:,} usuarios")
+except Exception as e:
+    print(f"   ⚠️ Error cargando caracterización: {e}")
+    df_caracterizacion = None
+
+# --- Parámetros del Modelo Anidado ---
+# Ya no usamos CONTRATO_IDS_RED, ahora usamos tipo_app de la tabla de caracterización
+
+# Códigos para la variable 'choice_nested'
+CHOICE_BIP = 0
+CHOICE_QR_RED = 1
+CHOICE_QR_OTHER = 2
+
+# Mapeo de alternativas para larch
+ALT_MAPPING_NESTED = {0: "BIP", 1: "QR_RED", 2: "QR_OTHER"}
+
+# --- Parámetros de Ejecución Secuencial ---
+PARTICIONES_A_PROCESAR = [
+    (2025, 17),
+    (2025, 18)
+]
+
+APPLY_SAMPLING = False  # Cambiar a True para aplicar muestreo
+SAMPLE_FRACTION = 0.20  # 20% estratificado por choice_nested
+SEED = 42
+BASE_OUTPUT_DIR = "model_outputs_nl_larch"  # Directorio específico para este modelo
+
+# Info de entorno
+print(f"🧮 Larch version: {getattr(lx, '__version__', 'dev')}")
+
+print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f"📊 Códigos elección: BIP={CHOICE_BIP}, QR_RED={CHOICE_QR_RED}, QR_OTHER={CHOICE_QR_OTHER}")
+print(f"📋 Identificación APP RED: usando tabla de caracterización (tipo_app='APP RED')")
+print(f"🔀 Aplicar muestreo: {APPLY_SAMPLING} (Fracción: {SAMPLE_FRACTION if APPLY_SAMPLING else 'N/A'})")
+print(f"📂 Directorio base de salida: {BASE_OUTPUT_DIR}")
+````
+
+## Documentación del Modelo Nested Logit
+
+En el esquema Nested Logit considerado:
+
+- **Codificación de elección `choice_nested`:**
+  - 0 = `BIP` (pago con Bip!).
+  - 1 = `QR_RED` (QR App Red).
+  - 2 = `QR_OTHER` (otras Apps QR).
+
+- **Estructura de nidos:**
+  - Nido `BIP`: contiene la alternativa 0 con parámetro de nido fijado en 1.0 (base).
+  - Nido `QR`: contiene las alternativas 1 y 2 con parámetro de nido `MU_QR ≥ 1` a estimar.
+
+- **Variables temporales (creadas a partir de fecha/hora):**
+  - `DUMMY_PM_LAB`: 1 si (hora ∈ {7,8} y día laboral), 0 en caso contrario.
+  - `DUMMY_PT_LAB`: 1 si (hora ∈ {18,19} y día laboral), 0 si no.
+  - `DUMMY_LJ_LAB`: 1 si (lunes–jueves laboral), 0 si no.
+  - `DUMMY_VIE_LAB`: 1 si (viernes laboral), 0 si no.
+
+- **Modelo baseline:**
+  - Utilidades: \(V_{BIP}=0\), \(V_{QR\_RED}=ASC₂ₓ₃₂₃+\beta\cdot X\), \(V_{QR\_OTHER}=0+\beta\cdot X\) con las dummies temporales.
+  - Nidos: `(1.0, [BIP])` y `(MU_QR, [QR_RED, QR_OTHER])`.
+
+- **Modelo extendido (análogo, pero con atributos adicionales del viaje):**
+  - Atributos típicos: minutos en vehículo, trasbordos, caminata, esperas; y combinaciones modales.
+  - Las utilidades para QR_RED y QR_OTHER comparten estructura y difieren en la constante de QR_RED.
+
+La probabilidad se calculará usando la estructura de nidos de larch.
+
+## Funciones Helper
+
+````{python}
+#|label: helper-functions-nested
+
+# --- Helper para Muestreo Estratificado por 'choice_nested' ---
+def get_stratified_sample_nested(df: pl.DataFrame, fraction: float, seed: int) -> pl.DataFrame:
+    """Realiza muestreo estratificado por la columna 'choice_nested'."""
+    total_rows = len(df)
+    if total_rows == 0: 
+        return df.clear()  # Devuelve vacío si no hay datos
+    target_rows = int(total_rows * fraction)
+    if target_rows == 0: 
+        return df.clear()  # Devuelve vacío si la muestra es 0
+
+    counts = df.group_by("choice_nested").agg(pl.len().alias("count")).sort("choice_nested")
+
+    # Calcula proporciones solo si hay filas
+    if total_rows > 0:
+         proportions = counts.with_columns(
+             (pl.col("count") / total_rows).alias("proportion")
+         )
+    else:
+         return df.clear()
+
+    samples = []
+    total_sampled = 0
+    num_groups = len(proportions)
+
+    for i, row in enumerate(proportions.iter_rows(named=True)):
+        choice_code = row['choice_nested']
+        count = row['count']
+        proportion = row['proportion']
+        
+        # Calcular n para este grupo
+        target_n = int(round(target_rows * proportion))  # Redondear al más cercano
+
+        # Ajuste simple para asegurar tamaño total correcto (añadir/quitar del último grupo)
+        if i == num_groups - 1:
+            target_n = target_rows - total_sampled
+
+        target_n = max(0, min(target_n, count))  # Asegurar que n esté entre 0 y count
+
+        if target_n > 0:
+            df_sample_group = df.filter(pl.col("choice_nested") == choice_code).sample(
+                n=target_n, shuffle=True, seed=seed + i  # Usar seed diferente por grupo
+            )
+            samples.append(df_sample_group)
+            total_sampled += target_n
+
+    if samples:
+        # Concatenar y barajar una vez más
+        df_model_sample = pl.concat(samples).sample(fraction=1.0, shuffle=True, seed=seed + num_groups)
+        # Verificar tamaño final (puede variar ligeramente por redondeo)
+        if abs(len(df_model_sample) - target_rows) > num_groups:  # Tolerancia
+             print(f"      Advertencia: Tamaño final de muestra ({len(df_model_sample)}) difiere del objetivo ({target_rows}).")
+        return df_model_sample
+    else:
+        return df.clear()  # Devuelve DataFrame vacío si no se pudo muestrear
+
+
+# --- Helper para Feature Engineering (Modelo Anidado Base) ---
+def prepare_nested_base_features(lazy_frame: pl.LazyFrame, df_caract: pl.DataFrame = None) -> pl.LazyFrame:
+    """
+    Prepara las features para el modelo anidado base (solo temporales).
+    
+    Args:
+        lazy_frame: LazyFrame con datos de viajes
+        df_caract: DataFrame con tabla de caracterización (tipo_app). Si es None, usa la global.
+    """
+    # Usar la tabla de caracterización global si no se proporciona una
+    if df_caract is None:
+        df_caract = globals().get('df_caracterizacion', None)
+    
+    # Columnas necesarias mínimas
+    cols_necesarias = ["is_qr", "id_tarjeta", "tiempo_inicio_viaje", "tipodia"]
+    
+    # Verificar columnas necesarias
+    schema = lazy_frame.collect_schema()
+    missing_cols = [col for col in cols_necesarias if col not in schema]
+    if missing_cols:
+        raise ValueError(f"Columnas faltantes en datos: {missing_cols}")
+    
+    # Preparar datos para join: convertir id_tarjeta a string
+    lf_prep = lazy_frame.select(cols_necesarias).with_columns(
+        pl.col("id_tarjeta").cast(pl.Utf8).alias("id_tarjeta_str")
+    )
+    
+    # Hacer join con tabla de caracterización si está disponible
+    if df_caract is not None:
+        # Convertir df_caract a LazyFrame para el join
+        lf_caract = df_caract.lazy()
+        lf_prep = lf_prep.join(
+            lf_caract,
+            on="id_tarjeta_str",
+            how="left"
+        )
+        print("      ✅ Join con tabla de caracterización realizado")
+        # Crear ts_local temporalmente para estadísticas de cobertura
+        lf_prep = lf_prep.with_columns(
+            pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local")
+        )
+        # Calcular cobertura del join (porcentaje de ids con caracterización)
+        try:
+            coverage_stats = (
+                lf_prep
+                .select([
+                    pl.len().alias("n_total"),
+                    pl.col("is_qr").sum().alias("n_qr"),
+                    pl.when(pl.col("is_qr") & pl.col("tipo_app").is_not_null()).then(1).otherwise(0).sum().alias("n_qr_con_caracterizacion"),
+                    pl.col("id_tarjeta").n_unique().alias("ids_unicos"),
+                    pl.when(pl.col("is_qr") & pl.col("tipo_app").is_not_null()).then(pl.col("id_tarjeta")).otherwise(None).n_unique().alias("ids_qr_con_caracterizacion"),
+                    pl.col("ts_local").min().alias("min_ts"),
+                    pl.col("ts_local").max().alias("max_ts"),
+                ])
+                .collect()
+                .row(0)
+            )
+            n_total, n_qr, n_qr_match, ids_total, ids_qr_match, ts_min, ts_max = coverage_stats
+            pct_qr = (n_qr / n_total * 100) if n_total else 0.0
+            pct_qr_match = (n_qr_match / n_qr * 100) if n_qr else 0.0
+            pct_ids_qr = (ids_qr_match / ids_total * 100) if ids_total else 0.0
+            print(
+                "         Cobertura caracterización (solo QR): "
+                f"{n_qr_match:,}/{n_qr:,} filas ({pct_qr_match:.2f}%) | "
+                f"{ids_qr_match:,}/{ids_total:,} ids ({pct_ids_qr:.2f}%)"
+            )
+            if ts_min is not None and ts_max is not None:
+                print(f"         Rango temporal partición: {ts_min.strftime('%Y-%m-%d')} → {ts_max.strftime('%Y-%m-%d')}")
+        except Exception as cov_err:
+            print(f"         ⚠️ No se pudo calcular cobertura de caracterización: {cov_err}")
+    else:
+        # Si no hay tabla de caracterización, crear columna tipo_app como None
+        lf_prep = lf_prep.with_columns(pl.lit(None).cast(pl.Utf8).alias("tipo_app"))
+        print("      ⚠️ Tabla de caracterización no disponible, todos los QR serán clasificados como 'OTHER'")
+    
+    # Crear choice_nested usando tipo_app
+    lf_prep = lf_prep.with_columns([
+        # Crear choice_nested (0=BIP, 1=QR_RED, 2=QR_OTHER)
+        pl.when(pl.col("is_qr") == False).then(pl.lit(CHOICE_BIP))
+          .when((pl.col("is_qr") == True) & (pl.col("tipo_app") == "APP RED")).then(pl.lit(CHOICE_QR_RED))
+          .when(pl.col("is_qr") == True).then(pl.lit(CHOICE_QR_OTHER))  # QR pero no APP RED
+          .otherwise(pl.lit(CHOICE_BIP))  # Fallback (no debería ocurrir)
+          .cast(pl.Int8)
+          .alias("choice_nested"),
+        pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
+    ]).with_columns([
+        pl.col("ts_local").dt.hour().alias("hora"),
+        pl.col("ts_local").dt.weekday().alias("dia_semana"),
+        (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+    ]).with_columns([
+        pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+        (pl.col("dia_semana") == 5).alias("es_viernes"),
+        pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
+    ]).with_columns([
+        # Dummies temporales
+        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+        (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+        (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+    ])
+    
+    # Seleccionar columnas finales
+    cols_modelo = ["choice_nested", "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+    return lf_prep.select(cols_modelo).fill_null(0)
+
+
+# --- Helper para convertir a formato idca para larch (3 alternativas) ---
+def build_long_format_for_larch_nested(
+    df_pl: pl.DataFrame,
+    feature_cols: list[str],
+    alt_mapping: dict[int, str] = ALT_MAPPING_NESTED,
+) -> pd.DataFrame:
+    """
+    Convierte el dataset en formato wide (una fila por viaje)
+    a formato idca requerido por larch (tres filas por viaje, una por alternativa).
+    
+    Para nested logit con 3 alternativas: BIP (0), QR_RED (1), QR_OTHER (2)
+    
+    El formato idca requiere:
+    - case_id: identificador único del caso (viaje)
+    - alt_id: identificador de la alternativa (0=BIP, 1=QR_RED, 2=QR_OTHER)
+    - choice_ind: 1 si esa alternativa fue elegida, 0 si no
+    - ASC_QR_RED: constante específica para QR_RED (1 para QR_RED, 0 para otras)
+    - feature_cols: variables que aplican a alternativas QR (0 para BIP)
+    """
+    df_with_case = (
+        df_pl.with_row_index("case_id")
+        .with_columns(
+            [
+                pl.col("choice_nested").cast(pl.Int8),
+                *[pl.col(col).cast(pl.Float64) for col in feature_cols],  # Cast a Float64
+            ]
+        )
+    )
+
+    zero_int = pl.lit(0, dtype=pl.Int8)
+    zero_float = pl.lit(0.0, dtype=pl.Float64)
+    one_int = pl.lit(1, dtype=pl.Int8)
+    one_float = pl.lit(1.0, dtype=pl.Float64)
+    two_int = pl.lit(2, dtype=pl.Int8)
+
+    alt_specific_cols = []
+    for col in feature_cols:
+        alt_specific_cols.extend([f"{col}_RED", f"{col}_OTHER"])
+
+    # Frame para BIP (alternativa 0)
+    bip_frame = df_with_case.select(
+        [
+            pl.col("case_id"),
+            zero_int.alias("alt_id"),
+            (pl.col("choice_nested") == CHOICE_BIP).cast(pl.Int8).alias("choice_ind"),
+            zero_float.alias("ASC_QR_RED"),
+            zero_float.alias("ASC_QR_OTHER"),
+            *[zero_float.alias(col) for col in feature_cols],
+            *[zero_float.alias(f"{col}_RED") for col in feature_cols],
+            *[zero_float.alias(f"{col}_OTHER") for col in feature_cols],
+        ]
+    )
+
+    # Frame para QR_RED (alternativa 1)
+    qr_red_frame = df_with_case.select(
+        [
+            pl.col("case_id"),
+            one_int.alias("alt_id"),
+            (pl.col("choice_nested") == CHOICE_QR_RED).cast(pl.Int8).alias("choice_ind"),
+            one_float.alias("ASC_QR_RED"),
+            zero_float.alias("ASC_QR_OTHER"),
+            *[pl.col(col) for col in feature_cols],
+            *[pl.col(col).alias(f"{col}_RED") for col in feature_cols],
+            *[zero_float.alias(f"{col}_OTHER") for col in feature_cols],
+        ]
+    )
+
+    # Frame para QR_OTHER (alternativa 2)
+    qr_other_frame = df_with_case.select(
+        [
+            pl.col("case_id"),
+            two_int.alias("alt_id"),
+            (pl.col("choice_nested") == CHOICE_QR_OTHER).cast(pl.Int8).alias("choice_ind"),
+            zero_float.alias("ASC_QR_RED"),
+            one_float.alias("ASC_QR_OTHER"),
+            *[pl.col(col) for col in feature_cols],
+            *[zero_float.alias(f"{col}_RED") for col in feature_cols],
+            *[pl.col(col).alias(f"{col}_OTHER") for col in feature_cols],
+        ]
+    )
+
+    df_long = pl.concat([bip_frame, qr_red_frame, qr_other_frame]).sort(["case_id", "alt_id"])
+
+    columns = [
+        "case_id",
+        "alt_id",
+        "choice_ind",
+        "ASC_QR_RED",
+        "ASC_QR_OTHER",
+    ] + feature_cols + alt_specific_cols
+    df_idca = df_long.select(columns).to_pandas()
+    df_idca.set_index(["case_id", "alt_id"], inplace=True)
+    df_idca.index.names = ["case_id", "alt_id"]
+    return df_idca
+
+
+# --- Helper para crear Dataset de larch para nested logit ---
+def create_larch_dataset_nested(
+    df_pl: pl.DataFrame,
+    feature_cols: list[str],
+    alt_mapping: dict[int, str] = ALT_MAPPING_NESTED,
+) -> Dataset:
+    """
+    Crea un Dataset de larch para nested logit desde un DataFrame de Polars.
+    """
+    if isinstance(df_pl, pd.DataFrame):
+        df_pl = pl.from_pandas(df_pl)
+    df_idca = build_long_format_for_larch_nested(df_pl, feature_cols, alt_mapping)
+    dataset = Dataset.construct.from_idca(df_idca)
+    dataset = dataset.dc.set_altnames(pd.Series(alt_mapping))
+    return dataset
+
+
+# --- Helper para detectar separación perfecta en dummies (para nested logit) ---
+def detect_separated_dummies_nested(
+    df_pl: pl.DataFrame,
+    y_col: str,
+    dummy_cols: dict[str, str],
+) -> dict[str, dict]:
+    """
+    Detecta, para cada dummy, si hay separación perfecta con choice_nested (3 alternativas).
+    
+    Para nested logit con choice_nested (0=BIP, 1=QR_RED, 2=QR_OTHER):
+    - all_zero   : siempre 0
+    - perfect_0  : cada vez que dummy=1, choice_nested=0 (separación perfecta hacia BIP)
+    - perfect_1  : cada vez que dummy=1, choice_nested=1 (separación perfecta hacia QR_RED)
+    - perfect_2  : cada vez que dummy=1, choice_nested=2 (separación perfecta hacia QR_OTHER)
+    - none       : nada raro
+    """
+    info = {}
+    y = df_pl[y_col].cast(pl.Int8).to_numpy()
+    n_total = len(y)
+
+    for feature_name, source_col in dummy_cols.items():
+        if source_col not in df_pl.columns:
+            info[feature_name] = {"type": "none", "n_1": 0, "n_total": 0, "p_1": 0.0}
+            continue
+            
+        x = df_pl[source_col].cast(pl.Int8).to_numpy()
+        n_1 = int(x.sum())
+
+        if n_total == 0:
+            info[feature_name] = {"type": "none", "n_1": 0, "n_total": 0, "p_1": 0.0}
+            continue
+
+        if n_1 == 0:
+            info[feature_name] = {
+                "type": "all_zero",
+                "n_1": n_1,
+                "n_total": n_total,
+                "p_1": 0.0,
+            }
+            continue
+
+        y_when_1 = y[x == 1]
+        unique_y = np.unique(y_when_1)
+
+        if len(unique_y) == 1:
+            # Separación perfecta hacia una alternativa específica
+            sep_type = f"perfect_{unique_y[0]}"
+        else:
+            sep_type = "none"
+
+        info[feature_name] = {
+            "type": sep_type,
+            "n_1": n_1,
+            "n_total": n_total,
+            "p_1": n_1 / n_total,
+        }
+
+    return info
+
+
+# --- Helper para detectar features activas (para nested logit) ---
+def detect_active_features_nested(
+    df_pl: pl.DataFrame,
+    feature_to_source: dict[str, str],
+    choice_col: str = "choice_nested"
+) -> tuple[list[str], dict[str, str], dict[str, dict]]:
+    """
+    Detecta features activas (sin problemas de variación o separación perfecta).
+    Adaptado para nested logit con choice_nested (3 alternativas).
+    
+    Returns:
+        active: lista de features activas
+        inactive_reason: dict con razón de inactividad por feature
+        sep_info: dict con información detallada de separación perfecta para dummies
+    """
+    active = []
+    inactive_reason = {}
+    sep_info = {}
+    
+    # Identificar dummies (variables binarias 0/1)
+    dummy_cols = []
+    continuous_cols = []
+    for feature_name, source_col in feature_to_source.items():
+        if source_col not in df_pl.columns:
+            inactive_reason[feature_name] = "missing_source_column"
+            continue
+            
+        series = df_pl[source_col]
+
+        if series.dtype not in [pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64]:
+            inactive_reason[feature_name] = "non_numeric_type"
+            continue
+        
+        stats = df_pl.select(
+            [
+                pl.col(source_col).n_unique().alias("n_unique"),
+                pl.col(source_col).min().alias("min_val"),
+                pl.col(source_col).max().alias("max_val"),
+            ]
+        ).row(0)
+        n_unique, min_val, max_val = stats
+        
+        if n_unique <= 1:
+            if min_val == 0 and max_val == 0:
+                reason = "all_zero"
+            else:
+                reason = "no_variation"
+            inactive_reason[feature_name] = reason
+        elif min_val == 0 and max_val == 1 and n_unique == 2:
+            dummy_cols.append((feature_name, source_col))
+        else:
+            continuous_cols.append(feature_name)
+    
+    # Detectar separación perfecta en dummies (usar la columna fuente)
+    if dummy_cols:
+        sep_input = {feat: src for feat, src in dummy_cols}
+        sep_info = detect_separated_dummies_nested(df_pl, choice_col, sep_input)
+        for feat_name, meta in sep_info.items():
+            if meta["type"] != "none":
+                inactive_reason[feat_name] = meta["type"]
+            else:
+                active.append(feat_name)
+    
+    # Las variables continuas se agregan directamente si tienen variación
+    for col in continuous_cols:
+        active.append(col)
+    
+    return active, inactive_reason, sep_info
+
+
+# --- Mapeo de parámetros para nested logit (dos especificaciones) ---
+FEATURE_COLS_BASE = ["DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+
+def _alt_specific_feature_names(base_cols: list[str]) -> list[str]:
+    names: list[str] = []
+    for col in base_cols:
+        names.append(f"{col}_RED")
+        names.append(f"{col}_OTHER")
+    return names
+
+ALT_SPECIFIC_FEATURES = _alt_specific_feature_names(FEATURE_COLS_BASE)
+
+SPEC_CONFIGS = {
+    "generic": {
+        "feature_columns": FEATURE_COLS_BASE,
+        "param_to_feature": {
+            "ASC_QR_RED": "ASC_QR_RED",
+            "ASC_QR_OTHER": "ASC_QR_OTHER",
+            "B_QR_PM_LAB": "DUMMY_PM_LAB",
+            "B_QR_PT_LAB": "DUMMY_PT_LAB",
+            "B_QR_LJ_LAB": "DUMMY_LJ_LAB",
+            "B_QR_VIE_LAB": "DUMMY_VIE_LAB",
+        },
+        "feature_to_source": {col: col for col in FEATURE_COLS_BASE},
+        "model_params": [
+            "ASC_QR_RED",
+            "ASC_QR_OTHER",
+            "B_QR_PM_LAB",
+            "B_QR_PT_LAB",
+            "B_QR_LJ_LAB",
+            "B_QR_VIE_LAB",
+            "MU_QR",
+        ],
+    },
+    "specific": {
+        "feature_columns": ALT_SPECIFIC_FEATURES,
+        "param_to_feature": {
+            "ASC_QR_RED": "ASC_QR_RED",
+            "ASC_QR_OTHER": "ASC_QR_OTHER",
+            "B_QR_RED_PM_LAB": "DUMMY_PM_LAB_RED",
+            "B_QR_OTHER_PM_LAB": "DUMMY_PM_LAB_OTHER",
+            "B_QR_RED_PT_LAB": "DUMMY_PT_LAB_RED",
+            "B_QR_OTHER_PT_LAB": "DUMMY_PT_LAB_OTHER",
+            "B_QR_RED_LJ_LAB": "DUMMY_LJ_LAB_RED",
+            "B_QR_OTHER_LJ_LAB": "DUMMY_LJ_LAB_OTHER",
+            "B_QR_RED_VIE_LAB": "DUMMY_VIE_LAB_RED",
+            "B_QR_OTHER_VIE_LAB": "DUMMY_VIE_LAB_OTHER",
+        },
+        "feature_to_source": {
+            "DUMMY_PM_LAB_RED": "DUMMY_PM_LAB",
+            "DUMMY_PM_LAB_OTHER": "DUMMY_PM_LAB",
+            "DUMMY_PT_LAB_RED": "DUMMY_PT_LAB",
+            "DUMMY_PT_LAB_OTHER": "DUMMY_PT_LAB",
+            "DUMMY_LJ_LAB_RED": "DUMMY_LJ_LAB",
+            "DUMMY_LJ_LAB_OTHER": "DUMMY_LJ_LAB",
+            "DUMMY_VIE_LAB_RED": "DUMMY_VIE_LAB",
+            "DUMMY_VIE_LAB_OTHER": "DUMMY_VIE_LAB",
+        },
+        "model_params": [
+            "ASC_QR_RED",
+            "ASC_QR_OTHER",
+            "B_QR_RED_PM_LAB",
+            "B_QR_OTHER_PM_LAB",
+            "B_QR_RED_PT_LAB",
+            "B_QR_OTHER_PT_LAB",
+            "B_QR_RED_LJ_LAB",
+            "B_QR_OTHER_LJ_LAB",
+            "B_QR_RED_VIE_LAB",
+            "B_QR_OTHER_VIE_LAB",
+            "MU_QR",
+        ],
+    },
+}
+
+print("✅ Funciones de ayuda definidas:")
+print("   - get_stratified_sample_nested")
+print("   - prepare_nested_base_features")
+print("   - build_long_format_for_larch_nested")
+print("   - create_larch_dataset_nested")
+print("   - detect_separated_dummies_nested")
+print("   - detect_active_features_nested")
+print("\n✅ Configuraciones de parámetros disponibles: 'generic' y 'specific'")
+````
+
+## Función de Estimación del Modelo Nested Logit Baseline
+
+````{python}
+#|label: estimate-nested-logit-larch-function
+
+def estimate_nested_logit_larch(
+    df_pl: pl.DataFrame,
+    partition_label: str,
+    output_dir: str,
+    alt_mapping: dict[int, str] = ALT_MAPPING_NESTED,
+    specification: str = "generic",
+) -> tuple[Model, pd.DataFrame, pd.DataFrame]:
+    """
+    Estima el modelo nested logit baseline usando larch y genera outputs compatibles.
+    
+    Basado en el ejemplo de larch v6.0: https://larch.driftless.xyz/v6.0/examples/swissmetro/109-swissmetro-nl.html
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    start_time = time.perf_counter()
+
+    spec_key = specification.lower()
+    if spec_key not in SPEC_CONFIGS:
+        raise ValueError(f"Especificación desconocida: {specification}. Opciones: {list(SPEC_CONFIGS.keys())}")
+
+    spec_cfg = SPEC_CONFIGS[spec_key]
+    feature_columns = spec_cfg["feature_columns"]
+    feature_to_source = spec_cfg["feature_to_source"]
+    param_to_feature = spec_cfg["param_to_feature"]
+    model_params_to_report = spec_cfg["model_params"]
+    feature_param_map = {
+        dataset_col: param_name
+        for param_name, dataset_col in param_to_feature.items()
+        if dataset_col not in {"ASC_QR_RED", "ASC_QR_OTHER"}
+    }
+
+    # Detectar features activas para esta partición (incluye detección de separación perfecta)
+    active_features, inactive_feature_reason, sep_info = detect_active_features_nested(
+        df_pl,
+        feature_to_source,
+        choice_col="choice_nested"
+    )
+
+    if inactive_feature_reason:
+        print(f"   🔎 Revisión de separación perfecta y variables inactivas (partition={partition_label}):")
+        # Mostrar información detallada de separación perfecta
+        for col, meta in sep_info.items():
+            if meta["type"] != "none":
+                print(
+                    f"      - {col}: type={meta['type']}, "
+                    f"n_1={meta['n_1']:,}, total={meta['n_total']:,}, "
+                    f"p_1={meta['p_1']:.4f}"
+                )
+        # Mostrar otras variables inactivas
+        for col, reason in inactive_feature_reason.items():
+            if col not in sep_info or sep_info.get(col, {}).get("type") == "none":
+                print(f"      - {col}: {reason}")
+
+    # Preparar el dataset de larch (incluye columnas genéricas y específicas)
+    dataset = create_larch_dataset_nested(
+        df_pl.select(["choice_nested"] + FEATURE_COLS_BASE),
+        FEATURE_COLS_BASE,
+        alt_mapping
+    )
+    
+    # Crear el modelo
+    model = Model(dataset)
+    model.title = f"nested_logit_larch_{partition_label}"
+    model.compute_engine = "numba"
+    model.choice_ca_var = "choice_ind"  # La columna que indica la elección real
+
+    # Definir utilidad como una sola expresión (similar al modelo binario)
+    # En formato idca, larch aplica la expresión a todas las alternativas
+    # Las variables dummy (ASC_QR_RED, features) determinan qué términos aplican a cada alternativa
+    # Alternativa 0 (BIP): ASC_QR_RED=0 y features=0, así que utilidad = 0
+    # Alternativa 1 (QR_RED): ASC_QR_RED=1 y features tienen valores, así que utilidad = ASC_QR_RED + betas*features
+    # Alternativa 2 (QR_OTHER): ASC_QR_RED=0 pero features tienen valores, así que utilidad = betas*features
+    
+    # Construir la expresión de utilidad única
+    utility_expr = (
+        P("ASC_QR_RED") * X("ASC_QR_RED") +
+        P("ASC_QR_OTHER") * X("ASC_QR_OTHER")
+    )
+    for feat in active_features:
+        param_name = feature_param_map.get(feat, feat)
+        utility_expr += P(param_name) * X(feat)
+    
+    # Asignar la expresión única (larch la aplica automáticamente según los valores en los datos)
+    model.utility_ca = utility_expr
+
+    # Crear estructura de nidos
+    # Nido QR: contiene QR_RED (1) y QR_OTHER (2), con parámetro MU_QR
+    # Nota: BIP (0) queda en el nivel raíz (mu=1.0 implícito)
+    # El parámetro MU_QR se crea automáticamente al crear el nido
+    model.graph.new_node(
+        parameter="MU_QR",
+        children=[CHOICE_QR_RED, CHOICE_QR_OTHER],
+        name="QR"
+    )
+    
+    # Aplicar límites generales a los parámetros para estabilizar el optimizador
+    # (cap general) y luego sobreescribir explícitamente los límites de MU_QR
+    model.set_cap()
+
+    # Establecer valor inicial y límites válidos para MU_QR (0 < MU_QR ≤ 1)
+   # Configurar MU_QR
+    pnames = list(model.pnames)
+    if "MU_QR" in pnames:
+        mu_idx = pnames.index("MU_QR")
+
+        # Valor inicial y fijo
+        model.pvals[mu_idx] = 0.5
+        model.pholdfast[mu_idx] = 0 
+
+        # Por prolijidad, fijamos los bounds exactamente en 0.42
+        model.pminimum[mu_idx] = 0.01
+        model.pmaximum[mu_idx] = 1.0
+
+        print("✅ MU_QR fijado en 0.42 (mismo valor que quieres comparar)")
+    else:
+        print("⚠️ MU_QR no aparece en model.pnames")
+
+    # Maximizar la verosimilitud
+    print(f"   Estimando modelo nested logit para {partition_label}...")
+    result = model.maximize_loglike()
+    model.calculate_parameter_covariance(robust=True)
+
+    # --- Parámetros ---
+    # Acceder directamente a los parámetros del modelo para máxima precisión
+    pvalues_dict = {}
+    pstderr_dict = {}
+    
+    try:
+        # Intentar acceder a model.pf (parameter frame)
+        pf_df = model.pf
+        for idx, row in pf_df.iterrows():
+            param_name = row.name if hasattr(row, 'name') else idx
+            param_value = row.get('value', row.get('Value', np.nan))
+            if param_value is not None and not pd.isna(param_value):
+                pvalues_dict[param_name] = float(param_value)
+            else:
+                pvalues_dict[param_name] = np.nan
+            
+            se = row.get('stderr', row.get('Std Err', row.get('std_err', np.nan)))
+            if se is not None and not pd.isna(se):
+                pstderr_dict[param_name] = float(se)
+            else:
+                pstderr_dict[param_name] = np.nan
+    except (AttributeError, TypeError):
+        # Fallback a parameter_summary()
+        summary_df = (
+            model.parameter_summary()
+            .data.rename_axis("Parameter")
+            .reset_index()
+            .set_index("Parameter")
+        )
+        for param_name in summary_df.index:
+            val = summary_df.loc[param_name, "Value"]
+            pvalues_dict[param_name] = pd.to_numeric(val, errors='coerce')
+            se = summary_df.loc[param_name, "Std Err"]
+            pstderr_dict[param_name] = pd.to_numeric(se, errors='coerce')
+    
+    # También obtenemos el summary para los t-stats (puede tener strings como "BIG")
+    summary_df = (
+        model.parameter_summary()
+        .data.rename_axis("Parameter")
+        .reset_index()
+        .set_index("Parameter")
+    )
+
+    def _safe_float(x):
+        """Convierte valores a float de forma segura, manejando casos especiales."""
+        if x is None or pd.isna(x):
+            return np.nan
+        if isinstance(x, (float, int, np.floating, np.integer)):
+            return float(x)
+        if isinstance(x, str):
+            # Limpiar espacios no rompibles y otros caracteres especiales
+            token = x.strip().replace('\xa0', ' ').strip().upper()
+            if token in {"BIG", "+BIG", "BIG"}:
+                return np.inf
+            if token == "-BIG":
+                return -np.inf
+            if token in {"NA", "N/A", "NAN", "NONE", ""}:
+                return np.nan
+            # Intentar convertir a float
+            try:
+                return float(x)
+            except (ValueError, TypeError):
+                return np.nan
+        # Si no es ninguno de los casos anteriores, intentar convertir
+        try:
+            return float(x)
+        except (ValueError, TypeError):
+            return np.nan
+
+    rows = []
+    t_max = float(np.finfo(float).max)
+    
+    # Crear un diccionario para mapear nombres de parámetros sin sufijo a nombres completos
+    param_name_mapping = {}
+    for full_name in pvalues_dict.keys():
+        clean_name = full_name.replace(f"_{partition_label}", "")
+        param_name_mapping[clean_name] = full_name
+    
+    for param in model_params_to_report:
+        # Buscar el nombre completo del parámetro en el modelo
+        matching_full_name = param_name_mapping.get(param)
+        
+        # Si no encontramos exacto, buscar por coincidencia parcial
+        if not matching_full_name:
+            for clean_name, full_name in param_name_mapping.items():
+                if param in clean_name:
+                    matching_full_name = full_name
+                    break
+
+        if matching_full_name and matching_full_name in pvalues_dict:
+            # Usar valores directos del modelo para máxima precisión
+            value = float(pvalues_dict[matching_full_name])
+            se = float(pstderr_dict.get(matching_full_name, np.nan))
+            
+            # Para t-stat, usar el summary (puede tener strings especiales)
+            summary_key = matching_full_name if matching_full_name in summary_df.index else param
+            if summary_key in summary_df.index:
+                t_stat = _safe_float(summary_df.loc[summary_key].get("Robust t Stat", 
+                                                                      summary_df.loc[summary_key].get("t Stat", np.nan)))
+            else:
+                # Calcular t-stat manualmente si no está en el summary
+                t_stat = value / se if se > 0 and not np.isnan(se) else np.nan
+        else: # El parámetro no fue estimado
+            value = 0.0
+            
+            # Intentar encontrar la razón de inactividad
+            feat_name_for_param = param_to_feature.get(param)
+            reason = inactive_feature_reason.get(feat_name_for_param, "inactive") if feat_name_for_param else "inactive"
+
+            if reason in {"all_zero", "no_variation", "perfect_0", "perfect_1", "perfect_2"}:
+                # Variables con separación perfecta o sin variación se reportan como en statsmodels:
+                # value=0.0, se=0.0, t_stat=t_max (infinito)
+                se = 0.0
+                t_stat = t_max
+            else:
+                se = np.nan
+                t_stat = np.nan
+        
+        rows.append(
+            {
+                "Name": f"{param}_{partition_label}",
+                "Value": value,
+                "Robust std err.": se,
+                "Robust t-stat.": t_stat,
+            }
+        )
+    params_df = pd.DataFrame(rows)
+
+    # --- Estadísticas ---
+    nobs = model.n_cases
+    ll_final = float(result["loglike"])
+    ll_init = nobs * np.log(1.0 / 3.0)  # Para 3 alternativas, probabilidad inicial = 1/3
+    k_params = len([
+        p for p in model_params_to_report
+        if p in pvalues_dict or
+        inactive_feature_reason.get(param_to_feature.get(p, ""), "") in
+        {"all_zero", "no_variation", "perfect_0", "perfect_1", "perfect_2"}
+    ])
+    rho_sq = 1.0 - ll_final / ll_init
+    rho_sq_bar = 1.0 - (ll_final - k_params) / ll_init
+
+    try:
+        grad = model.d_loglike()
+        grad_norm = float(np.linalg.norm(grad))
+    except Exception:
+        grad_norm = np.nan
+
+    elapsed_seconds = time.perf_counter() - start_time
+    print(f"   ⏱️ Tiempo total partición {partition_label}: {elapsed_seconds:.1f} s")
+
+    stats_df = pd.DataFrame(
+        [
+            {
+                "Number of estimated parameters": k_params,
+                "Sample size": nobs,
+                "Excluded observations": 0,
+                "Init log likelihood": ll_init,
+                "Final log likelihood": ll_final,
+                "Likelihood ratio test for the init. model": -2 * (ll_init - ll_final),
+                "Rho-square for the init. model": rho_sq,
+                "Rho-square-bar for the init. model": rho_sq_bar,
+                "Akaike Information Criterion": -2 * ll_final + 2 * k_params,
+                "Bayesian Information Criterion": -2 * ll_final + k_params * np.log(nobs),
+                "Final gradient norm": grad_norm,
+                "Bootstrapping time": None,
+                "Wall-clock seconds": elapsed_seconds,
+            }
+        ]
+    )
+
+    params_path = os.path.join(output_dir, f"params_nl_{partition_label}.csv")
+    stats_path = os.path.join(output_dir, f"stats_nl_{partition_label}.csv")
+    # Guardar con máxima precisión numérica
+    params_df.to_csv(params_path, index=False, float_format='%.15g')
+    stats_df.to_csv(stats_path, index=False, float_format='%.15g')
+
+    print(f"📁 Parámetros (larch nested) guardados en: {params_path}")
+    print(f"📁 Estadísticas (larch nested) guardadas en: {stats_path}")
+    print(f"   ✅ Rho-cuadrado ajustado (Biogeme-style): {rho_sq_bar:.3f}")
+
+    return model, params_df, stats_df
+
+print("✅ Función de estimación `estimate_nested_logit_larch` definida.")
+````
+
+## Estimación de Prueba - Una Partición
+
+Esta celda permite probar la estimación del modelo nested logit baseline en una sola partición antes de ejecutar el proceso secuencial completo.
+
+````{python}
+#|label: test-estimation-single-partition
+
+# --- Configuración para la prueba ---
+TEST_YEAR = 2025
+TEST_WEEK = 15
+TEST_PARTITION_LABEL = f"{TEST_YEAR}-W{TEST_WEEK}"
+
+# Configuración de muestreo para la prueba (recomendado usar muestreo para pruebas rápidas)
+TEST_APPLY_SAMPLING = True
+TEST_SAMPLE_FRACTION = 0.20  # 20% para prueba rápida
+TEST_SEED = 42
+
+# Selector de especificaciones para la prueba
+TEST_SPECIFICATIONS = ["generic"]
+
+print("="*80)
+print("--- PRUEBA DE ESTIMACIÓN: Modelo Nested Logit Baseline (Larch) ---")
+print("="*80)
+print(f"Partición de prueba: {TEST_PARTITION_LABEL}")
+print(f"Aplicar muestreo: {TEST_APPLY_SAMPLING}")
+if TEST_APPLY_SAMPLING:
+    print(f"Fracción de muestreo: {TEST_SAMPLE_FRACTION*100:.0f}%")
+print("="*80)
+
+try:
+    # 1. Cargar datos
+    print(f"\n📂 Paso 1: Cargando datos de la partición {TEST_PARTITION_LABEL}...")
+    input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={TEST_YEAR}/iso_week={TEST_WEEK}/*.parquet"
+    print(f"   Ruta: {input_path_glob}")
+    
+    lf_data = read_parquet_portable(input_path_glob)
+    n_rows_initial = lf_data.select(pl.len()).collect().item()
+    print(f"   ✅ Datos cargados: {n_rows_initial:,} filas")
+    
+    # 2. Preparar features (modelo baseline)
+    print(f"\n🔧 Paso 2: Preparando features para modelo nested logit baseline...")
+    lf_model_ready = prepare_nested_base_features(lf_data)
+    df_model_data = lf_model_ready.collect()
+    print(f"   ✅ Features preparados: {len(df_model_data):,} filas")
+    
+    # Verificar distribución de choice_nested
+    print(f"\n   📊 Distribución de choice_nested (antes de muestreo):")
+    choice_dist = df_model_data['choice_nested'].value_counts().sort('choice_nested')
+    for row in choice_dist.iter_rows(named=True):
+        choice_val = row['choice_nested']
+        count = row['count']
+        pct = (count / len(df_model_data)) * 100
+        choice_name = ALT_MAPPING_NESTED.get(choice_val, f"Unknown({choice_val})")
+        print(f"      - {choice_name} ({choice_val}): {count:,} ({pct:.2f}%)")
+    
+    # 3. Aplicar muestreo si es necesario
+    if TEST_APPLY_SAMPLING:
+        print(f"\n🎲 Paso 3: Aplicando muestreo estratificado ({TEST_SAMPLE_FRACTION*100:.0f}%)...")
+        df_for_model = get_stratified_sample_nested(df_model_data, TEST_SAMPLE_FRACTION, TEST_SEED)
+        print(f"   ✅ Muestreo completado: {len(df_for_model):,} filas")
+        
+        # Verificar distribución después del muestreo
+        print(f"\n   📊 Distribución de choice_nested (después de muestreo):")
+        choice_dist_after = df_for_model['choice_nested'].value_counts().sort('choice_nested')
+        for row in choice_dist_after.iter_rows(named=True):
+            choice_val = row['choice_nested']
+            count = row['count']
+            pct = (count / len(df_for_model)) * 100
+            choice_name = ALT_MAPPING_NESTED.get(choice_val, f"Unknown({choice_val})")
+            print(f"      - {choice_name} ({choice_val}): {count:,} ({pct:.2f}%)")
+    else:
+        print(f"\n📊 Paso 3: Usando dataset completo (sin muestreo")
+        df_for_model = df_model_data
+    
+    # 4. Verificar que tenemos datos
+    if len(df_for_model) == 0:
+        raise ValueError("El dataset está vacío después del procesamiento")
+    
+    # 5. Estimar cada especificación
+    for spec in TEST_SPECIFICATIONS:
+        spec_key = spec.lower()
+        spec_cfg = SPEC_CONFIGS[spec_key]
+        spec_output_dir = os.path.join(
+            BASE_OUTPUT_DIR,
+            f"{TEST_PARTITION_LABEL}-nested-base-{spec_key}-sample{int(TEST_SAMPLE_FRACTION*100)}pct"
+        )
+
+        print(f"\n🔬 Paso 4: Estimando modelo nested logit baseline ({spec_key})...")
+        print(f"   Features a incluir: {spec_cfg['feature_columns']}")
+        print(f"   Parámetros a estimar: {spec_cfg['model_params']}")
+        print(f"   Directorio de salida: {spec_output_dir}")
+
+        model_nl, params_df_nl, stats_df_nl = estimate_nested_logit_larch(
+            df_pl=df_for_model,
+            partition_label=TEST_PARTITION_LABEL,
+            output_dir=spec_output_dir,
+            alt_mapping=ALT_MAPPING_NESTED,
+            specification=spec_key,
+        )
+
+        print(f"\n{'='*80}")
+        print(f"--- RESULTADOS DE LA ESTIMACIÓN ({spec_key.upper()}) ---")
+        print("="*80)
+
+        print(f"\n📊 Estadísticas del modelo:")
+        pd.set_option('display.float_format', '{:.6f}'.format)
+        print(stats_df_nl.to_string(index=False))
+
+        print(f"\n📈 Parámetros estimados:")
+        pd.set_option('display.float_format', '{:.6f}'.format)
+        print(params_df_nl.to_string(index=False))
+
+        print(f"\n🔍 Información adicional del modelo:")
+        print(f"   - Log-likelihood final: {stats_df_nl.iloc[0]['Final log likelihood']:.6f}")
+        print(f"   - Rho-square-bar: {stats_df_nl.iloc[0]['Rho-square-bar for the init. model']:.6f}")
+        print(f"   - Número de parámetros: {stats_df_nl.iloc[0]['Number of estimated parameters']}")
+        print(f"   - Tamaño de muestra: {stats_df_nl.iloc[0]['Sample size']:,}")
+        print(f"   - Tiempo de ejecución: {stats_df_nl.iloc[0]['Wall-clock seconds']:.2f} segundos")
+
+        mu_qr_row = params_df_nl[params_df_nl['Name'].str.contains('MU_QR')]
+        if len(mu_qr_row) > 0:
+            mu_qr_value = mu_qr_row.iloc[0]['Value']
+            mu_qr_tstat = mu_qr_row.iloc[0]['Robust t-stat.']
+            print(f"\n   📌 Parámetro del nido QR (MU_QR):")
+            print(f"      - Valor estimado: {mu_qr_value:.6f}")
+            print(f"      - t-stat: {mu_qr_tstat:.6f}")
+
+        print(f"\n{'='*80}")
+        print(f"✅ PRUEBA ({spec_key.upper()}) COMPLETADA")
+        print("="*80)
+    
+except Exception as e:
+    print(f"\n{'='*80}")
+    print("❌ ERROR EN LA PRUEBA")
+    print("="*80)
+    print(f"Error: {e}")
+    import traceback
+    print(f"\nTraceback completo:")
+    traceback.print_exc()
+    print("="*80)
+````
+
+## Estimación Secuencial (multi-especificación)
+
+Esta celda recorre múltiples combinaciones de semana ISO, fracción de muestreo y especificación. Cada corrida valida la cobertura del join con caracterización y guarda los artefactos bajo `model_outputs_nl_larch/particion-nested-base-{spec}-{pct}`.
+
+> **Nota:** `df_caracterizacion` corresponde a abril 2025. Antes de ejecutar semanas de otros meses redefine `CARACTERIZACION_PATH` (o carga la tabla correcta) y vuelve a ejecutar la celda de carga.
+
+````{python}
+#|label: sequential-estimation
+
+SEQUENTIAL_RUNS = [
+    # (year, iso_week, sample_fraction, specification, seed)
+    (2025, 15, 0.20, "generic", 42),
+    (2025, 15, 0.50, "generic", 42),
+    (2025, 15, 1.00, "generic", 42),
+    (2025, 15, 0.20, "specific", 42),
+    (2025, 15, 0.50, "specific", 42),
+    (2025, 15, 1.00, "specific", 42),
+    
+    (2025, 17, 0.20, "generic", 42),
+    (2025, 17, 0.50, "generic", 42),
+    (2025, 17, 1.00, "generic", 42),
+    (2025, 17, 0.20, "specific", 42),
+    (2025, 17, 0.50, "specific", 42),
+    (2025, 17, 1.00, "specific", 42),
+]
+
+print("=" * 80)
+print("--- ESTIMACIÓN SECUENCIAL: Nested Logit QR vs Bip ---")
+print("=" * 80)
+
+for year, iso_week, sample_frac, spec, seed in SEQUENTIAL_RUNS:
+    partition_label = f"{year}-W{iso_week:02d}"
+    sample_label = "full" if sample_frac >= 0.999 else f"{int(sample_frac * 100):02d}pct"
+    spec_key = spec.lower()
+    if spec_key not in SPEC_CONFIGS:
+        print(f"⚠️ Especificación desconocida '{spec}'. Se omite la corrida.")
+        continue
+
+    output_dir = os.path.join(
+        BASE_OUTPUT_DIR,
+        f"{partition_label}-nested-base-{spec_key}-{sample_label}"
+    )
+
+    print(f"\n➡️ Partición: {partition_label} | Muestra: {sample_label} | Spec: {spec_key}")
+
+    input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={iso_week}/*.parquet"
+    lf_data = read_parquet_portable(input_path_glob)
+    n_rows_initial = lf_data.select(pl.len()).collect().item()
+    print(f"   📂 Datos cargados: {n_rows_initial:,} filas")
+
+    lf_model_ready = prepare_nested_base_features(lf_data)
+    df_model_data = lf_model_ready.collect()
+    print(f"   ✅ Features preparados: {len(df_model_data):,} filas")
+
+    if sample_frac < 1.0:
+        df_for_model = get_stratified_sample_nested(df_model_data, sample_frac, seed)
+        print(f"   🎲 Muestreo aplicado ({sample_frac*100:.0f}%): {len(df_for_model):,} filas")
+    else:
+        df_for_model = df_model_data
+        print("   ✅ Usando dataset completo (100%)")
+
+    if len(df_for_model) == 0:
+        print("   ⚠️ Dataset vacío después del muestreo. Se omite.")
+        continue
+
+    model_nl, params_df_nl, stats_df_nl = estimate_nested_logit_larch(
+        df_pl=df_for_model,
+        partition_label=partition_label,
+        output_dir=output_dir,
+        alt_mapping=ALT_MAPPING_NESTED,
+        specification=spec_key,
+    )
+
+    print(f"   ✅ Guardado en: {output_dir}")
+    print(f"      - Log-likelihood final: {stats_df_nl.iloc[0]['Final log likelihood']:.2f}")
+    print(f"      - Rho-square-bar: {stats_df_nl.iloc[0]['Rho-square-bar for the init. model']:.3f}")
+    print(f"      - N parámetros: {stats_df_nl.iloc[0]['Number of estimated parameters']}")
+    mu_row = params_df_nl[params_df_nl['Name'].str.contains('MU_QR')]
+    if len(mu_row) > 0:
+        print(f"      - MU_QR: {mu_row.iloc[0]['Value']:.4f}")
+
+print("\n" + "=" * 80)
+print("✅ ESTIMACIÓN SECUENCIAL COMPLETADA")
+print("=" * 80)
+````
+
+## Verificación de Cobertura de Caracterización
+
+Esta celda permite inspeccionar la cobertura `id_tarjeta` ↔ `tipo_app` para cualquier semana antes de correr estimaciones secuenciales.
+
+````{python}
+#|label: coverage-check
+
+VERIFICATION_RUNS = [
+    (2025, 15),
+    (2025, 17),
+]
+
+print("=" * 80)
+print("--- COBERTURA CARACTERIZACIÓN vs PARTICIÓN ---")
+print("=" * 80)
+
+for year, iso_week in VERIFICATION_RUNS:
+    partition_label = f"{year}-W{iso_week:02d}"
+    input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={iso_week}/*.parquet"
+    print(f"\n➡️ Partición: {partition_label}")
+    lf_data = read_parquet_portable(input_path_glob)
+    n_rows = lf_data.select(pl.len()).collect().item()
+    print(f"   📂 Datos cargados: {n_rows:,} filas")
+
+    lf_model_ready = prepare_nested_base_features(lf_data)
+    df_sample = lf_model_ready.select("choice_nested").head(5).collect()
+    print(f"   ✅ Sample choice_nested: {df_sample['choice_nested'].to_list()}\n")
+
+print("=" * 80)
+print("✅ COBERTURA VALIDADA")
+print("=" * 80)
+````
+
+## Validación de Representatividad de la Partición
+
+Esta celda revisa si, dentro de la partición seleccionada, están presentes todas las alternativas (`choice_nested` = 0/1/2) y si cada dummy temporal toma ambos valores (0 y 1). Sirve como chequeo rápido antes de modelar que el subconjunto de datos no esté filtrado de forma accidental.
+
+````{python}
+#|label: representation-check
+
+REPRESENTATION_RUNS = [
+    (2025, 15),
+    (2025, 17),
+]
+
+CHECK_DUMMIES = ["DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+
+print("=" * 80)
+print("--- VALIDACIÓN DE REPRESENTATIVIDAD ---")
+print("=" * 80)
+
+for year, iso_week in REPRESENTATION_RUNS:
+    partition_label = f"{year}-W{iso_week:02d}"
+    input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={iso_week}/*.parquet"
+    print(f"\n➡️ Partición: {partition_label}")
+
+    lf_data = read_parquet_portable(input_path_glob)
+    lf_model_ready = prepare_nested_base_features(lf_data)
+    df_model = lf_model_ready.collect()
+    n_rows = len(df_model)
+    print(f"   📂 Observaciones totales (post-features): {n_rows:,}")
+
+    # Validar alternativas
+    choice_counts = (
+        df_model["choice_nested"]
+        .value_counts()
+        .sort("choice_nested")
+    )
+    seen_choices = set(choice_counts["choice_nested"].to_list())
+    print("   📊 Distribución choice_nested:")
+    for row in choice_counts.iter_rows(named=True):
+        code = row["choice_nested"]
+        count = row["count"]
+        pct = (count / n_rows * 100) if n_rows else 0.0
+        print(f"      - {ALT_MAPPING_NESTED.get(code, code)} ({code}): {count:,} ({pct:.2f}%)")
+    missing_choices = {0, 1, 2} - seen_choices
+    if missing_choices:
+        print(f"      ⚠️ Faltan alternativas en los datos: {sorted(missing_choices)}")
+
+    # Validar que cada dummy tenga 0 y 1
+    for dummy in CHECK_DUMMIES:
+        if dummy not in df_model.columns:
+            print(f"      ⚠️ {dummy} no está presente en la tabla de features")
+            continue
+        counts = (
+            df_model.select(dummy)
+            .group_by(dummy)
+            .count()
+            .sort(dummy)
+        )
+        values = set(counts[dummy].to_list())
+        msg = ", ".join(
+            [
+                f"{int(row[dummy])}: {row['count']:,}"
+                for row in counts.iter_rows(named=True)
+            ]
+        )
+        if values == {0.0, 1.0}:
+            print(f"      ✅ {dummy}: {msg}")
+        else:
+            print(f"      ⚠️ {dummy} no presenta ambos valores (detalle: {msg})")
+
+print("\n" + "=" * 80)
+print("✅ VALIDACIÓN COMPLETADA")
+print("=" * 80)
+````
+
+## Comparación de Resultados (Parámetros y Estadísticas)
+
+Esta celda lee los CSV generados por la estimación secuencial (`params_nl_*.csv` y `stats_nl_*.csv`) y concatena los resultados para comparar rápidamente especificaciones y fracciones.
+
+````{python}
+#|label: compare-results
+
+RESULTS_TO_COMPARE = [
+    ("2025-W17", "generic", "20pct"),
+    ("2025-W17", "generic", "50pct"),
+    ("2025-W17", "generic", "full"),
+    ("2025-W17", "specific", "20pct"),
+    ("2025-W17", "specific", "50pct"),
+    ("2025-W17", "specific", "full"),
+    ("2025-W15", "generic", "20pct"),
+    ("2025-W15", "generic", "50pct"),
+    ("2025-W15", "generic", "full"),
+    ("2025-W15", "specific", "20pct"),
+    ("2025-W15", "specific", "50pct"),
+    ("2025-W15", "specific", "full"),
+]
+
+def load_result_frames(partition_label: str, spec: str, sample_label: str):
+    base_path = os.path.join(
+        BASE_OUTPUT_DIR,
+        f"{partition_label}-nested-base-{spec}-{sample_label}"
+    )
+    params_path = os.path.join(base_path, f"params_nl_{partition_label}.csv")
+    stats_path = os.path.join(base_path, f"stats_nl_{partition_label}.csv")
+    if not os.path.exists(params_path) or not os.path.exists(stats_path):
+        raise FileNotFoundError(f"No se encontraron resultados en {base_path}")
+    params_df = pl.read_csv(params_path)
+    stats_df = pl.read_csv(stats_path)
+    return params_df, stats_df
+
+param_frames = []
+stat_frames = []
+
+for partition_label, spec, sample_label in RESULTS_TO_COMPARE:
+    try:
+        params_df, stats_df = load_result_frames(partition_label, spec, sample_label)
+    except FileNotFoundError as err:
+        print(f"⚠️ {err}")
+        continue
+
+    params_df = params_df.with_columns([
+        pl.lit(partition_label).alias("partition"),
+        pl.lit(spec).alias("spec"),
+        pl.lit(sample_label).alias("sample"),
+    ])
+    stats_df = stats_df.with_columns([
+        pl.lit(partition_label).alias("partition"),
+        pl.lit(spec).alias("spec"),
+        pl.lit(sample_label).alias("sample"),
+    ])
+
+    param_frames.append(params_df)
+    stat_frames.append(stats_df)
+
+if param_frames:
+    params_concat = pl.concat(param_frames)
+    print("\n=== Comparación de Parámetros (formato compacto) ===")
+    params_pd = params_concat.to_pandas().copy()
+    params_pd["base_param"] = params_pd.apply(
+        lambda row: row["Name"].replace(f"_{row['partition']}", ""), axis=1
+    )
+
+    for spec_type in sorted(params_pd["spec"].unique()):
+        subset = params_pd[params_pd["spec"] == spec_type].copy()
+        pivot = subset.pivot_table(
+            index="base_param",
+            columns=["partition", "sample"],
+            values="Value"
+        )
+        print(f"\n--- Especificación: {spec_type} ---")
+        with pd.option_context(
+            "display.max_rows", None,
+            "display.max_columns", None,
+            "display.width", 200,
+        ):
+            print(pivot)
+else:
+    print("No se encontraron parámetros para las combinaciones solicitadas.")
+
+if stat_frames:
+    stats_concat = pl.concat(stat_frames)
+    print("\n=== Comparación de Estadísticas (formato compacto) ===")
+    stats_pd = stats_concat.to_pandas().copy()
+    metrics = [
+        "Final log likelihood",
+        "Rho-square-bar for the init. model",
+        "Number of estimated parameters",
+    ]
+
+    for spec_type in sorted(stats_pd["spec"].unique()):
+        subset = stats_pd[stats_pd["spec"] == spec_type].copy()
+        print(f"\n--- Especificación: {spec_type} ---")
+        for metric in metrics:
+            pivot = subset.pivot_table(
+                index="partition",
+                columns="sample",
+                values=metric
+            )
+            print(f"\n{metric}:")
+            with pd.option_context(
+                "display.max_rows", None,
+                "display.max_columns", None,
+                "display.width", 200,
+            ):
+                print(pivot)
+else:
+    print("No se encontraron estadísticas para las combinaciones solicitadas.")
+````

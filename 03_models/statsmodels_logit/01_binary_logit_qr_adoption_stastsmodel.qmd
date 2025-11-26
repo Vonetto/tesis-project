@@ -1,0 +1,1159 @@
+---
+title: "EDA y Modelo Logit Binario - Adopción QR vs Bip"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: auto
+---
+
+::: {.callout-note}
+# Navegación Rápida
+
+En caso de querer leer solo la definición del modelo y los resultados, puede saltar directamente a las secciones de [Definición del Modelo Logit con `statsmodels`](#definición-del-modelo-logit-con-statsmodels) y [Resultados del Modelo Baseline](#resultados-del-modelo-baseline-semana-2025-w17).
+:::
+
+# Objetivo
+
+Este notebook tiene como objetivo:
+
+1. Realizar un análisis exploratorio de las variables relevantes para modelar la elección entre pago con QR y Tarjeta Bip!.
+
+2. Preparar los datos de una partición semanal para la estimación.
+
+3. Estimar un **modelo Logit Binario simple usando `statsmodels.Logit`** para identificar factores asociados a la elección del método de pago (QR vs Bip), enfocándose en variables temporales (hora punta, día de la semana).
+
+4. Dejar los resultados en un formato compatible con los outputs previos de `biogeme` para poder comparar ajustes y parámetros entre ambas herramientas.
+
+---
+
+::: {.callout-warning}
+# Alcance del Análisis
+
+Para desarrollar y validar el modelo de forma controlada, este análisis se centra en una **semana representativa: la Semana 17 del año 2025**, y se deja preparado un bloque para correr el mismo modelo de forma secuencial en otras semanas (por ejemplo, **2025-W18**). El objetivo es consolidar un modelo robusto en este subconjunto de datos antes de escalar el análisis. Una vez que el modelo esté validado, se explorarán estrategias (como el **muestreo estratificado**) para integrar eficientemente el resto de las particiones semanales sin incurrir en costos computacionales prohibitivos o problemas de memoria.
+:::
+
+## Setup e Importación de Librerías
+
+```{python}
+#|label: setup-and-imports
+import os
+import sys
+from pathlib import Path
+from datetime import date
+
+import polars as pl
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import time
+
+import statsmodels.api as sm  # usaremos statsmodels.Logit
+
+# Asegurar que el paquete 'config' y 'lib' sean importables
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+    else:
+        raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
+
+# Importar funciones de acceso a datos centralizadas
+from lib.datalake import read_parquet_portable
+from config import (
+    HORAS_PUNTA_MANANA,
+    HORAS_PUNTA_TARDE,
+    USE_LOCAL_PATHS,
+    LOCAL_SILVER_PATH,
+    GCS_SILVER_PATH,
+)
+
+# --- Parámetros de paths ---
+if USE_LOCAL_PATHS:
+    SILVER_BASE_PATH = LOCAL_SILVER_PATH
+else:
+    SILVER_BASE_PATH = GCS_SILVER_PATH
+
+# Usaremos 'viajes_filtrados' como base, ya que contiene todos los viajes válidos
+INPUT_DATASET_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados"
+
+# --- Partición para Análisis Inicial ---
+YEAR_ANALISIS = 2025
+WEEK_ANALISIS = 17
+PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
+
+print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
+````
+
+## Helpers para Feature Engineering y Muestreo
+
+```{python}
+#|label: helper-functions
+
+def prepare_features(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Construye el dataset mínimo para el modelo simple:
+    choice (1=QR, 0=Bip) + dummies de tiempo laboral/punta.
+    """
+    lf_prep = (
+        lazy_frame
+        .select("is_qr", "tiempo_inicio_viaje", "tipodia")
+        .with_columns([
+            pl.col("is_qr").cast(pl.Int8).alias("choice"),
+            pl.col("tiempo_inicio_viaje")
+              .dt.replace_time_zone("America/Santiago", ambiguous="earliest")
+              .alias("ts_local"),
+        ])
+        .with_columns([
+            pl.col("ts_local").dt.hour().alias("hora"),
+            pl.col("ts_local").dt.weekday().alias("dia_semana"),
+            (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+        ])
+        .with_columns([
+            pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+            pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+            (pl.col("dia_semana") == 5).alias("es_viernes"),
+            pl.col("dia_semana").is_between(1, 4, closed="both").alias("es_lun_jue"),
+        ])
+        .with_columns([
+            (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+            (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+            (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+            (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+        ])
+    )
+    cols_modelo = ["choice", "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+    return lf_prep.select(cols_modelo)
+
+
+def get_stratified_sample(df: pl.DataFrame, fraction: float, seed: int) -> pl.DataFrame:
+    """
+    Muestreo estratificado por 'choice' (0=Bip, 1=QR), conservando proporciones.
+    """
+    total_rows = len(df)
+    target_rows = int(total_rows * fraction)
+
+    counts = df.group_by("choice").agg(pl.len().alias("count")).sort("choice")
+    bip_count = counts.filter(pl.col("choice") == 0)["count"][0] if len(
+        counts.filter(pl.col("choice") == 0)
+    ) > 0 else 0
+    qr_count = counts.filter(pl.col("choice") == 1)["count"][0] if len(
+        counts.filter(pl.col("choice") == 1)
+    ) > 0 else 0
+    total_original = bip_count + qr_count
+
+    if total_original == 0:
+        return df
+
+    bip_proportion = bip_count / total_original
+    qr_proportion = qr_count / total_original
+
+    target_bip = int(target_rows * bip_proportion)
+    target_qr = int(target_rows * qr_proportion)
+    actual_total = target_bip + target_qr
+
+    if actual_total < target_rows and qr_count > 0:
+        target_qr += (target_rows - actual_total)
+    elif actual_total < target_rows and bip_count > 0:
+        target_bip += (target_rows - actual_total)
+
+    samples = []
+
+    if target_bip > 0 and bip_count > 0:
+        df_sample_bip = df.filter(pl.col("choice") == 0).sample(
+            n=min(target_bip, bip_count),
+            shuffle=True,
+            seed=seed,
+        )
+        samples.append(df_sample_bip)
+
+    if target_qr > 0 and qr_count > 0:
+        df_sample_qr = df.filter(pl.col("choice") == 1).sample(
+            n=min(target_qr, qr_count),
+            shuffle=True,
+            seed=seed,
+        )
+        samples.append(df_sample_qr)
+
+    if samples:
+        df_model_sample = pl.concat(samples).sample(fraction=1.0, shuffle=True, seed=seed)
+        return df_model_sample
+    else:
+        return df
+
+print("✅ Funciones de ayuda `prepare_features` y `get_stratified_sample` definidas.")
+```
+
+## Carga de Datos (Una Partición para Análisis)
+
+```{python}
+#|label: load-data
+print(f"Cargando partición {PARTITION_LABEL} desde {INPUT_DATASET_PATH}...")
+
+partition_path_glob = (
+    f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
+)
+
+try:
+    lf_data = read_parquet_portable(partition_path_glob)
+
+    schema = lf_data.collect_schema()
+    n_rows = lf_data.select(pl.len()).collect().item()
+
+    print(f"✅ Partición cargada (LazyFrame): {n_rows:,} filas.")
+    print(f"   Columnas disponibles: {len(schema.names())}")
+    relevant_cols = ["is_qr", "tiempo_inicio_viaje", "tipodia"]
+    print(f"   Columnas clave presentes: {[c for c in relevant_cols if c in schema.names()]}")
+except Exception as e:
+    print(f"❌ Error al cargar la partición: {e}")
+    print(f"   Verifica que la ruta y partición existan: {partition_path_glob}")
+    lf_data = None
+```
+
+## Exploración de las Variables Relevantes
+
+```{python}
+#|label: explore-variables
+
+if lf_data is not None:
+    print("\n🔍 Exploramos las variables relevantes")
+
+    print(f"\n📊 Información del dataset:")
+    print(f"   - Filas: {lf_data.select(pl.len()).collect().item():,}")
+    print(f"   - Columnas: {len(lf_data.collect_schema().names())}")
+
+    print(f"\n⚡ Plan de ejecución optimizado:")
+    print(lf_data.explain(optimized=True))
+
+    print(f"\n🎯 Variables clave para el modelo Logit:")
+
+    if "is_qr" in lf_data.collect_schema().names():
+        qr_stats = lf_data.select([
+            pl.col("is_qr").sum().alias("qr_count"),
+            pl.len().alias("total_count"),
+            (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage"),
+        ]).collect()
+
+        print(f"   📱 Adopción QR:")
+        print(f"      - Viajes con QR: {qr_stats['qr_count'][0]:,}")
+        print(f"      - Total viajes: {qr_stats['total_count'][0]:,}")
+        print(f"      - % QR: {qr_stats['qr_percentage'][0]:.2f}%")
+
+    temporal_vars = ["tiempo_inicio_viaje", "tipodia", "hora_punta"]
+    available_temporal = [
+        var for var in temporal_vars if var in lf_data.collect_schema().names()
+    ]
+
+    if available_temporal:
+        print(f"\n⏰ Variables temporales disponibles: {available_temporal}")
+
+        if "tipodia" in available_temporal:
+            tipodia_stats = (
+                lf_data
+                .group_by("tipodia")
+                .agg([
+                    pl.len().alias("count"),
+                    pl.col("is_qr").sum().alias("qr_count"),
+                    (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage"),
+                ])
+                .sort("count", descending=True)
+                .collect()
+            )
+
+            print(f"\n   📅 Distribución por tipo de día:")
+            for row in tipodia_stats.iter_rows(named=True):
+                print(
+                    f"      - {row['tipodia']}: {row['count']:,} viajes "
+                    f"({row['qr_percentage']:.1f}% QR)"
+                )
+
+        if "hora_punta" in available_temporal:
+            hora_punta_stats = (
+                lf_data
+                .group_by("hora_punta")
+                .agg([
+                    pl.len().alias("count"),
+                    pl.col("is_qr").sum().alias("qr_count"),
+                    (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage"),
+                ])
+                .sort("count", descending=True)
+                .collect()
+            )
+
+            print(f"\n   🚌 Distribución por hora punta:")
+            for row in hora_punta_stats.iter_rows(named=True):
+                etiqueta = "Hora Punta" if row["hora_punta"] else "Fuera Punta"
+                print(
+                    f"      - {etiqueta}: {row['count']:,} viajes "
+                    f"({row['qr_percentage']:.1f}% QR)"
+                )
+
+    print(f"\n📋 Muestra de datos (primeras 5 filas):")
+    sample_cols = ["is_qr", "tiempo_inicio_viaje", "tipodia", "hora_punta"]
+    available_sample_cols = [
+        col for col in sample_cols if col in lf_data.collect_schema().names()
+    ]
+
+    if available_sample_cols:
+        sample_data = lf_data.select(available_sample_cols).head(5).collect()
+        print(sample_data)
+    else:
+        print("   No se encontraron las columnas esperadas para la muestra")
+
+    print(f"\n📊 Distribución de las horas de inicio de viaje:")
+    hora_stats = (
+        lf_data
+        .with_columns([
+            pl.col("tiempo_inicio_viaje").dt.hour().alias("hora_inicio"),
+        ])
+        .group_by("hora_inicio")
+        .agg([
+            pl.len().alias("count"),
+            pl.col("is_qr").sum().alias("qr_count"),
+            (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage"),
+        ])
+        .sort("hora_inicio")
+        .collect()
+    )
+    print(hora_stats)
+
+    print(f"\n📊 Distribución de los tipodia de los viajes:")
+    tipodia_stats = (
+        lf_data
+        .group_by("tipodia")
+        .agg([
+            pl.len().alias("count"),
+            pl.col("is_qr").sum().alias("qr_count"),
+            (pl.col("is_qr").sum() / pl.len() * 100).alias("qr_percentage"),
+        ])
+        .sort("tipodia")
+        .collect()
+    )
+
+    tipodia_labels = {0: "Laboral", 1: "Sábado", 2: "Domingo"}
+
+    print("   Tipo de día | Viajes | QR Count | % QR")
+    print("   " + "-" * 40)
+    for row in tipodia_stats.iter_rows(named=True):
+        tipo_label = tipodia_labels.get(row["tipodia"], f"Tipo {row['tipodia']}")
+        print(
+            f"   {tipo_label:10} | {row['count']:6,} | {row['qr_count']:8,} "
+            f"| {row['qr_percentage']:5.1f}%"
+        )
+
+    print(f"\n📝 Esquema completo del dataset:")
+    schema_info = lf_data.collect_schema()
+    for i, (col_name, col_type) in enumerate(schema_info.items()):
+        if i < 10:
+            print(f"   {i+1:2d}. {col_name}: {col_type}")
+        elif i == 10:
+            print(f"   ... y {len(schema_info) - 10} columnas más")
+            break
+```
+
+Vemos que `tipodia` puede tomar 3 valores, donde 0: Laboral, 1: Sábado, 2: Domingo.
+
+## Preparación de Datos para el Modelo Logit (statsmodels)
+
+```{python}
+#|label: prepare-model-data-statsmodels
+
+if lf_data is not None:
+    print("🔧 Preparando variables para el modelo (statsmodels)...")
+
+    lf_model_ready = prepare_features(lf_data)
+
+    print(
+        f"⚙️  Calculando variables y cargando datos en memoria "
+        f"para la partición {PARTITION_LABEL}..."
+    )
+    try:
+        df_model_data = lf_model_ready.collect()
+        print(
+            f"✅ Datos listos: {len(df_model_data):,} filas, "
+            f"{len(df_model_data.columns)} columnas."
+        )
+
+        pandas_df = df_model_data.to_pandas()
+        print("✅ DataFrame de pandas listo para statsmodels.")
+
+        print("\nMuestra de datos para el modelo (primeras 10 filas):")
+        print(pandas_df.head(10))
+
+    except Exception as e:
+        print(f"❌ Error durante la preparación de datos: {e}")
+        pandas_df = None
+else:
+    print("⚠️ No hay datos cargados (`lf_data`) para preparar.")
+    pandas_df = None
+```
+
+## Definición del Modelo Logit con `statsmodels`
+
+En esta sección implementamos la misma especificación lineal que antes (constante + dummies temporales), pero ahora usando `statsmodels.Logit`. Además:
+
+* Calculamos **errores robustos (HC1)**.
+* Construimos **Rho-cuadrado** y **Rho-cuadrado ajustado** para poder comparar con Biogeme (usando el mismo `Init log likelihood = N * log(0.5)`).
+* Detectamos **separación perfecta en dummies** (como el caso de `DUMMY_VIE_LAB` en algunas semanas) y:
+
+  * Ajustamos el modelo solo con las columnas no separadas.
+  * Reportamos las dummies separadas con **beta = 0, std = 0, t = +1.79e308**, imitando el estilo de Biogeme.
+* Guardamos los resultados en CSV con nombres de columnas compatibles con el flujo anterior.
+
+```{python}
+#|label: helper-statsmodels-logit
+
+import os
+import warnings
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from statsmodels.tools.sm_exceptions import HessianInversionWarning
+
+def detect_separated_dummies(
+    df: pd.DataFrame,
+    y_col: str,
+    dummy_cols: list[str],
+):
+    """
+    Detecta, para cada dummy, si hay:
+    - all_zero   : siempre 0
+    - perfect_1  : cada vez que dummy=1, y=1 (separación perfecta a favor de 1)
+    - perfect_0  : cada vez que dummy=1, y=0 (separación perfecta a favor de 0)
+    - none       : nada raro
+    """
+    info = {}
+    y = df[y_col].astype(int).to_numpy()
+    n_total = len(y)
+
+    for col in dummy_cols:
+        x = df[col].astype(int).to_numpy()
+        n_1 = int(x.sum())
+
+        if n_total == 0:
+            info[col] = {"type": "none", "n_1": 0, "n_total": 0, "p_1": 0.0}
+            continue
+
+        if n_1 == 0:
+            info[col] = {
+                "type": "all_zero",
+                "n_1": n_1,
+                "n_total": n_total,
+                "p_1": 0.0,
+            }
+            continue
+
+        y_when_1 = y[x == 1]
+        unique_y = np.unique(y_when_1)
+
+        if len(unique_y) == 1:
+            sep_type = "perfect_1" if unique_y[0] == 1 else "perfect_0"
+        else:
+            sep_type = "none"
+
+        info[col] = {
+            "type": sep_type,
+            "n_1": n_1,
+            "n_total": n_total,
+            "p_1": n_1 / n_total,
+        }
+
+    return info
+
+
+def estimate_logit_statsmodels(
+    df: pd.DataFrame,
+    partition_label: str,
+    output_dir: str,
+    robust: bool = True,
+):
+    """
+    Estima un logit binario equivalente al de Biogeme, pero con statsmodels.
+
+    - Usa choice como dependiente (0/1).
+    - Usa las dummies temporales como X.
+    - Calcula Rho^2 y Rho^2-bar al estilo Biogeme (Init log likelihood = N*log(0.5)).
+    - Maneja separación perfecta y problemas de Hessiana:
+        * dummies con separación → se excluyen de la estimación,
+          pero se reportan con beta=0, se=0 y t≈1.79e308 (como Biogeme).
+        * si Logit.fit() revienta → fallback con fit_regularized (ridge muy suave),
+          y en ese caso NO se intentan calcular errores estándar (se ponen NaN).
+    """
+
+    os.makedirs(output_dir, exist_ok=True)
+    start_time = time.perf_counter()
+
+    # --- 1. Definir columnas relevantes ---
+    dummy_cols = ["DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+
+    y = df["choice"].astype(int)
+
+    # --- 2. Detectar separación por dummy ---
+    sep_info = detect_separated_dummies(df, "choice", dummy_cols)
+
+    print(f"   🔎 Revisión de separación perfecta (partition={partition_label}):")
+    for col, meta in sep_info.items():
+        if meta["type"] != "none":
+            print(
+                f"      - {col}: type={meta['type']}, "
+                f"n_1={meta['n_1']:,}, total={meta['n_total']:,}, "
+                f"p_1={meta['p_1']:.4f}"
+            )
+
+    # Sólo incluimos en el X de estimación las columnas SIN problemas gordos
+    cols_for_fit = [c for c in dummy_cols if sep_info[c]["type"] == "none"]
+
+    if len(cols_for_fit) == 0:
+        # En el caso extremo (no debería ocurrir aquí), sólo constante
+        X_fit = pd.DataFrame(index=df.index)
+    else:
+        X_fit = df[cols_for_fit].copy()
+
+    # Agregamos constante → ASC_QR
+    X_fit = sm.add_constant(X_fit, has_constant="add")
+
+    # --- 3. Ajustar modelo Logit, con fallback regularizado ---
+    # Verificar si hay variables all_zero que puedan causar problemas numéricos
+    has_all_zero = any(sep_info.get(col, {}).get("type") == "all_zero" for col in dummy_cols)
+    
+    model = sm.Logit(y, X_fit)
+    used_regularized = False
+    fit_successful = False
+
+    # Si hay variables all_zero, usamos un método más robusto desde el inicio
+    if has_all_zero:
+        print(f"   ℹ️ Detectadas variables all_zero: usando método robusto desde el inicio")
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                res = model.fit(
+                    method="lbfgs",
+                    maxiter=100,
+                    disp=False,
+                    warn_convergence=False,
+                )
+            fit_successful = True
+            used_regularized = False  # No es regularizado, pero puede tener problemas numéricos
+        except Exception as e:
+            print(f"   ⚠️ Método 'lbfgs' falló con variables all_zero ({partition_label}): {e}")
+            # Continuar con el flujo normal de fallbacks
+            fit_successful = False
+    
+    if not fit_successful:
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=HessianInversionWarning)
+                res = model.fit(disp=False, maxiter=100)
+            fit_successful = True
+        except (np.linalg.LinAlgError, ValueError) as e:
+            print(f"   ⚠️ Problema numérico al ajustar (partition={partition_label}): {e}")
+            print("      Intentando fallback con fit_regularized (ridge muy suave)...")
+            used_regularized = True
+
+            try:
+                # Fallback 1: ridge muy suave para evitar explosión por separación
+                # Nota: fit_regularized puede fallar al calcular covarianza, pero el ajuste puede funcionar
+                # Intentamos capturar el error específico de covarianza
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore")
+                    try:
+                        res = model.fit_regularized(
+                            method="l1",
+                            L1_wt=0.0,   # 0 → L2 (ridge)
+                            alpha=1e-6,  # penalización muy pequeña
+                            disp=False,
+                            maxiter=1000,
+                        )
+                        fit_successful = True
+                    except (np.linalg.LinAlgError, ValueError) as e_cov:
+                        # El error puede ser al calcular covarianza, pero el ajuste puede haber funcionado
+                        # Verificamos si tenemos parámetros antes de re-lanzar
+                        error_str = str(e_cov).lower()
+                        traceback_str = str(e_cov.__traceback__) if hasattr(e_cov, '__traceback__') else ""
+                        
+                        # Si el error menciona covarianza o hessiana, puede que el ajuste haya funcionado
+                        if "singular" in error_str or "cov_params" in error_str or "hessian" in error_str:
+                            print(f"      ⚠️ Error al calcular covarianza (posible ajuste exitoso): {e_cov}")
+                            # Intentamos extraer los parámetros del objeto res si existe
+                            # pero esto puede no funcionar si el error ocurrió antes de crear res
+                            # Por ahora, re-lanzamos para intentar siguiente fallback
+                            raise e_cov
+                        else:
+                            # Error diferente, re-lanzamos
+                            raise e_cov
+            except (np.linalg.LinAlgError, ValueError) as e2:
+                print(f"   ⚠️ fit_regularized también falló ({partition_label}): {e2}")
+                print("      Intentando con alpha más grande...")
+                try:
+                    # Fallback 2: alpha más grande para mayor regularización
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore")
+                        res = model.fit_regularized(
+                            method="l1",
+                            L1_wt=0.0,   # 0 → L2 (ridge)
+                            alpha=1e-3,  # penalización más grande
+                            disp=False,
+                            maxiter=1000,
+                        )
+                    fit_successful = True
+                except Exception as e3:
+                    print(f"   ⚠️ fit_regularized con alpha=1e-3 también falló ({partition_label}): {e3}")
+                    print("      Intentando ajuste con método alternativo (sin calcular covarianza)...")
+                    try:
+                        # Fallback 3: Usar 'lbfgs' que es más robusto para problemas mal condicionados
+                        # y no requiere invertir la Hessiana completa
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings("ignore")
+                            res = model.fit(
+                                method="lbfgs",
+                                maxiter=100,
+                                disp=False,
+                                warn_convergence=False,
+                            )
+                        fit_successful = True
+                        used_regularized = False
+                        # Marcamos que hubo problemas numéricos para no intentar calcular errores estándar
+                        print("      ⚠️ Ajuste exitoso pero puede haber problemas numéricos.")
+                        print("      No se intentarán calcular errores estándar robustos.")
+                    except Exception as e4:
+                        print(f"   ❌ Todos los métodos de ajuste fallaron ({partition_label})")
+                        print(f"      Último error: {e4}")
+                        print("      El modelo no se puede ajustar. Esto puede deberse a:")
+                        print("      - Separación perfecta en múltiples variables")
+                        print("      - Datos insuficientes o colinealidad perfecta")
+                        print("      - Problemas numéricos extremos")
+                        print("      - Variables con varianza cero (all_zero)")
+                        print("      - Matriz de diseño singular (colinealidad perfecta)")
+                        raise RuntimeError(
+                            f"No se pudo ajustar el modelo para {partition_label} después de múltiples intentos. "
+                            f"Último error: {e4}"
+                        )
+
+    params_fit = res.params
+    nobs = int(res.nobs)
+
+    # Queremos reportar SIEMPRE 5 parámetros (constante + 4 dummies),
+    # aunque alguno tenga separación y no se haya estimado.
+    all_param_names = ["const"] + dummy_cols
+    k_params_report = len(all_param_names)
+
+    # --- 4. Log-likelihood y pseudo-R² al estilo Biogeme ---
+    # Para modelos regularizados, puede que no haya llf disponible
+    try:
+        ll_final = res.llf
+    except (AttributeError, ValueError) as e:
+        print(f"   ⚠️ No se pudo obtener log-likelihood del modelo ({partition_label}): {e}")
+        print("      Calculando log-likelihood manualmente...")
+        # Calcular log-likelihood manualmente
+        X_array = X_fit.values
+        params_array = params_fit.values
+        linear_predictor = X_array @ params_array
+        probs = 1 / (1 + np.exp(-linear_predictor))  # sigmoid
+        ll_final = np.sum(y * np.log(probs + 1e-15) + (1 - y) * np.log(1 - probs + 1e-15))
+    
+    ll_init = nobs * np.log(0.5)
+
+    rho_sq = 1.0 - ll_final / ll_init
+    rho_sq_bar = 1.0 - (ll_final - k_params_report) / ll_init
+
+    # --- 5. Errores estándar / t / p ---
+    # Intentamos calcular errores estándar, pero si falla (Hessiana singular),
+    # simplemente usamos NaN para todos excepto los que tienen separación perfecta
+    bse_fit_dict = {}
+    tvalues_fit_dict = {}
+    pvalues_fit_dict = {}
+    
+    # Verificar si hay variables all_zero que puedan causar problemas
+    has_all_zero = any(sep_info.get(col, {}).get("type") == "all_zero" for col in dummy_cols)
+    
+    if used_regularized or has_all_zero:
+        # Para modelos regularizados o con variables all_zero, NO intentamos calcular errores estándar
+        # porque la Hessiana puede ser singular
+        reason = "regularizado" if used_regularized else "variables all_zero"
+        print(
+            f"   ℹ️ Ajuste {reason}: se omiten errores estándar "
+            "(se reportan como NaN salvo en dummies con separación perfecta)."
+        )
+        for name in params_fit.index:
+            bse_fit_dict[name] = np.nan
+            tvalues_fit_dict[name] = np.nan
+            pvalues_fit_dict[name] = np.nan
+    else:
+        # Caso "normal": intentamos errores robustos HC1
+        try:
+            if robust and hasattr(res, "get_robustcov_results"):
+                try:
+                    rob = res.get_robustcov_results(cov_type="HC1")
+                    bse = rob.bse
+                    tvalues = rob.tvalues
+                    pvalues = rob.pvalues
+                except (np.linalg.LinAlgError, ValueError) as e:
+                    print(
+                        f"   ⚠️ No se pudo calcular SE robustos (Hessiana singular) "
+                        f"({partition_label}): {e}"
+                    )
+                    # Fallback a errores estándar normales
+                    bse = getattr(res, "bse", None)
+                    tvalues = getattr(res, "tvalues", None)
+                    pvalues = getattr(res, "pvalues", None)
+                    if bse is None:
+                        raise e  # Si tampoco hay errores normales, lanzamos el error
+            else:
+                # Si no pedimos robustos, usamos los errores estándar normales
+                bse = getattr(res, "bse", None)
+                tvalues = getattr(res, "tvalues", None)
+                pvalues = getattr(res, "pvalues", None)
+                if bse is None:
+                    raise AttributeError("No se pudieron obtener errores estándar del modelo")
+            
+            # Convertir a diccionarios
+            bse_fit_dict = bse.to_dict()
+            tvalues_fit_dict = tvalues.to_dict()
+            pvalues_fit_dict = pvalues.to_dict()
+            
+        except (np.linalg.LinAlgError, ValueError, AttributeError) as e:
+            # Si todo falla, usamos NaN para todos los parámetros estimados
+            print(
+                f"   ⚠️ No se pudieron calcular errores estándar "
+                f"({partition_label}): {e}"
+            )
+            print("      Reportando NaN para todos los errores estándar...")
+            for name in params_fit.index:
+                bse_fit_dict[name] = np.nan
+                tvalues_fit_dict[name] = np.nan
+                pvalues_fit_dict[name] = np.nan
+
+    params_fit_dict = params_fit.to_dict()
+
+    # --- 6. Construir DataFrame de parámetros "tipo Biogeme" ---
+    name_map = {
+        "const": "ASC_QR",
+        "DUMMY_PM_LAB": "B_PM_LAB",
+        "DUMMY_PT_LAB": "B_PT_LAB",
+        "DUMMY_LJ_LAB": "B_LJ_LAB",
+        "DUMMY_VIE_LAB": "B_VIE_LAB",
+    }
+
+    rows = []
+    t_max = float(np.finfo(float).max)
+
+    for param_name in all_param_names:
+        base_name = name_map.get(param_name, param_name)
+        full_name = f"{base_name}_{partition_label}"
+
+        if param_name in params_fit_dict:
+            # Parámetro realmente estimado
+            value = float(params_fit_dict[param_name])
+            se = float(bse_fit_dict.get(param_name, np.nan))
+            tval = float(tvalues_fit_dict.get(param_name, np.nan))
+            pval = float(pvalues_fit_dict.get(param_name, np.nan))
+        else:
+            # Parámetro no estimado (p.ej. dummy con separación perfecta
+            # o all_zero que excluimos del X de estimación)
+            sep_type = sep_info.get(param_name, {}).get("type", "none")
+
+            # Mimetizar Biogeme: todas las variables con problemas se tratan igual
+            if sep_type in {"perfect_1", "perfect_0", "all_zero"}:
+                # Emular patrón Biogeme:
+                # beta=0, se=0, t=+inf numérico, p≈0
+                value = 0.0
+                se = 0.0
+                tval = t_max
+                pval = 0.0
+            else:
+                # Caso raro: por si acaso, la dejamos en 0 con NaN en todo lo demás
+                value = 0.0
+                se = np.nan
+                tval = np.nan
+                pval = np.nan
+
+        rows.append(
+            {
+                "Name": full_name,
+                "Value": value,
+                "Robust std err.": se,
+                "Robust t-stat.": tval,
+                "Robust p-value": pval,
+            }
+        )
+
+    params_df = pd.DataFrame(rows)
+
+    # --- 7. Estadísticas generales tipo Biogeme ---
+    elapsed_seconds = time.perf_counter() - start_time
+    print(f"   ⏱️ Tiempo total partición {partition_label}: {elapsed_seconds:.1f} s")
+
+    stats_row = {
+        "Number of estimated parameters": k_params_report,
+        "Sample size": nobs,
+        "Excluded observations": 0,
+        "Init log likelihood": ll_init,
+        "Final log likelihood": ll_final,
+        "Likelihood ratio test for the init. model": -2 * (ll_init - ll_final),
+        "Rho-square for the init. model": rho_sq,
+        "Rho-square-bar for the init. model": rho_sq_bar,
+        "Akaike Information Criterion": -2 * ll_final + 2 * k_params_report,
+        "Bayesian Information Criterion": -2 * ll_final + k_params_report * np.log(nobs),
+        "Final gradient norm": np.nan,  # no lo calculamos aquí
+        "Bootstrapping time": None,
+        "Wall-clock seconds": elapsed_seconds,
+    }
+    stats_df = pd.DataFrame([stats_row])
+
+    # --- 8. Guardar en CSV ---
+    params_path = os.path.join(output_dir, f"params_{partition_label}.csv")
+    stats_path = os.path.join(output_dir, f"stats_{partition_label}.csv")
+
+    params_df.to_csv(params_path, index=False)
+    stats_df.to_csv(stats_path, index=False)
+
+    print(f"📁 Parámetros guardados en: {params_path}")
+    print(f"📁 Estadísticas guardadas en: {stats_path}")
+    print(f"   ✅ Rho-cuadrado ajustado (Biogeme-style): {rho_sq_bar:.3f}")
+
+    return res, params_df, stats_df
+```
+
+## Estimación del Modelo Baseline (Semana 2025-W17)
+
+```{python}
+#|label: estimate-baseline-2025W17-statsmodels
+
+BASE_OUTPUT_DIR_SM = "model_outputs_sm"
+results_folder_sm = os.path.join(BASE_OUTPUT_DIR_SM, "W17-baseline")
+
+if pandas_df is not None:
+    print(f"🚀 Estimando modelo Logit (statsmodels) para {PARTITION_LABEL}...")
+
+    APPLY_SAMPLING = False
+    SAMPLE_FRACTION = 0.20
+    SEED = 42
+
+    if APPLY_SAMPLING:
+        print(f"   Aplicando muestreo estratificado ({SAMPLE_FRACTION*100:.0f}%)...")
+        df_pl = pl.from_pandas(pandas_df)
+        df_sample = get_stratified_sample(df_pl, SAMPLE_FRACTION, SEED)
+        df_for_model = df_sample.to_pandas()
+        print(f"   Filas después del muestreo: {len(df_for_model):,}")
+    else:
+        print("   Usando el dataset completo (sin muestreo).")
+        df_for_model = pandas_df
+
+    res_sm, params_df_sm, stats_df_sm = estimate_logit_statsmodels(
+        df=df_for_model,
+        partition_label=PARTITION_LABEL,
+        output_dir=results_folder_sm,
+        robust=True,
+    )
+
+    print("\n✅ Estimación completada (statsmodels).")
+
+    print("\n📊 Resumen rápido de parámetros:")
+    display(
+        params_df_sm[["Name", "Value", "Robust t-stat."]]
+        .set_index("Name")
+        .style.format({"Value": "{:.4f}", "Robust t-stat.": "{:.1f}"})
+    )
+
+    print("\n📊 Estadísticas generales:")
+    display(
+        stats_df_sm[
+            [
+                "Sample size",
+                "Final log likelihood",
+                "Rho-square for the init. model",
+                "Rho-square-bar for the init. model",
+            ]
+        ].style.format(
+            {
+                "Sample size": "{:.0f}",
+                "Final log likelihood": "{:.2f}",
+                "Rho-square for the init. model": "{:.3f}",
+                "Rho-square-bar for the init. model": "{:.3f}",
+            }
+        )
+    )
+else:
+    print("⚠️ No hay `pandas_df` disponible. Revisa la celda de preparación de datos.")
+```
+
+## Configuración para Ejecución Secuencial (statsmodels)
+
+```{python}
+#|label: setup-sequential-run-statsmodels
+
+BASE_OUTPUT_DIR_SM = "model_outputs_sm"
+PARTICIONES_A_PROCESAR = [(2025, 17), (2025, 18)]  # puedes extender esta lista
+APPLY_SAMPLING = False
+SAMPLE_FRACTION = 0.20
+SEED = 42
+
+print("✅ Configuración de ejecución secuencial lista.")
+print(f"   Particiones a procesar: {PARTICIONES_A_PROCESAR}")
+```
+
+## Estimación Secuencial del Modelo Simple (statsmodels)
+
+```{python}
+#|label: sequential-estimation-statsmodels
+#|eval: false
+
+import gc
+import time
+
+print("\n--- Iniciando Proceso de Estimación Secuencial (statsmodels) ---")
+
+for year, week in PARTICIONES_A_PROCESAR:
+    partition_label = f"{year}-W{week}"
+    print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} ---\n{'='*60}")
+
+    output_dir_partition = os.path.join(BASE_OUTPUT_DIR_SM, f"W{week}-baseline")
+    os.makedirs(output_dir_partition, exist_ok=True)
+    print(f"   Resultados se guardarán en: {output_dir_partition}")
+
+    try:
+        input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+        lf_data_seq = read_parquet_portable(input_path_glob)
+        print(f"   Cargando datos desde: {input_path_glob}")
+
+        lf_model_ready_seq = prepare_features(lf_data_seq)  # mismo helper que para Biogeme
+        df_model_data_seq = lf_model_ready_seq.collect()
+        print(f"   Datos preparados: {len(df_model_data_seq):,} filas")
+
+        if APPLY_SAMPLING:
+            print(f"   Aplicando muestreo estratificado ({SAMPLE_FRACTION*100:.0f}%)...")
+            df_sample_seq = get_stratified_sample(df_model_data_seq, SAMPLE_FRACTION, SEED)
+            df_for_model_seq = df_sample_seq.to_pandas()
+            print(f"   Filas después del muestreo: {len(df_for_model_seq):,}")
+        else:
+            print("   Usando dataset completo (sin muestreo).")
+            df_for_model_seq = df_model_data_seq.to_pandas()
+
+        # 👉 Aquí llamamos a la función robusta con detección de separación
+        _, params_df_sm_seq, stats_df_sm_seq = estimate_logit_statsmodels(
+            df=df_for_model_seq,
+            partition_label=partition_label,
+            output_dir=output_dir_partition,
+            robust=True,
+        )
+
+    except Exception as e:
+        import traceback
+        print(f"   ❌ ERROR procesando {partition_label}: {e}")
+        print(f"   📋 Traceback completo:")
+        traceback.print_exc()
+        # Continuar con la siguiente partición en lugar de detenerse
+        continue
+    finally:
+        # Limpiar variables si existen
+        try:
+            if 'lf_data_seq' in locals():
+                del lf_data_seq
+        except:
+            pass
+        try:
+            if 'df_model_data_seq' in locals():
+                del df_model_data_seq
+        except:
+            pass
+        try:
+            if 'df_for_model_seq' in locals():
+                del df_for_model_seq
+        except:
+            pass
+        gc.collect()
+        time.sleep(2)
+
+print("\n" + "="*60 + "\n--- Proceso Finalizado (statsmodels) ---\n" + "="*60)
+```
+
+
+# Resultados del Modelo Baseline (Semana 2025-W17)
+
+A continuación se presentan y analizan los resultados del modelo logit simple estimado con `statsmodels` sobre la partición completa de la semana 17 del año 2025.
+
+## Carga de Resultados
+
+```{python}
+#|label: load-results-statsmodels
+import os
+import pandas as pd
+
+results_folder_sm = "model_outputs_sm/W17-baseline"
+partition_label = "2025-W17"
+
+try:
+    params_file_sm = os.path.join(results_folder_sm, f"params_{partition_label}.csv")
+    stats_file_sm = os.path.join(results_folder_sm, f"stats_{partition_label}.csv")
+
+    df_params_sm = pd.read_csv(params_file_sm)
+    df_stats_sm = pd.read_csv(stats_file_sm)
+
+    print(f"Resultados (statsmodels) cargados exitosamente desde: {results_folder_sm}")
+
+    df_params_sm.set_index("Name", inplace=True)
+except FileNotFoundError:
+    print(
+        f"ERROR: No se encontraron los archivos de resultados en la carpeta "
+        f"'{results_folder_sm}'."
+    )
+    df_params_sm = None
+    df_stats_sm = None
+```
+
+## Bondad de Ajuste
+
+```{python}
+#|label: display-stats-statsmodels
+if df_stats_sm is not None:
+    stats_display = df_stats_sm[
+        [
+            "Sample size",
+            "Final log likelihood",
+            "Rho-square for the init. model",
+            "Rho-square-bar for the init. model",
+            "Wall-clock seconds",
+        ]
+    ].copy()
+
+    stats_display.rename(
+        columns={
+            "Sample size": "Observaciones",
+            "Final log likelihood": "Log-Likelihood Final",
+            "Rho-square for the init. model": "Rho-cuadrado",
+            "Rho-square-bar for the init. model": "Rho-cuadrado Ajustado",
+            "Wall-clock seconds": "Tiempo total (s)",
+        },
+        inplace=True,
+    )
+
+    stats_display["Observaciones"] = stats_display["Observaciones"].apply(lambda x: f"{x:,}")
+    stats_display["Log-Likelihood Final"] = stats_display["Log-Likelihood Final"].round(2)
+    stats_display["Rho-cuadrado"] = stats_display["Rho-cuadrado"].round(3)
+    stats_display["Rho-cuadrado Ajustado"] = stats_display["Rho-cuadrado Ajustado"].round(3)
+    stats_display["Tiempo total (s)"] = stats_display["Tiempo total (s)"].round(1)
+
+    print("Tabla 1: Estadísticas Generales del Modelo (statsmodels)")
+    display(stats_display.T)
+```
+
+## Parámetros Estimados
+
+```{python}
+#|label: display-params-statsmodels
+if df_params_sm is not None:
+    params_display = df_params_sm[["Value", "Robust t-stat."]].copy()
+    params_display.rename(
+        columns={
+            "Value": "Coeficiente (Beta)",
+            "Robust t-stat.": "Estadístico t (robusto)",
+        },
+        inplace=True,
+    )
+
+    print("Tabla 2: Parámetros Estimados del Modelo (statsmodels)")
+    display(
+        params_display.style.format(
+            {"Coeficiente (Beta)": "{:.3f}", "Estadístico t (robusto)": "{:.1f}"}
+        )
+    )
+```
+
+# Comparación conjunta: Biogeme, statsmodels y larch
+
+```{python}
+#|label: compare-biogeme-statsmodels-larch
+
+import pandas as pd
+import os
+
+partition_label = PARTITION_LABEL
+
+model_paths = {
+    "Biogeme": "../biogeme-logit/model_outputs/W17-baseline",
+    "Statsmodels": "model_outputs_sm/W17-baseline",
+    "Larch": "../larch_logit/model_outputs_larch/W17-baseline",
+}
+
+params_tables = []
+stats_tables = []
+
+for model_name, folder in model_paths.items():
+    params_path = os.path.join(folder, f"params_{partition_label}.csv")
+    stats_path = os.path.join(folder, f"stats_{partition_label}.csv")
+    if not os.path.exists(params_path) or not os.path.exists(stats_path):
+    raise FileNotFoundError(
+            f"No se encontró uno de los archivos para {model_name}: {params_path} / {stats_path}"
+    )
+
+    params_df = pd.read_csv(params_path)
+    if "Name" in params_df.columns:
+        params_df["Name"] = params_df["Name"].str.replace(
+        f"_{partition_label}", "", regex=False
+    )
+    params_df.set_index("Name", inplace=True)
+    params_tables.append(
+        params_df[["Value", "Robust t-stat."]].rename(
+            columns={
+                "Value": f"Coef. {model_name}",
+                "Robust t-stat.": f"t-stat {model_name}",
+            }
+        )
+    )
+
+    stats_df = pd.read_csv(stats_path)
+    stats_df["Model"] = model_name
+    stats_tables.append(stats_df)
+
+params_comparison = pd.concat(params_tables, axis=1).sort_index()
+print("Tabla: parámetros estimados (Biogeme / statsmodels / larch)")
+display(params_comparison)
+
+stats_df = pd.concat(stats_tables, ignore_index=True).set_index("Model")
+cols_stats = [
+    "Sample size",
+    "Final log likelihood",
+    "Rho-square for the init. model",
+    "Rho-square-bar for the init. model",
+    "Wall-clock seconds",
+]
+stats_display = stats_df[cols_stats].rename(
+    columns={
+        "Sample size": "Observaciones",
+        "Final log likelihood": "Log-Likelihood Final",
+        "Rho-square for the init. model": "Rho-cuadrado",
+        "Rho-square-bar for the init. model": "Rho-cuadrado Ajustado",
+        "Wall-clock seconds": "Tiempo total (s)",
+    }
+).round({"Log-Likelihood Final": 2, "Rho-cuadrado": 3, "Rho-cuadrado Ajustado": 3, "Tiempo total (s)": 1})
+
+print("\nTabla: estadísticas de ajuste y tiempo de ejecución")
+display(stats_display)
+```
+
+# Interpretación y Próximos Pasos
+
+En resumen, este notebook:
+
+* Reproduce el **modelo logit binario simple** que antes se estimaba con Biogeme, ahora usando `statsmodels.Logit`.
+* Mantiene la misma estructura de variables (constante + dummies temporales) y la misma partición de datos.
+* Genera **outputs compatibles** (CSV de parámetros y estadísticas) para facilitar la comparación entre herramientas.
+
+Con esto se puede:
+
+1. Verificar que los coeficientes, t-statistics y medidas de ajuste (`Rho-cuadrado`, `Rho-cuadrado ajustado`) sean muy similares entre Biogeme y statsmodels.
+2. Usar `statsmodels` como alternativa más liviana/rápida para modelos logit binarios simples, manteniendo la flexibilidad de Polars y tu pipeline actual.
+
+```
+
