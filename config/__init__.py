@@ -1,0 +1,46 @@
+"""
+Public interface for shared configuration constants.
+
+Usage:
+    from config import HORAS_PUNTA_MANANA, HORAS_PUNTA_TARDE, USE_LOCAL_PATHS
+"""
+
+from .constants import (
+    HORAS_PUNTA_MANANA,
+    HORAS_PUNTA_TARDE,
+    HORAS_VALLE,
+    HORAS_BAJO,
+    USE_LOCAL_PATHS,
+    LOCAL_RAW_PATH,
+    LOCAL_RAW_PERFILES_PATH,
+    LOCAL_BRONZE_PATH,
+    LOCAL_SILVER_PATH,
+    LOCAL_GOLD_PATH,
+    GCS_BUCKET_NAME,
+    GCS_RAW_PATH,
+    GCS_BRONZE_PATH,
+    GCS_BRONZE_PERFILES_PATH,
+    GCS_SILVER_PATH,
+    GCS_GOLD_PATH,
+)
+
+__all__ = [
+    "HORAS_PUNTA_MANANA",
+    "HORAS_PUNTA_TARDE",
+    "HORAS_VALLE",
+    "HORAS_BAJO",
+    "USE_LOCAL_PATHS",
+    "LOCAL_RAW_PATH",
+    "LOCAL_RAW_PERFILES_PATH",
+    "LOCAL_BRONZE_PATH",
+    "LOCAL_SILVER_PATH",
+    "LOCAL_GOLD_PATH",
+    "GCS_BUCKET_NAME",
+    "GCS_RAW_PATH",
+    "GCS_BRONZE_PATH",
+    "GCS_BRONZE_PERFILES_PATH",
+    "GCS_SILVER_PATH",
+    "GCS_GOLD_PATH",
+]
+
+
