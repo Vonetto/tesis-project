@@ -46,6 +46,7 @@ BASE_LOCAL_PATH: Final[str] = "/Volumes/KINGSTON/tesis-project"
 
 # Rutas locales para el Data Lake
 LOCAL_RAW_PATH: Final[str] = f"{BASE_LOCAL_PATH}/raw"
+LOCAL_RAW_PERFILES_PATH: Final[str] = "/Volumes/TOSHIBA EXT/Vicente/tesis-project/raw/raw_csv/perfiles_carga"
 LOCAL_BRONZE_PATH: Final[str] = f"{BASE_LOCAL_PATH}/lake/bronze"
 LOCAL_SILVER_PATH: Final[str] = f"{BASE_LOCAL_PATH}/lake/silver"
 LOCAL_GOLD_PATH: Final[str] = f"{BASE_LOCAL_PATH}/lake/gold"
@@ -54,5 +55,6 @@ LOCAL_GOLD_PATH: Final[str] = f"{BASE_LOCAL_PATH}/lake/gold"
 # Futuras constantes compartidas pueden agregarse aquí (p. ej. rutas GCS,
 # parámetros de particiones, seeds, etc.).
 # ---------------------------------------------------------------------------
+GCS_BRONZE_PERFILES_PATH: Final[str] = f"{GCS_BRONZE_PATH}/perfiles_carga"
 
 

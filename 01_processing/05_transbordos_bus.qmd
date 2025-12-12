@@ -1,0 +1,301 @@
+---
+title: "Tesis — 05 | Tiempos de espera de buses (estrategia desagregada)"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Calcular tiempos de espera **desagregados** para etapas de bus, asumiendo que el pasajero espera la misma línea que tomó. Fórmula (paper Arriagada et al.):
+
+\[
+WT_{desag} = \frac{60}{f_l}\ \text{(min)}\,\,\, donde\ f_l = \text{frecuencia observada de la línea en buses/hora}
+\]
+
+Usaremos la tabla de frecuencias observadas generada en `06_recalculo_tiempos_espera.qmd` (p.ej. `tmp/frecuencias_buses_iso_year=2025_iso_week=17.parquet`).
+
+# Setup
+
+```{python}
+#| label: config
+import sys
+from pathlib import Path
+import polars as pl
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+
+from config.constants import USE_LOCAL_PATHS, LOCAL_SILVER_PATH, GCS_SILVER_PATH
+from lib.datalake import read_parquet_portable
+```
+
+# Parámetros
+
+```{python}
+#| label: params
+YEAR_ANALISIS = 2025
+WEEK_ANALISIS = 17
+PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
+
+FREQ_PATH = PROJECT_ROOT / "tmp" / f"frecuencias_buses_{PARTITION_LABEL}.parquet"
+
+print("Partición:", PARTITION_LABEL)
+print("Frecuencias:", FREQ_PATH)
+```
+
+# Generación de Frecuencias (desde Perfiles de Carga)
+
+```{python}
+#| label: validate-perfiles-bronze
+import polars as pl
+from pathlib import Path
+import sys
+
+# --- Setup de Paths ---
+# Hacemos esto de nuevo para asegurar que las constantes son las correctas para esta sección
+# (PROJECT_ROOT ya está definido arriba, pero importamos constantes específicas)
+
+from config.constants import USE_LOCAL_PATHS, LOCAL_BRONZE_PATH, GCS_BRONZE_PERFILES_PATH
+
+# --- Configuración ---
+if USE_LOCAL_PATHS:
+    BRONZE_PATH = LOCAL_BRONZE_PATH
+else:
+    # Este path ya está definido en constants, pero lo re-construimos por claridad
+    BRONZE_PATH = GCS_BRONZE_PERFILES_PATH
+
+PARTICION_PATH = f"{BRONZE_PATH}/perfiles_de_carga_consolidados/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/"
+print(f"🔍 Analizando la partición de perfiles de carga: {PARTICION_PATH}")
+
+# --- 1. Carga de Datos (Lazy) ---
+try:
+    lf_perfiles = read_parquet_portable(f"{PARTICION_PATH}/*.parquet")
+    total_rows = lf_perfiles.select(pl.len()).collect().item()
+    print(f"✅ Partición cargada exitosamente (LazyFrame). Total de registros: {total_rows:,}")
+except Exception as e:
+    print(f"❌ Error al cargar la partición: {e}")
+    lf_perfiles = None
+
+if lf_perfiles is not None:
+    # --- 2. Muestra rápida y esquema ---
+    df_sample = lf_perfiles.limit(5).collect()
+    print("\n--- Esquema de Datos ---")
+    print(df_sample.schema)
+    print("\n--- Muestra de Datos (primeras 5 filas) ---")
+    with pl.Config(tbl_cols=-1, tbl_rows=5, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+        print(df_sample)
+
+    # --- 3. Selección robusta de timestamp de referencia (ts_ref) ---
+    MAX_DELTA = 600  # 10 minutos en segundos
+    cond_mc = (
+        pl.col("timestamp_gps_mas_cercano").is_not_null() &
+        ((pl.col("timestamp_gps_mas_cercano") - pl.col("timestamp")).dt.total_seconds().abs() <= MAX_DELTA)
+    )
+    cond_int = (
+        pl.col("timestamp_gps_interpolado").is_not_null() &
+        ((pl.col("timestamp_gps_interpolado") - pl.col("timestamp")).dt.total_seconds().abs() <= MAX_DELTA)
+    )
+    ts_ref_expr = (
+        pl.when(cond_mc).then(pl.col("timestamp_gps_mas_cercano"))
+        .when(cond_int).then(pl.col("timestamp_gps_interpolado"))
+        .otherwise(pl.col("timestamp"))
+    )
+
+    lf_perfiles_ts = lf_perfiles.with_columns([
+        ts_ref_expr.alias("ts_ref"),
+        pl.when(cond_mc).then(pl.lit("gps_mas_cercano"))
+         .when(cond_int).then(pl.lit("gps_interpolado"))
+         .otherwise(pl.lit("timestamp"))
+         .alias("ts_ref_source")
+    ])
+
+    src_counts = lf_perfiles_ts.group_by("ts_ref_source").agg(pl.len().alias("rows")).collect()
+    print("\n--- Distribución de fuente usada para ts_ref ---")
+    print(src_counts)
+
+    # --- 4. Tabla de frecuencias por hora ---
+    freqs = (
+    lf_perfiles_ts
+    .filter(pl.col("ts_ref").is_not_null())
+    .with_columns(pl.col("ts_ref").dt.truncate("1h").alias("hour_start"))
+    .group_by("ServicioSentido", "Paradero", "hour_start")
+    .agg([
+        pl.len().alias("n_eventos"),
+        pl.n_unique("Patente").alias("n_buses_unicos"),
+    ])
+    .with_columns([
+        # ✅ FIX: freq_buses_h = n_eventos (YA está en buses/hora porque agrupamos por hora)
+        pl.col("n_eventos").cast(pl.Float64).alias("freq_buses_h"),
+        
+        # headway_prom_s = segundos entre buses = 3600 / n_eventos
+        pl.when(pl.col("n_eventos") > 0)
+          .then(3600.0 / pl.col("n_eventos"))
+          .otherwise(None)
+          .alias("headway_prom_s")
+    ])
+    .sort(["ServicioSentido", "Paradero", "hour_start"])
+)
+
+    # Usamos FREQ_PATH definido en params
+    OUT_FREQ_PATH = FREQ_PATH
+    OUT_FREQ_PATH.parent.mkdir(parents=True, exist_ok=True)
+    freqs.sink_parquet(OUT_FREQ_PATH, compression="zstd")
+
+    print(f"\n✅ Tabla de frecuencias escrita en: {OUT_FREQ_PATH}")
+    df_freq_sample = pl.scan_parquet(OUT_FREQ_PATH.as_posix()).limit(5).collect()
+    print("\n--- Muestra de frecuencias (5 filas) ---")
+    with pl.Config(tbl_cols=-1, tbl_rows=5, tbl_width_chars=400, tbl_cell_alignment="LEFT"):
+        print(df_freq_sample)
+
+    print("\n--- Veredicto ---")
+    print("✅ ts_ref aplicado con umbral ±10 min. Frecuencias por hora calculadas y persistidas.")
+    print("   Esta tabla servirá para calcular tiempos de espera desagregados y agregados.")
+```
+
+```{python}
+#| label: verify-perfiles-row-count
+
+import polars as pl
+from pathlib import Path
+import re
+import os
+from datetime import datetime
+from tqdm import tqdm
+
+# Importar constantes necesarias
+from config import (
+    USE_LOCAL_PATHS, 
+    LOCAL_RAW_PERFILES_PATH, 
+    GCS_RAW_PATH
+)
+from lib.datalake import get_filesystem
+
+print("--- Verificación de Conteo de Filas (CSV vs Parquet) ---")
+print(f"Partición a verificar: iso_year={YEAR_ANALISIS}, iso_week={WEEK_ANALISIS}")
+
+if 'lf_perfiles' not in locals() or lf_perfiles is None:
+    print("❌ El LazyFrame `lf_perfiles` no está cargado. Ejecuta la celda anterior primero.")
+else:
+    # 1. Total de filas en el Parquet ya cargado
+    total_parquet_rows = lf_perfiles.select(pl.len()).collect().item()
+    print(f"\n1. Total de filas en Parquet procesado: {total_parquet_rows:,}")
+
+    # 2. Identificar y contar filas en los CSVs fuente
+    print("\n2. Contando filas en los archivos CSV originales...")
+    
+    # Re-usamos la lógica para encontrar los archivos fuente
+    if USE_LOCAL_PATHS:
+        file_paths = [str(p) for p in Path(LOCAL_RAW_PERFILES_PATH).glob("*.perfiles_de_carga.csv")]
+    else:
+        # Lógica para GCS (si fuera necesaria en el futuro)
+        fs = get_filesystem()
+        raw_path = f"{GCS_RAW_PATH}/raw_csv/perfiles_carga"
+        gcs_path = raw_path.replace("gs://", "").strip("/")
+        file_paths = [f"gs://{p}" for p in fs.glob(f"{gcs_path}/*.perfiles_de_carga.csv")]
+
+    files_for_week = []
+    for f in file_paths:
+        filename = os.path.basename(f)
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", filename)
+        if match:
+            try:
+                date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+                iso_year, iso_week, _ = date.isocalendar()
+                if iso_year == YEAR_ANALISIS and iso_week == WEEK_ANALISIS:
+                    files_for_week.append(f)
+            except ValueError:
+                continue
+    
+    print(f"   Se encontraron {len(files_for_week)} archivos CSV para la semana {YEAR_ANALISIS}-W{WEEK_ANALISIS}.")
+
+    # Contar filas en los CSVs seleccionados
+    total_csv_rows = 0
+    for file in tqdm(files_for_week, desc="Escaneando CSVs", unit="file"):
+        try:
+            # Hacemos un scan perezoso solo para contar las filas
+            row_count = pl.scan_csv(file, separator='|', has_header=True, low_memory=True).select(pl.len()).collect().item()
+            total_csv_rows += row_count
+        except Exception as e:
+            print(f"\n   ⚠️ Error al leer el archivo {os.path.basename(file)}: {e}")
+
+    print(f"   Total de filas en los archivos CSV fuente: {total_csv_rows:,}")
+
+    # 3. Comparar y Validar
+    print("\n--- Resultado de la Validación ---")
+    if total_parquet_rows == total_csv_rows:
+        print(f"✅ ¡Éxito! El número de filas coincide ({total_parquet_rows:,}). El proceso de consolidación fue completo.")
+    else:
+        diferencia = abs(total_parquet_rows - total_csv_rows)
+        print(f"❌ ¡Falla! El número de filas no coincide.")
+        print(f"   - Filas en Parquet: {total_parquet_rows:,}")
+        print(f"   - Filas en CSVs:    {total_csv_rows:,}")
+        print(f"   - Diferencia:       {diferencia:,} filas")
+        print("\n   Posibles causas: El script de pre-procesamiento podría estar filtrando algunas filas (ej. con `drop_nulls`) o podría haber errores de lectura en algunos CSVs.")
+
+```
+
+
+```{python}
+#| label: validation-check-freq
+import polars as pl
+from pathlib import Path
+
+print("--- 🔍 INICIANDO VALIDACIÓN TÉCNICA DE FRECUENCIAS ---")
+
+# 1. Cargar el archivo generado
+out_path = PROJECT_ROOT / "tmp" / f"frecuencias_buses_{PARTITION_LABEL}.parquet"
+if not out_path.exists():
+    raise FileNotFoundError(f"❌ No se encontró el archivo de salida: {out_path}")
+
+df_val = pl.read_parquet(out_path)
+print(f"📂 Archivo cargado: {out_path.name} ({df_val.height:,} filas)")
+
+# 2. Validar Schema
+expected_cols = ["ServicioSentido", "Paradero", "hour_start", "freq_buses_h", "headway_prom_s"]
+missing = [c for c in expected_cols if c not in df_val.columns]
+
+if missing:
+    print(f"❌ FALTAN COLUMNAS: {missing}")
+else:
+    print("✅ Schema correcto.")
+
+# 3. Validar Unicidad de Clave (CRÍTICO para Lookup)
+print("\n📊 Verificando unicidad de clave (Servicio, Paradero, Hora)...")
+# En versiones antiguas de Polars (< 0.19), is_duplicated no acepta argumentos de columnas directamente.
+# Se debe usar select() primero o usar group_by().len().filter(pl.col("len") > 1)
+# Alternativa robusta: contar duplicados manualmente
+duplicados = df_val.select(["ServicioSentido", "Paradero", "hour_start"]).is_duplicated().sum()
+
+if duplicados == 0:
+    print("✅ CLAVE ÚNICA: No hay duplicados para (Servicio, Paradero, Hora).")
+else:
+    print(f"❌ ALERTA: Se encontraron {duplicados} filas duplicadas para la misma clave.")
+    # Mostrar ejemplos
+    print(df_val.filter(df_val.is_duplicated(["ServicioSentido", "Paradero", "hour_start"])).head())
+
+# 4. Validar Rangos de Valores
+print("\n📉 Verificando rangos de valores...")
+invalid_freq = df_val.filter(pl.col("freq_buses_h") <= 0).height
+invalid_headway = df_val.filter(pl.col("headway_prom_s") <= 0).height
+
+if invalid_freq == 0 and invalid_headway == 0:
+    print("✅ Valores positivos: Todas las frecuencias y headways son > 0.")
+else:
+    print(f"⚠️ ALERTA: Hay {invalid_freq} frecuencias <= 0 y {invalid_headway} headways <= 0.")
+
+# 5. Validar Cobertura Temporal (Opcional pero útil)
+horas_unicas = df_val["hour_start"].dt.hour().unique().sort()
+print(f"\n⏰ Cobertura horaria detectada: {horas_unicas.to_list()}")
+
+print("\n--- ✅ VALIDACIÓN FINALIZADA ---")
+```

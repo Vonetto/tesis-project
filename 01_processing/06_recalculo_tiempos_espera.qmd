@@ -1,0 +1,1989 @@
+---
+title: "Tesis — 05 | Re-cálculo de tiempos de espera (Metro)"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Calcular tiempos de espera esperados para etapas Metro usando GTFS, generando nuevas columnas `te0_calculado`, `te1_calculado`, … sin sobrescribir las originales.
+
+# Setup
+
+```{python}
+#| label: config
+from pathlib import Path
+import sys
+import polars as pl
+
+# Añadir raíz del proyecto al path
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+
+from config import USE_LOCAL_PATHS, LOCAL_SILVER_PATH, GCS_SILVER_PATH
+from lib.datalake import read_parquet_portable
+from lib.transbordos_metro.metro_graph_builder import normalize_station_name, shortest_path_with_line
+```
+
+# Parámetros
+
+```{python}
+#| label: params
+YEAR_ANALISIS = 2025
+WEEK_ANALISIS = 17
+PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
+GTFS_VERSION = "GTFS_20250412"  # la que aplica a 2025-04-21 (semana 17)
+
+RECON_PATH = PROJECT_ROOT / "01_processing" / "tmp" / f"etapas_reconstruidas_{PARTITION_LABEL}.parquet"
+if not RECON_PATH.exists():
+    # fallback a tmp/ raíz si se mueve
+    alt_path = PROJECT_ROOT / "tmp" / f"etapas_reconstruidas_{PARTITION_LABEL}.parquet"
+    if alt_path.exists():
+        RECON_PATH = alt_path
+print("Partición reconstruida:", RECON_PATH)
+print("GTFS:", GTFS_VERSION)
+```
+
+# Carga de datos: viajes (Lazy)
+
+```{python}
+#| label: load-viajes
+# Intentar cargar archivo reconstruido, si no existe usar fuente original
+if RECON_PATH.exists():
+    print(f"✅ Cargando archivo reconstruido: {RECON_PATH}")
+    lf_viajes = pl.scan_parquet(RECON_PATH)
+    total = lf_viajes.select(pl.len()).collect().item()
+    print(f"Viajes cargados (reconstruidos): {total:,}")
+else:
+    print(f"⚠️ Archivo reconstruido no encontrado: {RECON_PATH}")
+    print("Cargando desde fuente original...")
+    if USE_LOCAL_PATHS:
+        INPUT_DATASET_PATH = f"{LOCAL_SILVER_PATH}/viajes_filtrados"
+    else:
+        INPUT_DATASET_PATH = f"{GCS_SILVER_PATH}/viajes_filtrados"
+    partition_glob = f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
+    lf_viajes = read_parquet_portable(partition_glob)
+    total = lf_viajes.select(pl.len()).collect().item()
+    print(f"Viajes cargados (originales): {total:,}")
+```
+
+# METRO:
+
+## Carga GTFS Metro (versión seleccionada)
+
+```{python}
+#| label: load-gtfs
+GTFS_DIR = PROJECT_ROOT / "config" / "GTFS" / GTFS_VERSION
+routes = pl.read_csv(GTFS_DIR / "routes.txt", schema_overrides={"route_id": pl.Utf8, "route_type": pl.Int64})
+trips = pl.read_csv(GTFS_DIR / "trips.txt", schema_overrides={"route_id": pl.Utf8, "trip_id": pl.Utf8, "direction_id": pl.Int64})
+freq = pl.read_csv(GTFS_DIR / "frequencies.txt", schema_overrides={"trip_id": pl.Utf8, "start_time": pl.Utf8, "end_time": pl.Utf8, "headway_secs": pl.Int64})
+stop_times = pl.read_csv(GTFS_DIR / "stop_times.txt", schema_overrides={"trip_id": pl.Utf8, "stop_id": pl.Utf8, "arrival_time": pl.Utf8, "departure_time": pl.Utf8})
+stops = pl.read_csv(GTFS_DIR / "stops.txt", schema_overrides={"stop_id": pl.Utf8, "stop_name": pl.Utf8, "parent_station": pl.Utf8})
+
+routes_metro = routes.filter(pl.col("route_type") == 1)
+metro_route_ids = routes_metro["route_id"].to_list()
+print("Rutas Metro en GTFS:", metro_route_ids)
+```
+
+## Carga del grafo Metro
+
+```{python}
+#| label: load-metro-graph
+import pickle
+import networkx as nx
+from datetime import date
+from lib.gtfs_manifest import build_manifest, pick_version_for_date
+
+GRAPH_DIR = PROJECT_ROOT / "01_processing" / "metro_graphs"
+GRAPH_MANIFEST = GRAPH_DIR / "manifest_graphs.parquet"
+
+if not GRAPH_MANIFEST.exists():
+    raise FileNotFoundError("No se encontró manifest_graphs.parquet. Ejecuta build_artifacts primero.")
+
+def load_graph_by_folder(folder: str) -> nx.Graph:
+    path = GRAPH_DIR / f"metro_graph_{folder}.gpickle"
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+manifest_gtfs = build_manifest(PROJECT_ROOT / "config" / "GTFS")
+print(f"GTFS en manifest: {[m.folder for m in manifest_gtfs]}")
+
+# Seleccionar y cargar el grafo según la fecha de la partición
+service_date = date.fromisocalendar(YEAR_ANALISIS, WEEK_ANALISIS, 1)
+version_for_date = pick_version_for_date(service_date, manifest_gtfs)
+if version_for_date is None:
+    raise ValueError(f"No GTFS válido para {service_date}")
+
+G_metro = load_graph_by_folder(version_for_date.folder)
+print(f"✅ Grafo cargado ({version_for_date.folder}) para {service_date}: {G_metro.number_of_nodes()} nodos, {G_metro.number_of_edges()} aristas.")
+```
+
+## Carga de Frecuencias de Buses (Pre-calculadas)
+
+```{python}
+#| label: load-bus-freq
+FREQ_PATH = PROJECT_ROOT / "tmp" / f"frecuencias_buses_{PARTITION_LABEL}.parquet"
+if FREQ_PATH.exists():
+    freq_buses = pl.read_parquet(FREQ_PATH)
+    print(f"✅ Frecuencias de buses cargadas: {freq_buses.height:,} filas")
+    print(freq_buses.head())
+else:
+    print(f"⚠️ No se encontró archivo de frecuencias de buses: {FREQ_PATH}")
+    freq_buses = pl.DataFrame()
+
+# Crear diccionario de frecuencias para búsqueda rápida O(1)
+# Clave: (Paradero, ServicioSentido, Hora_int) -> Valor: freq_buses_h
+# Hora_int: 0..23
+freq_bus_dict = {}
+if not freq_buses.is_empty():
+    # Asumimos que hour_start es datetime, extraemos la hora
+    # Ojo: hour_start en el parquet generado en 05 es datetime.
+    # Vamos a iterar y llenar el dict.
+    print("Construyendo índice de frecuencias de buses...")
+    for row in freq_buses.select(["Paradero", "ServicioSentido", "hour_start", "freq_buses_h"]).iter_rows():
+        par, srv, h_dt, f = row
+        if h_dt is not None:
+            h_int = h_dt.hour
+            freq_bus_dict[(par, srv, h_int)] = f
+    print(f"✅ Índice de frecuencias construido: {len(freq_bus_dict):,} entradas")
+
+def get_bus_freq(paradero, servicio, hora_time):
+    if not paradero or not servicio or hora_time is None:
+        return None
+    h_int = hora_time.hour
+    return freq_bus_dict.get((paradero, servicio, h_int))
+
+def wt_bus_seconds(freq_h):
+    if freq_h is None or freq_h <= 0:
+        return None
+    return 3600.0 / freq_h
+
+```
+
+## Mapeo de estaciones por variante y dirección
+
+```{python}
+#| label: build-variant-stops
+# trips de metro
+trips_metro = trips.filter(pl.col("route_id").is_in(metro_route_ids))
+stop_times_metro = stop_times.join(trips_metro, on="trip_id", how="inner").join(stops, on="stop_id", how="left")
+
+# Función para normalizar stop_name a estación (sin "Dirección")
+def station_from_stop_name(name: str) -> str:
+    if name is None:
+        return ""
+    import re, unicodedata
+    # quitar acentos para ubicar el marcador
+    name_ascii = ''.join(c for c in unicodedata.normalize('NFD', name) if unicodedata.category(c) != 'Mn')
+    # cortar todo lo que sigue a DIRECCION (cualquier may/min)
+    base = re.sub(r"(?i)\s*DIRECCION.*$", "", name_ascii).strip()
+    base = base.replace("(M)", "").replace("(m)", "").strip()
+    return normalize_station_name(base)
+
+# Añadir estación normalizada
+stop_times_metro = stop_times_metro.with_columns(
+    pl.col("stop_name").map_elements(station_from_stop_name, return_dtype=pl.Utf8).alias("station_norm")
+)
+
+# Cobertura por variante y dirección
+variant_cov = (
+    stop_times_metro
+    .select(["route_id","direction_id","station_norm"])
+    .unique()
+    .group_by(["route_id","direction_id"])
+    .agg(pl.col("station_norm"))
+)
+print("Ejemplo cobertura L2 variantes:")
+print(variant_cov.filter(pl.col("route_id").str.contains("L2")).head(6))
+```
+
+## Headways por trip_id y franja
+
+```{python}
+#| label: headways-by-trip
+freq = freq.with_columns([
+    pl.when(pl.col("start_time")=="24:00:00").then(pl.lit("23:59:59")).otherwise(pl.col("start_time")).str.strptime(pl.Time, "%H:%M:%S").alias("start_time"),
+    pl.when(pl.col("end_time")=="24:00:00").then(pl.lit("23:59:59")).otherwise(pl.col("end_time")).str.strptime(pl.Time, "%H:%M:%S").alias("end_time"),
+    (pl.col("headway_secs")/60).alias("headway_min")
+])
+print(freq.head(10))
+```
+
+## Selección de variantes válidas para una etapa (subida, bajada, línea base)
+
+```{python}
+#| label: variant-selector
+from datetime import time
+
+def variants_covering(station_sub, station_baj, line_base, direction):
+    """Devuelve lista de route_id (variante) que cubren ambas estaciones en la dirección dada."""
+    candidates = [r for r in metro_route_ids if r.startswith(line_base)]
+    vals = []
+    for rid in candidates:
+        stations_list = variant_cov.filter(
+            (pl.col("route_id")==rid) & (pl.col("direction_id")==direction)
+        )["station_norm"].to_list()
+        if not stations_list:
+            continue
+        stations = stations_list[0]  # lista de strings
+        if station_sub in stations and station_baj in stations:
+            vals.append(rid)
+    return vals
+
+# Índice de orden por variante/dirección/estación
+variant_order = (
+    stop_times_metro
+    .select(["route_id","direction_id","station_norm","stop_sequence"])
+    .unique()
+)
+
+def valid_directions_by_order(station_sub, station_baj, line_base):
+    """Devuelve direction_id que cumplen orden sub<baj dentro de alguna variante de la línea base."""
+    dirs_valid = set()
+    for d in (0,1):
+        variants = variants_covering(station_sub, station_baj, line_base, d)
+        for rid in variants:
+            sub_seq = variant_order.filter((pl.col("route_id")==rid)&(pl.col("direction_id")==d)&(pl.col("station_norm")==station_sub))["stop_sequence"]
+            baj_seq = variant_order.filter((pl.col("route_id")==rid)&(pl.col("direction_id")==d)&(pl.col("station_norm")==station_baj))["stop_sequence"]
+            if len(sub_seq)>0 and len(baj_seq)>0 and sub_seq.min() < baj_seq.min():
+                dirs_valid.add(d)
+    return list(dirs_valid)
+```
+
+## Función de headway equivalente para una etapa
+
+```{python}
+#| label: headway-equivalent
+def headway_equiv_minutes(station_sub, station_baj, line_base, directions, hora: time):
+    """Devuelve headway equivalente (min) y variantes usadas, considerando solo directions válidas."""
+    variants_all = []
+    for d in directions:
+        variants_all.extend(variants_covering(station_sub, station_baj, line_base, d))
+    variants_all = list(set(variants_all))
+    if not variants_all:
+        return None, []
+    freq_ok = freq.filter(
+        pl.col("trip_id").is_in(
+            trips_metro.filter(pl.col("route_id").is_in(variants_all))["trip_id"].to_list()
+        )
+        & (pl.col("start_time") <= hora)
+        & (pl.col("end_time") > hora)
+    )
+    # si no hay franja que contenga la hora, usar la franja más cercana (snap)
+    if freq_ok.is_empty():
+        freq_route = freq.filter(pl.col("trip_id").is_in(
+            trips_metro.filter(pl.col("route_id").is_in(variants_all))["trip_id"].to_list()
+        ))
+        if freq_route.is_empty():
+            return None, variants_all
+        # distancia en segundos a start_time y end_time
+        def dist_to_interval(row):
+            st, et = row["start_time"], row["end_time"]
+            if hora < st:
+                return (st.hour*3600+st.minute*60+st.second) - (hora.hour*3600+hora.minute*60+hora.second)
+            if hora > et:
+                return (hora.hour*3600+hora.minute*60+hora.second) - (et.hour*3600+et.minute*60+et.second)
+            return 0
+        freq_route = freq_route.with_columns(
+            pl.struct(["start_time","end_time"]).map_elements(dist_to_interval, return_dtype=pl.Int64).alias("dist_sec")
+        ).sort("dist_sec")
+        freq_ok = freq_route.head(1)
+    # ---
+    if freq_ok.is_empty():
+        return None, variants_all
+    h_list = freq_ok["headway_min"].to_list()
+    h_list = [h for h in h_list if h and h>0]
+    if not h_list:
+        return None, variants_all
+    freq_sum = sum(1.0/h for h in h_list)
+    if freq_sum == 0:
+        return None, variants_all
+    h_eq = 1.0 / freq_sum
+    return h_eq, variants_all
+```
+
+## Aplicar a viajes Metro: nuevas columnas `te*_calculado`
+
+```{python}
+#| label: compute-te
+from datetime import time as dtime, datetime
+
+def parse_time_str(s):
+    """Parsea un string de tiempo, manejando el formato 24:00:00."""
+    if s is None:
+        return None
+    try:
+        # Reemplazar "24:00:00" que es inválido por un valor manejable
+        if s.startswith("24:"):
+            s = f"00:{s[3:]}"
+        
+        # Intentar parsear el tiempo
+        h, m, ss = map(int, s.split(':'))
+        return dtime(h % 24, m, ss)
+    except Exception:
+        # Fallback si el formato es inesperado
+        try:
+            dt = datetime.fromisoformat(s)
+            return dt.time()
+        except Exception:
+            return None
+
+def te_best_direction(sub, baj, srv, hora_str):
+    """
+    Calcula el tiempo de espera (headway/2) para una etapa de metro,
+    encontrando la dirección y variantes correctas.
+    """
+    if not all([sub, baj, srv, hora_str]):
+        return None
+    
+    hora_viaje = parse_time_str(hora_str)
+    if hora_viaje is None:
+        return None
+        
+    sub_n = normalize_station_name(sub)
+    baj_n = normalize_station_name(baj)
+    line_base = str(srv).strip().upper()
+
+    # Determinar direcciones válidas basadas en el orden de las estaciones
+    valid_dirs = valid_directions_by_order(sub_n, baj_n, line_base)
+    if not valid_dirs:
+        # Fallback: si el orden falla, buscar cualquier dirección que contenga ambas estaciones
+        valid_dirs = [d for d in (0, 1) if variants_covering(sub_n, baj_n, line_base, d)]
+
+    if not valid_dirs:
+        return None
+
+    # Calcular headway equivalente considerando todas las direcciones válidas
+    h_eq, _ = headway_equiv_minutes(sub_n, baj_n, line_base, valid_dirs, hora_viaje)
+    
+    # El tiempo de espera es la mitad del headway equivalente, en segundos
+    return h_eq / 2 * 60 if h_eq is not None else None
+
+def add_te_calculado(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Añade columnas teN_calculado (tiempo de espera) y tvN_calculado (tiempo en vehículo)
+    para etapas de Metro Y Bus.
+    - te0_calculado..te5_calculado corresponden a etapas 1..6.
+    - tv1_calculado..tv6_calculado corresponden a etapas 1..6.
+    """
+    # El tiempo de referencia para todo el viaje es el inicio de la primera etapa.
+    hora_referencia_col = "tiempo_subida_1" 
+    from datetime import datetime, date, timedelta
+    
+    result_rows = []
+    # Usamos iter_rows ya que la lógica de encadenamiento de tiempos es secuencial por fila
+    for row in df.iter_rows(named=True):
+        waits = [None] * 6  # te0_calculado..te5_calculado en segundos (etapas 1-6)
+        travel_times_veh = [None] * 6 # tv1_calculado..tv6_calculado en segundos (etapas 1-6)
+        times_imputed = [None] * 6  # tiempo_subida_i imputado/observado como datetime.time
+
+        # --- Lógica para la etapa 1 (índice 0 en waits/travel_times_veh) ---
+        srv1 = row.get("srv_1")
+        tipo1 = str(row.get("tipo_transporte_1"))
+        
+        if srv1:
+            # Hora de referencia es la observada para la etapa 1
+            t1 = parse_time_str(row.get(hora_referencia_col))
+            times_imputed[0] = t1
+            
+            if tipo1 == "2" or srv1 in ("L1","L2","L3","L4","L4A","L5","L6"): # Metro
+                # Calcular te0_calculado (espera antes de etapa 1)
+                waits[0] = te_best_direction(row.get("paradero_subida_1"), row.get("paradero_bajada_1"), srv1, row.get(hora_referencia_col))
+                
+                # Calcular tv1_calculado (tiempo en vehículo etapa 1)
+                try:
+                    dist_min, _ = shortest_path_with_line(G_metro, row.get("paradero_subida_1"), srv1, row.get("paradero_bajada_1"))
+                    travel_times_veh[0] = dist_min * 60 if dist_min is not None else None
+                except Exception:
+                    travel_times_veh[0] = None
+            
+            elif tipo1 in ("1", "3"): # Bus
+                # Calcular te0_calculado usando frecuencias
+                f = get_bus_freq(row.get("paradero_subida_1"), srv1, t1)
+                waits[0] = wt_bus_seconds(f)
+                
+                # Calcular tv1_calculado usando observado (si existe)
+                ts = parse_time_str(row.get("tiempo_subida_1"))
+                tb = parse_time_str(row.get("tiempo_bajada_1"))
+                if ts and tb:
+                    d1 = datetime.combine(date.min, tb) - datetime.combine(date.min, ts)
+                    travel_times_veh[0] = d1.total_seconds()
+
+        # --- Lógica para etapas 2 a 6 (índices 1 a 5 en waits/travel_times_veh) ---
+        for i in range(2, 7): # i representa el número de etapa (2, 3, 4, 5, 6)
+            idx_calc = i - 1 # Índice para waits y travel_times_veh (0=te0/tv0, 1=te1/tv1, etc.)
+            srv = row.get(f"srv_{i}")
+            tipo = str(row.get(f"tipo_transporte_{i}"))
+            
+            if not srv:
+                continue
+
+            # Hora de la etapa actual: observada o imputada
+            obs_time = parse_time_str(row.get(f"tiempo_subida_{i}"))
+            if obs_time is not None:
+                times_imputed[idx_calc] = obs_time
+            elif times_imputed[idx_calc-1] is not None:
+                # Imputar hora de subida a la etapa 'i': hora_subida_anterior + espera_anterior + tiempo_vehiculo_anterior
+                prev_time = times_imputed[idx_calc-1]
+                prev_wait = waits[idx_calc-1] or 0.0 # esperar anterior (teN-1_calculado)
+                prev_travel = travel_times_veh[idx_calc-1] or 0.0 # tiempo vehículo anterior (tvN-1_calculado)
+
+                # Suma prev_wait y prev_travel (ambos en segundos)
+                add_seconds = prev_wait + prev_travel
+                
+                dummy_dt = datetime.combine(date(2000,1,1), prev_time) + timedelta(seconds=add_seconds)
+                times_imputed[idx_calc] = dummy_dt.time()
+            
+            # Hora para buscar frecuencia/headway
+            current_time = times_imputed[idx_calc]
+            hour_str_for_te = None
+            if current_time:
+                hour_str_for_te = current_time.replace(microsecond=0).isoformat()
+            
+            if tipo == "2" or srv in ("L1","L2","L3","L4","L4A","L5","L6"): # Metro
+                waits[idx_calc] = te_best_direction(row.get(f"paradero_subida_{i}"), row.get(f"paradero_bajada_{i}"), srv, hour_str_for_te)
+                try:
+                    dist_min, _ = shortest_path_with_line(G_metro, row.get(f"paradero_subida_{i}"), srv, row.get(f"paradero_bajada_{i}"))
+                    travel_times_veh[idx_calc] = dist_min * 60 if dist_min is not None else None
+                except Exception:
+                    travel_times_veh[idx_calc] = None
+            
+            elif tipo in ("1", "3"): # Bus
+                f = get_bus_freq(row.get(f"paradero_subida_{i}"), srv, current_time)
+                waits[idx_calc] = wt_bus_seconds(f)
+                
+                # TV Bus para propagar
+                ts = parse_time_str(row.get(f"tiempo_subida_{i}"))
+                tb = parse_time_str(row.get(f"tiempo_bajada_{i}"))
+                if ts and tb:
+                     d = datetime.combine(date.min, tb) - datetime.combine(date.min, ts)
+                     travel_times_veh[idx_calc] = d.total_seconds()
+
+        # --- Construir la fila con los nuevos valores ---
+        new_row = dict(row) # Copia la fila original
+        
+        # Función auxiliar para asegurar el tipo Float64 o None
+        def to_float_or_none(val):
+            return float(val) if val is not None else None
+        
+        new_row["te0_calculado"] = to_float_or_none(waits[0])  # espera etapa 1
+        new_row["te1_calculado"] = to_float_or_none(waits[1])  # espera etapa 2
+        new_row["te2_calculado"] = to_float_or_none(waits[2])  # espera etapa 3
+        new_row["te3_calculado"] = to_float_or_none(waits[3])  # espera etapa 4
+        new_row["te4_calculado"] = to_float_or_none(waits[4])  # espera etapa 5
+        new_row["te5_calculado"] = to_float_or_none(waits[5])  # espera etapa 6
+        
+        new_row["tv1_calculado"] = to_float_or_none(travel_times_veh[0])  # tiempo vehículo etapa 1
+        new_row["tv2_calculado"] = to_float_or_none(travel_times_veh[1])  # tiempo vehículo etapa 2
+        new_row["tv3_calculado"] = to_float_or_none(travel_times_veh[2])  # tiempo vehículo etapa 3
+        new_row["tv4_calculado"] = to_float_or_none(travel_times_veh[3])  # tiempo vehículo etapa 4
+        new_row["tv5_calculado"] = to_float_or_none(travel_times_veh[4])  # tiempo vehículo etapa 5
+        new_row["tv6_calculado"] = to_float_or_none(travel_times_veh[5])  # tiempo vehículo etapa 6
+
+        result_rows.append(new_row)
+
+    # Definir el esquema para las nuevas columnas calculadas
+    te_tv_schema = {
+        "te0_calculado": pl.Float64, "te1_calculado": pl.Float64, "te2_calculado": pl.Float64, "te3_calculado": pl.Float64, "te4_calculado": pl.Float64, "te5_calculado": pl.Float64,
+        "tv1_calculado": pl.Float64, "tv2_calculado": pl.Float64, "tv3_calculado": pl.Float64, "tv4_calculado": pl.Float64, "tv5_calculado": pl.Float64, "tv6_calculado": pl.Float64,
+    }
+    
+    # Obtener schema original y actualizar con las nuevas columnas
+    original_schema = dict(df.schema)
+    original_schema.update(te_tv_schema)
+    
+    # Construir DataFrame con schema_overrides para todas las columnas
+    df_out = pl.DataFrame(result_rows, schema_overrides=original_schema, strict=False, orient="row")
+    return df_out
+
+# --- Ejecución y Muestra ---
+df_sample = lf_viajes.limit(1000).collect()
+df_sample_te_tv = add_te_calculado(df_sample)
+
+# Seleccionar columnas para mostrar (tiempos de espera y de viaje)
+cols_to_show = []
+for i in range(6):
+    if f"te{i}" in df_sample_te_tv.columns: cols_to_show.append(f"te{i}")
+    if f"te{i}_calculado" in df_sample_te_tv.columns: cols_to_show.append(f"te{i}_calculado")
+    # Para tv, los índices van de 1 a 6 (no de 0 a 5)
+    if i < 6:
+        tv_col = f"tv{i+1}_calculado"
+        if tv_col in df_sample_te_tv.columns: cols_to_show.append(tv_col)
+
+print("Muestra de tiempos de espera y viaje calculados (en segundos):")
+with pl.Config(tbl_cols=-1, tbl_width_chars=120):
+    print(df_sample_te_tv.filter(pl.col("metro_any") == True).select(cols_to_show).head(10))
+
+
+```
+
+## Debug opcional: trazar 3 viajes metro y ver cada paso
+
+```{python}
+#| label: debug-viajes
+dbg = lf_viajes.filter(pl.col("tipo_transporte_1")=="2").limit(3).collect()
+for row in dbg.iter_rows(named=True):
+    sub = row["paradero_subida_1"]; baj = row["paradero_bajada_1"]; srv = row["srv_1"]; hora = row["tiempo_subida_1"]
+    sub_n = normalize_station_name(sub); baj_n = normalize_station_name(baj)
+    h = parse_time_str(hora)
+    dirs = valid_directions_by_order(sub_n, baj_n, srv)
+    print(f"\nPK={row['pk_viaje']} {sub} -> {baj} ({srv}) hora={hora}")
+    print("  dirs_valid", dirs)
+    for d in (0,1):
+        vars_d = variants_covering(sub_n, baj_n, srv, d)
+        print(f"  dir {d} variants_covering:", vars_d)
+    directions = dirs if dirs else [d for d in (0,1) if variants_covering(sub_n,baj_n,srv,d)]
+    print("  directions used:", directions)
+    if h is None or not directions:
+        print("  parse_time None o sin dirs -> te=None"); continue
+    freq_ok = freq.filter(
+        pl.col("trip_id").is_in(trips_metro.filter(pl.col("route_id").is_in(variants_covering(sub_n,baj_n,srv, directions[0])) )["trip_id"].to_list())
+        & (pl.col("start_time") <= h)
+        & (pl.col("end_time") > h)
+    )
+    print("  freq_ok rows:", freq_ok.height)
+    if freq_ok.is_empty():
+        print("  freq_ok vacío -> te=None"); continue
+    h_list = [x for x in freq_ok["headway_min"].to_list() if x and x>0]
+    print("  headways:", h_list)
+    freq_sum = sum(1.0/x for x in h_list)
+    h_eq = 1.0/freq_sum if freq_sum else None
+    print("  h_eq:", h_eq, "te:", h_eq/2 if h_eq else None)
+
+
+```
+
+```{python}
+# Test unitario rápido: un viaje con >1 etapa metro
+print(50*"-")
+test_one = (
+    lf_viajes
+    .filter((pl.col("n_etapas_recon")>1) & (pl.col("tipo_transporte_1")=="2") & (pl.col("tipo_transporte_2")=="2"))
+    .limit(2)
+    .collect()
+)
+if test_one.height > 0:
+    test_one_te = add_te_calculado(test_one)
+    with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+        print("Viaje de prueba con múltiples etapas Metro:")
+        print(test_one_te.select([
+            "pk_viaje","n_etapas_recon",
+            "paradero_subida_1","paradero_bajada_1","srv_1","tiempo_subida_1", 
+            "paradero_subida_2","paradero_bajada_2","srv_2","tiempo_subida_2",
+            "te0_calculado", "te1_calculado","te2_calculado","te3_calculado", "paradero_subida_3","paradero_bajada_3","srv_3","tiempo_subida_3", 
+            "tv1_calculado", "tv2_calculado", "tv3_calculado", "tv4_calculado"
+        ]))
+else:
+    print("No se encontró viaje con >1 etapa metro para el test.")
+```
+
+```{python}
+# Test unitario rápido: un viaje con etapa Bus
+print(50*"-")
+test_bus = (
+    lf_viajes
+    .filter(pl.col("tipo_transporte_1").is_in(["1", "3"]))
+    .limit(2)
+    .collect()
+)
+if test_bus.height > 0:
+    test_bus_te = add_te_calculado(test_bus)
+    with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+        print("Viaje de prueba con etapa Bus:")
+        print(test_bus_te.select([
+            "pk_viaje",
+            "paradero_subida_1","srv_1","tiempo_subida_1", 
+            "te0_calculado", "tv1_calculado"
+        ]))
+else:
+    print("No se encontró viaje con etapa Bus para el test.")
+```
+
+## Guardar resultado (demo: solo muestra; decidir si escribir parquet completo)
+
+```{python}
+#| label: output
+OUT_PATH = PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{PARTITION_LABEL}.parquet"
+
+# Procesamiento en batches para no explotar memoria y ver progreso
+batch_size = 200_000
+total_rows = lf_viajes.select(pl.len()).collect().item()
+print(f"Procesando en batches de {batch_size} filas (total {total_rows:,})...")
+
+result_batches = []
+offset = 0
+while offset < total_rows:
+    batch = lf_viajes.slice(offset, batch_size).collect()
+    batch_out = add_te_calculado(batch)
+    result_batches.append(batch_out)
+    offset += batch_size
+    print(f"  avance: {min(offset, total_rows):,}/{total_rows:,}")
+    # muestra rápida de un viaje metro en este batch
+    batch_metro = batch_out.filter(pl.col("tipo_transporte_1")=="2").select([
+        "pk_viaje","n_etapas_recon","paradero_inicio_viaje","paradero_fin_viaje","paradero_subida_1","paradero_bajada_1","srv_1","tiempo_subida_1", "tv1_calculado",
+        "te0_calculado","paradero_subida_2", "paradero_bajada_2", "srv_2", "tiempo_subida_2", "te1_calculado", "tv2_calculado", "paradero_subida_3", "paradero_bajada_3", "srv_3", "tiempo_subida_3", "te2_calculado", "tv3_calculado",
+        "paradero_subida_4", "paradero_bajada_4", "srv_4", "tiempo_subida_4", "te3_calculado", "tv4_calculado"
+    ]).head(1)
+    if batch_metro.height > 0:
+        print("    ejemplo metro batch:")
+        with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+            print(batch_metro)
+
+df_full = pl.concat(result_batches, how="vertical")
+df_full.write_parquet(OUT_PATH)
+print("Escrito:", OUT_PATH, "filas:", df_full.height)
+
+```
+
+```{python}
+#| label: show-te-example
+# Mostrar una muestra de viajes Metro con te calculados
+df_metro = (
+    df_full
+    .filter(pl.col("tipo_transporte_1")=="2")
+    .filter((pl.col("n_etapas_recon")>1) & (pl.col("tipo_transporte_2")=="2"))
+    .select([
+        "pk_viaje","n_etapas_recon",
+        "paradero_subida_1","paradero_bajada_1","srv_1","tiempo_subida_1",
+        "te0_calculado","te1_calculado","te2_calculado","te3_calculado", "tipo_transporte_2","srv_2", "tipo_transporte_3", "srv_3", 
+    ])
+    .head(20)
+)
+with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+    print(df_metro)
+```
+
+```{python}
+#| label: show-te-example-3tapas
+# Mostrar una muestra de viajes Metro con te calculados
+df_metro = (
+    df_full
+    .filter(pl.col("tipo_transporte_1")!="2")
+    .filter((pl.col("n_etapas_recon")>2) & (pl.col("tipo_transporte_3")=="2"))
+    .select([
+        "pk_viaje","n_etapas_recon",
+        "paradero_subida_1","paradero_bajada_1","srv_1","tiempo_subida_1",
+        "te0_calculado","te1_calculado","te2_calculado","te3_calculado", "tipo_transporte_2","srv_2", "tipo_transporte_3", "srv_3", 
+    ])
+    .head(50)
+)
+with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+    print(df_metro)
+```
+
+## Análisis de nulos en te\*\_calculado para viajes Metro con múltiples etapas
+
+```{python}
+#| label: check-nulls-metro
+cols_te = ["te0_calculado", "te1_calculado", "te2_calculado", "te3_calculado"]
+# Mapeo: te0 = espera etapa 1, te1 = espera etapa 2 (primer transbordo), etc.
+etapa_map = {0: 1, 1: 2, 2: 3, 3: 4}
+
+print("="*80)
+print("Porcentaje de nulos en te*_calculado (condicionado a que la etapa sea Metro):")
+print("="*80)
+print("Nota: te0 = espera etapa 1, te1 = espera etapa 2 (primer transbordo), etc.")
+print()
+
+# Calcular porcentaje de nulos condicionado a que la etapa correspondiente sea Metro
+null_stats_list = []
+for idx, col_te in enumerate(cols_te):
+    etapa_num = etapa_map[idx]
+    # Filtrar solo viajes donde esta etapa es Metro
+    df_etapa_metro = df_full.filter(pl.col(f"tipo_transporte_{etapa_num}") == "2")
+    
+    if df_etapa_metro.height > 0:
+        pct_null = df_etapa_metro[col_te].is_null().mean() * 100
+        total_etapas = df_etapa_metro.height
+        null_count = df_etapa_metro[col_te].is_null().sum()
+    else:
+        pct_null = None
+        total_etapas = 0
+        null_count = 0
+    
+    null_stats_list.append({
+        "te_columna": col_te,
+        "etapa": etapa_num,
+        "total_etapas_metro": total_etapas,
+        "nulos": null_count,
+        "pct_null": round(pct_null, 3) if pct_null is not None else None
+    })
+
+null_stats_df = pl.DataFrame(null_stats_list)
+with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+    print(null_stats_df)
+
+print("\n" + "="*80)
+print("Ejemplos de viajes con te*_calculado NULL (por columna, solo donde la etapa es Metro):")
+print("="*80)
+
+# Mostrar ejemplos separados para cada columna te*_calculado que sea null
+for idx, col_te in enumerate(cols_te):
+    etapa_num = etapa_map[idx]
+    print(f"\n--- Ejemplos donde {col_te} es NULL (etapa {etapa_num} es Metro) ---")
+    
+    # Filtrar: etapa correspondiente es Metro Y esta columna es null
+    df_etapa_metro = df_full.filter(pl.col(f"tipo_transporte_{etapa_num}") == "2")
+    
+    ej_col_nulo = (
+        df_etapa_metro
+        .filter(pl.col(col_te).is_null())
+        .select([
+            "pk_viaje", "n_etapas_recon",
+            "paradero_subida_1", "paradero_bajada_1", "srv_1", "tiempo_subida_1",
+            "paradero_subida_2", "paradero_bajada_2", "srv_2", "tiempo_subida_2",
+            "paradero_subida_3", "paradero_bajada_3", "srv_3", "tiempo_subida_3",
+            "paradero_subida_4", "paradero_bajada_4", "srv_4", "tiempo_subida_4",
+        ] + cols_te)
+        .head(3)
+    )
+    
+    if ej_col_nulo.height > 0:
+        with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+            print(ej_col_nulo)
+    else:
+        print(f"  (No se encontraron ejemplos con {col_te} NULL donde etapa {etapa_num} es Metro)")
+
+print("\n" + "="*80)
+print("Ejemplos de viajes con te*_calculado completos (donde todas las etapas relevantes son Metro):")
+print("="*80)
+
+# Buscar viajes donde todas las etapas Metro tienen te*_calculado completo
+# Un viaje está "completo" si todas las etapas Metro que tiene tienen su te*_calculado no nulo
+ej_ok_list = []
+for idx, col_te in enumerate(cols_te):
+    etapa_num = etapa_map[idx]
+    df_etapa_metro_completo = (
+        df_full
+        .filter(
+            (pl.col(f"tipo_transporte_{etapa_num}") == "2") &
+            pl.col(col_te).is_not_null()
+        )
+        .select([
+            "pk_viaje", "n_etapas_recon",
+            "paradero_subida_1", "paradero_bajada_1", "srv_1", "tiempo_subida_1",
+            "paradero_subida_2", "paradero_bajada_2", "srv_2", "tiempo_subida_2",
+            "paradero_subida_3", "paradero_bajada_3", "srv_3", "tiempo_subida_3",
+            "paradero_subida_4", "paradero_bajada_4", "srv_4", "tiempo_subida_4",
+        ] + cols_te)
+        .head(2)
+    )
+    if df_etapa_metro_completo.height > 0:
+        ej_ok_list.append(df_etapa_metro_completo)
+
+if ej_ok_list:
+    ej_ok = pl.concat(ej_ok_list).unique("pk_viaje").head(10)
+    with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000, tbl_cell_alignment="LEFT"): print(ej_ok)
+else:
+    print("No se encontraron ejemplos completos.")
+
+# Resumen final: los conteos ya están en null_stats_df, pero podemos agregar más detalles
+print("\n" + "="*80)
+print("Resumen detallado por etapa:")
+print("="*80)
+with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+    print(null_stats_df)
+```
+
+## Distribución de tiempos de caminata OBSERVADOS (entrada/tc1..tc3/egreso) por hora y línea
+
+```{python}
+#| label: walk-dist-real
+# Usa los tiempos de caminata observados:
+#  - entrada: acceso a la primera etapa (si esa etapa es Metro)
+#  - tc1, tc2, tc3: caminata en los transbordos previos a etapas 2,3,4
+#  - egreso: caminata de salida cuando la última etapa es Metro
+
+records = []
+
+for r in df_full.iter_rows(named=True):
+    # primera etapa Metro en el viaje
+    first_k = None
+    for k in range(1,5):
+        if r.get(f"tipo_transporte_{k}") == "2":
+            first_k = k
+            break
+    if first_k:
+        if first_k == 1:
+            walk_obs = r.get("entrada")
+        elif first_k == 2:
+            walk_obs = r.get("tc1")
+        elif first_k == 3:
+            walk_obs = r.get("tc2")
+        else:  # first_k == 4
+            walk_obs = r.get("tc3")
+        if walk_obs is not None:
+            records.append({
+                "pk_viaje": r["pk_viaje"],
+                "k": first_k,
+                "linea": r.get(f"srv_{first_k}"),
+                "estacion": r.get(f"paradero_subida_{first_k}"),
+                "hora_str": r.get(f"tiempo_subida_{first_k}"),
+                "walk_obs": walk_obs,
+                "tipo": "acceso_primer_metro"
+            })
+    # egreso si última etapa es Metro
+    last_k = r.get("n_etapas_recon") or r.get("n_etapas")
+    if last_k and last_k <= 4 and r.get(f"tipo_transporte_{last_k}") == "2":
+        walk_exit = r.get("egreso")
+        if walk_exit is not None:
+            records.append({
+                "pk_viaje": r["pk_viaje"],
+                "k": last_k,
+                "linea": r.get(f"srv_{last_k}"),
+                "estacion": r.get(f"paradero_bajada_{last_k}"),
+                "hora_str": r.get(f"tiempo_bajada_{last_k}") or r.get(f"tiempo_subida_{last_k}"),
+                "walk_obs": walk_exit,
+                "tipo": "egreso_ultimo_metro"
+            })
+
+walk_df = pl.DataFrame(records) if records else pl.DataFrame({"pk_viaje":[], "k":[], "linea":[], "estacion":[], "hora_str":[], "walk_obs":[], "tipo":[]})
+walk_df = walk_df.with_columns(
+    pl.col("hora_str")
+      .str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S", strict=False)
+      .dt.hour()
+      .alias("hour")
+)
+
+print(f"Registros de caminata observada (acceso primera metro + egreso): {walk_df.height:,}")
+
+# Tabla por tipo y línea
+walk_line = (
+    walk_df
+    .group_by(["tipo","linea"])
+    .agg([
+        pl.len().alias("n"),
+        pl.col("walk_obs").median().alias("p50"),
+        pl.col("walk_obs").quantile(0.9).alias("p90"),
+        pl.col("walk_obs").quantile(0.95).alias("p95"),
+        pl.col("walk_obs").quantile(0.99).alias("p99"),
+        pl.col("walk_obs").max().alias("max"),
+    ])
+    .sort(["tipo","linea"])
+)
+print("\nCaminata observada por tipo (acceso/egreso) y línea:")
+with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=800, tbl_cell_alignment="LEFT"):
+    print(walk_line)
+
+# Tabla por tipo y hora
+walk_hour = (
+    walk_df
+    .group_by(["tipo","hour"])
+    .agg([
+        pl.len().alias("n"),
+        pl.col("walk_obs").median().alias("p50"),
+        pl.col("walk_obs").quantile(0.9).alias("p90"),
+        pl.col("walk_obs").quantile(0.95).alias("p95"),
+        pl.col("walk_obs").quantile(0.99).alias("p99"),
+        pl.col("walk_obs").max().alias("max"),
+    ])
+    .sort(["tipo","hour"])
+)
+print("\nCaminata observada por tipo y hora:")
+with pl.Config(tbl_cols=-1, tbl_rows=80, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+    print(walk_hour)
+
+# Outliers > 15 min
+out_walk = walk_df.filter(pl.col("walk_obs") > 900).height
+total_walk = walk_df.height
+print(f"\nOutliers walk_obs > 15 min: {out_walk} ({out_walk/total_walk*100:.3f}% de {total_walk} registros de caminata)")
+```
+
+## Tablas de caminata por estación y franja horaria
+
+```{python}
+#| label: walk-tables-by-station
+# 1) Entrada (acceso a primera etapa Metro)
+walk_ent = walk_df.filter(pl.col("tipo")=="acceso_primer_metro").select(
+    pl.col("estacion"), pl.col("linea"), pl.col("hour"), pl.col("walk_obs")
+)
+
+# 2) Transbordo (tc1/tc2/tc3) cuando la primera etapa Metro no es la etapa 1 (k>1)
+walk_trans = walk_df.filter((pl.col("tipo")=="acceso_primer_metro") & (pl.col("k")>1)).select(
+    pl.col("estacion"), pl.col("linea"), pl.col("hour"), pl.col("walk_obs"), pl.col("k")
+)
+
+# 3) Egreso (salida después de última etapa Metro)
+walk_egr = walk_df.filter(pl.col("tipo")=="egreso_ultimo_metro").select(
+    pl.col("estacion"), pl.col("linea"), pl.col("hour"), pl.col("walk_obs")
+)
+
+def agg_table(df):
+    if df.is_empty():
+        return df
+    return (
+        df.group_by(["estacion","linea","hour"])
+          .agg([
+              pl.len().alias("n"),
+              pl.col("walk_obs").median().alias("p50"),
+              pl.col("walk_obs").quantile(0.9).alias("p90"),
+              pl.col("walk_obs").quantile(0.95).alias("p95"),
+              pl.col("walk_obs").quantile(0.99).alias("p99"),
+              pl.col("walk_obs").max().alias("max"),
+          ])
+          .sort(["estacion","linea","hour"])
+    )
+
+tab_ent = agg_table(walk_ent)
+tab_trans = agg_table(walk_trans)
+tab_egr = agg_table(walk_egr)
+
+print("\nTabla Entrada (acceso) por estación y hora:")
+with pl.Config(tbl_cols=-1, tbl_rows=30, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+    print(tab_ent)
+
+print("\nTabla Transbordo (tc1/2/3 como primera etapa Metro no-etapa1) por estación y hora:")
+with pl.Config(tbl_cols=-1, tbl_rows=30, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+    print(tab_trans)
+
+print("\nTabla Egreso por estación y hora:")
+with pl.Config(tbl_cols=-1, tbl_rows=30, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+    print(tab_egr)
+```
+
+## Debug comparativa entrada vs egreso por estación/hora (medianas)
+
+```{python}
+#| label: walk-compare-entry-exit
+if (not tab_ent.is_empty()) and (not tab_egr.is_empty()):
+    comp_ent_egr = (
+        tab_ent.select(["estacion","linea","hour","p50"])
+        .rename({"p50":"p50_ent"})
+        .join(
+            tab_egr.select(["estacion","linea","hour","p50"]).rename({"p50":"p50_egr"}),
+            on=["estacion","linea","hour"],
+            how="inner"
+        )
+        .with_columns([
+            (pl.col("p50_egr") - pl.col("p50_ent")).alias("delta_egr_ent"),
+            (pl.col("p50_egr") / pl.col("p50_ent")).alias("ratio_egr_ent")
+        ])
+        .sort("delta_egr_ent", descending=True)
+    )
+    print("\nTop 20 estaciones/hora donde egreso >> entrada (mediana):")
+    with pl.Config(tbl_cols=-1, tbl_rows=20, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+        print(comp_ent_egr.head(20))
+else:
+    print("\nNo hay datos suficientes para comparar entrada vs egreso.")
+```
+
+## Debug inspección manual de tiempos de espera y caminata
+
+```{python}
+#| label: validate-manual-tc1
+import polars as pl
+from datetime import timedelta
+ 
+# --- 1. Digitalizar Anexo 4.2 (PLACEHOLDER - DEBES LLENAR CON TUS DATOS REALES) ---
+# Estos valores son EJEMPLOS, debes reemplazarlos con los de tu Anexo 4.2
+# Unidades en SEGUNDOS para consistencia.
+
+# Tiempos promedio de acceso/egreso por estación (ej. desde torniquete hasta andén)
+TIEMPOS_ACCESO_EGRESO = {
+     "LA MONEDA": 114,       # 1.9 min
+     "LOS HEROES": 150,      # 2.5 min
+     "PARQUE OHIGGINS": 126, # 2.1 min
+     "BAQUEDANO": 186,       # 3.1 min
+     "TOBALABA": 168,        # 2.8 min
+     "SANTA ANA": 174        # 2.9 min
+     # ... Añadir todas las estaciones relevantes del Anexo 4.2
+}
+ 
+ # Tiempos de caminata en trasbordo Metro-Metro (Línea origen -> Línea destino en la estación)
+ # La clave es (ESTACION_NORMALIZADA, LINEA_ORIGEN, LINEA_DESTINO)
+TIEMPOS_TRASBORDO_OFICIALES = {
+     ("LOS HEROES", "L1", "L2"): 215, # 3.58 min * 60
+     ("LOS HEROES", "L2", "L1"): 215, # Asumimos simetría
+     ("SANTA ANA", "L2", "L5"): 247, # 4.12 min * 60
+     ("SANTA ANA", "L5", "L2"): 247, # Asumimos simetría
+     ("BAQUEDANO", "L1", "L5"): 349, # 5.82 min * 60
+     ("BAQUEDANO", "L5", "L1"): 349, # Asumimos simetría
+     ("TOBALABA", "L1", "L4"): 300,  # Valor de ejemplo
+     ("TOBALABA", "L4", "L1"): 300,  # Valor de ejemplo
+     # ... Añadir todos los demás trasbordos del Anexo 4.2
+}
+ 
+print(f"--- Datos del Anexo 4.2 digitalizados (en segundos) ---")
+print(f"   - {len(TIEMPOS_TRASBORDO_OFICIALES)} tiempos de trasbordo oficiales.")
+print(f"   - {len(TIEMPOS_ACCESO_EGRESO)} tiempos de acceso/egreso oficiales.")
+ 
+ 
+ # --- 2. Seleccionar un Caso de Estudio REAL para validar la ecuación ---
+print("\n--- Buscando un caso de estudio real para la validación manual ---")
+ 
+ # Vamos a buscar un viaje de 2 etapas, ambas Metro, con trasbordo L1-L2 en Los Héroes.
+ # El viaje debe tener datos en las columnas te0_calculado, tv1_calculado, te1_calculado, tv2_calculado
+ # y además debe tener valores NO NULOS en tviaje2.
+df_target_trip = (
+ df_full # Usamos df_full ya que contiene teN_calculado y tvN_calculado
+ .filter(
+     (pl.col("n_etapas_recon") == 2) &
+     (pl.col("tipo_transporte_1") == "2") &
+     (pl.col("tipo_transporte_2") == "2") &
+     (pl.col("paradero_bajada_1").map_elements(normalize_station_name, return_dtype=pl.Utf8) == "LOS HEROES") &
+     (pl.col("paradero_subida_2").map_elements(normalize_station_name, return_dtype=pl.Utf8) == "LOS HEROES") &
+     (
+         ((pl.col("srv_1") == "L1") & (pl.col("srv_2") == "L2")) |
+         ((pl.col("srv_1") == "L2") & (pl.col("srv_2") == "L1"))
+     ) &
+     pl.col("te0_calculado").is_not_null() &
+     pl.col("tv1_calculado").is_not_null() &
+     pl.col("te1_calculado").is_not_null() &
+     pl.col("tv2_calculado").is_not_null() &
+     pl.col("tviaje2").is_not_null() # Asegurarse de que tviaje2 tenga valor
+ )
+.with_columns([
+    (pl.col("tiempo_imputado") * 60).alias("tiempo_imputado_seg")
+])
+.select([
+    "pk_viaje", "n_etapas_recon", "tipo_transporte_1", "paradero_subida_1", "paradero_bajada_1", "srv_1", "entrada", "te0_calculado", "tv1_calculado", "tv1", 
+    "tipo_transporte_2", "paradero_subida_2", "paradero_bajada_2", "srv_2", "tc1", "te1_calculado", "tv2_calculado", 
+    "tipo_transporte_3", "paradero_subida_3", "paradero_bajada_3", "srv_3", "tc2", "te2_calculado", "tv3_calculado",
+    "tipo_transporte_4", "paradero_subida_4", "paradero_bajada_4", "srv_4", "tc3", "te3_calculado", "tv4_calculado", "egreso",
+    "tviaje2", "tiempo_imputado_seg"
+])
+.head(10)
+)
+with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000, tbl_cell_alignment="LEFT"):
+   print(df_target_trip)
+```
+
+## Debug inspección manual de tiempos de espera y caminata
+
+```{python}
+#| label: manual-validation-with-real-data
+import polars as pl
+
+# 1. Digitalización de las tablas del Anexo (en segundos)
+# -------------------------------------------------------------
+print("--- Paso 1: Digitalizando datos del Anexo 4.2 ---")
+
+TIEMPOS_TRASBORDO_OFICIALES = {
+    # (Estación, Línea Menor, Línea Mayor)
+    ("BAQUEDANO", "L1", "L5"): 133,
+    ("BAQUEDANO", "L5", "L1"): 142,
+    ("LA CISTERNA", "L2", "L4A"): 220,
+    ("LA CISTERNA", "L4A", "L2"): 212,
+    ("LOS HEROES", "L1", "L2"): 84,
+    ("LOS HEROES", "L2", "L1"): 97,
+    ("SAN PABLO", "L1", "L5"): 138,
+    ("SAN PABLO", "L5", "L1"): 146,
+    ("SANTA ANA", "L2", "L5"): 92,
+    ("SANTA ANA", "L5", "L2"): 115,
+    ("TOBALABA", "L1", "L4"): 124,
+    ("TOBALABA", "L4", "L1"): 156,
+    ("VICENTE VALDES", "L4", "L5"): 90,
+    ("VICENTE VALDES", "L5", "L4"): 122,
+    ("VICUNA MACKENNA", "L4", "L4A"): 73,
+    ("VICUNA MACKENNA", "L4A", "L4"): 78,
+}
+
+TIEMPOS_ACCESO_EGRESO = {
+    # L1
+    "SAN PABLO": (38, 38), "NEPTUNO": (38, 38), "PAJARITOS": (38, 38), "LAS REJAS": (38, 77),
+    "ECUADOR": (38, 77), "SAN ALBERTO HURTADO": (38, 77), "UNIVERSIDAD DE SANTIAGO": (38, 77),
+    "ESTACION CENTRAL": (38, 77), "UNION LATINO AMERICANA": (38, 77), "REPUBLICA": (38, 77),
+    "LOS HEROES": (38, 77), "LA MONEDA": (38, 77), "UNIVERSIDAD DE CHILE": (38, 101),
+    "SANTA LUCIA": (38, 77), "UNIVERSIDAD CATOLICA": (38, 77), "BAQUEDANO": (38, 77),
+    "SALVADOR": (38, 38), "MANUEL MONTT": (38, 77), "PEDRO DE VALDIVIA": (38, 77),
+    "LOS LEONES": (38, 77), "TOBALABA": (38, 101), "EL GOLF": (38, 77), "ALCANTARA": (38, 77),
+    "ESCUELA MILITAR": (38, 77), "MANQUEHUE": (37, 101), "HERNANDO DE MAGALLANES": (37, 101),
+    "LOS DOMINICOS": (37, 101),
+    # L2
+    "VESPUCIO NORTE": (42, 122), "ZAPADORES": (42, 122), "DORSAL": (42, 122), "EINSTEIN": (42, 122),
+    "CEMENTERIOS": (42, 122), "CERRO BLANCO": (42, 122), "PATRONATO": (42, 122),
+    "CAL Y CANTO": (50, 122), "SANTA ANA": (42, 79), "TOESCA": (50, 79),
+    "PARQUE OHIGGINS": (74, 43), "RONDIZONNI": (50, 79), "FRANKLIN": (42, 110),
+    "EL LLANO": (42, 66), "SAN MIGUEL": (42, 66), "LO VIAL": (42, 66), "DEPARTAMENTAL": (42, 66),
+    "CIUDAD DEL NINO": (42, 66), "LO OVALLE": (42, 66), "EL PARRON": (42, 122), "LA CISTERNA": (42, 110),
+    # L4
+    "PLAZA DE PUENTE ALTO": (55, 123), "LAS MERCEDES": (55, 123), "PROTECTORA DE LA INFANCIA": (43, 71),
+    "HOSPITAL SOTERO DEL RIO": (68, 123), "ELISA CORREA": (43, 71), "LOS QUILLAYES": (43, 71),
+    "SAN JOSE DE LA ESTRELLA": (43, 71), "TRINIDAD": (43, 71), "ROJAS MAGALLANES": (43, 71),
+    "VICENTE VALDES": (55, 123), "VICUNA MACKENNA": (75, 123), "MACUL": (43, 71), "LAS TORRES": (33, 155),
+    "QUILIN": (43, 71), "LOS PRESIDENTES": (33, 155), "GRECIA": (33, 74), "LOS ORIENTALES": (33, 128),
+    "PLAZA EGANA": (33, 74), "SIMON BOLIVAR": (33, 128), "PRINCIPE DE GALES": (33, 128),
+    "FRANCISCO BILBAO": (33, 128), "CRISTOBAL COLON": (33, 128),
+    # L4A (segun tabla L4)
+    "LA CISTERNA": (118, 172), "SAN RAMON": (96, 104), "SANTA ROSA": (37, 81),
+    "LA GRANJA": (96, 104), "SANTA JULIA": (96, 104),
+    # L5
+    "PLAZA MAIPU": (51, 166), "SANTIAGO BUERAS": (95, 126), "DEL SOL": (51, 85),
+    "MONTE TABOR": (102, 106), "LAS PARCELAS": (102, 106), "LAGUNA SUR": (102, 106),
+    "BARRANCAS": (95, 126), "PUDAHUEL": (95, 126), "LO PRADO": (95, 126),
+    "BLANQUEADO": (95, 126), "GRUTA DE LOURDES": (95, 126), "QUINTA NORMAL": (51, 126),
+    "CUMMING": (51, 85), "PLAZA DE ARMAS": (51, 126), "BELLAS ARTES": (51, 85),
+    "PARQUE BUSTAMANTE": (51, 85), "SANTA ISABEL": (51, 85), "IRARRAZAVAL": (37, 50),
+    "NUBLE": (37, 50), "RODRIGO DE ARAYA": (37, 50), "CARLOS VALDOVINOS": (37, 50),
+    "CAMINO AGRICOLA": (37, 50), "SAN JOAQUIN": (37, 50), "PEDRERO": (37, 50),
+    "MIRADOR": (51, 85), "BELLAVISTA DE LA FLORIDA": (51, 126)
+}
+
+print("✅ Tablas de tiempos del anexo digitalizadas.")
+
+# 2. Búsqueda de casos de estudio
+# ---------------------------------
+print("\n--- Paso 2: Buscando casos de estudio con trasbordos conocidos ---")
+
+# Normalizar las claves del diccionario de trasbordos para búsqueda
+trasbordos_conocidos_estaciones = {k[0] for k in TIEMPOS_TRASBORDO_OFICIALES}
+
+df_casos_estudio = (
+    df_full # Usamos df_full ya calculado
+    .lazy()
+    .with_columns(
+        pl.col("paradero_bajada_1").map_elements(normalize_station_name, return_dtype=pl.Utf8).alias("paradero_bajada_1_norm")
+    )
+    .filter(
+        (pl.col("n_etapas_recon") == 2) &
+        (pl.col("tipo_transporte_1") == "2") &
+        (pl.col("tipo_transporte_2") == "2") &
+        (pl.col("paradero_bajada_1_norm").is_in(trasbordos_conocidos_estaciones)) &
+        (pl.col("paradero_subida_2").map_elements(normalize_station_name, return_dtype=pl.Utf8) == pl.col("paradero_bajada_1_norm")) &
+        (pl.all_horizontal(pl.col(c).is_not_null() for c in ["tviaje2", "te0_calculado", "tv1_calculado", "te1_calculado", "tv2_calculado"]))
+    )
+    .head(10)
+    .collect()
+)
+
+if df_casos_estudio.is_empty():
+    print("\n❌ No se encontraron viajes de estudio que cumplan todos los criterios.")
+else:
+    print(f"\n✅ Se encontraron {df_casos_estudio.height} casos de estudio. Analizando...")
+    
+    results = []
+    for r in df_casos_estudio.iter_rows(named=True):
+        subida_1_norm = normalize_station_name(r["paradero_subida_1"])
+        bajada_2_norm = normalize_station_name(r["paradero_bajada_2"])
+        estacion_trasbordo = normalize_station_name(r["paradero_bajada_1"])
+        linea_1_srv = r["srv_1"]
+        linea_2_srv = r["srv_2"]
+        linea_key = tuple(sorted((linea_1_srv, linea_2_srv)))
+        
+        t_acceso = TIEMPOS_ACCESO_EGRESO.get(subida_1_norm, (None, None))[0]
+        t_egreso = TIEMPOS_ACCESO_EGRESO.get(bajada_2_norm, (None, None))[1]
+        
+        tc1_oficial_key = (estacion_trasbordo, linea_key[0], linea_key[1])
+        tc1_oficial = TIEMPOS_TRASBORDO_OFICIALES.get(tc1_oficial_key)
+        
+        componentes = [t_acceso, r["te0_calculado"], r["tv1_calculado"], r["tv2_calculado"], t_egreso]
+        t_trasbordo_imputado = None
+        if all(v is not None for v in componentes):
+            suma_componentes = sum(v for v in componentes if v is not None)
+            t_trasbordo_imputado = r["tviaje2"] - suma_componentes
+
+        t_trasbordo_referencia = None
+        if tc1_oficial is not None and r["te1_calculado"] is not None:
+            t_trasbordo_referencia = tc1_oficial + r["te1_calculado"]
+            
+        results.append({
+            "pk_viaje": r["pk_viaje"],
+            "tviaje2": r["tviaje2"],
+            "tv1_orig": r["tv1"],
+            "t_imputado": r["tiempo_imputado"],
+            "trasbordo_en": estacion_trasbordo,
+            "t_trasbordo_imputado": t_trasbordo_imputado,
+            "t_trasbordo_referencia": t_trasbordo_referencia,
+            "tc1_oficial": tc1_oficial,
+            "te1_calc": r["te1_calculado"]
+        })
+
+    df_results = pl.DataFrame(results)
+    
+    with pl.Config(tbl_cols=-1, tbl_width_chars=200, tbl_rows=20):
+        print("\n--- Tabla de Validación Manual (Todos los tiempos en segundos) ---")
+        display(df_results)
+
+```
+
+```{python}
+#| label: validation-check-te
+import polars as pl
+from pathlib import Path
+
+print("--- 🔍 INICIANDO VALIDACIÓN TÉCNICA DE TIEMPOS CALCULADOS ---")
+
+# 1. Cargar el archivo generado
+out_path = PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{PARTITION_LABEL}.parquet"
+if not out_path.exists():
+    raise FileNotFoundError(f"❌ No se encontró el archivo de salida: {out_path}")
+
+df_val = pl.read_parquet(out_path)
+print(f"📂 Archivo cargado: {out_path.name} ({df_val.height:,} filas)")
+
+# 2. Validar Existencia de Columnas Nuevas (hasta etapa 6)
+expected_cols = []
+for i in range(6):
+    expected_cols.append(f"te{i}_calculado") # te0..te5
+    expected_cols.append(f"tv{i+1}_calculado") # tv1..tv6
+
+missing = [c for c in expected_cols if c not in df_val.columns]
+if missing:
+    print(f"❌ FALTAN COLUMNAS: {missing}")
+else:
+    print("✅ Todas las columnas te/tv calculadas existen.")
+
+# 3. Validar Cobertura de Cálculo (¿Cuántos nulos quedaron?)
+print("\n📊 Cobertura de cálculo (porcentaje de no-nulos en etapas existentes):")
+for i in range(1, 7):
+    # Filtramos solo las filas que TIENEN esa etapa (srv_i no nulo)
+    subset = df_val.filter(pl.col(f"srv_{i}").is_not_null())
+    if subset.height == 0:
+        continue
+    
+    te_col = f"te{i-1}_calculado"
+    tv_col = f"tv{i}_calculado"
+    
+    pct_te = subset.filter(pl.col(te_col).is_not_null()).height / subset.height * 100
+    pct_tv = subset.filter(pl.col(tv_col).is_not_null()).height / subset.height * 100
+    
+    print(f"  Etapa {i}: TE calculado {pct_te:.1f}% | TV calculado {pct_tv:.1f}% (Base: {subset.height:,} viajes)")
+
+# 4. Validar Rangos Físicos (Sanity Check)
+print("\n📉 Verificando rangos físicos (Sanity Check)...")
+# Definimos umbrales razonables: Espera < 2 horas (7200s), Viaje < 3 horas (10800s)
+# Ojo: Valores negativos son error crítico. Valores muy altos son sospechosos.
+
+errores_criticos = 0
+sospechosos = 0
+
+for i in range(6):
+    te_col = f"te{i}_calculado"
+    tv_col = f"tv{i+1}_calculado"
+    
+    if te_col in df_val.columns:
+        neg_te = df_val.filter(pl.col(te_col) < 0).height
+        high_te = df_val.filter(pl.col(te_col) > 7200).height
+        if neg_te > 0: print(f"  ❌ {te_col}: {neg_te} valores negativos!")
+        if high_te > 0: print(f"  ⚠️ {te_col}: {high_te} valores > 2 horas.")
+        errores_criticos += neg_te
+        sospechosos += high_te
+
+    if tv_col in df_val.columns:
+        neg_tv = df_val.filter(pl.col(tv_col) < 0).height
+        zero_tv = df_val.filter(pl.col(tv_col) == 0).height # Viaje instantáneo?
+        high_tv = df_val.filter(pl.col(tv_col) > 10800).height
+        if neg_tv > 0: print(f"  ❌ {tv_col}: {neg_tv} valores negativos!")
+        if zero_tv > 0: print(f"  ⚠️ {tv_col}: {zero_tv} valores cero (teletransportación?).")
+        if high_tv > 0: print(f"  ⚠️ {tv_col}: {high_tv} valores > 3 horas.")
+        errores_criticos += neg_tv
+        sospechosos += high_tv + zero_tv
+
+if errores_criticos == 0:
+    print("✅ No hay errores críticos (valores negativos).")
+else:
+    print(f"❌ Se encontraron {errores_criticos} errores críticos.")
+
+print("\n--- ✅ VALIDACIÓN FINALIZADA ---")
+```
+
+```{python}
+#| label: comparison-orig-vs-calc
+import polars as pl
+
+print("--- ⚖️ COMPARACIÓN: ORIGINAL VS CALCULADO ---")
+
+# Cargar datos (si no están en memoria)
+if 'df_val' not in locals():
+    out_path = PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{PARTITION_LABEL}.parquet"
+    df_val = pl.read_parquet(out_path)
+
+total_rows = df_val.height
+
+# 1. Comparación de Etapas (n_etapas vs n_etapas_recon)
+print("\n1. Distribución de Etapas (Original vs Reconstruido):")
+dist_orig = df_val["n_etapas"].value_counts().sort("n_etapas")
+dist_recon = df_val["n_etapas_recon"].value_counts().sort("n_etapas_recon")
+
+# Unir para comparar lado a lado
+comp_etapas = (
+    dist_orig.rename({"count": "count_orig"})
+    .join(dist_recon.rename({"n_etapas_recon": "n_etapas", "count": "count_recon"}), on="n_etapas", how="outer")
+    .with_columns([
+        (pl.col("count_orig") / total_rows * 100).alias("pct_orig"),
+        (pl.col("count_recon") / total_rows * 100).alias("pct_recon"),
+        (pl.col("count_recon").fill_null(0) - pl.col("count_orig").fill_null(0)).alias("delta")
+    ])
+    .sort("n_etapas")
+)
+
+with pl.Config(tbl_cols=-1, tbl_width_chars=100):
+    print(comp_etapas)
+
+# 2. Comparación de Cobertura (No-Nulos) en Tiempos
+print("\n2. Cobertura de Tiempos (Porcentaje de datos NO nulos):")
+print(f"{'Variable':<15} | {'Original (%)':<12} | {'Calculado (%)':<12} | {'Delta':<10}")
+print("-" * 55)
+
+metrics = []
+for i in range(6): # Etapas 0 a 5 (te) / 1 a 6 (tv)
+    # --- Tiempos de Espera (te) ---
+    # Nota: te original suele llamarse 'te0', 'te1'... coincidiendo con nuestro índice
+    col_orig_te = f"te{i}"
+    col_calc_te = f"te{i}_calculado"
+    
+    pct_orig_te = 0.0
+    if col_orig_te in df_val.columns:
+        pct_orig_te = (df_val[col_orig_te].null_count() / total_rows * 100)
+        pct_orig_te = 100 - pct_orig_te # Convertir a % de NO nulos
+    
+    pct_calc_te = 0.0
+    if col_calc_te in df_val.columns:
+        pct_calc_te = (df_val[col_calc_te].null_count() / total_rows * 100)
+        pct_calc_te = 100 - pct_calc_te
+
+    print(f"{f'te{i}':<15} | {pct_orig_te:10.1f}% | {pct_calc_te:10.1f}% | {pct_calc_te - pct_orig_te:+8.1f}")
+
+    # --- Tiempos de Viaje (tv) ---
+    # Nota: tv original suele ser tv1, tv2...
+    col_orig_tv = f"tv{i+1}"
+    col_calc_tv = f"tv{i+1}_calculado"
+    
+    pct_orig_tv = 0.0
+    if col_orig_tv in df_val.columns:
+        pct_orig_tv = (df_val[col_orig_tv].null_count() / total_rows * 100)
+        pct_orig_tv = 100 - pct_orig_tv
+    
+    pct_calc_tv = 0.0
+    if col_calc_tv in df_val.columns:
+        pct_calc_tv = (df_val[col_calc_tv].null_count() / total_rows * 100)
+        pct_calc_tv = 100 - pct_calc_tv
+
+    print(f"{f'tv{i+1}':<15} | {pct_orig_tv:10.1f}% | {pct_calc_tv:10.1f}% | {pct_calc_tv - pct_orig_tv:+8.1f}")
+    print("-" * 55)
+
+print("\nInterpretación:")
+print("- Si Delta > 0: Hemos recuperado datos que antes eran nulos.")
+print("- Si Delta < 0: Tenemos menos datos que el original (¿por qué?).")
+print("- Si Original es 0%: Esa columna no existía o estaba vacía en el dataset de entrada.")
+```
+
+```{python}
+#| label: comparison-stats
+import polars as pl
+import numpy as np
+
+print("--- 📊 ANÁLISIS ESTADÍSTICO: ORIGINAL VS CALCULADO ---")
+
+if 'df_val' not in locals():
+    out_path = PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{PARTITION_LABEL}.parquet"
+    df_val = pl.read_parquet(out_path)
+
+# Función auxiliar para calcular estadísticas
+def get_stats(df, col_name):
+    if col_name not in df.columns:
+        return None
+    
+    # Filtrar nulos
+    series = df[col_name].drop_nulls()
+    if series.len() == 0:
+        return None
+        
+    return {
+        "mean": series.mean(),
+        "median": series.median(),
+        "std": series.std(),
+        "min": series.min(),
+        "max": series.max(),
+        "count": series.len()
+    }
+
+print(f"{'Variable':<15} | {'Tipo':<10} | {'Mean':<10} | {'Median':<10} | {'Std':<10} | {'Count':<10}")
+print("-" * 80)
+
+for i in range(6):
+    # --- Tiempos de Espera (te) ---
+    col_orig = f"te{i}"
+    col_calc = f"te{i}_calculado"
+    
+    stats_orig = get_stats(df_val, col_orig)
+    stats_calc = get_stats(df_val, col_calc)
+    
+    if stats_orig:
+        print(f"{col_orig:<15} | {'Orig':<10} | {stats_orig['mean']:<10.2f} | {stats_orig['median']:<10.2f} | {stats_orig['std']:<10.2f} | {stats_orig['count']:<10,}")
+    else:
+        print(f"{col_orig:<15} | {'Orig':<10} | {'-':<10} | {'-':<10} | {'-':<10} | {'0':<10}")
+        
+    if stats_calc:
+        print(f"{col_calc:<15} | {'Calc':<10} | {stats_calc['mean']:<10.2f} | {stats_calc['median']:<10.2f} | {stats_calc['std']:<10.2f} | {stats_calc['count']:<10,}")
+    else:
+        print(f"{col_calc:<15} | {'Calc':<10} | {'-':<10} | {'-':<10} | {'-':<10} | {'0':<10}")
+    
+    # Comparación directa (Delta)
+    if col_orig in df_val.columns and col_calc in df_val.columns:
+        # Filtrar donde ambos existen
+        both = df_val.select([col_orig, col_calc]).drop_nulls()
+
+    
+    print("-" * 80)
+
+    # --- Tiempos de Viaje (tv) ---
+    col_orig = f"tv{i+1}"
+    col_calc = f"tv{i+1}_calculado"
+    
+    stats_orig = get_stats(df_val, col_orig)
+    stats_calc = get_stats(df_val, col_calc)
+    
+    if stats_orig:
+        print(f"{col_orig:<15} | {'Orig':<10} | {stats_orig['mean']:<10.2f} | {stats_orig['median']:<10.2f} | {stats_orig['std']:<10.2f} | {stats_orig['count']:<10,}")
+    else:
+        print(f"{col_orig:<15} | {'Orig':<10} | {'-':<10} | {'-':<10} | {'-':<10} | {'0':<10}")
+
+    if stats_calc:
+        print(f"{col_calc:<15} | {'Calc':<10} | {stats_calc['mean']:<10.2f} | {stats_calc['median']:<10.2f} | {stats_calc['std']:<10.2f} | {stats_calc['count']:<10,}")
+    else:
+        print(f"{col_calc:<15} | {'Calc':<10} | {'-':<10} | {'-':<10} | {'-':<10} | {'0':<10}")
+
+    # Comparación directa (Delta)
+    if col_orig in df_val.columns and col_calc in df_val.columns:
+        # Filtrar donde ambos existen
+        both = df_val.select([col_orig, col_calc]).drop_nulls()
+      
+    print("-" * 80)
+```
+
+```{python}
+#| label: comparison-stats-mode
+import polars as pl
+import numpy as np
+
+print("--- 📊 ANÁLISIS ESTADÍSTICO: ORIGINAL VS CALCULADO (POR MODO) ---")
+
+if 'df_val' not in locals():
+    out_path = PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{PARTITION_LABEL}.parquet"
+    df_val = pl.read_parquet(out_path)
+
+# Función auxiliar para calcular estadísticas
+def get_stats(df, col_name):
+    if col_name not in df.columns:
+        return None
+    
+    # Filtrar nulos
+    series = df[col_name].drop_nulls()
+    if series.len() == 0:
+        return None
+        
+    return {
+        "mean": series.mean(),
+        "median": series.median(),
+        "std": series.std(),
+        "min": series.min(),
+        "max": series.max(),
+        "count": series.len()
+    }
+
+# Función para clasificar modo
+def add_mode_col(df, srv_col):
+    # Asumimos que si empieza con 'L' seguido de un número es Metro, sino Bus
+    return df.with_columns(
+        pl.when(pl.col(srv_col).str.strip_chars().str.contains(r"^L\d+"))
+          .then(pl.lit("Metro"))
+          .otherwise(pl.lit("Bus"))
+          .alias("mode_temp")
+    )
+
+print(f"{'Etapa/Modo':<20} | {'Variable':<15} | {'Tipo':<6} | {'Mean':<10} | {'Median':<10} | {'Std':<10} | {'Count':<10}")
+print("-" * 100)
+
+for i in range(6):
+    srv_col = f"srv_{i+1}"
+    if srv_col not in df_val.columns:
+        continue
+
+    # Crear columna temporal de modo para esta etapa
+    # Filtramos filas donde existe el servicio para esta etapa
+    df_stage = df_val.filter(pl.col(srv_col).is_not_null() & (pl.col(srv_col) != ""))
+    
+    if df_stage.height == 0:
+        continue
+        
+    df_stage = add_mode_col(df_stage, srv_col)
+    
+    modes = df_stage["mode_temp"].unique().to_list()
+    modes.sort(reverse=True) # Metro primero usualmente si está presente
+
+    for mode in modes:
+        df_mode = df_stage.filter(pl.col("mode_temp") == mode)
+        prefix = f"E{i+1} ({mode})"
+
+        # --- Tiempos de Espera (te) ---
+        col_orig = f"te{i}"
+        col_calc = f"te{i}_calculado"
+        
+        stats_orig = get_stats(df_mode, col_orig)
+        stats_calc = get_stats(df_mode, col_calc)
+        
+        if stats_orig:
+            # Manejo seguro de None para formateo
+            mean_val = stats_orig['mean'] if stats_orig['mean'] is not None else 0.0
+            median_val = stats_orig['median'] if stats_orig['median'] is not None else 0.0
+            std_val = stats_orig['std'] if stats_orig['std'] is not None else 0.0
+            print(f"{prefix:<20} | {col_orig:<15} | {'Orig':<6} | {mean_val:<10.2f} | {median_val:<10.2f} | {std_val:<10.2f} | {stats_orig['count']:<10,}")
+        
+        if stats_calc:
+            # Manejo seguro de None para formateo
+            mean_val = stats_calc['mean'] if stats_calc['mean'] is not None else 0.0
+            median_val = stats_calc['median'] if stats_calc['median'] is not None else 0.0
+            std_val = stats_calc['std'] if stats_calc['std'] is not None else 0.0
+            print(f"{prefix:<20} | {col_calc:<15} | {'Calc':<6} | {mean_val:<10.2f} | {median_val:<10.2f} | {std_val:<10.2f} | {stats_calc['count']:<10,}")
+        
+        # Delta
+        if col_orig in df_mode.columns and col_calc in df_mode.columns:
+            both = df_mode.select([col_orig, col_calc]).drop_nulls()
+
+
+        # --- Tiempos de Viaje (tv) ---
+        col_orig_tv = f"tv{i+1}"
+        col_calc_tv = f"tv{i+1}_calculado"
+        
+        stats_orig_tv = get_stats(df_mode, col_orig_tv)
+        stats_calc_tv = get_stats(df_mode, col_calc_tv)
+        
+        if stats_orig_tv:
+            print(f"{prefix:<20} | {col_orig_tv:<15} | {'Orig':<6} | {stats_orig_tv['mean']:<10.2f} | {stats_orig_tv['median']:<10.2f} | {stats_orig_tv['std']:<10.2f} | {stats_orig_tv['count']:<10,}")
+        
+        if stats_calc_tv:
+            print(f"{prefix:<20} | {col_calc_tv:<15} | {'Calc':<6} | {stats_calc_tv['mean']:<10.2f} | {stats_calc_tv['median']:<10.2f} | {stats_calc_tv['std']:<10.2f} | {stats_calc_tv['count']:<10,}")
+
+        # Delta TV
+        if col_orig_tv in df_mode.columns and col_calc_tv in df_mode.columns:
+            both_tv = df_mode.select([col_orig_tv, col_calc_tv]).drop_nulls()
+
+        
+        print("-" * 100)
+```
+
+```{python}
+#| label: comparison-stats-metro-lines
+import polars as pl
+import numpy as np
+
+print("--- 📊 ANÁLISIS ESTADÍSTICO: METRO POR LÍNEA ---")
+
+if 'df_val' not in locals():
+    out_path = PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{PARTITION_LABEL}.parquet"
+    df_val = pl.read_parquet(out_path)
+
+# Función auxiliar para calcular estadísticas
+def get_stats(df, col_name):
+    if col_name not in df.columns:
+        return None
+    
+    # Filtrar nulos
+    series = df[col_name].drop_nulls()
+    if series.len() == 0:
+        return None
+        
+    return {
+        "mean": series.mean(),
+        "median": series.median(),
+        "std": series.std(),
+        "min": series.min(),
+        "max": series.max(),
+        "count": series.len()
+    }
+
+# Función para extraer la línea base (L1, L2, etc.)
+def add_line_base(df, srv_col):
+    return df.with_columns(
+        pl.col(srv_col).str.strip_chars().str.extract(r"^(L\d+[A-Z]?)").alias("line_base")
+    )
+
+print(f"{'Etapa/Línea':<20} | {'Variable':<15} | {'Tipo':<6} | {'Mean':<10} | {'Median':<10} | {'Std':<10} | {'Count':<10}")
+print("-" * 100)
+
+# Solo analizamos etapas de Metro
+for i in range(6):
+    srv_col = f"srv_{i+1}"
+    if srv_col not in df_val.columns:
+        continue
+
+    # Filtrar solo Metro (L...)
+    df_stage = df_val.filter(
+        pl.col(srv_col).is_not_null() & 
+        (pl.col(srv_col) != "") &
+        pl.col(srv_col).str.strip_chars().str.contains(r"^L\d+")
+    )
+    
+    if df_stage.height == 0:
+        continue
+        
+    df_stage = add_line_base(df_stage, srv_col)
+    
+    lines = df_stage["line_base"].unique().to_list()
+    lines.sort()
+
+    for line in lines:
+        if not line: continue
+        
+        df_line = df_stage.filter(pl.col("line_base") == line)
+        prefix = f"E{i+1} ({line})"
+
+        # --- Tiempos de Espera (te) ---
+        col_orig = f"te{i}"
+        col_calc = f"te{i}_calculado"
+        
+        stats_orig = get_stats(df_line, col_orig)
+        stats_calc = get_stats(df_line, col_calc)
+        
+        if stats_orig:
+            # Manejo seguro de None para formateo
+            mean_val = stats_orig['mean'] if stats_orig['mean'] is not None else 0.0
+            median_val = stats_orig['median'] if stats_orig['median'] is not None else 0.0
+            std_val = stats_orig['std'] if stats_orig['std'] is not None else 0.0
+            print(f"{prefix:<20} | {col_orig:<15} | {'Orig':<6} | {mean_val:<10.2f} | {median_val:<10.2f} | {std_val:<10.2f} | {stats_orig['count']:<10,}")
+        
+        if stats_calc:
+            # Manejo seguro de None para formateo
+            mean_val = stats_calc['mean'] if stats_calc['mean'] is not None else 0.0
+            median_val = stats_calc['median'] if stats_calc['median'] is not None else 0.0
+            std_val = stats_calc['std'] if stats_calc['std'] is not None else 0.0
+            print(f"{prefix:<20} | {col_calc:<15} | {'Calc':<6} | {mean_val:<10.2f} | {median_val:<10.2f} | {std_val:<10.2f} | {stats_calc['count']:<10,}")
+        
+        
+        
+        print("-" * 100)
+```
+
+```{python}
+#| label: estimate-internal-transfers
+import polars as pl
+import re
+
+print("--- 🚶 ESTIMACIÓN DE TIEMPOS DE CAMINATA EN TRANSBORDOS INTERNOS ---")
+
+if 'df_val' not in locals():
+    out_path = PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{PARTITION_LABEL}.parquet"
+    df_val = pl.read_parquet(out_path)
+
+# 1. Datos Oficiales (Prioridad 1)
+TIEMPOS_OFICIALES_DICT = {
+    ("BAQUEDANO", "L1", "L5"): 133, ("BAQUEDANO", "L5", "L1"): 142,
+    ("LA CISTERNA", "L2", "L4A"): 220, ("LA CISTERNA", "L4A", "L2"): 212,
+    ("LOS HEROES", "L1", "L2"): 84, ("LOS HEROES", "L2", "L1"): 97,
+    ("SAN PABLO", "L1", "L5"): 138, ("SAN PABLO", "L5", "L1"): 146,
+    ("SANTA ANA", "L2", "L5"): 92, ("SANTA ANA", "L5", "L2"): 115,
+    ("TOBALABA", "L1", "L4"): 124, ("TOBALABA", "L4", "L1"): 156,
+    ("VICENTE VALDES", "L4", "L5"): 90, ("VICENTE VALDES", "L5", "L4"): 122,
+    ("VICUNA MACKENNA", "L4", "L4A"): 73, ("VICUNA MACKENNA", "L4A", "L4"): 78,
+}
+
+# Convertir a DataFrame para Join
+official_rows = [{"station": k[0], "l_orig": k[1], "l_dest": k[2], "t_official": v} for k, v in TIEMPOS_OFICIALES_DICT.items()]
+df_official = pl.DataFrame(official_rows)
+
+# 2. Datos de Acceso/Egreso (Diccionario Oficial)
+TIEMPOS_ACCESO_EGRESO = {
+    # L1
+    "SAN PABLO": (38, 38), "NEPTUNO": (38, 38), "PAJARITOS": (38, 38), "LAS REJAS": (38, 77),
+    "ECUADOR": (38, 77), "SAN ALBERTO HURTADO": (38, 77), "UNIVERSIDAD DE SANTIAGO": (38, 77),
+    "ESTACION CENTRAL": (38, 77), "U L A": (38, 77), "UNION LATINO AMERICANA": (38, 77), "REPUBLICA": (38, 77),
+    "LOS HEROES": (38, 77), "LA MONEDA": (38, 77), "UNIVERSIDAD DE CHILE": (38, 101),
+    "SANTA LUCIA": (38, 77), "UNIVERSIDAD CATOLICA": (38, 77), "BAQUEDANO": (38, 77),
+    "SALVADOR": (38, 38), "MANUEL MONTT": (38, 77), "PEDRO DE VALDIVIA": (38, 77),
+    "LOS LEONES": (38, 77), "TOBALABA": (38, 101), "EL GOLF": (38, 77), "ALCANTARA": (38, 77),
+    "ESCUELA MILITAR": (38, 77), "MANQUEHUE": (37, 101), "HERNANDO DE MAGALLANES": (37, 101),
+    "LOS DOMINICOS": (37, 101),
+    # L2
+    "VESPUCIO NORTE": (42, 122), "ZAPADORES": (42, 122), "DORSAL": (42, 122), "EINSTEIN": (42, 122),
+    "CEMENTERIOS": (42, 122), "CERRO BLANCO": (42, 122), "PATRONATO": (42, 122),
+    "PUENTE CAL Y CANTO": (50, 122), "CAL Y CANTO": (50, 122), "SANTA ANA": (42, 79), "TOESCA": (50, 79),
+    "PARQUE OHIGGINS": (74, 43), "RONDIZZONI": (50, 79), "RONDIZONNI": (50, 79), "FRANKLIN": (42, 110),
+    "EL LLANO": (42, 66), "SAN MIGUEL": (42, 66), "LO VIAL": (42, 66), "DEPARTAMENTAL": (42, 66),
+    "CIUDAD DEL NINO": (42, 66), "LO OVALLE": (42, 66), "EL PARRON": (42, 122), "LA CISTERNA": (42, 110),
+    # L4
+    "PLAZA DE PUENTE ALTO": (55, 123), "LAS MERCEDES": (55, 123), "PROTECTORA DE LA INFANCIA": (43, 71),
+    "HOSPITAL SOTERO DEL RIO": (68, 123), "ELISA CORREA": (43, 71), "LOS QUILLAYES": (43, 71),
+    "SAN JOSE DE LA ESTRELLA": (43, 71), "TRINIDAD": (43, 71), "ROJAS MAGALLANES": (43, 71),
+    "VICENTE VALDES": (55, 123), "VICUNA MACKENNA": (75, 123), "MACUL": (43, 71), "LAS TORRES": (33, 155),
+    "QUILIN": (43, 71), "LOS PRESIDENTES": (33, 155), "GRECIA": (33, 74), "LOS ORIENTALES": (33, 128),
+    "PLAZA EGANA": (33, 74), "SIMON BOLIVAR": (33, 128), "PRINCIPE DE GALES": (33, 128),
+    "FRANCISCO BILBAO": (33, 128), "CRISTOBAL COLON": (33, 128),
+    # L4A (segun tabla L4)
+    "LA CISTERNA": (118, 172), "SAN RAMON": (96, 104), "SANTA ROSA": (37, 81),
+    "LA GRANJA": (96, 104), "SANTA JULIA": (96, 104),
+    # L5
+    "PLAZA DE MAIPU": (51, 166), "PLAZA MAIPU": (51, 166), "SANTIAGO BUERAS": (95, 126), "DEL SOL": (51, 85),
+    "MONTE TABOR": (102, 106), "LAS PARCELAS": (102, 106), "LAGUNA SUR": (102, 106),
+    "BARRANCAS": (95, 126), "PUDAHUEL": (95, 126), "LO PRADO": (95, 126),
+    "BLANQUEADO": (95, 126), "GRUTA DE LOURDES": (95, 126), "QUINTA NORMAL": (51, 126),
+    "CUMMING": (51, 85), "PLAZA DE ARMAS": (51, 126), "BELLAS ARTES": (51, 85),
+    "PARQUE BUSTAMANTE": (51, 85), "SANTA ISABEL": (51, 85), "IRARRAZAVAL": (37, 50),
+    "NUBLE": (37, 50), "RODRIGO DE ARAYA": (37, 50), "CARLOS VALDOVINOS": (37, 50),
+    "CAMINO AGRICOLA": (37, 50), "SAN JOAQUIN": (37, 50), "PEDRERO": (37, 50),
+    "MIRADOR": (51, 85), "BELLAVISTA DE LA FLORIDA": (51, 126)
+}
+
+# Convertir a DataFrame
+access_egress_rows = [{"station": k, "avg_access": v[0], "avg_egress": v[1]} for k, v in TIEMPOS_ACCESO_EGRESO.items()]
+df_stats = pl.DataFrame(access_egress_rows)
+
+# 3. Identificar y Calcular Transbordos Internos
+# Iteramos sobre pares de etapas (1-2, 2-3, etc.)
+
+transfers_list = []
+
+for i in range(1, 6):
+    col_srv_curr = f"srv_{i}"
+    col_srv_next = f"srv_{i+1}"
+    col_type_curr = f"tipo_transporte_{i}"
+    col_type_next = f"tipo_transporte_{i+1}"
+    col_station = f"paradero_bajada_{i}" # Estación de transbordo
+    
+    if col_srv_next not in df_val.columns: continue
+
+    # Filtrar transbordos Metro-Metro
+    df_trans = df_val.filter(
+        (pl.col(col_type_curr) == "2") & 
+        (pl.col(col_type_next) == "2") &
+        pl.col(col_srv_curr).is_not_null() &
+        pl.col(col_srv_next).is_not_null()
+    ).select([
+        pl.col("pk_viaje"),
+        pl.col(col_station).str.replace(r" \(L\d+[A-Z]?\)$", "").str.strip_chars().str.to_uppercase().alias("station"),
+        pl.col(col_srv_curr).alias("l_orig"),
+        pl.col(col_srv_next).alias("l_dest"),
+        pl.lit(i).alias("etapa_origen")
+    ])
+    
+    if df_trans.height > 0:
+        transfers_list.append(df_trans)
+
+if not transfers_list:
+    print("No se encontraron transbordos Metro-Metro en la muestra.")
+else:
+    df_all_transfers = pl.concat(transfers_list)
+    
+    # Join con Oficial
+    df_calc = df_all_transfers.join(
+        df_official, on=["station", "l_orig", "l_dest"], how="left"
+    )
+    
+    # Join con Stats (Origen -> Egreso)
+    df_calc = df_calc.join(
+        df_stats.select(["station", "avg_egress"]), 
+        on="station", how="left"
+    )
+    
+    # Join con Stats (Destino -> Acceso)
+    df_calc = df_calc.join(
+        df_stats.select(["station", "avg_access"]), 
+        on="station", how="left"
+    )
+    
+    # Calcular Estimación
+    # Lógica: Si hay oficial, usar oficial. Si no, 0.75 * (egreso + acceso).
+    df_calc = df_calc.with_columns([
+        (pl.col("avg_egress") + pl.col("avg_access")).alias("sum_access_egress"),
+        (0.75 * (pl.col("avg_egress") + pl.col("avg_access"))).alias("proxy_val")
+    ]).with_columns(
+        pl.coalesce([pl.col("t_official"), pl.col("proxy_val")]).alias("tc_estimado")
+    )
+    
+    print(f"Total Transbordos Analizados: {df_calc.height:,}")
+    print(f"Cobertura Dato Oficial: {df_calc.filter(pl.col('t_official').is_not_null()).height:,} ({df_calc.filter(pl.col('t_official').is_not_null()).height/df_calc.height:.1%})")
+    print(f"Cobertura Proxy: {df_calc.filter(pl.col('t_official').is_null() & pl.col('proxy_val').is_not_null()).height:,}")
+    
+    print("\nEjemplos de Estimación:")
+    with pl.Config(tbl_cols=-1, tbl_rows=10):
+        print(df_calc.filter(pl.col("tc_estimado").is_not_null()).sample(min(10, df_calc.height)).select([
+            "station", "l_orig", "l_dest", "t_official", "sum_access_egress", "tc_estimado"
+        ]))
+    
+    # Stats finales
+    print("\nEstadísticas de tc_estimado:")
+    print(df_calc["tc_estimado"].describe())
+
+    # 4. Aplicar Cambios al DataFrame Principal (df_val)
+    print("\n--- Aplicando correcciones a df_val ---")
+    
+    # NO Imputar nulos (se dejan como null si no hay info)
+    print(f"Se mantienen {df_calc['tc_estimado'].null_count():,} valores nulos en la estimación.")
+    
+    df_calc_clean = df_calc.select(["pk_viaje", "etapa_origen", "tc_estimado"])
+
+    # Actualizar columnas tc2, tc3, etc.
+    # tc_{i+1} corresponde al transbordo después de la etapa i
+    
+    for i in range(1, 6):
+        source_col = f"tc{i+1}"
+        target_col = f"tc{i+1}_calculado"
+        
+        if source_col not in df_val.columns: continue
+        
+        # Inicializar columna calculada con la original si no existe
+        if target_col not in df_val.columns:
+            print(f"Creando columna {target_col} a partir de {source_col}...")
+            df_val = df_val.with_columns(pl.col(source_col).alias(target_col))
+        
+        # Filtrar actualizaciones para esta etapa
+        df_update = df_calc_clean.filter(pl.col("etapa_origen") == i).select(["pk_viaje", "tc_estimado"])
+        
+        if df_update.height == 0: continue
+        
+        print(f"Actualizando {target_col} para {df_update.height:,} viajes (Metro-Metro)...")
+        
+        # Join y Coalesce
+        # Renombramos tc_estimado para evitar colisiones en iteraciones futuras si no se dropea bien
+        df_val = df_val.join(df_update, on="pk_viaje", how="left", suffix="_update")
+        
+        df_val = df_val.with_columns(
+            pl.coalesce([pl.col("tc_estimado"), pl.col(target_col)]).alias(target_col)
+        ).drop("tc_estimado")
+
+    # Guardar resultado final (Sobrescribiendo el archivo original)
+    out_path = PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{PARTITION_LABEL}.parquet"
+    print(f"\nGuardando resultado final (actualizando) en: {out_path}")
+    df_val.write_parquet(out_path)
+    print("✅ Proceso completado.")
+
+```
+
+# 7. Conclusiones y Reporte de Resultados
+
+En este notebook se abordó el recálculo de los tiempos de espera y viaje para las etapas de Metro, utilizando la programación GTFS oficial (versión 2025-04-12). Esto complementa el trabajo previo de identificación de transbordos realizado en los notebooks `04_transbordos_metro` y `05_transbordos_bus`.
+
+## Metodología de Tiempos de Caminata
+
+Adicionalmente, se implementó una lógica para estimar los **tiempos de caminata** en transbordos internos (Metro-Metro), los cuales no estaban explícitos en los datos originales. La metodología aplicada fue:
+
+1.  **Fuente Oficial:** Se priorizó el uso de una tabla de tiempos de transbordo oficiales de Metro.
+2.  **Estimación Proxy:** Para combinaciones sin dato oficial, se utilizó la fórmula: $$ 0.75 \times (\text{Tiempo Egreso Origen} + \text{Tiempo Acceso Destino}) $$
+
+**Nota Importante:** Esta corrección de tiempos de caminata se aplicó exclusivamente a transbordos **Metro-Metro**. La imputación para transbordos que involucran buses (Bus-Bus, Bus-Metro, Metro-Bus) se ha dejado **pausada** debido a la alta prevalencia de valores nulos en los datos observados para estos modos, lo que impedía una estimación confiable en esta etapa.
+
+**Estructura de las columnas `tc*_calculado`:**
+
+Las columnas de tiempo de caminata (`tc2_calculado`, `tc3_calculado`, etc.) se generaron para **todos los viajes** en el dataset. La lógica de construcción fue:
+
+1.  **Inicialización:** Se copiaron los valores originales de `tc` (si existían).
+2.  **Actualización Metro-Metro:** Se sobrescribieron únicamente los valores correspondientes a transbordos entre líneas de Metro con la estimación descrita arriba.
+3.  **Buses y otros:** Para transbordos que involucran buses, el valor en `tc*_calculado` es idéntico al original (manteniendo `null` si el dato original no existía).
+
+## Detalles del Archivo Generado
+
+*   **Nombre del archivo:** `viajes_con_te_calculado_2025-W17.parquet`
+*   **Ubicación:** Se guarda en la carpeta `tmp` dentro de la raíz del proyecto.
+*   **Ruta completa:** `tmp/viajes_con_te_calculado_2025-W17.parquet`
+*   **Columnas agregadas:**
+    *   **Tiempos de Espera (te):** `te0_calculado`, `te1_calculado`, `te2_calculado`, `te3_calculado`, `te4_calculado`, `te5_calculado`.
+    *   **Tiempos de Viaje en Vehículo (tv):** `tv1_calculado`, `tv2_calculado`, `tv3_calculado`, `tv4_calculado`, `tv5_calculado`, `tv6_calculado`.
+    *   **Tiempos de Caminata en Transbordo (tc):** `tc2_calculado`, `tc3_calculado`, `tc4_calculado`, `tc5_calculado`, `tc6_calculado`.
+    *   *(Nota: `te0` es la espera inicial antes de la etapa 1. `tc` comienza desde la etapa 2 porque corresponde al transbordo entre etapas).*
+
+## Resultados Estadísticos
+
+A continuación se presentan las estadísticas comparativas entre los valores originales (`Orig`) y los calculados (`Calc`) para tiempos de espera (`te`) y tiempos de viaje (`tv`).
+
+### Análisis General por Modo
+
+| Etapa/Modo | Variable | Tipo | Mean | Median | Std | Count |
+|---|---|---|---|---|---|---|
+| E1 (Metro) | te0 | Orig | 90.09 | 78.00 | 35.57 | 5,996,522 |
+| E1 (Metro) | te0_calculado | Calc | 22.95 | 20.32 | 16.93 | 6,000,564 |
+| E1 (Metro) | tv1 | Orig | 1102.59 | 1018.00 | 672.65 | 5,996,522 |
+| E1 (Metro) | tv1_calculado | Calc | 520.93 | 427.00 | 394.92 | 6,000,564 |
+| E1 (Bus) | te0 | Orig | 269.02 | 209.00 | 296.64 | 6,093,197 |
+| E1 (Bus) | te0_calculado | Calc | 1025.90 | 900.00 | 559.18 | 6,012,821 |
+| E1 (Bus) | tv1 | Orig | 1063.00 | 808.00 | 881.25 | 6,155,747 |
+| E1 (Bus) | tv1_calculado | Calc | 1064.97 | 807.00 | 885.00 | 6,093,173 |
+| E2 (Metro) | te1 | Orig | 177.37 | 112.00 | 250.51 | 1,829,743 |
+| E2 (Metro) | te1_calculado | Calc | 23.75 | 21.47 | 18.31 | 4,380,340 |
+| E2 (Metro) | tv2 | Orig | 1207.43 | 1125.00 | 736.38 | 1,831,645 |
+| E2 (Metro) | tv2_calculado | Calc | 581.35 | 512.00 | 412.71 | 4,380,340 |
+| E2 (Bus) | te1 | Orig | 410.25 | 298.00 | 389.22 | 1,221,124 |
+| E2 (Bus) | te1_calculado | Calc | 1039.71 | 900.00 | 569.12 | 1,122,545 |
+| E2 (Bus) | tv2 | Orig | 1071.53 | 822.00 | 906.47 | 1,223,254 |
+| E2 (Bus) | tv2_calculado | Calc | 1083.16 | 806.00 | 933.22 | 1,142,089 |
+| E3 (Metro) | te2 | Orig | 388.30 | 232.00 | 404.99 | 110,165 |
+| E3 (Metro) | te2_calculado | Calc | 23.52 | 21.47 | 15.69 | 1,085,863 |
+| E3 (Metro) | tv3 | Orig | 925.49 | 718.00 | 766.99 | 110,392 |
+| E3 (Metro) | tv3_calculado | Calc | 455.12 | 360.00 | 358.61 | 1,085,863 |
+| E3 (Bus) | te2 | Orig | 461.35 | 355.00 | 407.77 | 199,340 |
+| E3 (Bus) | te2_calculado | Calc | 1065.07 | 900.00 | 593.22 | 475,103 |
+| E3 (Bus) | tv3 | Orig | 904.71 | 688.00 | 781.73 | 199,801 |
+| E3 (Bus) | tv3_calculado | Calc | 894.85 | 664.00 | 790.88 | 201,270 |
+| E4 (Metro) | te3 | Orig | 344.18 | 156.00 | 404.31 | 960 |
+| E4 (Metro) | te3_calculado | Calc | 23.91 | 21.47 | 13.71 | 107,781 |
+| E4 (Metro) | tv4 | Orig | 894.63 | 656.00 | 779.07 | 960 |
+| E4 (Metro) | tv4_calculado | Calc | 310.43 | 245.00 | 238.06 | 107,781 |
+| E4 (Bus) | te3 | Orig | 519.78 | 377.00 | 477.48 | 5,074 |
+| E4 (Bus) | te3_calculado | Calc | 1050.92 | 900.00 | 586.38 | 111,976 |
+| E4 (Bus) | tv4 | Orig | 714.36 | 498.00 | 724.43 | 5,075 |
+| E4 (Bus) | tv4_calculado | Calc | 708.15 | 481.00 | 730.90 | 5,262 |
+| E5 (Metro) | te4_calculado | Calc | 25.79 | 24.68 | 13.96 | 4,624 |
+| E5 (Metro) | tv5_calculado | Calc | 193.40 | 115.00 | 172.10 | 4,624 |
+| E5 (Bus) | te4_calculado | Calc | 1053.53 | 900.00 | 568.95 | 9,142 |
+| E6 (Metro) | te5_calculado | Calc | 26.42 | 24.68 | 3.54 | 24 |
+| E6 (Metro) | tv6_calculado | Calc | 305.76 | 179.50 | 299.94 | 24 |
+| E6 (Bus) | te5_calculado | Calc | 1071.76 | 900.00 | 467.81 | 235 |
+
+### Análisis Detallado Metro por Línea
+
+| Etapa/Línea | Variable | Tipo | Mean | Median | Std | Count |
+|---|---|---|---|---|---|---|
+| E1 (L1) | te0 | Orig | 66.28 | 64.00 | 16.77 | 2,518,655 |
+| E1 (L1) | te0_calculado | Calc | 18.44 | 19.04 | 4.59 | 2,518,938 |
+| E1 (L2) | te0 | Orig | 115.25 | 105.00 | 31.15 | 902,624 |
+| E1 (L2) | te0_calculado | Calc | 24.59 | 24.68 | 9.82 | 903,351 |
+| E1 (L3) | te0 | Orig | 79.09 | 78.00 | 22.32 | 235,256 |
+| E1 (L3) | te0_calculado | Calc | 29.94 | 29.02 | 9.80 | 236,640 |
+| E1 (L4) | te0 | Orig | 114.09 | 112.00 | 33.46 | 858,684 |
+| E1 (L4) | te0_calculado | Calc | 27.02 | 28.24 | 14.82 | 858,722 |
+| E1 (L4A) | te0 | Orig | 147.25 | 163.00 | 22.64 | 141,090 |
+| E1 (L4A) | te0_calculado | Calc | 52.54 | 27.25 | 86.23 | 141,100 |
+| E1 (L5) | te0 | Orig | 98.26 | 78.00 | 36.37 | 1,285,353 |
+| E1 (L5) | te0_calculado | Calc | 22.80 | 24.11 | 8.59 | 1,285,687 |
+| E1 (L6) | te0 | Orig | 102.00 | 105.00 | 37.00 | 54,860 |
+| E1 (L6) | te0_calculado | Calc | 36.36 | 34.62 | 14.56 | 56,126 |
+| E2 (L1) | te1 | Orig | 120.99 | 64.00 | 194.69 | 582,166 |
+| E2 (L1) | te1_calculado | Calc | 18.65 | 19.04 | 5.84 | 1,332,139 |
+| E2 (L2) | te1 | Orig | 229.58 | 105.00 | 303.83 | 229,580 |
+| E2 (L2) | te1_calculado | Calc | 23.65 | 24.68 | 9.91 | 660,440 |
+| E2 (L3) | te1 | Orig | 177.01 | 105.00 | 271.78 | 31,166 |
+| E2 (L3) | te1_calculado | Calc | 31.28 | 29.02 | 12.83 | 199,874 |
+| E2 (L4) | te1 | Orig | 171.98 | 112.00 | 210.84 | 424,108 |
+| E2 (L4) | te1_calculado | Calc | 26.37 | 28.24 | 14.49 | 757,890 |
+| E2 (L4A) | te1 | Orig | 210.74 | 163.00 | 214.39 | 78,537 |
+| E2 (L4A) | te1_calculado | Calc | 48.38 | 27.25 | 76.72 | 149,217 |
+| E2 (L5) | te1 | Orig | 217.92 | 128.00 | 296.95 | 473,617 |
+| E2 (L5) | te1_calculado | Calc | 22.06 | 24.11 | 9.31 | 1,146,085 |
+| E2 (L6) | te1 | Orig | 300.53 | 156.00 | 379.29 | 10,569 |
+| E2 (L6) | te1_calculado | Calc | 35.85 | 34.62 | 13.43 | 134,695 |
+| E3 (L1) | te2 | Orig | 294.26 | 73.00 | 366.66 | 46,894 |
+| E3 (L1) | te2_calculado | Calc | 18.75 | 19.04 | 5.90 | 347,542 |
+| E3 (L2) | te2 | Orig | 480.92 | 355.00 | 435.67 | 13,323 |
+| E3 (L2) | te2_calculado | Calc | 23.24 | 24.68 | 8.76 | 148,217 |
+| E3 (L3) | te2 | Orig | 395.57 | 205.00 | 450.63 | 1,900 |
+| E3 (L3) | te2_calculado | Calc | 31.17 | 29.02 | 12.29 | 64,449 |
+| E3 (L4) | te2 | Orig | 435.20 | 336.00 | 380.69 | 19,161 |
+| E3 (L4) | te2_calculado | Calc | 24.92 | 28.24 | 10.26 | 195,456 |
+| E3 (L4A) | te2 | Orig | 416.51 | 308.50 | 370.36 | 6,924 |
+| E3 (L4A) | te2_calculado | Calc | 37.00 | 27.25 | 49.98 | 65,057 |
+| E3 (L5) | te2 | Orig | 485.55 | 359.00 | 446.30 | 21,167 |
+| E3 (L5) | te2_calculado | Calc | 21.62 | 24.11 | 7.82 | 226,151 |
+| E3 (L6) | te2 | Orig | 400.28 | 276.50 | 405.59 | 796 |
+| E3 (L6) | te2_calculado | Calc | 35.78 | 34.62 | 13.20 | 38,991 |
+| E4 (L1) | te3 | Orig | 283.34 | 64.00 | 373.54 | 317 |
+| E4 (L1) | te3_calculado | Calc | 18.64 | 19.04 | 5.34 | 39,005 |
+| E4 (L2) | te3 | Orig | 452.06 | 235.50 | 469.06 | 144 |
+| E4 (L2) | te3_calculado | Calc | 24.62 | 24.68 | 9.25 | 19,762 |
+| E4 (L3) | te3 | Orig | 301.41 | 110.00 | 324.07 | 17 |
+| E4 (L3) | te3_calculado | Calc | 31.98 | 29.02 | 13.21 | 6,605 |
+| E4 (L4) | te3 | Orig | 347.18 | 150.00 | 393.96 | 200 |
+| E4 (L4) | te3_calculado | Calc | 25.47 | 28.24 | 10.67 | 19,484 |
+| E4 (L4A) | te3 | Orig | 334.53 | 163.00 | 336.77 | 59 |
+| E4 (L4A) | te3_calculado | Calc | 33.52 | 27.25 | 39.15 | 5,875 |
+| E4 (L5) | te3 | Orig | 362.54 | 156.00 | 415.22 | 209 |
+| E4 (L5) | te3_calculado | Calc | 22.12 | 24.11 | 7.54 | 11,715 |
+| E4 (L6) | te3 | Orig | 387.71 | 142.00 | 497.78 | 14 |
+| E4 (L6) | te3_calculado | Calc | 37.56 | 34.62 | 15.42 | 5,335 |

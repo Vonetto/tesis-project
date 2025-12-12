@@ -797,12 +797,12 @@ def reconstruir_viaje(row_dict):
         if str(tipo) == '2':
             _, t, legs = reconstruir_etapas(sub, baj, srv)
             if legs is None:
-                etapas_out.append({'paradero_subida': sub, 'paradero_bajada': baj, 'srv': srv, 'tipo': tipo})
+                etapas_out.append({'paradero_subida': sub,'paradero_bajada': baj,'srv': srv,'tipo': tipo})
             else:
                 tiempo_imputado += t
                 etapas_out.extend(legs)
         else:
-            etapas_out.append({'paradero_subida': sub, 'paradero_bajada': baj, 'srv': srv, 'tipo': tipo})
+            etapas_out.append({'paradero_subida': sub,'paradero_bajada': baj,'srv': srv,'tipo': tipo})
     return tiempo_imputado, etapas_out
 
 recon_rows = []
@@ -903,7 +903,7 @@ import polars as pl
 from lib.transbordos_metro.metro_graph_builder import shortest_path_with_line, normalize_station_name
 
 OUT_PATH = Path("tmp") / f"etapas_reconstruidas_{PARTITION_LABEL}.parquet"
-MAX_ETAPAS = 4  # mantenemos el esquema original (hasta 4 etapas)
+MAX_ETAPAS = 6  # Aumentado de 4 a 6 para evitar truncamiento excesivo
 
 # ------------------------------------------------------------------
 # 1) Combos inválidos únicos (posible_sin_transfer = False)
@@ -1013,6 +1013,20 @@ schema_dict.update({
     "metro_any": pl.Boolean,
 })
 
+# Agregar columnas para etapas 5 y 6 al esquema si no existen
+for i in range(5, MAX_ETAPAS + 1):
+    schema_dict[f"paradero_subida_{i}"] = pl.Utf8
+    schema_dict[f"paradero_bajada_{i}"] = pl.Utf8
+    schema_dict[f"srv_{i}"] = pl.Utf8
+    schema_dict[f"tipo_transporte_{i}"] = pl.Utf8
+    schema_dict[f"tiempo_subida_{i}"] = pl.Utf8
+    schema_dict[f"tiempo_bajada_{i}"] = pl.Utf8
+    schema_dict[f"zona_subida_{i}"] = pl.Utf8
+    schema_dict[f"zona_bajada_{i}"] = pl.Utf8
+    schema_dict[f"op_1era_etapa"] = pl.Utf8 # Solo por si acaso, aunque estas suelen ser fijas
+    # Nota: Agregamos las principales. Si hay más columnas específicas por etapa en tu schema original, 
+    # idealmente deberían agregarse, pero estas son las críticas para la reconstrucción.
+
 def _cast_value(val, dtype):
     if val is None:
         return None
@@ -1074,9 +1088,10 @@ for row in df_bad.iter_rows(named=True):
             torniq_flag = torniq_flag or rec["torniquete_cambio_detectado"]
             legs_out.extend([(s, b, srv_leg, "2") for (s, b, srv_leg, _w) in rec["legs"]])
 
-    legs_out = legs_out[:MAX_ETAPAS]
+    # Calcular n_etapas_recon ANTES de truncar para saber si hubo corte
     n_etapas_recon = len(legs_out)
-
+    legs_out = legs_out[:MAX_ETAPAS]
+    
     # mantener todas las columnas originales con casteo al dtype original
     out = {c: _cast_value(row[c], orig_schema[c]) for c in orig_cols}
     out["tiempo_imputado"] = float(tiempo_total)
@@ -1086,7 +1101,7 @@ for row in df_bad.iter_rows(named=True):
     out["metro_any"] = True
 
     for j in range(1, MAX_ETAPAS + 1):
-        if j <= n_etapas_recon:
+        if j <= len(legs_out):
             s, b, srv, tipo = legs_out[j - 1]
             out[f"paradero_subida_{j}"] = s
             out[f"paradero_bajada_{j}"] = b
@@ -1105,18 +1120,42 @@ df_bad_recon = pl.DataFrame(recon_rows, schema=schema_dict, strict=False, orient
 # ------------------------------------------------------------------
 # 5) Preparar viajes buenos con columnas nuevas por consistencia
 # ------------------------------------------------------------------
+# Asegurar que df_good tenga también las columnas de etapa 5 y 6 (vacías)
+cols_extra_etapas = []
+for i in range(5, MAX_ETAPAS + 1):
+    cols_extra_etapas.extend([
+        pl.lit(None).cast(pl.Utf8).alias(f"paradero_subida_{i}"),
+        pl.lit(None).cast(pl.Utf8).alias(f"paradero_bajada_{i}"),
+        pl.lit(None).cast(pl.Utf8).alias(f"srv_{i}"),
+        pl.lit(None).cast(pl.Utf8).alias(f"tipo_transporte_{i}"),
+        # Agregar otras si es necesario para mantener simetría estricta, 
+        # pero estas son las que validamos.
+    ])
+
 df_good = (
     lf_good
     .with_columns(
         tiempo_imputado=pl.lit(0.0),
         n_etapas_recon=pl.col("n_etapas"),
         torniquete_cambio_detectado=pl.lit(False),
+        transbordo_interno_no_id=pl.lit(False), # Asegurar que este flag exista
+        metro_any=pl.col("tipo_transporte_1") == "2" # Aproximación inicial, se refina luego si se quiere
     )
+    .with_columns(cols_extra_etapas)
     .collect()
 )
 
 # Asegurar mismo orden/columnas en ambos dataframes
-all_cols = list(df_good.columns)
+# Usamos las columnas de df_bad_recon como referencia maestra porque tiene las nuevas etapas
+all_cols = df_bad_recon.columns
+# Rellenar en df_good cualquier columna que falte y esté en df_bad_recon (ej. tiempos de etapa 5/6 si no los pusimos arriba)
+for col in all_cols:
+    if col not in df_good.columns:
+        df_good = df_good.with_columns(pl.lit(None).alias(col))
+
+# Alinear columnas
+df_good = df_good.select(all_cols)
+
 df_bad_recon = df_bad_recon.cast(df_good.schema, strict=False)
 df_bad_recon = df_bad_recon.select(all_cols)
 
@@ -1333,4 +1372,81 @@ if delta_neg.height > 0:
     print(df_orig_neg.select(pl.col("n_etapas").value_counts()).to_pandas())
 else:
     print("No hay casos con delta_etapas<0")
+```
+
+```{python}
+#| label: validation-check
+import polars as pl
+from pathlib import Path
+
+print("--- 🔍 INICIANDO VALIDACIÓN TÉCNICA DEL OUTPUT ---")
+
+# 1. Cargar el archivo generado
+out_path = Path("tmp") / f"etapas_reconstruidas_{PARTITION_LABEL}.parquet"
+if not out_path.exists():
+    raise FileNotFoundError(f"❌ No se encontró el archivo de salida: {out_path}")
+
+df_val = pl.read_parquet(out_path)
+print(f"📂 Archivo cargado: {out_path.name} ({df_val.height:,} filas)")
+
+# 2. Validar Existencia de Columnas Nuevas y Estructura de Etapas
+expected_flags = [
+    "n_etapas_recon", "tiempo_imputado", "torniquete_cambio_detectado",
+    "transbordo_interno_no_id", "metro_any"
+]
+missing_cols = [c for c in expected_flags if c not in df_val.columns]
+
+if missing_cols:
+    print(f"❌ FALTAN COLUMNAS CRÍTICAS: {missing_cols}")
+else:
+    print("✅ Todas las columnas de control (flags) existen.")
+
+# Verificar que existen las columnas para las 6 etapas
+stages_missing = []
+for i in range(1, 7):
+    cols_stage = [f"paradero_subida_{i}", f"paradero_bajada_{i}", f"srv_{i}", f"tipo_transporte_{i}"]
+    if not all(c in df_val.columns for c in cols_stage):
+        stages_missing.append(i)
+
+if stages_missing:
+    print(f"❌ Faltan columnas para las etapas: {stages_missing}")
+else:
+    print("✅ Columnas para etapas 1 a 6 creadas correctamente.")
+
+# 3. Validación de Consistencia: n_etapas_recon vs Columnas Pobladas
+# Contamos cuántas columnas 'srv_i' tienen datos por fila y lo comparamos con n_etapas_recon
+print("\n📊 Verificando consistencia: n_etapas_recon vs columnas llenas...")
+
+# Expresión para contar etapas no nulas (basado en srv_i)
+expr_count_stages = sum([pl.col(f"srv_{i}").is_not_null().cast(pl.UInt8) for i in range(1, 7)])
+
+inconsistencias = df_val.filter(
+    (pl.col("n_etapas_recon") <= 6) &  # Solo validamos consistencia estricta si entra en las 6 columnas
+    (pl.col("n_etapas_recon") != expr_count_stages)
+)
+
+if inconsistencias.height == 0:
+    print("✅ CONSISTENCIA PERFECTA: Para todos los viajes (<= 6 etapas), el número de columnas llenas coincide con 'n_etapas_recon'.")
+else:
+    print(f"⚠️ ALERTA: Hay {inconsistencias.height} filas donde 'n_etapas_recon' no coincide con la cantidad de columnas llenas.")
+    print("Ejemplo de inconsistencia:")
+    print(inconsistencias.select(["pk_viaje", "n_etapas_recon"] + [f"srv_{i}" for i in range(1, 7)]).head())
+
+# 4. Validación de Tipos de Datos
+print("\ntypes check:")
+type_checks = {
+    "tiempo_imputado": [pl.Float64, pl.Float32],
+    "torniquete_cambio_detectado": [pl.Boolean],
+    "transbordo_interno_no_id": [pl.Boolean],
+    "n_etapas_recon": [pl.Int64, pl.Int32, pl.UInt32, pl.Int8]
+}
+
+for col, valid_types in type_checks.items():
+    curr_type = df_val.schema[col]
+    if curr_type in valid_types:
+        print(f"  ✅ {col}: {curr_type} (Correcto)")
+    else:
+        print(f"  ❌ {col}: {curr_type} (Esperado: {valid_types})")
+
+print("\n--- ✅ VALIDACIÓN FINALIZADA ---")
 ```
