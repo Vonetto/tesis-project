@@ -13,37 +13,34 @@ freeze: auto
 
 Este notebook tiene como objetivo:
 
-1. Estimar un modelo Logit Binario extendido usando `biogeme` que incorpore no solo variables temporales (como en el modelo baseline), sino también **atributos del viaje** (tiempo en vehículo, número de trasbordos, tiempo de caminata, esperas, modos de transporte).
+1.  Estimar un modelo Logit Binario extendido usando `biogeme` que incorpore no solo variables temporales (como en el modelo baseline), sino también **atributos del viaje** (tiempo en vehículo, número de trasbordos, tiempo de caminata, esperas, modos de transporte).
 
-2. Analizar e interpretar los resultados del modelo extendido, comparando diferentes configuraciones de muestreo (20% y 50%) para validar la eficiencia del muestreo estratificado.
+2.  Analizar e interpretar los resultados del modelo extendido, comparando diferentes configuraciones de muestreo (20% y 50%) para validar la eficiencia del muestreo estratificado.
 
-3. Extraer conclusiones sobre cómo los atributos del viaje influyen en la elección entre pago con QR y Tarjeta Bip!.
+3.  Extraer conclusiones sobre cómo los atributos del viaje influyen en la elección entre pago con QR y Tarjeta Bip!.
 
----
+------------------------------------------------------------------------
 
-::: {.callout-note}
+::: callout-note
 # Navegación Rápida
 
 En caso de querer leer solo la definición del modelo y los resultados, puede saltar directamente a las secciones de [Definición del Modelo Logit Extendido](#definición-del-modelo-logit-extendido) y [Resultados del Modelo Extendido](#resultados-del-modelo-extendido).
 :::
 
-::: {.callout-warning}
+::: callout-warning
 # ⚠️ Limitación Importante: Transbordos Internos entre Metro
 
-**IMPORTANTE:** Los resultados de este modelo deben interpretarse con precaución debido a la presencia de **transbordos  internos entre metro no mostrados no mostrados** en los datos. Estos transbordos no detectados están sesgando las siguientes variables del modelo:
+**IMPORTANTE:** Los resultados de este modelo deben interpretarse con precaución debido a la presencia de **transbordos internos entre metro no mostrados no mostrados** en los datos. Estos transbordos no detectados están sesgando las siguientes variables del modelo:
 
-- **Número de trasbordos (`VAR_N_TRASBORDOS`)**: Se está sobreestimando el número real de trasbordos cuando en realidad algunos son transbordos internos dentro de la misma red de Metro.
+-   **Número de trasbordos (`VAR_N_TRASBORDOS`)**: Se está sobreestimando el número real de trasbordos cuando en realidad algunos son transbordos internos dentro de la misma red de Metro.
 
-- **Tiempos de espera en trasbordo (`VAR_T_ESPERA_TRASBORDO_MIN`)**: Los tiempos de espera asociados a estos transbordos fantasmas no reflejan esperas reales entre modos distintos.
+-   **Tiempos de espera en trasbordo (`VAR_T_ESPERA_TRASBORDO_MIN`)**: Los tiempos de espera asociados a estos transbordos fantasmas no reflejan esperas reales entre modos distintos.
 
-- **Tiempos de caminata (`VAR_T_CAMINATA_MIN`)**: Los tiempos de caminata entre etapas que en realidad son transbordos internos están siendo contabilizados incorrectamente.
+-   **Tiempos de caminata (`VAR_T_CAMINATA_MIN`)**: Los tiempos de caminata entre etapas que en realidad son transbordos internos están siendo contabilizados incorrectamente.
 
-- **Modos de transporte (`DUMMY_SOLO_METRO`, `DUMMY_METRO_BUS`)**: La clasificación de modos puede estar incorrecta cuando hay transbordos internos no detectados.
+-   **Modos de transporte (`DUMMY_SOLO_METRO`, `DUMMY_METRO_BUS`)**: La clasificación de modos puede estar incorrecta cuando hay transbordos internos no detectados.
 
-Para una interpretación correcta de los resultados, se recomienda:
-1. Revisar los resultados del notebook de corrección de transbordos internos (`04_transbordos_metro.qmd`).
-2. Considerar que los coeficientes de variables relacionadas con trasbordos y tiempos pueden estar subestimados o sobreestimados.
-3. Las variables temporales (horas punta, días laborales) no se ven afectadas por este problema.
+Para una interpretación correcta de los resultados, se recomienda: 1. Revisar los resultados del notebook de corrección de transbordos internos (`04_transbordos_metro.qmd`). 2. Considerar que los coeficientes de variables relacionadas con trasbordos y tiempos pueden estar subestimados o sobreestimados. 3. Las variables temporales (horas punta, días laborales) no se ven afectadas por este problema.
 :::
 
 ### Setup e Importación de Librerías
@@ -107,8 +104,6 @@ PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
 print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
 print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
 ```
-
-
 
 ```{python}
 #|label: helper-functions
@@ -282,8 +277,6 @@ except Exception as e:
     lf_data = None
 ```
 
-
-
 ```{python}
 #| label: define-logit-model
 
@@ -359,22 +352,39 @@ if lf_data is not None:
         print(f"📋 Columnas disponibles en el dataset: {len(available_cols)} columnas")
         print(f"🔍 Verificando columnas necesarias...")
         
-        # Verificar si las columnas necesarias están disponibles
-        cols_necesarias = [
+        # Verificar si las columnas necesarias están disponibles.
+        # Mantener las columnas originales (baseline extendido) y, si existen,
+        # añadir columnas corregidas *_calculado para construir un set alternativo de features.
+        cols_necesarias_base = [
             "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
-            "t_vehiculo_total_seg", "te0", 
-            "tc1", "tc2", "tc3",  # Tiempos de caminata por etapa
-            "te1", "te2", "te3",  # Tiempos de espera por etapa
-            "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
+            "t_vehiculo_total_seg", "te0",
+            "tc1", "tc2", "tc3",  # caminata observada original
+            "te1", "te2", "te3",  # espera observada original
+            "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4",
         ]
-        
-        missing_cols = [col for col in cols_necesarias if col not in available_cols]
-        if missing_cols:
-            print(f"❌ Columnas faltantes: {missing_cols}")
+
+        # Columnas nuevas del recálculo (06_recalculo_tiempos_espera.qmd)
+        cols_calculadas = (
+            ["n_etapas_recon"]
+            + [f"te{i}_calculado" for i in range(6)]         # te0..te5_calculado
+            + [f"tv{i}_calculado" for i in range(1, 7)]      # tv1..tv6_calculado
+            + [f"tc{i}_calculado" for i in range(2, 7)]      # tc2..tc6_calculado
+        )
+
+        missing_base = [col for col in cols_necesarias_base if col not in available_cols]
+        if missing_base:
+            print(f"❌ Columnas base faltantes: {missing_base}")
             print(f"✅ Columnas disponibles: {available_cols}")
-            raise ValueError(f"Columnas faltantes: {missing_cols}")
-        else:
-            print(f"✅ Todas las columnas necesarias están disponibles")
+            raise ValueError(f"Columnas base faltantes: {missing_base}")
+
+        missing_calc = [col for col in cols_calculadas if col not in available_cols]
+        HAS_CALC_FEATURES = len(missing_calc) == 0
+        if not HAS_CALC_FEATURES:
+            print("⚠️ Algunas columnas *_calculado no están disponibles; se omitirá el set alternativo de features corregidas.")
+            print(f"   Faltan: {missing_calc}")
+
+        cols_necesarias = cols_necesarias_base + ([c for c in cols_calculadas if c in available_cols])
+        print(f"✅ Columnas base disponibles. Columnas calculadas presentes: {len(cols_necesarias) - len(cols_necesarias_base)}")
             
     except Exception as e:
         print(f"❌ Error al verificar el esquema: {e}")
@@ -429,6 +439,33 @@ if lf_data is not None:
         (pl.col("te0") / 60).alias("VAR_T_ESPERA_INICIAL_MIN"),
     ])
 
+    # 2b. Set alternativo de variables CORREGIDAS usando columnas *_calculado (si están presentes)
+    if HAS_CALC_FEATURES:
+        cols_te_calc = [f"te{i}_calculado" for i in range(6)]      # te0..te5
+        cols_te_transfer_calc = [f"te{i}_calculado" for i in range(1, 6)]  # te1..te5 (evita doble conteo con te0)
+        cols_tv_calc = [f"tv{i}_calculado" for i in range(1, 7)]   # tv1..tv6
+        cols_tc_calc = [f"tc{i}_calculado" for i in range(2, 7)]   # tc2..tc6
+
+        lf_prep_ext = lf_prep_ext.with_columns([
+            pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_te_transfer_calc]).alias("t_espera_trasbordo_calc_seg"),
+            pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_tv_calc]).alias("t_vehiculo_total_calc_seg"),
+            pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_tc_calc]).alias("t_caminata_total_calc_seg"),
+        ]).with_columns([
+            # Espera inicial corregida (incluye Metro y Bus)
+            (pl.col("te0_calculado") / 60).alias("VAR_T_ESPERA_INICIAL_MIN_CALC"),
+            # Espera en trasbordos corregida (solo te1..te5; te0 va en espera inicial)
+            (pl.col("t_espera_trasbordo_calc_seg") / 60).alias("VAR_T_ESPERA_TRASBORDO_MIN_CALC"),
+            # Tiempo total en vehículo corregido (suma tv*_calculado)
+            (pl.col("t_vehiculo_total_calc_seg") / 60).alias("VAR_T_VEHICULO_MIN_CALC"),
+            # Caminata corregida (solo Metro-Metro cambia; Bus queda nulo -> 0)
+            (pl.col("t_caminata_total_calc_seg") / 60).alias("VAR_T_CAMINATA_MIN_CALC"),
+            # Trasbordos corregidos usando n_etapas_recon
+            (pl.col("n_etapas_recon") - 1).alias("VAR_N_TRASBORDOS_RECON"),
+        ])
+        print("✅ Features corregidas *_CALC agregadas al dataset.")
+    else:
+        print("ℹ️ Set alternativo *_CALC no generado (faltan columnas calculadas).")
+
     # Var 6: Dummies de modo de transporte
     # Reclasificar modos: MetroTren(4)->Metro(2), ZonaPaga(3)->Bus(1)
     cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
@@ -463,6 +500,16 @@ if lf_data is not None:
         "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN",
         "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS"
     ]
+
+    # Si existen columnas calculadas, anexar el set alternativo corregido
+    if HAS_CALC_FEATURES:
+        cols_modelo_ext += [
+            "VAR_T_VEHICULO_MIN_CALC",
+            "VAR_N_TRASBORDOS_RECON",
+            "VAR_T_CAMINATA_MIN_CALC",
+            "VAR_T_ESPERA_TRASBORDO_MIN_CALC",
+            "VAR_T_ESPERA_INICIAL_MIN_CALC",
+        ]
     
     lf_model_ready_ext = lf_prep_ext.select(cols_modelo_ext).fill_null(0) # Rellenar nulos con 0
     
@@ -487,24 +534,195 @@ else:
 
 ```
 
-### Definición del Modelo Logit Extendido
+### Preparación de Datos para Modelo Extendido v2 (sin caminata, con tiempos recalculados)
+
+Esta versión usa las columnas generadas por `01_processing/06_recalculo_tiempos_espera.qmd` y **omite caminata**.
+
+```{python}
+#|label: prepare-extended-model-data-v2
+
+print("🔧 Preparando variables para el MODELO EXTENDIDO v2 (sin caminata)...")
+
+# Por ahora la partición corregida es única y vive en tmp/
+EXTENDED_V2_PARQUET_PATH = PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet"
+PARTITION_LABEL_V2 = "2025-W17"
+
+try:
+    lf_data_v2 = read_parquet_portable(str(EXTENDED_V2_PARQUET_PATH))
+    print(f"📁 Usando parquet corregido v2: {EXTENDED_V2_PARQUET_PATH}")
+except Exception as e:
+    print(f"❌ No se pudo cargar parquet v2: {e}")
+    lf_data_v2 = None
+
+if lf_data_v2 is not None:
+    # Columnas requeridas (corregidas)
+    cols_req_v2 = (
+        ["is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas_recon"]
+        + [f"te{i}_calculado" for i in range(6)]        # te0..te5_calculado
+        + [f"tv{i}_calculado" for i in range(1, 7)]     # tv1..tv6_calculado
+        + [f"tipo_transporte_{i}" for i in range(1, 5)]
+    )
+
+    schema_v2 = lf_data_v2.collect_schema()
+    available_cols_v2 = set(schema_v2.keys())
+    missing_v2 = [c for c in cols_req_v2 if c not in available_cols_v2]
+    if missing_v2:
+        raise ValueError(f"❌ Faltan columnas para v2: {missing_v2}")
+
+    # 1) Base + dummies temporales
+    lf_prep_ext_v2 = lf_data_v2.select(cols_req_v2).with_columns([
+        pl.col("is_qr").cast(pl.Int8).alias("choice"),
+        pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
+    ]).with_columns([
+        pl.col("ts_local").dt.hour().alias("hora"),
+        pl.col("ts_local").dt.weekday().alias("dia_semana"),
+        (pl.col("tipodia").cast(pl.Utf8).cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+    ]).with_columns([
+        pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+        (pl.col("dia_semana") == 5).alias("es_viernes"),
+        pl.col("dia_semana").is_between(1, 4, closed="both").alias("es_lun_jue"),
+    ]).with_columns([
+        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+        (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+        (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+    ])
+
+    # 2) Variables corregidas (sin caminata)
+    cols_te_transfer_calc = [f"te{i}_calculado" for i in range(1, 6)]  # te1..te5 (te0 es espera inicial)
+    cols_tv_calc = [f"tv{i}_calculado" for i in range(1, 7)]
+    lf_prep_ext_v2 = lf_prep_ext_v2.with_columns([
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_te_transfer_calc]).alias("t_espera_trasbordo_calc_seg"),
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_tv_calc]).alias("t_vehiculo_total_calc_seg"),
+    ]).with_columns([
+        (pl.col("t_vehiculo_total_calc_seg") / 60).alias("VAR_T_VEHICULO_MIN_V2"),
+        (pl.col("n_etapas_recon") - 1).alias("VAR_N_TRASBORDOS_V2"),
+        (pl.col("t_espera_trasbordo_calc_seg") / 60).alias("VAR_T_ESPERA_TRASBORDO_MIN_V2"),
+        (pl.col("te0_calculado") / 60).alias("VAR_T_ESPERA_INICIAL_MIN_V2"),
+    ])
+
+    # 3) Dummies modales (alineado con Larch/Statsmodels v2):
+    # - ZonaPaga(3) -> Bus(1)
+    # - MetroTren(4) se mantiene como 4 y se excluye de SOLO_METRO y METRO_BUS
+    cols_modos_v2 = [f"tipo_transporte_{i}" for i in range(1, 5)]
+    for col in cols_modos_v2:
+        lf_prep_ext_v2 = lf_prep_ext_v2.with_columns([
+            pl.when(pl.col(col).cast(pl.Utf8) == "3").then(pl.lit("1"))
+              .otherwise(pl.col(col).cast(pl.Utf8))
+              .alias(col)
+        ])
+
+    bus_flags_v2 = [pl.col(c).fill_null("0") == "1" for c in cols_modos_v2]
+    metro_flags_v2 = [pl.col(c).fill_null("0") == "2" for c in cols_modos_v2]
+    metrotren_flags_v2 = [pl.col(c).fill_null("0") == "4" for c in cols_modos_v2]
+    lf_prep_ext_v2 = lf_prep_ext_v2.with_columns([
+        pl.any_horizontal(bus_flags_v2).alias("usa_bus"),
+        pl.any_horizontal(metro_flags_v2).alias("usa_metro"),
+        pl.any_horizontal(metrotren_flags_v2).alias("usa_metrotren"),
+    ]).with_columns([
+        (pl.col("usa_metro") & ~pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+        (pl.col("usa_metro") & pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+    ])
+
+    cols_modelo_ext_v2 = [
+        "choice",
+        "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB",
+        "VAR_T_VEHICULO_MIN_V2", "VAR_N_TRASBORDOS_V2",
+        "VAR_T_ESPERA_TRASBORDO_MIN_V2", "VAR_T_ESPERA_INICIAL_MIN_V2",
+        "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS",
+    ]
+
+    lf_model_ready_ext_v2 = lf_prep_ext_v2.select(cols_modelo_ext_v2).fill_null(0)
+    df_model_data_ext_v2 = lf_model_ready_ext_v2.collect()
+    print(f"✅ Datos v2 listos: {len(df_model_data_ext_v2):,} filas, {len(df_model_data_ext_v2.columns)} columnas.")
+
+    pandas_df_ext_v2 = df_model_data_ext_v2.to_pandas()
+    biodb_ext_v2 = db.Database("viajes_qr_bip_ext_v2", pandas_df_ext_v2)
+    print("✅ Base de datos Biogeme 'biodb_ext_v2' creada.")
+else:
+    print("⚠️ No hay datos v2 cargados para preparar v2.")
+    biodb_ext_v2 = None
+
+```
+
+### Definición del Modelo Logit Extendido v2 (sin caminata)
+
+```{python}
+#|label: define-extended-logit-model-v2
+
+if "biodb_ext_v2" in locals() and biodb_ext_v2 is not None:
+    print("Especificando el MODELO EXTENDIDO v2 (sin caminata)...")
+
+    ASC_QR_EXT_V2 = Beta("ASC_QR_EXT_V2", 0, None, None, 0)
+    B_PM_LAB_EXT_V2 = Beta("B_PM_LAB_EXT_V2", 0, None, None, 0)
+    B_PT_LAB_EXT_V2 = Beta("B_PT_LAB_EXT_V2", 0, None, None, 0)
+    B_LJ_LAB_EXT_V2 = Beta("B_LJ_LAB_EXT_V2", 0, None, None, 0)
+    B_VIE_LAB_EXT_V2 = Beta("B_VIE_LAB_EXT_V2", 0, None, None, 0)
+
+    B_T_VEHICULO_V2 = Beta("B_T_VEHICULO_V2", 0, None, None, 0)
+    B_N_TRASBORDOS_V2 = Beta("B_N_TRASBORDOS_V2", 0, None, None, 0)
+    B_T_ESPERA_TRASB_V2 = Beta("B_T_ESPERA_TRASB_V2", 0, None, None, 0)
+    B_T_ESPERA_INI_V2 = Beta("B_T_ESPERA_INI_V2", 0, None, None, 0)
+    B_SOLO_METRO_V2 = Beta("B_SOLO_METRO_V2", 0, None, None, 0)
+    B_METRO_BUS_V2 = Beta("B_METRO_BUS_V2", 0, None, None, 0)
+
+    PM_LAB_V2 = Variable("DUMMY_PM_LAB")
+    PT_LAB_V2 = Variable("DUMMY_PT_LAB")
+    LJ_LAB_V2 = Variable("DUMMY_LJ_LAB")
+    VIE_LAB_V2 = Variable("DUMMY_VIE_LAB")
+
+    T_VEHICULO_V2 = Variable("VAR_T_VEHICULO_MIN_V2")
+    N_TRASBORDOS_V2 = Variable("VAR_N_TRASBORDOS_V2")
+    T_ESPERA_TRASB_V2 = Variable("VAR_T_ESPERA_TRASBORDO_MIN_V2")
+    T_ESPERA_INI_V2 = Variable("VAR_T_ESPERA_INICIAL_MIN_V2")
+    SOLO_METRO_V2 = Variable("DUMMY_SOLO_METRO")
+    METRO_BUS_V2 = Variable("DUMMY_METRO_BUS")
+    CHOICE_EXT_V2 = Variable("choice")
+
+    V_BIP_EXT_V2 = 0
+    V_QR_EXT_V2 = (
+        ASC_QR_EXT_V2
+        + B_PM_LAB_EXT_V2 * PM_LAB_V2
+        + B_PT_LAB_EXT_V2 * PT_LAB_V2
+        + B_LJ_LAB_EXT_V2 * LJ_LAB_V2
+        + B_VIE_LAB_EXT_V2 * VIE_LAB_V2
+        + B_T_VEHICULO_V2 * T_VEHICULO_V2
+        + B_N_TRASBORDOS_V2 * N_TRASBORDOS_V2
+        + B_T_ESPERA_TRASB_V2 * T_ESPERA_TRASB_V2
+        + B_T_ESPERA_INI_V2 * T_ESPERA_INI_V2
+        + B_SOLO_METRO_V2 * SOLO_METRO_V2
+        + B_METRO_BUS_V2 * METRO_BUS_V2
+    )
+
+    V_EXT_V2 = {0: V_BIP_EXT_V2, 1: V_QR_EXT_V2}
+    av_ext_v2 = {0: 1, 1: 1}
+    logprob_ext_v2 = models.loglogit(V_EXT_V2, av_ext_v2, CHOICE_EXT_V2)
+
+    print("✅ Especificación v2 lista. Usa `logprob_ext_v2` y `biodb_ext_v2` para estimar.")
+else:
+    print("⚠️ No hay `biodb_ext_v2` disponible. Ejecuta la celda de preparación v2.")
+
+```
+
+### Definición del Modelo Logit Extendido {#definición-del-modelo-logit-extendido}
 
 En esta sección se documenta el modelo extendido:
 
-- Variables temporales (dummies creadas desde hora/día laboral):
-  - `DUMMY_PM_LAB`: 1 si viaje inicia en hora punta mañana (7–8) y día laboral (`tipodia == 0`), 0 en caso contrario. Se construye como `(punta_manana & is_laboral).cast(Int8)`.
-  - `DUMMY_PT_LAB`: 1 si viaje inicia en hora punta tarde (18–19) y día laboral, 0 si no. Se construye como `(punta_tarde & is_laboral).cast(Int8)`.
-  - `DUMMY_LJ_LAB`: 1 si es lunes–jueves y laboral, 0 si no. Se construye como `(es_lun_jue & is_laboral).cast(Int8)`.
-  - `DUMMY_VIE_LAB`: 1 si es viernes y laboral, 0 si no. Se construye como `(es_viernes & is_laboral).cast(Int8)`.
-- Atributos del viaje (derivados de tiempos y etapas):
-  - `VAR_T_VEHICULO_MIN`: minutos en vehículo. Se calcula como `t_vehiculo_total_seg / 60`.
-  - `VAR_N_TRASBORDOS`: cantidad de trasbordos. Se calcula como `n_etapas - 1`.
-  - `VAR_T_CAMINATA_MIN`: minutos totales de caminata. Se calcula como `(tc1 + tc2 + tc3) / 60` (con `fill_null(0)`).
-  - `VAR_T_ESPERA_TRASBORDO_MIN`: minutos de espera en trasbordos. Se calcula como `(te1 + te2 + te3) / 60` (con `fill_null(0)`).
-  - `VAR_T_ESPERA_INICIAL_MIN`: minutos de espera inicial antes del primer abordaje. Se calcula como `te0 / 60`.
-  - `DUMMY_SOLO_METRO`: 1 si usa Metro y no usa Bus en ninguna etapa; 0 en caso contrario. Se obtiene recodificando `tipo_transporte_i` (4→2, 3→1) y evaluando presencia exclusiva de Metro.
-  - `DUMMY_METRO_BUS`: 1 si el viaje combina Metro y Bus en sus etapas; 0 si no. Se obtiene tras la misma recodificación verificando presencia conjunta.
-- Parámetros del modelo: `ASC_QR_EXT` (constante de QR) y betas para cada variable anterior.
+-   Variables temporales (dummies creadas desde hora/día laboral):
+    -   `DUMMY_PM_LAB`: 1 si viaje inicia en hora punta mañana (7–8) y día laboral (`tipodia == 0`), 0 en caso contrario. Se construye como `(punta_manana & is_laboral).cast(Int8)`.
+    -   `DUMMY_PT_LAB`: 1 si viaje inicia en hora punta tarde (18–19) y día laboral, 0 si no. Se construye como `(punta_tarde & is_laboral).cast(Int8)`.
+    -   `DUMMY_LJ_LAB`: 1 si es lunes–jueves y laboral, 0 si no. Se construye como `(es_lun_jue & is_laboral).cast(Int8)`.
+    -   `DUMMY_VIE_LAB`: 1 si es viernes y laboral, 0 si no. Se construye como `(es_viernes & is_laboral).cast(Int8)`.
+-   Atributos del viaje (derivados de tiempos y etapas):
+    -   `VAR_T_VEHICULO_MIN`: minutos en vehículo. Se calcula como `t_vehiculo_total_seg / 60`.
+    -   `VAR_N_TRASBORDOS`: cantidad de trasbordos. Se calcula como `n_etapas - 1`.
+    -   `VAR_T_CAMINATA_MIN`: minutos totales de caminata. Se calcula como `(tc1 + tc2 + tc3) / 60` (con `fill_null(0)`).
+    -   `VAR_T_ESPERA_TRASBORDO_MIN`: minutos de espera en trasbordos. Se calcula como `(te1 + te2 + te3) / 60` (con `fill_null(0)`).
+    -   `VAR_T_ESPERA_INICIAL_MIN`: minutos de espera inicial antes del primer abordaje. Se calcula como `te0 / 60`.
+    -   `DUMMY_SOLO_METRO`: 1 si usa Metro y no usa Bus en ninguna etapa; 0 en caso contrario. Se obtiene recodificando `tipo_transporte_i` (4→2, 3→1) y evaluando presencia exclusiva de Metro.
+    -   `DUMMY_METRO_BUS`: 1 si el viaje combina Metro y Bus en sus etapas; 0 si no. Se obtiene tras la misma recodificación verificando presencia conjunta.
+-   Parámetros del modelo: `ASC_QR_EXT` (constante de QR) y betas para cada variable anterior.
 
 #### Ecuaciones de Utilidad
 
@@ -801,7 +1019,223 @@ for year, week in PARTICIONES_A_PROCESAR_EXT:
 print(f"\n{'='*60}\n--- Proceso Finalizado (Modelo Extendido) ---\n{'='*60}")
 ```
 
-## Resultados del Modelo Extendido
+### Celda 1b: Configuración de Ejecución Secuencial (Modelo Extendido v2)
+
+Versión v2: usa `*_calculado`, `n_etapas_recon` y **no incluye caminata**.
+
+```{python}
+#|label: setup-sequential-run-extended-v2
+
+# --- CONFIGURACIÓN EJECUCIÓN (MODELO EXTENDIDO v2) ---
+PARTICIONES_A_PROCESAR_EXT_V2 = [
+    (2025, 17),  # por ahora única partición corregida
+]
+APPLY_SAMPLING_EXT_V2 = True
+SAMPLE_FRACTION_EXT_V2 = 0.5
+BASE_OUTPUT_DIR_EXT_V2 = "model_outputs"
+
+# Parquet corregido v2 (único por ahora)
+EXTENDED_V2_PARQUET_PATH = PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet"
+PARTITION_LABEL_EXT_V2 = "2025-W17"
+
+print("--- Configuración de Ejecución Lista (Modelo Extendido v2) ---")
+print(f"Particiones a procesar: {PARTICIONES_A_PROCESAR_EXT_V2}")
+print(f"Aplicar muestreo: {APPLY_SAMPLING_EXT_V2}")
+if APPLY_SAMPLING_EXT_V2:
+    print(f"Fracción de muestreo: {SAMPLE_FRACTION_EXT_V2}")
+print(f"Parquet corregido v2: {EXTENDED_V2_PARQUET_PATH}")
+```
+
+### Celda 2b: Estimación Secuencial del Modelo Extendido v2 (sin caminata)
+
+```{python}
+#|label: sequential-estimation-extended-v2
+#|eval: false
+
+import biogeme.biogeme_logging as blog
+from biogeme.version import get_text as biogeme_version_text
+import biogeme.results_processing as br
+from biogeme.results_processing import get_pandas_estimated_parameters
+import pandas as pd
+import gc
+import time
+
+SEED = 42
+
+logger = blog.get_screen_logger(level=blog.INFO)
+logger.info(biogeme_version_text())
+
+print("--- Iniciando Proceso de Estimación Secuencial (Modelo Extendido v2) ---")
+
+for year, week in PARTICIONES_A_PROCESAR_EXT_V2:
+    partition_label = PARTITION_LABEL_EXT_V2 if "PARTITION_LABEL_EXT_V2" in locals() else f"{year}-W{week}"
+    print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} (Extendido v2) ---\n{'='*60}")
+
+    sample_label = f"sample{int(SAMPLE_FRACTION_EXT_V2*100)}pct" if APPLY_SAMPLING_EXT_V2 else "full"
+    output_dir_partition = os.path.join(BASE_OUTPUT_DIR_EXT_V2, f"W{week}-extended-v2-{sample_label}")
+    os.makedirs(output_dir_partition, exist_ok=True)
+    print(f"    Resultados se guardarán en: {output_dir_partition}")
+
+    lf_data = df_model_data = df_for_pandas = pandas_df = biodb = biogeme_model = results = None
+
+    try:
+        lf_data = read_parquet_portable(str(EXTENDED_V2_PARQUET_PATH))
+        print(f"    Cargando parquet corregido v2: {EXTENDED_V2_PARQUET_PATH}")
+
+        # --- Preparar features v2 (sin caminata) ---
+        cols_req_v2 = (
+            ["is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas_recon"]
+            + [f"te{i}_calculado" for i in range(6)]
+            + [f"tv{i}_calculado" for i in range(1, 7)]
+            + [f"tipo_transporte_{i}" for i in range(1, 5)]
+        )
+        schema = lf_data.collect_schema()
+        missing = [c for c in cols_req_v2 if c not in schema]
+        if missing:
+            raise ValueError(f"Faltan columnas v2 en {partition_label}: {missing}")
+
+        lf_prep_ext_v2 = lf_data.select(cols_req_v2).with_columns([
+            pl.col("is_qr").cast(pl.Int8).alias("choice"),
+            pl.col("tiempo_inicio_viaje").dt.replace_time_zone("America/Santiago", ambiguous="earliest").alias("ts_local"),
+        ]).with_columns([
+            pl.col("ts_local").dt.hour().alias("hora"),
+            pl.col("ts_local").dt.weekday().alias("dia_semana"),
+            (pl.col("tipodia").cast(pl.Utf8).cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+        ]).with_columns([
+            pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+            pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+            (pl.col("dia_semana") == 5).alias("es_viernes"),
+            pl.col("dia_semana").is_between(1, 4, closed="both").alias("es_lun_jue"),
+        ]).with_columns([
+            (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+            (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+            (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+            (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+        ])
+
+        cols_te_transfer_calc = [f"te{i}_calculado" for i in range(1, 6)]  # te1..te5 (te0 es espera inicial)
+        cols_tv_calc = [f"tv{i}_calculado" for i in range(1, 7)]
+        lf_prep_ext_v2 = lf_prep_ext_v2.with_columns([
+            pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_te_transfer_calc]).alias("t_espera_trasbordo_calc_seg"),
+            pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_tv_calc]).alias("t_vehiculo_total_calc_seg"),
+        ]).with_columns([
+            (pl.col("t_vehiculo_total_calc_seg") / 60).alias("VAR_T_VEHICULO_MIN_V2"),
+            (pl.col("n_etapas_recon") - 1).alias("VAR_N_TRASBORDOS_V2"),
+            (pl.col("t_espera_trasbordo_calc_seg") / 60).alias("VAR_T_ESPERA_TRASBORDO_MIN_V2"),
+            (pl.col("te0_calculado") / 60).alias("VAR_T_ESPERA_INICIAL_MIN_V2"),
+        ])
+
+        # Dummies modales (alineado con Larch/Statsmodels v2):
+        # - ZonaPaga(3) -> Bus(1)
+        # - MetroTren(4) se mantiene como 4 y se excluye de SOLO_METRO y METRO_BUS
+        cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
+        for col in cols_modos:
+            lf_prep_ext_v2 = lf_prep_ext_v2.with_columns([
+                pl.when(pl.col(col).cast(pl.Utf8) == "3").then(pl.lit("1"))
+                  .otherwise(pl.col(col).cast(pl.Utf8))
+                  .alias(col)
+            ])
+
+        bus_flags = [pl.col(c).fill_null("0") == "1" for c in cols_modos]
+        metro_flags = [pl.col(c).fill_null("0") == "2" for c in cols_modos]
+        metrotren_flags = [pl.col(c).fill_null("0") == "4" for c in cols_modos]
+        lf_prep_ext_v2 = lf_prep_ext_v2.with_columns([
+            pl.any_horizontal(bus_flags).alias("usa_bus"),
+            pl.any_horizontal(metro_flags).alias("usa_metro"),
+            pl.any_horizontal(metrotren_flags).alias("usa_metrotren"),
+        ]).with_columns([
+            (pl.col("usa_metro") & ~pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+            (pl.col("usa_metro") & pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+        ])
+
+        cols_modelo_ext_v2 = [
+            "choice",
+            "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB",
+            "VAR_T_VEHICULO_MIN_V2", "VAR_N_TRASBORDOS_V2",
+            "VAR_T_ESPERA_TRASBORDO_MIN_V2", "VAR_T_ESPERA_INICIAL_MIN_V2",
+            "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS",
+        ]
+        df_model_data = lf_prep_ext_v2.select(cols_modelo_ext_v2).fill_null(0).collect()
+        print(f"    Variables v2 calculadas. Filas antes de muestreo: {len(df_model_data):,}")
+
+        if APPLY_SAMPLING_EXT_V2:
+            print(f"    Aplicando muestreo estratificado ({SAMPLE_FRACTION_EXT_V2*100:.0f}%).")
+            df_for_pandas = get_stratified_sample(df_model_data, SAMPLE_FRACTION_EXT_V2, SEED)
+            print(f"    Filas después del muestreo: {len(df_for_pandas):,}")
+        else:
+            df_for_pandas = df_model_data
+
+        pandas_df = df_for_pandas.to_pandas()
+
+        print("    Definiendo especificación del modelo extendido v2...")
+        biodb = db.Database(f"db_ext_v2_{partition_label}", pandas_df)
+
+        ASC_QR = Beta(f"ASC_QR_ext_v2_{partition_label}", 0, None, None, 0)
+        B_PM_LAB = Beta(f"B_PM_LAB_ext_v2_{partition_label}", 0, None, None, 0)
+        B_PT_LAB = Beta(f"B_PT_LAB_ext_v2_{partition_label}", 0, None, None, 0)
+        B_LJ_LAB = Beta(f"B_LJ_LAB_ext_v2_{partition_label}", 0, None, None, 0)
+        B_VIE_LAB = Beta(f"B_VIE_LAB_ext_v2_{partition_label}", 0, None, None, 0)
+        B_T_VEHICULO = Beta(f"B_T_VEHICULO_ext_v2_{partition_label}", 0, None, None, 0)
+        B_N_TRASBORDOS = Beta(f"B_N_TRASBORDOS_ext_v2_{partition_label}", 0, None, None, 0)
+        B_T_ESPERA_TRASB = Beta(f"B_T_ESPERA_TRASB_ext_v2_{partition_label}", 0, None, None, 0)
+        B_T_ESPERA_INI = Beta(f"B_T_ESPERA_INI_ext_v2_{partition_label}", 0, None, None, 0)
+        B_SOLO_METRO = Beta(f"B_SOLO_METRO_ext_v2_{partition_label}", 0, None, None, 0)
+        B_METRO_BUS = Beta(f"B_METRO_BUS_ext_v2_{partition_label}", 0, None, None, 0)
+
+        V_QR = (
+            ASC_QR
+            + B_PM_LAB * Variable("DUMMY_PM_LAB")
+            + B_PT_LAB * Variable("DUMMY_PT_LAB")
+            + B_LJ_LAB * Variable("DUMMY_LJ_LAB")
+            + B_VIE_LAB * Variable("DUMMY_VIE_LAB")
+            + B_T_VEHICULO * Variable("VAR_T_VEHICULO_MIN_V2")
+            + B_N_TRASBORDOS * Variable("VAR_N_TRASBORDOS_V2")
+            + B_T_ESPERA_TRASB * Variable("VAR_T_ESPERA_TRASBORDO_MIN_V2")
+            + B_T_ESPERA_INI * Variable("VAR_T_ESPERA_INICIAL_MIN_V2")
+            + B_SOLO_METRO * Variable("DUMMY_SOLO_METRO")
+            + B_METRO_BUS * Variable("DUMMY_METRO_BUS")
+        )
+
+        V = {0: 0, 1: V_QR}
+        av = {0: 1, 1: 1}
+        logprob = models.loglogit(V, av, Variable("choice"))
+
+        model_name = f"logit_qr_bip_ext_v2_{partition_label}"
+        biogeme_model = bio.BIOGEME(biodb, logprob)
+        biogeme_model.model_name = model_name
+
+        original_cwd = os.getcwd()
+        os.chdir(output_dir_partition)
+        print("    Estimando el modelo extendido v2...")
+        results = biogeme_model.estimate()
+        print("    ✅ Estimación completada!")
+
+        params_df = br.get_pandas_estimated_parameters(estimation_results=results)
+        stats_dict = results.get_general_statistics()
+        params_df.to_csv(f"params_ext_v2_{partition_label}.csv")
+        pd.DataFrame([stats_dict]).to_csv(f"stats_ext_v2_{partition_label}.csv", index=False)
+        print("    📁 Resultados v2 guardados.")
+
+        os.chdir(original_cwd)
+
+    except Exception as e:
+        print(f"    ❌ ERROR procesando {partition_label} (v2): {e}")
+        if "original_cwd" in locals() and os.getcwd() != original_cwd:
+            os.chdir(original_cwd)
+
+    finally:
+        print("    Limpiando memoria de la partición v2...")
+        try:
+            del lf_data, df_model_data, df_for_pandas, pandas_df, biodb, biogeme_model, results
+        except NameError:
+            pass
+        gc.collect()
+        time.sleep(2)
+
+print(f"\n{'='*60}\n--- Proceso Finalizado (Modelo Extendido v2) ---\n{'='*60}")
+```
+
+## Resultados del Modelo Extendido {#resultados-del-modelo-extendido}
 
 A continuación, se presentan y analizan los resultados del modelo logit extendido, estimado sobre muestras estratificadas de las semanas 17 y 18 del año 2025.
 
@@ -814,15 +1248,18 @@ Primero, cargamos los resultados previamente calculados para nuestras semanas de
 import pandas as pd
 import numpy as np
 import os
+from pathlib import Path
 
 # --- Configuración ---
-BASE_RESULTS_DIR = "model_outputs"
+# Ojo: dependiendo del CWD desde donde corras el notebook, `model_outputs/` puede no resolverse.
+# Usamos una ruta absoluta al repo para que siempre encuentre los outputs generados por este notebook.
+BASE_RESULTS_DIR = PROJECT_ROOT / "03_models" / "biogeme-logit" / "model_outputs"
 
 # Semanas y configuraciones de muestreo
-PARTITIONS = ["2025-W17", "2025-W18"]
+PARTITIONS = ["2025-W17"]
 SAMPLE_CONFIGS = {
-    "20%": "extended-sample20pct",
-    "50%": "extended-sample50pct"
+    "20%": "extended-v2-sample20pct",
+    "50%": "extended-v2-sample50pct"
 }
 
 # Diccionario para almacenar los resultados
@@ -836,43 +1273,32 @@ for partition in PARTITIONS:
     
     for sample_label, folder_suffix in SAMPLE_CONFIGS.items():
         folder_name = f"W{week_num}-{folder_suffix}"
-        results_folder = os.path.join(BASE_RESULTS_DIR, folder_name)
+        results_folder = Path(BASE_RESULTS_DIR) / folder_name
         
-        params_file = os.path.join(results_folder, f"params_ext_{partition}.csv")
-        stats_file = os.path.join(results_folder, f"stats_ext_{partition}.csv")
+        # Biogeme v2 guarda con sufijo `_v2`
+        params_file = results_folder / f"params_ext_v2_{partition}.csv"
+        stats_file = results_folder / f"stats_ext_v2_{partition}.csv"
         
         try:
-            df_params = pd.read_csv(params_file, index_col=0)
+            df_params = pd.read_csv(params_file)
             df_stats = pd.read_csv(stats_file)
+
+            # El CSV de biogeme suele traer una primera columna sin nombre.
+            if "Unnamed: 0" in df_params.columns:
+                df_params = df_params.drop(columns=["Unnamed: 0"])
             
-            # Limpiar nombres de parámetros (remover sufijos de partición y normalizar)
-            # Primero remover sufijos de partición si existen
-            df_params['Name'] = df_params['Name'].str.replace(f'_ext_{partition}', '', regex=False)
-            # Remover sufijos _EXT o _ext al final
-            df_params['Name'] = df_params['Name'].str.replace('_EXT$', '', regex=True)
-            df_params['Name'] = df_params['Name'].str.replace('_ext$', '', regex=True)
-            # Normalizar nombres específicos (remover cualquier sufijo restante)
-            name_mapping = {
-                'ASC_QR_EXT': 'ASC_QR',
-                'ASC_QR_ext': 'ASC_QR',
-                'B_PM_LAB_EXT': 'B_PM_LAB',
-                'B_PM_LAB_ext': 'B_PM_LAB',
-                'B_PT_LAB_EXT': 'B_PT_LAB',
-                'B_PT_LAB_ext': 'B_PT_LAB',
-                'B_LJ_LAB_EXT': 'B_LJ_LAB',
-                'B_LJ_LAB_ext': 'B_LJ_LAB',
-                'B_VIE_LAB_EXT': 'B_VIE_LAB',
-                'B_VIE_LAB_ext': 'B_VIE_LAB',
-                'B_T_VEHICULO_ext': 'B_T_VEHICULO',
-                'B_N_TRASBORDOS_ext': 'B_N_TRASBORDOS',
-                'B_T_CAMINATA_ext': 'B_T_CAMINATA',
-                'B_T_ESPERA_TRASB_ext': 'B_T_ESPERA_TRASB',
-                'B_T_ESPERA_INI_ext': 'B_T_ESPERA_INI',
-                'B_SOLO_METRO_ext': 'B_SOLO_METRO',
-                'B_METRO_BUS_ext': 'B_METRO_BUS'
-            }
-            df_params['Name'] = df_params['Name'].replace(name_mapping)
-            df_params.index = df_params['Name']
+            # Limpiar nombres de parámetros: *_ext_v2_<partition> -> base
+            df_params["Name_clean"] = (
+                df_params["Name"]
+                .astype(str)
+                .str.replace(f"_ext_v2_{partition}", "", regex=False)
+                .str.replace(f"_{partition}", "", regex=False)
+                .str.replace("_ext_v2", "", regex=False)
+                .str.replace("_EXT_V2", "", regex=False)
+                .str.replace("_ext", "", regex=False)
+                .str.replace("_EXT", "", regex=False)
+            )
+            df_params = df_params.set_index("Name_clean")
             
             results_data[partition][sample_label] = {
                 'params': df_params,
@@ -890,6 +1316,7 @@ for partition in PARTITIONS:
 
 print(f"\n✅ Carga de resultados completada para {len(PARTITIONS)} particiones.")
 ```
+
 ### Análisis de la Estimación
 
 #### Bondad de Ajuste
@@ -1089,11 +1516,11 @@ Para validar la eficiencia de usar una muestra en lugar del dataset completo, se
 
 **Análisis de la Comparación:**
 
-1. **Bondad de Ajuste Consistente:** El **Rho-cuadrado ajustado** es prácticamente idéntico entre ambas configuraciones de muestreo para cada semana, demostrando que el muestreo estratificado al 20% captura el poder explicativo del modelo de manera equivalente al 50%.
+1.  **Bondad de Ajuste Consistente:** El **Rho-cuadrado ajustado** es prácticamente idéntico entre ambas configuraciones de muestreo para cada semana, demostrando que el muestreo estratificado al 20% captura el poder explicativo del modelo de manera equivalente al 50%.
 
-2. **Coeficientes Estables:** Los valores de los coeficientes (Betas) son extremadamente similares entre ambos modelos. Las pequeñas diferencias son despreciables y no alteran ninguna de las conclusiones.
+2.  **Coeficientes Estables:** Los valores de los coeficientes (Betas) son extremadamente similares entre ambos modelos. Las pequeñas diferencias son despreciables y no alteran ninguna de las conclusiones.
 
-3. **Estadísticos t (Esperados):** Como es de esperar, los estadísticos t tienden a ser ligeramente menores en la muestra del 20% debido al mayor error estándar en muestras más pequeñas. Sin embargo, los valores siguen siendo altamente significativos, validando la robustez de los hallazgos.
+3.  **Estadísticos t (Esperados):** Como es de esperar, los estadísticos t tienden a ser ligeramente menores en la muestra del 20% debido al mayor error estándar en muestras más pequeñas. Sin embargo, los valores siguen siendo altamente significativos, validando la robustez de los hallazgos.
 
 ### Interpretación y Conclusiones
 
@@ -1101,37 +1528,37 @@ Los resultados del modelo extendido nos permiten extraer conclusiones más profu
 
 #### Variables Temporales (Consistentes con el Modelo Baseline)
 
-1. **Preferencia Base por la Tarjeta Bip!**: El coeficiente de la constante (`ASC_QR`) es fuertemente negativo en ambas semanas, indicando una preferencia inherente por usar la tarjeta Bip! sobre el código QR en la situación de referencia.
+1.  **Preferencia Base por la Tarjeta Bip!**: El coeficiente de la constante (`ASC_QR`) es fuertemente negativo en ambas semanas, indicando una preferencia inherente por usar la tarjeta Bip! sobre el código QR en la situación de referencia.
 
-2. **El Efecto de la Rutina**: Los coeficientes para los días laborales fuera de punta (`B_LJ_LAB` y `B_VIE_LAB`) son negativos, sugiriendo que los viajeros habituales en sus trayectos cotidianos son más propensos a usar la tarjeta Bip!, probablemente por hábito e inercia.
+2.  **El Efecto de la Rutina**: Los coeficientes para los días laborales fuera de punta (`B_LJ_LAB` y `B_VIE_LAB`) son negativos, sugiriendo que los viajeros habituales en sus trayectos cotidianos son más propensos a usar la tarjeta Bip!, probablemente por hábito e inercia.
 
-3. **El QR como Alternativa de Conveniencia**: Los coeficientes para las horas punta (`B_PM_LAB` y `B_PT_LAB`) son positivos y significativos, revelando que durante los períodos de mayor congestión, la probabilidad de usar QR aumenta considerablemente.
+3.  **El QR como Alternativa de Conveniencia**: Los coeficientes para las horas punta (`B_PM_LAB` y `B_PT_LAB`) son positivos y significativos, revelando que durante los períodos de mayor congestión, la probabilidad de usar QR aumenta considerablemente.
 
 #### Atributos del Viaje (Nuevos Hallazgos)
 
-::: {.callout-warning}
+::: callout-warning
 # ⚠️ Interpretación con Precaución
 
 Las siguientes interpretaciones sobre atributos del viaje deben considerarse con precaución debido a la presencia de **transbordos fantasmas internos entre metro** en los datos. Los valores de número de trasbordos, tiempos de caminata y esperas pueden estar sesgados, lo que afecta la interpretación de sus coeficientes.
 :::
 
-4. **Tiempo en Vehículo**: El coeficiente `B_T_VEHICULO` es ligeramente positivo, indicando que viajes más largos aumentan la preferencia por QR. Esto podría sugerir que los usuarios valoran más la conveniencia del QR en viajes que requieren mayor tiempo de espera. **Nota:** Esta variable puede verse afectada por el problema de transbordos fantasmas.
+4.  **Tiempo en Vehículo**: El coeficiente `B_T_VEHICULO` es ligeramente positivo, indicando que viajes más largos aumentan la preferencia por QR. Esto podría sugerir que los usuarios valoran más la conveniencia del QR en viajes que requieren mayor tiempo de espera. **Nota:** Esta variable puede verse afectada por el problema de transbordos fantasmas.
 
-5. **Complejidad del Viaje**: Los coeficientes `B_N_TRASBORDOS`, `B_T_CAMINATA`, y `B_T_ESPERA_TRASBORDO` son negativos y significativos, mostrando que la complejidad del viaje (más trasbordos, más caminata, más esperas) reduce la preferencia por QR. Esto sugiere que los usuarios prefieren la familiaridad de la tarjeta Bip! en viajes complejos. **⚠️ Limitación:** Estos coeficientes pueden estar sesgados debido a transbordos fantasmas internos entre metro que inflan artificialmente el número de trasbordos y los tiempos asociados.
+5.  **Complejidad del Viaje**: Los coeficientes `B_N_TRASBORDOS`, `B_T_CAMINATA`, y `B_T_ESPERA_TRASBORDO` son negativos y significativos, mostrando que la complejidad del viaje (más trasbordos, más caminata, más esperas) reduce la preferencia por QR. Esto sugiere que los usuarios prefieren la familiaridad de la tarjeta Bip! en viajes complejos. **⚠️ Limitación:** Estos coeficientes pueden estar sesgados debido a transbordos fantasmas internos entre metro que inflan artificialmente el número de trasbordos y los tiempos asociados.
 
-6. **Tiempo de Espera Inicial**: El coeficiente `B_T_ESPERA_INI` es negativo aunque de menor magnitud, indicando una ligera penalización al QR cuando aumenta el tiempo de espera inicial. **Nota:** Esta variable no se ve directamente afectada por transbordos fantasmas, pero podría estar indirectamente relacionada si estos transbordos afectan la medición del tiempo inicial.
+6.  **Tiempo de Espera Inicial**: El coeficiente `B_T_ESPERA_INI` es negativo aunque de menor magnitud, indicando una ligera penalización al QR cuando aumenta el tiempo de espera inicial. **Nota:** Esta variable no se ve directamente afectada por transbordos fantasmas, pero podría estar indirectamente relacionada si estos transbordos afectan la medición del tiempo inicial.
 
-7. **Modos de Transporte**: El coeficiente `B_METRO_BUS` es negativo y significativo, mostrando que viajes que combinan Metro y Bus reducen la preferencia por QR. Por otro lado, `B_SOLO_METRO` no está identificado (valor = 0), lo que podría indicar problemas de identificación o colinealidad. **⚠️ Limitación:** La clasificación de modos puede estar incorrecta cuando hay transbordos fantasmas internos entre metro que no se detectan correctamente, lo que afecta la precisión de estas variables dummy.
+7.  **Modos de Transporte**: El coeficiente `B_METRO_BUS` es negativo y significativo, mostrando que viajes que combinan Metro y Bus reducen la preferencia por QR. Por otro lado, `B_SOLO_METRO` no está identificado (valor = 0), lo que podría indicar problemas de identificación o colinealidad. **⚠️ Limitación:** La clasificación de modos puede estar incorrecta cuando hay transbordos fantasmas internos entre metro que no se detectan correctamente, lo que afecta la precisión de estas variables dummy.
 
 #### Diferencias entre Semanas
 
-8. **Evolución Temporal**: La semana W18 muestra una menor magnitud negativa en `ASC_QR` comparada con W17, sugiriendo una mayor preferencia base por QR en la semana más reciente. Esto podría indicar una tendencia de adopción creciente del QR a lo largo del tiempo.
+8.  **Evolución Temporal**: La semana W18 muestra una menor magnitud negativa en `ASC_QR` comparada con W17, sugiriendo una mayor preferencia base por QR en la semana más reciente. Esto podría indicar una tendencia de adopción creciente del QR a lo largo del tiempo.
 
 En resumen, el modelo extendido confirma y amplía los hallazgos del modelo baseline: la **tarjeta Bip! domina por hábito** en los viajes regulares y simples, mientras que el **código QR se posiciona como una herramienta de conveniencia** valorada en situaciones de mayor demanda temporal y para viajes más largos, pero menos preferida en viajes complejos que involucran múltiples trasbordos y modos de transporte.
 
-### Consolidación de Resultados del Modelo Extendido{.visually-hidden}
+### Consolidación de Resultados del Modelo Extendido {.visually-hidden}
 
-``` {python}
+```{python}
 #| label: consolidate-extended-results
 #| eval: false
 import pandas as pd
@@ -1290,5 +1717,69 @@ else:
     print("❌ DataFrame 'df_consolidated_params' no encontrado. Ejecuta la celda de consolidación primero.")
 ```
 
+## Tabla de Parámetros — Modelo Extendido v2 (Biogeme)
 
+```{python}
+#|label: show-params-v2-biogeme
 
+import pandas as pd
+from pathlib import Path 
+
+print("📊 Cargando parámetros del modelo extendido v2 (Biogeme)...")
+
+# Ruta por defecto a la corrida v2 sample20%
+params_v2_path = Path("model_outputs") / "W17-extended-v2-sample20pct" / "params_ext_v2_2025-W17.csv"
+
+# Fallback: buscar cualquier params_ext_v2_2025-W17.csv
+if not params_v2_path.exists():
+    candidates = list(Path("model_outputs").glob("W17-extended-v2-*/params_ext_v2_2025-W17.csv"))
+    params_v2_path = candidates[0] if candidates else None
+
+if params_v2_path and params_v2_path.exists():
+    df_params_v2 = pd.read_csv(params_v2_path)
+    df_params_v2 = df_params_v2[["Name", "Value", "Robust std err.", "Robust t-stat.", "Robust p-value"]]
+    display(
+        df_params_v2
+        .set_index("Name")
+        .style.format(
+            {
+                "Value": "{:.6f}",
+                "Robust std err.": "{:.6f}",
+                "Robust t-stat.": "{:.2f}",
+                "Robust p-value": "{:.3g}",
+            }
+        )
+    )
+    print(f"✅ Tabla v2 cargada desde: {params_v2_path}")
+else:
+    print("⚠️ No se encontró archivo de parámetros v2 para mostrar.")
+
+```
+
+<!-- Snapshot estático de parámetros v2 (Biogeme, W17 sample20pct). -->
+
++------------------------------+-----------+-----------------+----------------+----------------+
+| Name                         | Value     | Robust std err. | Robust t-stat. | Robust p-value |
++==============================+===========+=================+================+================+
+| ASC_QR_2025-W17              | -1.471807 | 0.006972        | -211.11        | 0              |
++------------------------------+-----------+-----------------+----------------+----------------+
+| B_PM_LAB_v2_2025-W17         | 0.151409  | 0.004411        | 34.32          | 0              |
++------------------------------+-----------+-----------------+----------------+----------------+
+| B_PT_LAB_v2_2025-W17         | 0.240008  | 0.005238        | 45.82          | 0              |
++------------------------------+-----------+-----------------+----------------+----------------+
+| B_LJ_LAB_v2_2025-W17         | -0.194583 | 0.005365        | -36.27         | 0              |
++------------------------------+-----------+-----------------+----------------+----------------+
+| B_VIE_LAB_v2_2025-W17        | -0.174902 | 0.006491        | -26.94         | 0              |
++------------------------------+-----------+-----------------+----------------+----------------+
+| B_T_VEHICULO_v2_2025-W17     | 0.001194  | 0.000129        | 9.24           | 0              |
++------------------------------+-----------+-----------------+----------------+----------------+
+| B_N_TRASBORDOS_v2_2025-W17   | -0.067697 | 0.003454        | -19.60         | 0              |
++------------------------------+-----------+-----------------+----------------+----------------+
+| B_T_ESPERA_TRASB_v2_2025-W17 | -0.003343 | 0.000301        | -11.11         | 0              |
++------------------------------+-----------+-----------------+----------------+----------------+
+| B_T_ESPERA_INI_ext_2025-W17  | 0.003201  | 0.000348        | 9.21           | 0              |
++------------------------------+-----------+-----------------+----------------+----------------+
+| B_SOLO_METRO_ext_2025-W17    | 0.048837  | 0.005987        | 8.16           | 4.44e-16       |
++------------------------------+-----------+-----------------+----------------+----------------+
+| B_METRO_BUS_ext_2025-W17     | -0.187030 | 0.006909        | -27.07         | 0              |
++------------------------------+-----------+-----------------+----------------+----------------+

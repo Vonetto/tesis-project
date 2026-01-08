@@ -97,12 +97,20 @@ else:
 # Usaremos 'viajes_filtrados' como base, ya que contiene todos los viajes válidos
 INPUT_DATASET_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados"
 
+# --- Config dataset (v1 vs v2) ---
+USE_V2_PARQUET = True
+V2_PARQUET_PATH = PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet"
+OUTPUT_SUFFIX = "-v2" if USE_V2_PARQUET else ""
+INCLUDE_WALKING = False if USE_V2_PARQUET else True
+
 # --- Partición para Análisis Inicial ---
 YEAR_ANALISIS = 2025
 WEEK_ANALISIS = 17
 PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
 
-print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f"\n📁 Dataset de entrada: {'parquet v2' if USE_V2_PARQUET else INPUT_DATASET_PATH}")
+if USE_V2_PARQUET:
+    print(f"   - V2 parquet: {V2_PARQUET_PATH}")
 print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
 ```
 
@@ -111,7 +119,7 @@ print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
 ```{python}
 #|label: helper-functions
 
-def prepare_features_extended(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
+def prepare_features_extended_v1(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
     """
     Construye el dataset para el modelo extendido:
     choice (1=QR, 0=Bip) + dummies temporales + atributos del viaje.
@@ -229,6 +237,113 @@ def prepare_features_extended(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
     return lf_prep_ext.select(cols_modelo_ext).fill_null(0)
 
 
+def prepare_features_extended_v2(lazy_frame: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Versión v2 (parquet corregido):
+    - Usa `n_etapas_recon`, `te*_calculado`, `tv*_calculado`
+    - Omite caminata
+    - Evita doble conteo: espera inicial = te0_calculado; espera trasbordo = sum(te1..te5_calculado)
+    """
+    cols_req = (
+        ["is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas_recon"]
+        + [f"te{i}_calculado" for i in range(6)]
+        + [f"tv{i}_calculado" for i in range(1, 7)]
+        + [f"tipo_transporte_{i}" for i in range(1, 5)]
+    )
+
+    available_cols = lazy_frame.collect_schema().names()
+    missing_cols = [col for col in cols_req if col not in available_cols]
+    if missing_cols:
+        raise ValueError(
+            f"Columnas faltantes en el dataset (v2): {missing_cols}. "
+            f"Columnas disponibles: {available_cols[:20]}..."
+        )
+
+    lf_prep_ext = (
+        lazy_frame
+        .select(cols_req)
+        .with_columns([
+            pl.col("is_qr").cast(pl.Int8).alias("choice"),
+            pl.col("tiempo_inicio_viaje")
+              .dt.replace_time_zone("America/Santiago", ambiguous="earliest")
+              .alias("ts_local"),
+        ])
+        .with_columns([
+            pl.col("ts_local").dt.hour().alias("hora"),
+            pl.col("ts_local").dt.weekday().alias("dia_semana"),
+            (pl.col("tipodia").cast(pl.Utf8).cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+        ])
+        .with_columns([
+            pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+            pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+            (pl.col("dia_semana") == 5).alias("es_viernes"),
+            pl.col("dia_semana").is_between(1, 4, closed="both").alias("es_lun_jue"),
+        ])
+        .with_columns([
+            (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+            (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+            (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+            (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+        ])
+    )
+
+    cols_te_transfer = [f"te{i}_calculado" for i in range(1, 6)]
+    cols_tv = [f"tv{i}_calculado" for i in range(1, 7)]
+    lf_prep_ext = (
+        lf_prep_ext
+        .with_columns([
+            pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_te_transfer]).alias("t_espera_trasbordo_calc_seg"),
+            pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_tv]).alias("t_vehiculo_total_calc_seg"),
+        ])
+        .with_columns([
+            (pl.col("t_vehiculo_total_calc_seg") / 60).alias("VAR_T_VEHICULO_MIN"),
+            (pl.col("n_etapas_recon") - 1).alias("VAR_N_TRASBORDOS"),
+            (pl.col("t_espera_trasbordo_calc_seg") / 60).alias("VAR_T_ESPERA_TRASBORDO_MIN"),
+            (pl.col("te0_calculado") / 60).alias("VAR_T_ESPERA_INICIAL_MIN"),
+        ])
+    )
+
+    # Dummies de modo (alineado con Larch/Biogeme):
+    # - ZonaPaga(3) -> Bus(1)
+    # - MetroTren(4) se mantiene como 4 y se excluye de SOLO_METRO y METRO_BUS
+    cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
+    for col in cols_modos:
+        lf_prep_ext = lf_prep_ext.with_columns([
+            pl.when(pl.col(col).cast(pl.Utf8) == "3").then(pl.lit("1"))
+              .otherwise(pl.col(col).cast(pl.Utf8))
+              .alias(col)
+        ])
+
+    bus_flags = [pl.col(c).fill_null("0") == "1" for c in cols_modos]
+    metro_flags = [pl.col(c).fill_null("0") == "2" for c in cols_modos]
+    metrotren_flags = [pl.col(c).fill_null("0") == "4" for c in cols_modos]
+    lf_prep_ext = (
+        lf_prep_ext
+        .with_columns([
+            pl.any_horizontal(bus_flags).alias("usa_bus"),
+            pl.any_horizontal(metro_flags).alias("usa_metro"),
+            pl.any_horizontal(metrotren_flags).alias("usa_metrotren"),
+        ])
+        .with_columns([
+            (pl.col("usa_metro") & ~pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+            (pl.col("usa_metro") & pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+        ])
+    )
+
+    cols_modelo_ext = [
+        "choice",
+        "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB",
+        "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS",
+        "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN",
+        "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS",
+    ]
+
+    return lf_prep_ext.select(cols_modelo_ext).fill_null(0)
+
+
+prepare_features_extended = prepare_features_extended_v2 if USE_V2_PARQUET else prepare_features_extended_v1
+
+
 def get_stratified_sample(df: pl.DataFrame, fraction: float, seed: int) -> pl.DataFrame:
     """
     Muestreo estratificado por 'choice' (0=Bip, 1=QR), conservando proporciones.
@@ -293,12 +408,15 @@ print("✅ Funciones de ayuda `prepare_features_extended` y `get_stratified_samp
 #|label: load-data
 print(f"Cargando partición {PARTITION_LABEL} desde {INPUT_DATASET_PATH}...")
 
-partition_path_glob = (
-    f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
-)
+if USE_V2_PARQUET:
+    input_path = str(V2_PARQUET_PATH)
+else:
+    input_path = (
+        f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
+    )
 
 try:
-    lf_data = read_parquet_portable(partition_path_glob)
+    lf_data = read_parquet_portable(input_path)
 
     schema = lf_data.collect_schema()
     n_rows = lf_data.select(pl.len()).collect().item()
@@ -307,13 +425,21 @@ try:
     print(f"   Columnas disponibles: {len(schema.names())}")
     
     # Verificar columnas necesarias para el modelo extendido
-    cols_necesarias = [
-        "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
-        "t_vehiculo_total_seg", "te0", 
-        "tc1", "tc2", "tc3",
-        "te1", "te2", "te3",
-        "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
-    ]
+    if USE_V2_PARQUET:
+        cols_necesarias = (
+            ["is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas_recon"]
+            + [f"te{i}_calculado" for i in range(6)]
+            + [f"tv{i}_calculado" for i in range(1, 7)]
+            + [f"tipo_transporte_{i}" for i in range(1, 5)]
+        )
+    else:
+        cols_necesarias = [
+            "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
+            "t_vehiculo_total_seg", "te0", 
+            "tc1", "tc2", "tc3",
+            "te1", "te2", "te3",
+            "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
+        ]
     available_cols = schema.names()
     missing_cols = [col for col in cols_necesarias if col not in available_cols]
     
@@ -321,12 +447,15 @@ try:
         print(f"❌ Columnas faltantes: {missing_cols}")
     else:
         print(f"✅ Todas las columnas necesarias para el modelo extendido están disponibles")
-        relevant_cols = ["is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas", "t_vehiculo_total_seg"]
+        if USE_V2_PARQUET:
+            relevant_cols = ["is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas_recon", "te0_calculado", "tv1_calculado"]
+        else:
+            relevant_cols = ["is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas", "t_vehiculo_total_seg"]
         print(f"   Columnas clave presentes: {[c for c in relevant_cols if c in available_cols]}")
         
 except Exception as e:
     print(f"❌ Error al cargar la partición: {e}")
-    print(f"   Verifica que la ruta y partición existan: {partition_path_glob}")
+    print(f"   Verifica que la ruta exista: {input_path}")
     lf_data = None
 ```
 
@@ -445,13 +574,21 @@ if lf_data is not None:
         print(f"🔍 Verificando columnas necesarias...")
         
         # Verificar si las columnas necesarias están disponibles
-        cols_necesarias = [
-            "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
-            "t_vehiculo_total_seg", "te0", 
-            "tc1", "tc2", "tc3",  # Tiempos de caminata por etapa
-            "te1", "te2", "te3",  # Tiempos de espera por etapa
-            "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
-        ]
+        if USE_V2_PARQUET:
+            cols_necesarias = (
+                ["is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas_recon"]
+                + [f"te{i}_calculado" for i in range(6)]
+                + [f"tv{i}_calculado" for i in range(1, 7)]
+                + [f"tipo_transporte_{i}" for i in range(1, 5)]
+            )
+        else:
+            cols_necesarias = [
+                "is_qr", "tiempo_inicio_viaje", "tipodia", "n_etapas",
+                "t_vehiculo_total_seg", "te0", 
+                "tc1", "tc2", "tc3",  # Tiempos de caminata por etapa
+                "te1", "te2", "te3",  # Tiempos de espera por etapa
+                "tipo_transporte_1", "tipo_transporte_2", "tipo_transporte_3", "tipo_transporte_4"
+            ]
         
         missing_cols = [col for col in cols_necesarias if col not in available_cols]
         if missing_cols:
@@ -482,9 +619,11 @@ if lf_data is not None:
         
         print("\n📊 Resumen estadístico de las variables continuas:")
         continuous_vars = [
-            "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS", "VAR_T_CAMINATA_MIN",
+            "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS",
             "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN"
         ]
+        if INCLUDE_WALKING:
+            continuous_vars.insert(2, "VAR_T_CAMINATA_MIN")
         print(pandas_df_ext[continuous_vars].describe())
         
         print("\n📊 Distribución de las dummies:")
@@ -607,9 +746,11 @@ def estimate_logit_extended_statsmodels(
     dummy_modo_cols = ["DUMMY_SOLO_METRO", "DUMMY_METRO_BUS"]
     # Variables continuas
     continuous_cols = [
-        "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS", "VAR_T_CAMINATA_MIN",
-        "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN"
+        "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS",
+        "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN",
     ]
+    if INCLUDE_WALKING:
+        continuous_cols.insert(2, "VAR_T_CAMINATA_MIN")
     
     # Todas las dummies (para detección de separación)
     all_dummy_cols = dummy_temporal_cols + dummy_modo_cols
@@ -879,7 +1020,7 @@ if 'pandas_df_ext' in locals() and pandas_df_ext is not None:
     print(f"🚀 Estimando modelo extendido para {PARTITION_LABEL}...")
     
     # Directorio de salida
-    results_folder_sm_ext = os.path.join("model_outputs_sm", f"W{WEEK_ANALISIS}-extended")
+    results_folder_sm_ext = os.path.join("model_outputs_sm", f"W{WEEK_ANALISIS}-extended{OUTPUT_SUFFIX}")
     os.makedirs(results_folder_sm_ext, exist_ok=True)
     
     # Estimar modelo
@@ -927,8 +1068,11 @@ else:
 #|label: setup-sequential-run-extended-statsmodels
 
 BASE_OUTPUT_DIR_SM_EXT = "model_outputs_sm"
-PARTICIONES_A_PROCESAR_EXT = [(2025, 17), (2025, 18)]  # puedes extender esta lista
-APPLY_SAMPLING_EXT = False  # Aplicar muestreo estratificado
+if USE_V2_PARQUET:
+    PARTICIONES_A_PROCESAR_EXT = [(2025, 17)]
+else:
+    PARTICIONES_A_PROCESAR_EXT = [(2025, 17), (2025, 18)]  # puedes extender esta lista
+APPLY_SAMPLING_EXT = True  # Aplicar muestreo estratificado
 SAMPLE_FRACTION_EXT = 0.50  # Fracción de muestreo (50%)
 SEED_EXT = 42
 
@@ -961,19 +1105,20 @@ for year, week in PARTICIONES_A_PROCESAR_EXT:
     df_for_model_seq = None
     
     try:
-        # Construir nombre de carpeta según si se aplica muestreo o no
-        if APPLY_SAMPLING_EXT:
-            folder_name = f"W{week}-extended-sample{int(SAMPLE_FRACTION_EXT*100)}pct"
-        else:
-            folder_name = f"W{week}-extended"
+        # Construir nombre de carpeta (incluye sufijo v2 + etiqueta de muestreo)
+        sample_label = f"sample{int(SAMPLE_FRACTION_EXT*100)}pct" if APPLY_SAMPLING_EXT else "full"
+        folder_name = f"W{week}-extended{OUTPUT_SUFFIX}-{sample_label}"
         
         output_dir_partition = os.path.join(BASE_OUTPUT_DIR_SM_EXT, folder_name)
         os.makedirs(output_dir_partition, exist_ok=True)
         print(f"   Resultados se guardarán en: {output_dir_partition}")
 
-        input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
-        lf_data_seq = read_parquet_portable(input_path_glob)
-        print(f"   Cargando datos desde: {input_path_glob}")
+        if USE_V2_PARQUET:
+            input_path = str(V2_PARQUET_PATH)
+        else:
+            input_path = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+        lf_data_seq = read_parquet_portable(input_path)
+        print(f"   Cargando datos desde: {input_path}")
 
         lf_model_ready_seq = prepare_features_extended(lf_data_seq)
         df_model_data_seq = lf_model_ready_seq.collect()
@@ -1024,10 +1169,13 @@ import numpy as np
 
 # --- Configuración ---
 BASE_RESULTS_DIR_SM = "model_outputs_sm"
-SAMPLE_FRACTION_LABEL = "20pct"  # Ajustar según el muestreo usado
+SAMPLE_LABEL = "sample50pct"  # "full" o "sample50pct" / "sample20pct", etc.
 
-# Semanas
-PARTITIONS = ["2025-W17", "2025-W18"]
+# Particiones
+if USE_V2_PARQUET:
+    PARTITIONS = ["2025-W17"]
+else:
+    PARTITIONS = ["2025-W17", "2025-W18"]
 
 # Diccionario para almacenar los resultados
 results_data_sm = {}
@@ -1036,7 +1184,7 @@ for partition in PARTITIONS:
     year, week = partition.split("-W")
     week_num = week
     
-    folder_name = f"W{week_num}-extended-sample{SAMPLE_FRACTION_LABEL}"
+    folder_name = f"W{week_num}-extended{OUTPUT_SUFFIX}-{SAMPLE_LABEL}"
     results_folder = os.path.join(BASE_RESULTS_DIR_SM, folder_name)
     
     params_file = os.path.join(results_folder, f"params_ext_{partition}.csv")
@@ -1152,8 +1300,8 @@ import os
 import pandas as pd
 
 # --- Configuración ---
-BASE_RESULTS_DIR_BIO = "../model_outputs"
-SAMPLE_FRACTION_LABEL_BIO = "20pct"  # Ajustar según el muestreo usado en Biogeme
+BASE_RESULTS_DIR_BIO = "../biogeme-logit/model_outputs"
+SAMPLE_LABEL_BIO = SAMPLE_LABEL  # Debe coincidir con la carpeta generada (p.ej. "full" o "sample50pct")
 
 # Diccionario para almacenar los resultados de Biogeme
 results_data_bio = {}
@@ -1162,18 +1310,25 @@ for partition in PARTITIONS:
     year, week = partition.split("-W")
     week_num = week
     
-    folder_name = f"W{week_num}-extended-sample{SAMPLE_FRACTION_LABEL_BIO}"
+    folder_name = f"W{week_num}-extended{OUTPUT_SUFFIX}-{SAMPLE_LABEL_BIO}"
     results_folder = os.path.join(BASE_RESULTS_DIR_BIO, folder_name)
     
-    params_file = os.path.join(results_folder, f"params_ext_{partition}.csv")
-    stats_file = os.path.join(results_folder, f"stats_ext_{partition}.csv")
+    if USE_V2_PARQUET:
+        params_file = os.path.join(results_folder, f"params_ext_v2_{partition}.csv")
+        stats_file = os.path.join(results_folder, f"stats_ext_v2_{partition}.csv")
+    else:
+        params_file = os.path.join(results_folder, f"params_ext_{partition}.csv")
+        stats_file = os.path.join(results_folder, f"stats_ext_{partition}.csv")
     
     try:
         df_params = pd.read_csv(params_file, index_col=0)
         df_stats = pd.read_csv(stats_file)
         
         # Limpiar nombres de parámetros
-        df_params['Name_clean'] = df_params['Name'].str.replace(f'_ext_{partition}', '', regex=False)
+        if USE_V2_PARQUET:
+            df_params['Name_clean'] = df_params['Name'].str.replace(f'_ext_v2_{partition}', '', regex=False)
+        else:
+            df_params['Name_clean'] = df_params['Name'].str.replace(f'_ext_{partition}', '', regex=False)
         df_params['Name_clean'] = df_params['Name_clean'].str.replace('_ext', '', regex=True)
         df_params['Name_clean'] = df_params['Name_clean'].str.replace('_EXT', '', regex=True)
         
@@ -1468,15 +1623,25 @@ import numpy as np
 # --- Configuración ---
 BASE_RESULTS_DIR_SM = "model_outputs_sm"
 
-# Semanas
-PARTITIONS = ["2025-W17", "2025-W18"]
+# Particiones
+if USE_V2_PARQUET:
+    PARTITIONS = ["2025-W17"]
+else:
+    PARTITIONS = ["2025-W17", "2025-W18"]
 
-# Configuraciones de muestreo
-SAMPLE_CONFIGS = {
-    "100%": "extended",
-    "50%": "extended-sample50pct",
-    "20%": "extended-sample20pct"
-}
+# Configuraciones de muestreo (nombres de carpetas bajo `model_outputs_sm/`)
+if USE_V2_PARQUET:
+    SAMPLE_CONFIGS = {
+        "100%": f"extended{OUTPUT_SUFFIX}-full",
+        "50%": f"extended{OUTPUT_SUFFIX}-sample50pct",
+        "20%": f"extended{OUTPUT_SUFFIX}-sample20pct",
+    }
+else:
+    SAMPLE_CONFIGS = {
+        "100%": "extended",
+        "50%": "extended-sample50pct",
+        "20%": "extended-sample20pct",
+    }
 
 # Diccionario para almacenar los resultados por nivel de muestreo
 results_by_sampling = {}
@@ -1873,4 +2038,3 @@ if summary_points:
 else:
     print("⚠️ No hay datos suficientes para generar el resumen.")
 ```
-

@@ -86,12 +86,19 @@ else:
 # Usaremos 'viajes_filtrados' como base, ya que contiene todos los viajes válidos
 INPUT_DATASET_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados"
 
+# --- Config dataset (v1 vs v2) ---
+USE_V2_PARQUET = True
+V2_PARQUET_PATH = PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet"
+OUTPUT_SUFFIX = "-v2" if USE_V2_PARQUET else ""
+
 # --- Partición para Análisis Inicial ---
 YEAR_ANALISIS = 2025
 WEEK_ANALISIS = 17
 PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
 
-print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f"\n📁 Dataset de entrada: {'parquet v2' if USE_V2_PARQUET else INPUT_DATASET_PATH}")
+if USE_V2_PARQUET:
+    print(f"   - V2 parquet: {V2_PARQUET_PATH}")
 print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
 ````
 
@@ -200,12 +207,15 @@ print("✅ Funciones de ayuda `prepare_features` y `get_stratified_sample` defin
 #|label: load-data
 print(f"Cargando partición {PARTITION_LABEL} desde {INPUT_DATASET_PATH}...")
 
-partition_path_glob = (
-    f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
-)
+if USE_V2_PARQUET:
+    input_path = str(V2_PARQUET_PATH)
+else:
+    input_path = (
+        f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
+    )
 
 try:
-    lf_data = read_parquet_portable(partition_path_glob)
+    lf_data = read_parquet_portable(input_path)
 
     schema = lf_data.collect_schema()
     n_rows = lf_data.select(pl.len()).collect().item()
@@ -216,7 +226,7 @@ try:
     print(f"   Columnas clave presentes: {[c for c in relevant_cols if c in schema.names()]}")
 except Exception as e:
     print(f"❌ Error al cargar la partición: {e}")
-    print(f"   Verifica que la ruta y partición existan: {partition_path_glob}")
+    print(f"   Verifica que la ruta exista: {input_path}")
     lf_data = None
 ```
 
@@ -831,7 +841,7 @@ def estimate_logit_statsmodels(
 #|label: estimate-baseline-2025W17-statsmodels
 
 BASE_OUTPUT_DIR_SM = "model_outputs_sm"
-results_folder_sm = os.path.join(BASE_OUTPUT_DIR_SM, "W17-baseline")
+results_folder_sm = os.path.join(BASE_OUTPUT_DIR_SM, f"W17-baseline{OUTPUT_SUFFIX}")
 
 if pandas_df is not None:
     print(f"🚀 Estimando modelo Logit (statsmodels) para {PARTITION_LABEL}...")
@@ -894,7 +904,10 @@ else:
 #|label: setup-sequential-run-statsmodels
 
 BASE_OUTPUT_DIR_SM = "model_outputs_sm"
-PARTICIONES_A_PROCESAR = [(2025, 17), (2025, 18)]  # puedes extender esta lista
+if USE_V2_PARQUET:
+    PARTICIONES_A_PROCESAR = [(2025, 17)]
+else:
+    PARTICIONES_A_PROCESAR = [(2025, 17), (2025, 18)]  # puedes extender esta lista
 APPLY_SAMPLING = False
 SAMPLE_FRACTION = 0.20
 SEED = 42
@@ -918,14 +931,18 @@ for year, week in PARTICIONES_A_PROCESAR:
     partition_label = f"{year}-W{week}"
     print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} ---\n{'='*60}")
 
-    output_dir_partition = os.path.join(BASE_OUTPUT_DIR_SM, f"W{week}-baseline")
+    sample_suffix = f"-{SAMPLE_FRACTION:g}" if APPLY_SAMPLING else ""
+    output_dir_partition = os.path.join(BASE_OUTPUT_DIR_SM, f"W{week}-baseline{OUTPUT_SUFFIX}{sample_suffix}")
     os.makedirs(output_dir_partition, exist_ok=True)
     print(f"   Resultados se guardarán en: {output_dir_partition}")
 
     try:
-        input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
-        lf_data_seq = read_parquet_portable(input_path_glob)
-        print(f"   Cargando datos desde: {input_path_glob}")
+        if USE_V2_PARQUET:
+            input_path = str(V2_PARQUET_PATH)
+        else:
+            input_path = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+        lf_data_seq = read_parquet_portable(input_path)
+        print(f"   Cargando datos desde: {input_path}")
 
         lf_model_ready_seq = prepare_features(lf_data_seq)  # mismo helper que para Biogeme
         df_model_data_seq = lf_model_ready_seq.collect()
@@ -990,7 +1007,7 @@ A continuación se presentan y analizan los resultados del modelo logit simple e
 import os
 import pandas as pd
 
-results_folder_sm = "model_outputs_sm/W17-baseline"
+results_folder_sm = f"model_outputs_sm/W17-baseline{OUTPUT_SUFFIX}"
 partition_label = "2025-W17"
 
 try:
@@ -1081,9 +1098,9 @@ import os
 partition_label = PARTITION_LABEL
 
 model_paths = {
-    "Biogeme": "../biogeme-logit/model_outputs/W17-baseline",
-    "Statsmodels": "model_outputs_sm/W17-baseline",
-    "Larch": "../larch_logit/model_outputs_larch/W17-baseline",
+    "Biogeme": f"../biogeme-logit/model_outputs/W17-baseline{OUTPUT_SUFFIX}",
+    "Statsmodels": f"model_outputs_sm/W17-baseline{OUTPUT_SUFFIX}",
+    "Larch": f"../larch_logit/model_outputs_larch/W17-baseline{OUTPUT_SUFFIX}",
 }
 
 params_tables = []
@@ -1093,9 +1110,9 @@ for model_name, folder in model_paths.items():
     params_path = os.path.join(folder, f"params_{partition_label}.csv")
     stats_path = os.path.join(folder, f"stats_{partition_label}.csv")
     if not os.path.exists(params_path) or not os.path.exists(stats_path):
-    raise FileNotFoundError(
+        raise FileNotFoundError(
             f"No se encontró uno de los archivos para {model_name}: {params_path} / {stats_path}"
-    )
+        )
 
     params_df = pd.read_csv(params_path)
     if "Name" in params_df.columns:
@@ -1156,4 +1173,3 @@ Con esto se puede:
 2. Usar `statsmodels` como alternativa más liviana/rápida para modelos logit binarios simples, manteniendo la flexibilidad de Polars y tu pipeline actual.
 
 ```
-

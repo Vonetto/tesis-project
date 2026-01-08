@@ -56,6 +56,7 @@ Para desarrollar y validar el modelo de forma controlada, este análisis se cent
 
 ````{python}
 #|label: setup-and-imports
+print("label: setup-and-imports")
 import os
 import sys
 from pathlib import Path
@@ -108,6 +109,16 @@ else:
 # Usaremos 'viajes_filtrados' como base, ya que contiene todos los viajes válidos
 INPUT_DATASET_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados"
 
+# --- Config dataset (base NL: v1 vs v2) ---
+USE_V2_PARQUET_BASE = True
+V2_PARQUET_PATH_BASE = PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet"
+OUTPUT_SUFFIX_BASE = "-v2" if USE_V2_PARQUET_BASE else ""
+
+def get_week_input_path(year: int, iso_week: int) -> str:
+    if USE_V2_PARQUET_BASE:
+        return str(V2_PARQUET_PATH_BASE)
+    return f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={iso_week}/*.parquet"
+
 # --- Ruta de Tabla de Caracterización ---
 # Tabla 1: caracterización qr_202504.csv (tiene tipo_app: 'APP RED' o 'OTRA APP')
 if USE_LOCAL_PATHS:
@@ -151,20 +162,28 @@ CHOICE_QR_OTHER = 2
 ALT_MAPPING_NESTED = {0: "BIP", 1: "QR_RED", 2: "QR_OTHER"}
 
 # --- Parámetros de Ejecución Secuencial ---
-PARTICIONES_A_PROCESAR = [
-    (2025, 17),
-    (2025, 18)
-]
+if USE_V2_PARQUET_BASE:
+    PARTICIONES_A_PROCESAR = [(2025, 17)]
+else:
+    PARTICIONES_A_PROCESAR = [
+        (2025, 17),
+        (2025, 18)
+    ]
 
 APPLY_SAMPLING = False  # Cambiar a True para aplicar muestreo
 SAMPLE_FRACTION = 0.20  # 20% estratificado por choice_nested
 SEED = 42
-BASE_OUTPUT_DIR = "model_outputs_nl_larch"  # Directorio específico para este modelo
+LARCH_NOTEBOOK_DIR = PROJECT_ROOT / "03_models" / "larch_logit"
+if not LARCH_NOTEBOOK_DIR.is_dir():
+    raise RuntimeError(f"No se encontró el directorio esperado: {LARCH_NOTEBOOK_DIR}")
+BASE_OUTPUT_DIR = str(LARCH_NOTEBOOK_DIR / "model_outputs_nl_larch")  # salida absoluta (evita confusiones por CWD)
 
 # Info de entorno
 print(f"🧮 Larch version: {getattr(lx, '__version__', 'dev')}")
 
-print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f"\n📁 Dataset de entrada: {'parquet v2' if USE_V2_PARQUET_BASE else INPUT_DATASET_PATH}")
+if USE_V2_PARQUET_BASE:
+    print(f"   - V2 parquet (base NL): {V2_PARQUET_PATH_BASE}")
 print(f"📊 Códigos elección: BIP={CHOICE_BIP}, QR_RED={CHOICE_QR_RED}, QR_OTHER={CHOICE_QR_OTHER}")
 print(f"📋 Identificación APP RED: usando tabla de caracterización (tipo_app='APP RED')")
 print(f"🔀 Aplicar muestreo: {APPLY_SAMPLING} (Fracción: {SAMPLE_FRACTION if APPLY_SAMPLING else 'N/A'})")
@@ -204,6 +223,7 @@ La probabilidad se calculará usando la estructura de nidos de larch.
 
 ````{python}
 #|label: helper-functions-nested
+print("label: helper-functions-nested")
 
 # --- Helper para Muestreo Estratificado por 'choice_nested' ---
 def get_stratified_sample_nested(df: pl.DataFrame, fraction: float, seed: int) -> pl.DataFrame:
@@ -699,6 +719,7 @@ print("\n✅ Configuraciones de parámetros disponibles: 'generic' y 'specific'"
 
 ````{python}
 #|label: estimate-nested-logit-larch-function
+print("label: estimate-nested-logit-larch-function")
 
 def estimate_nested_logit_larch(
     df_pl: pl.DataFrame,
@@ -808,11 +829,14 @@ def estimate_nested_logit_larch(
         model.pvals[mu_idx] = 0.5
         model.pholdfast[mu_idx] = 0 
 
-        # Por prolijidad, fijamos los bounds exactamente en 0.42
+        # Bounds típicos en larch para dissimilarity (λ): 0 < λ ≤ 1
         model.pminimum[mu_idx] = 0.01
         model.pmaximum[mu_idx] = 1.0
 
-        print("✅ MU_QR fijado en 0.42 (mismo valor que quieres comparar)")
+        print(
+            "✅ MU_QR configurado (larch suele interpretar MU_QR como dissimilarity λ): "
+            f"init={model.pvals[mu_idx]:.3f}, bounds=[{model.pminimum[mu_idx]:.3f}, {model.pmaximum[mu_idx]:.3f}]"
+        )
     else:
         print("⚠️ MU_QR no aparece en model.pnames")
 
@@ -1006,12 +1030,824 @@ def estimate_nested_logit_larch(
 print("✅ Función de estimación `estimate_nested_logit_larch` definida.")
 ````
 
+## Modelo Nested Logit Extendido v2 (sin caminata, con tiempos recalculados)
+
+Esta sección agrega una versión **extendida v2** (análoga a la extendida de Biogeme), usando el parquet corregido en `tmp/` que incluye:
+
+- `n_etapas_recon`
+- `te*_calculado` y `tv*_calculado`
+
+> Por ahora se **omite caminata** (no incluimos `VAR_T_CAMINATA_MIN` ni parámetros asociados).
+
+### Helpers v2 (features + configs)
+
+````{python}
+#|label: helper-functions-nested-extended-v2-larch
+print("label: helper-functions-nested-extended-v2-larch")
+
+# --- Feature engineering: Nested Logit extendido v2 (sin caminata) ---
+# Nota: para poder estimar "con y sin dummies modales" sin re-preparar el parquet,
+# las features v2 SIEMPRE incluyen las columnas de dummies modales, y la especificación
+# del modelo decide si las usa o no.
+FEATURE_COLS_EXTENDED_V2_NL_CORE = [
+    # Temporales
+    "DUMMY_PM_LAB",
+    "DUMMY_PT_LAB",
+    "DUMMY_LJ_LAB",
+    "DUMMY_VIE_LAB",
+    # Atributos de viaje (v2, recalculados)
+    "VAR_T_VEHICULO_MIN",
+    "VAR_N_TRASBORDOS",
+    "VAR_T_ESPERA_TRASBORDO_MIN",
+    "VAR_T_ESPERA_INICIAL_MIN",
+]
+
+FEATURE_COLS_MODE_DUMMIES_NL = [
+    "DUMMY_SOLO_METRO",
+    "DUMMY_METRO_BUS",
+]
+
+
+def _alt_specific_feature_names_v2(base_cols: list[str]) -> list[str]:
+    names: list[str] = []
+    for col in base_cols:
+        names.append(f"{col}_RED")
+        names.append(f"{col}_OTHER")
+    return names
+
+
+def _feature_to_source_for_specific_v2(base_cols: list[str]) -> dict[str, str]:
+    m: dict[str, str] = {}
+    for col in base_cols:
+        m[f"{col}_RED"] = col
+        m[f"{col}_OTHER"] = col
+    return m
+
+
+def build_spec_configs_extended_v2_nl(include_mode_dummies: bool) -> dict:
+    """
+    Construye configuraciones para:
+    - generic  : betas compartidos para QR_RED y QR_OTHER
+    - specific : betas diferenciados por alternativa
+
+    `include_mode_dummies=False` permite correr el mismo nested v2 sin
+    `DUMMY_SOLO_METRO` / `DUMMY_METRO_BUS` (recomendación típica si hay colinealidad o mala medición).
+    """
+    feature_cols_generic = FEATURE_COLS_EXTENDED_V2_NL_CORE + (
+        FEATURE_COLS_MODE_DUMMIES_NL if include_mode_dummies else []
+    )
+    feature_cols_specific = _alt_specific_feature_names_v2(feature_cols_generic)
+
+    generic_param_to_feature = {
+        "ASC_QR_RED": "ASC_QR_RED",
+        "ASC_QR_OTHER": "ASC_QR_OTHER",
+        "B_QR_PM_LAB": "DUMMY_PM_LAB",
+        "B_QR_PT_LAB": "DUMMY_PT_LAB",
+        "B_QR_LJ_LAB": "DUMMY_LJ_LAB",
+        "B_QR_VIE_LAB": "DUMMY_VIE_LAB",
+        "B_QR_T_VEHICULO": "VAR_T_VEHICULO_MIN",
+        "B_QR_N_TRASBORDOS": "VAR_N_TRASBORDOS",
+        "B_QR_T_ESPERA_TRASB": "VAR_T_ESPERA_TRASBORDO_MIN",
+        "B_QR_T_ESPERA_INI": "VAR_T_ESPERA_INICIAL_MIN",
+    }
+    generic_model_params = [
+        "ASC_QR_RED",
+        "ASC_QR_OTHER",
+        "B_QR_PM_LAB",
+        "B_QR_PT_LAB",
+        "B_QR_LJ_LAB",
+        "B_QR_VIE_LAB",
+        "B_QR_T_VEHICULO",
+        "B_QR_N_TRASBORDOS",
+        "B_QR_T_ESPERA_TRASB",
+        "B_QR_T_ESPERA_INI",
+    ]
+
+    if include_mode_dummies:
+        generic_param_to_feature.update(
+            {
+                "B_QR_SOLO_METRO": "DUMMY_SOLO_METRO",
+                "B_QR_METRO_BUS": "DUMMY_METRO_BUS",
+            }
+        )
+        generic_model_params += ["B_QR_SOLO_METRO", "B_QR_METRO_BUS"]
+
+    generic_model_params.append("MU_QR")
+
+    specific_param_to_feature = {
+        "ASC_QR_RED": "ASC_QR_RED",
+        "ASC_QR_OTHER": "ASC_QR_OTHER",
+        "B_QR_RED_PM_LAB": "DUMMY_PM_LAB_RED",
+        "B_QR_OTHER_PM_LAB": "DUMMY_PM_LAB_OTHER",
+        "B_QR_RED_PT_LAB": "DUMMY_PT_LAB_RED",
+        "B_QR_OTHER_PT_LAB": "DUMMY_PT_LAB_OTHER",
+        "B_QR_RED_LJ_LAB": "DUMMY_LJ_LAB_RED",
+        "B_QR_OTHER_LJ_LAB": "DUMMY_LJ_LAB_OTHER",
+        "B_QR_RED_VIE_LAB": "DUMMY_VIE_LAB_RED",
+        "B_QR_OTHER_VIE_LAB": "DUMMY_VIE_LAB_OTHER",
+        "B_QR_RED_T_VEHICULO": "VAR_T_VEHICULO_MIN_RED",
+        "B_QR_OTHER_T_VEHICULO": "VAR_T_VEHICULO_MIN_OTHER",
+        "B_QR_RED_N_TRASBORDOS": "VAR_N_TRASBORDOS_RED",
+        "B_QR_OTHER_N_TRASBORDOS": "VAR_N_TRASBORDOS_OTHER",
+        "B_QR_RED_T_ESPERA_TRASB": "VAR_T_ESPERA_TRASBORDO_MIN_RED",
+        "B_QR_OTHER_T_ESPERA_TRASB": "VAR_T_ESPERA_TRASBORDO_MIN_OTHER",
+        "B_QR_RED_T_ESPERA_INI": "VAR_T_ESPERA_INICIAL_MIN_RED",
+        "B_QR_OTHER_T_ESPERA_INI": "VAR_T_ESPERA_INICIAL_MIN_OTHER",
+    }
+    specific_model_params = [
+        "ASC_QR_RED",
+        "ASC_QR_OTHER",
+        "B_QR_RED_PM_LAB",
+        "B_QR_OTHER_PM_LAB",
+        "B_QR_RED_PT_LAB",
+        "B_QR_OTHER_PT_LAB",
+        "B_QR_RED_LJ_LAB",
+        "B_QR_OTHER_LJ_LAB",
+        "B_QR_RED_VIE_LAB",
+        "B_QR_OTHER_VIE_LAB",
+        "B_QR_RED_T_VEHICULO",
+        "B_QR_OTHER_T_VEHICULO",
+        "B_QR_RED_N_TRASBORDOS",
+        "B_QR_OTHER_N_TRASBORDOS",
+        "B_QR_RED_T_ESPERA_TRASB",
+        "B_QR_OTHER_T_ESPERA_TRASB",
+        "B_QR_RED_T_ESPERA_INI",
+        "B_QR_OTHER_T_ESPERA_INI",
+    ]
+
+    if include_mode_dummies:
+        specific_param_to_feature.update(
+            {
+                "B_QR_RED_SOLO_METRO": "DUMMY_SOLO_METRO_RED",
+                "B_QR_OTHER_SOLO_METRO": "DUMMY_SOLO_METRO_OTHER",
+                "B_QR_RED_METRO_BUS": "DUMMY_METRO_BUS_RED",
+                "B_QR_OTHER_METRO_BUS": "DUMMY_METRO_BUS_OTHER",
+            }
+        )
+        specific_model_params += [
+            "B_QR_RED_SOLO_METRO",
+            "B_QR_OTHER_SOLO_METRO",
+            "B_QR_RED_METRO_BUS",
+            "B_QR_OTHER_METRO_BUS",
+        ]
+
+    specific_model_params.append("MU_QR")
+
+    return {
+        "generic": {
+            "feature_columns": feature_cols_generic,
+            "param_to_feature": generic_param_to_feature,
+            "feature_to_source": {col: col for col in feature_cols_generic},
+            "model_params": generic_model_params,
+        },
+        "specific": {
+            "feature_columns": feature_cols_specific,
+            "param_to_feature": specific_param_to_feature,
+            "feature_to_source": _feature_to_source_for_specific_v2(feature_cols_generic),
+            "model_params": specific_model_params,
+        },
+    }
+
+
+# Default: mantenemos el comportamiento anterior (sin dummies modales) y dejamos que
+# la sección de ejecución corra ambas variantes si se desea.
+SPEC_CONFIGS_EXTENDED_V2_NL = build_spec_configs_extended_v2_nl(include_mode_dummies=False)
+
+
+def _alt_specific_feature_names_v2(base_cols: list[str]) -> list[str]:
+    names: list[str] = []
+    for col in base_cols:
+        names.append(f"{col}_RED")
+        names.append(f"{col}_OTHER")
+    return names
+
+
+def prepare_nested_extended_v2_features(lazy_frame: pl.LazyFrame, df_caract: pl.DataFrame = None) -> pl.LazyFrame:
+    """
+    Prepara features para Nested Logit extendido v2:
+    - Usa *_calculado y n_etapas_recon del parquet corregido.
+    - Omite caminata.
+    - Mantiene choice_nested vía tabla de caracterización (tipo_app).
+    """
+    if df_caract is None:
+        df_caract = globals().get("df_caracterizacion", None)
+
+    cols_necesarias = (
+        ["is_qr", "id_tarjeta", "tiempo_inicio_viaje", "tipodia", "n_etapas_recon"]
+        + [f"te{i}_calculado" for i in range(6)]      # te0..te5
+        + [f"tv{i}_calculado" for i in range(1, 7)]   # tv1..tv6
+        + [f"tipo_transporte_{i}" for i in range(1, 5)]
+    )
+
+    schema = lazy_frame.collect_schema()
+    missing_cols = [c for c in cols_necesarias if c not in schema]
+    if missing_cols:
+        raise ValueError(f"Columnas faltantes en datos v2 (nested larch): {missing_cols}")
+
+    lf_prep = lazy_frame.select(cols_necesarias).with_columns(
+        pl.col("id_tarjeta").cast(pl.Utf8).alias("id_tarjeta_str")
+    )
+
+    if df_caract is not None:
+        lf_prep = lf_prep.join(df_caract.lazy(), on="id_tarjeta_str", how="left")
+        print("      ✅ Join con tabla de caracterización realizado (extendido v2)")
+    else:
+        lf_prep = lf_prep.with_columns(pl.lit(None).cast(pl.Utf8).alias("tipo_app"))
+        print("      ⚠️ Tabla de caracterización no disponible (extendido v2)")
+
+    # Base + choice_nested
+    lf_prep = lf_prep.with_columns([
+        pl.col("tiempo_inicio_viaje")
+          .dt.replace_time_zone("America/Santiago", ambiguous="earliest")
+          .alias("ts_local"),
+        pl.col("n_etapas_recon").fill_null(1).cast(pl.Int8).alias("n_etapas_recon"),
+        (pl.col("tipodia").cast(pl.Utf8).cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
+        pl.when(pl.col("is_qr") == False).then(pl.lit(CHOICE_BIP))
+          .when((pl.col("is_qr") == True) & (pl.col("tipo_app") == "APP RED")).then(pl.lit(CHOICE_QR_RED))
+          .when(pl.col("is_qr") == True).then(pl.lit(CHOICE_QR_OTHER))
+          .otherwise(pl.lit(CHOICE_BIP))
+          .cast(pl.Int8)
+          .alias("choice_nested"),
+    ])
+
+    # 1) Dummies temporales
+    lf_prep = lf_prep.with_columns([
+        pl.col("ts_local").dt.hour().alias("hora"),
+        pl.col("ts_local").dt.weekday().alias("dia_semana"),
+    ]).with_columns([
+        pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
+        (pl.col("dia_semana") == 5).alias("es_viernes"),
+        pl.col("dia_semana").is_between(1, 4, closed="both").alias("es_lun_jue"),
+    ]).with_columns([
+        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
+        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
+        (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
+        (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+    ])
+
+    # 2) Atributos v2 (sin caminata)
+    # Nota: para evitar doble conteo, te0 es espera inicial y te1..te5 son esperas de trasbordo.
+    cols_te_transfer_calc = [f"te{i}_calculado" for i in range(1, 6)]
+    cols_tv_calc = [f"tv{i}_calculado" for i in range(1, 7)]
+    lf_prep = lf_prep.with_columns([
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_te_transfer_calc]).alias("t_espera_trasbordo_calc_seg"),
+        pl.sum_horizontal([pl.col(c).fill_null(0) for c in cols_tv_calc]).alias("t_vehiculo_total_calc_seg"),
+    ]).with_columns([
+        (pl.col("t_vehiculo_total_calc_seg") / 60.0).alias("VAR_T_VEHICULO_MIN"),
+        (pl.col("n_etapas_recon") - 1).alias("VAR_N_TRASBORDOS"),
+        (pl.col("t_espera_trasbordo_calc_seg") / 60.0).alias("VAR_T_ESPERA_TRASBORDO_MIN"),
+        (pl.col("te0_calculado").fill_null(0) / 60.0).alias("VAR_T_ESPERA_INICIAL_MIN"),
+    ])
+
+    # 3) Dummies modales (usando n_etapas_recon)
+    cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
+    for col in cols_modos:
+        lf_prep = lf_prep.with_columns([
+            pl.when(pl.col(col).cast(pl.Utf8) == "3").then(pl.lit("1"))
+              .otherwise(pl.col(col).cast(pl.Utf8))
+              .alias(col)
+        ])
+
+    lf_prep = lf_prep.with_columns([
+        pl.any_horizontal([
+            pl.when(pl.col("n_etapas_recon") >= i).then(pl.col(f"tipo_transporte_{i}") == "1").otherwise(False)
+            for i in range(1, 5)
+        ]).alias("usa_bus"),
+        pl.any_horizontal([
+            pl.when(pl.col("n_etapas_recon") >= i).then(pl.col(f"tipo_transporte_{i}") == "2").otherwise(False)
+            for i in range(1, 5)
+        ]).alias("usa_metro"),
+        pl.any_horizontal([
+            pl.when(pl.col("n_etapas_recon") >= i).then(pl.col(f"tipo_transporte_{i}") == "4").otherwise(False)
+            for i in range(1, 5)
+        ]).alias("usa_metrotren"),
+    ])
+
+    # Dummies modales (alineado con Biogeme/Statsmodels)
+    lf_prep = lf_prep.with_columns([
+        (pl.col("usa_metro") & ~pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+        (pl.col("usa_metro") & pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+    ])
+
+    # Importante: retornamos el superset (core + dummies) para poder estimar ambas variantes
+    cols_modelo = ["choice_nested"] + FEATURE_COLS_EXTENDED_V2_NL_CORE + FEATURE_COLS_MODE_DUMMIES_NL
+    return lf_prep.select(cols_modelo).fill_null(0)
+
+
+print("✅ Helpers v2 definidos: build_spec_configs_extended_v2_nl, SPEC_CONFIGS_EXTENDED_V2_NL, prepare_nested_extended_v2_features")
+````
+
+### Función de estimación (extendido v2)
+
+````{python}
+#|label: estimate-nested-logit-larch-extended-v2-function
+print("label: estimate-nested-logit-larch-extended-v2-function")
+
+def estimate_nested_logit_larch_extended_v2(
+    df_pl: pl.DataFrame,
+    partition_label: str,
+    output_dir: str,
+    alt_mapping: dict[int, str] = ALT_MAPPING_NESTED,
+    specification: str = "generic",
+) -> tuple[Model, pd.DataFrame, pd.DataFrame]:
+    """
+    Estima el nested logit extendido v2 usando larch, con outputs compatibles.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    start_time = time.perf_counter()
+
+    spec_key = specification.lower()
+    if spec_key not in SPEC_CONFIGS_EXTENDED_V2_NL:
+        raise ValueError(
+            f"Especificación desconocida: {specification}. "
+            f"Opciones: {list(SPEC_CONFIGS_EXTENDED_V2_NL.keys())}"
+        )
+
+    spec_cfg = SPEC_CONFIGS_EXTENDED_V2_NL[spec_key]
+    feature_columns = spec_cfg["feature_columns"]
+    feature_to_source = spec_cfg["feature_to_source"]
+    param_to_feature = spec_cfg["param_to_feature"]
+    model_params_to_report = spec_cfg["model_params"]
+    feature_param_map = {
+        dataset_col: param_name
+        for param_name, dataset_col in param_to_feature.items()
+        if dataset_col not in {"ASC_QR_RED", "ASC_QR_OTHER"}
+    }
+
+    active_features, inactive_feature_reason, sep_info = detect_active_features_nested(
+        df_pl,
+        feature_to_source,
+        choice_col="choice_nested"
+    )
+
+    if inactive_feature_reason:
+        print(f"   🔎 Revisión de separación perfecta y variables inactivas (partition={partition_label}, spec={spec_key}):")
+        for col, meta in sep_info.items():
+            if meta["type"] != "none":
+                print(
+                    f"      - {col}: type={meta['type']}, "
+                    f"n_1={meta['n_1']:,}, total={meta['n_total']:,}, "
+                    f"p_1={meta['p_1']:.4f}"
+                )
+        for col, reason in inactive_feature_reason.items():
+            if col not in sep_info or sep_info.get(col, {}).get("type") == "none":
+                print(f"      - {col}: {reason}")
+
+    # Dataset: build_long_format_for_larch_nested espera FEATURES BASE (wide) y crea automáticamente
+    # las columnas alternativas (p.ej. DUMMY_PM_LAB_RED / DUMMY_PM_LAB_OTHER).
+    base_feature_cols_for_dataset = list(dict.fromkeys(feature_to_source.values()))
+    dataset = create_larch_dataset_nested(
+        df_pl.select(["choice_nested"] + base_feature_cols_for_dataset),
+        base_feature_cols_for_dataset,
+        alt_mapping
+    )
+
+    model = Model(dataset)
+    model.title = f"nested_logit_larch_ext_v2_{spec_key}_{partition_label}"
+    model.compute_engine = "numba"
+    model.choice_ca_var = "choice_ind"
+
+    utility_expr = (
+        P("ASC_QR_RED") * X("ASC_QR_RED") +
+        P("ASC_QR_OTHER") * X("ASC_QR_OTHER")
+    )
+    for feat in active_features:
+        param_name = feature_param_map.get(feat, feat)
+        utility_expr += P(param_name) * X(feat)
+
+    model.utility_ca = utility_expr
+
+    # Nido QR
+    model.graph.new_node(
+        parameter="MU_QR",
+        children=[CHOICE_QR_RED, CHOICE_QR_OTHER],
+        name="QR"
+    )
+
+    model.set_cap()
+
+    # Bounds MU_QR (en larch típicamente 0<mu<=1)
+    pnames = list(model.pnames)
+    if "MU_QR" in pnames:
+        mu_idx = pnames.index("MU_QR")
+        model.pvals[mu_idx] = 0.5
+        model.pholdfast[mu_idx] = 0
+        model.pminimum[mu_idx] = 0.01
+        model.pmaximum[mu_idx] = 1.0
+    else:
+        print("⚠️ MU_QR no aparece en model.pnames")
+
+    print(f"   Estimando modelo nested logit extendido v2 ({spec_key}) para {partition_label}...")
+    result = model.maximize_loglike()
+    model.calculate_parameter_covariance(robust=True)
+
+    # --- Extraer parámetros en formato Biogeme-style ---
+    pvalues_dict: dict[str, float] = {}
+    pstderr_dict: dict[str, float] = {}
+    try:
+        pf_df = model.pf
+        for idx, row in pf_df.iterrows():
+            param_name = row.name if hasattr(row, "name") else idx
+            param_value = row.get("value", row.get("Value", np.nan))
+            pvalues_dict[param_name] = float(param_value) if param_value is not None and not pd.isna(param_value) else np.nan
+            # Robust SE puede venir con varios nombres según versión de larch/pandas
+            se = row.get(
+                "robust_stderr",
+                row.get(
+                    "robust stderr",
+                    row.get(
+                        "robust_std_err",
+                        row.get(
+                            "Robust Std Err",
+                            row.get(
+                                "Robust Std Err.",
+                                row.get(
+                                    "stderr",
+                                    row.get("Std Err", row.get("std_err", np.nan)),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            pstderr_dict[param_name] = float(se) if se is not None and not pd.isna(se) else np.nan
+    except (AttributeError, TypeError):
+        summary_df = (
+            model.parameter_summary()
+            .data.rename_axis("Parameter")
+            .reset_index()
+            .set_index("Parameter")
+        )
+        for param_name in summary_df.index:
+            val = summary_df.loc[param_name, "Value"]
+            pvalues_dict[param_name] = pd.to_numeric(val, errors="coerce")
+            se = summary_df.loc[param_name].get(
+                "Robust Std Err",
+                summary_df.loc[param_name].get(
+                    "Robust Std Err.",
+                    summary_df.loc[param_name].get("Std Err", np.nan),
+                ),
+            )
+            pstderr_dict[param_name] = pd.to_numeric(se, errors="coerce")
+
+    summary_df = (
+        model.parameter_summary()
+        .data.rename_axis("Parameter")
+        .reset_index()
+        .set_index("Parameter")
+    )
+
+    def _safe_float(x):
+        if x is None or pd.isna(x):
+            return np.nan
+        if isinstance(x, (float, int, np.floating, np.integer)):
+            return float(x)
+        if isinstance(x, str):
+            token = x.strip().replace("\xa0", " ").strip().upper()
+            if token in {"BIG", "+BIG"}:
+                return np.inf
+            if token == "-BIG":
+                return -np.inf
+            if token in {"NA", "N/A", "NAN", "NONE", ""}:
+                return np.nan
+            try:
+                return float(x)
+            except (ValueError, TypeError):
+                return np.nan
+        try:
+            return float(x)
+        except (ValueError, TypeError):
+            return np.nan
+
+    rows = []
+    t_max = float(np.finfo(float).max)
+
+    param_name_mapping = {}
+    for full_name in pvalues_dict.keys():
+        clean_name = full_name.replace(f"_{partition_label}", "")
+        param_name_mapping[clean_name] = full_name
+
+    for param in model_params_to_report:
+        matching_full_name = param_name_mapping.get(param)
+        if not matching_full_name:
+            for clean_name, full_name in param_name_mapping.items():
+                if param in clean_name:
+                    matching_full_name = full_name
+                    break
+
+        if matching_full_name and matching_full_name in pvalues_dict:
+            value = float(pvalues_dict[matching_full_name])
+            summary_key = matching_full_name if matching_full_name in summary_df.index else param
+            if summary_key in summary_df.index:
+                # Preferir Robust SE desde parameter_summary si existe
+                se = _safe_float(
+                    summary_df.loc[summary_key].get(
+                        "Robust Std Err",
+                        summary_df.loc[summary_key].get(
+                            "Robust Std Err.",
+                            pstderr_dict.get(matching_full_name, np.nan),
+                        ),
+                    )
+                )
+                t_stat = _safe_float(
+                    summary_df.loc[summary_key].get(
+                        "Robust t Stat",
+                        summary_df.loc[summary_key].get("t Stat", np.nan),
+                    )
+                )
+            else:
+                se = float(pstderr_dict.get(matching_full_name, np.nan))
+                t_stat = value / se if se > 0 and not np.isnan(se) else np.nan
+        else:
+            value = 0.0
+            feat_name_for_param = param_to_feature.get(param)
+            reason = inactive_feature_reason.get(feat_name_for_param, "inactive") if feat_name_for_param else "inactive"
+            if reason in {"all_zero", "no_variation", "perfect_0", "perfect_1", "perfect_2"}:
+                se = 0.0
+                t_stat = t_max
+            else:
+                se = np.nan
+                t_stat = np.nan
+
+        rows.append(
+            {
+                "Name": f"{param}_{partition_label}",
+                "Value": value,
+                "Robust std err.": se,
+                "Robust t-stat.": t_stat,
+            }
+        )
+
+    params_df = pd.DataFrame(rows)
+
+    # --- Estadísticas ---
+    nobs = model.n_cases
+    ll_final = float(result["loglike"])
+    ll_init = nobs * np.log(1.0 / 3.0)  # 3 alternativas => p0=1/3
+    k_params = len(
+        [
+            p
+            for p in model_params_to_report
+            if p in pvalues_dict
+            or inactive_feature_reason.get(param_to_feature.get(p, ""), "")
+            in {"all_zero", "no_variation", "perfect_0", "perfect_1", "perfect_2"}
+        ]
+    )
+    rho_sq = 1.0 - ll_final / ll_init
+    rho_sq_bar = 1.0 - (ll_final - k_params) / ll_init
+
+    try:
+        grad = model.d_loglike()
+        grad_norm = float(np.linalg.norm(grad))
+    except Exception:
+        grad_norm = np.nan
+
+    elapsed_seconds = time.perf_counter() - start_time
+    print(f"   ⏱️ Tiempo total partición {partition_label}: {elapsed_seconds:.1f} s")
+
+    stats_df = pd.DataFrame(
+        [
+            {
+                "Number of estimated parameters": k_params,
+                "Sample size": nobs,
+                "Excluded observations": 0,
+                "Init log likelihood": ll_init,
+                "Final log likelihood": ll_final,
+                "Likelihood ratio test for the init. model": -2 * (ll_init - ll_final),
+                "Rho-square for the init. model": rho_sq,
+                "Rho-square-bar for the init. model": rho_sq_bar,
+                "Akaike Information Criterion": -2 * ll_final + 2 * k_params,
+                "Bayesian Information Criterion": -2 * ll_final + k_params * np.log(nobs),
+                "Final gradient norm": grad_norm,
+                "Bootstrapping time": None,
+                "Wall-clock seconds": elapsed_seconds,
+            }
+        ]
+    )
+
+    params_path = os.path.join(output_dir, f"params_nl_ext_v2_{spec_key}_{partition_label}.csv")
+    stats_path = os.path.join(output_dir, f"stats_nl_ext_v2_{spec_key}_{partition_label}.csv")
+    params_df.to_csv(params_path, index=False, float_format="%.15g")
+    stats_df.to_csv(stats_path, index=False, float_format="%.15g")
+
+    print(f"📁 Parámetros (larch nested ext v2) guardados en: {params_path}")
+    print(f"📁 Estadísticas (larch nested ext v2) guardadas en: {stats_path}")
+
+    return model, params_df, stats_df
+
+
+print("✅ Función de estimación `estimate_nested_logit_larch_extended_v2` definida.")
+````
+
+### Setup y ejecución v2 (parquet corregido)
+
+````{python}
+#|label: setup-nested-ext-v2-larch
+print("label: setup-nested-ext-v2-larch")
+
+PARTITION_LABEL_EXT_V2_NL = "2025-W17"
+EXTENDED_V2_PARQUET_PATH_NL = PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet"
+
+APPLY_SAMPLING_EXT_V2_NL = True
+SAMPLE_FRACTION_EXT_V2_NL = 0.20
+SEED_EXT_V2_NL = 42
+
+BASE_OUTPUT_DIR_EXT_V2_NL = BASE_OUTPUT_DIR
+
+# Etiqueta de muestra (fallback) para nombres de carpeta.
+# Si ejecutas la preparación de datos, esta variable se sobreescribe con la etiqueta real.
+sample_label_ext_v2_nl = (
+    f"sample{int(SAMPLE_FRACTION_EXT_V2_NL*100)}pct" if APPLY_SAMPLING_EXT_V2_NL else "full"
+)
+
+# --- Matched sample (para comparar Biogeme vs Larch con EXACTAMENTE las mismas filas) ---
+USE_MATCHED_SAMPLE_FILE_EXT_V2_NL = False
+EXPORT_MATCHED_SAMPLE_FILE_EXT_V2_NL = False
+MATCHED_SAMPLE_PATH_EXT_V2_NL = (
+    PROJECT_ROOT
+    / "tmp"
+    / "matched_samples"
+    / f"nested_ext_v2_{PARTITION_LABEL_EXT_V2_NL}_{sample_label_ext_v2_nl}.parquet"
+)
+
+# Queremos guardar ambos resultados (con y sin dummies modales) para comparar
+MODE_DUMMY_VARIANTS_EXT_V2_NL = [False, True]  # False=noModeDummies, True=modeDummies
+SPECS_EXT_V2_NL_TO_RUN = ["generic", "specific"]
+
+print("=" * 80)
+print("--- Nested Logit Extendido v2 (Larch) ---")
+print("=" * 80)
+print(f"Parquet v2: {EXTENDED_V2_PARQUET_PATH_NL}")
+print(f"Partition label: {PARTITION_LABEL_EXT_V2_NL}")
+print(f"Sampling: {APPLY_SAMPLING_EXT_V2_NL} (fraction={SAMPLE_FRACTION_EXT_V2_NL if APPLY_SAMPLING_EXT_V2_NL else 'full'})")
+print(f"Output base dir: {BASE_OUTPUT_DIR_EXT_V2_NL}")
+print(f"Matched sample: {USE_MATCHED_SAMPLE_FILE_EXT_V2_NL} (path={MATCHED_SAMPLE_PATH_EXT_V2_NL})")
+print(f"Mode-dummy variants: {MODE_DUMMY_VARIANTS_EXT_V2_NL}")
+print(f"Specs to run: {SPECS_EXT_V2_NL_TO_RUN}")
+````
+
+````{python}
+#|label: prepare-data-nested-ext-v2-larch
+#|eval: false
+print("label: prepare-data-nested-ext-v2-larch")
+
+print(f"\n📂 Parquet corregido v2: {EXTENDED_V2_PARQUET_PATH_NL}")
+print(f"📌 Matched sample path: {MATCHED_SAMPLE_PATH_EXT_V2_NL}")
+
+if USE_MATCHED_SAMPLE_FILE_EXT_V2_NL and MATCHED_SAMPLE_PATH_EXT_V2_NL.exists():
+    print(f"✅ Usando matched sample existente: {MATCHED_SAMPLE_PATH_EXT_V2_NL}")
+    df_for_model_ext_v2_nl = pl.read_parquet(MATCHED_SAMPLE_PATH_EXT_V2_NL)
+    # inferir etiqueta desde nombre (último token del stem)
+    sample_label_ext_v2_nl = MATCHED_SAMPLE_PATH_EXT_V2_NL.stem.split("_")[-1]
+    # Para no sobre-escribir outputs anteriores, etiquetamos explícitamente esta corrida.
+    if not sample_label_ext_v2_nl.endswith("-matched"):
+        sample_label_ext_v2_nl = f"{sample_label_ext_v2_nl}-matched"
+else:
+    print("\n📂 Cargando parquet corregido v2 completo...")
+    lf_data_ext_v2_nl = read_parquet_portable(str(EXTENDED_V2_PARQUET_PATH_NL))
+
+    print("🔧 Preparando features (extendido v2, sin caminata)...")
+    lf_model_ready_ext_v2_nl = prepare_nested_extended_v2_features(lf_data_ext_v2_nl)
+    df_model_data_ext_v2_nl = lf_model_ready_ext_v2_nl.collect()
+    print(f"   ✅ Features preparados: {len(df_model_data_ext_v2_nl):,} filas")
+
+    print("\n   📊 Distribución choice_nested (antes de muestreo):")
+    choice_dist = df_model_data_ext_v2_nl["choice_nested"].value_counts().sort("choice_nested")
+    for row in choice_dist.iter_rows(named=True):
+        choice_val = row["choice_nested"]
+        count = row["count"]
+        pct = (count / len(df_model_data_ext_v2_nl)) * 100
+        choice_name = ALT_MAPPING_NESTED.get(choice_val, f"Unknown({choice_val})")
+        print(f"      - {choice_name} ({choice_val}): {count:,} ({pct:.2f}%)")
+
+    if APPLY_SAMPLING_EXT_V2_NL:
+        print(f"\n🎲 Aplicando muestreo estratificado ({SAMPLE_FRACTION_EXT_V2_NL*100:.0f}%)...")
+        df_for_model_ext_v2_nl = get_stratified_sample_nested(
+            df_model_data_ext_v2_nl, SAMPLE_FRACTION_EXT_V2_NL, SEED_EXT_V2_NL
+        )
+        sample_label_ext_v2_nl = f"sample{int(SAMPLE_FRACTION_EXT_V2_NL*100)}pct"
+    else:
+        df_for_model_ext_v2_nl = df_model_data_ext_v2_nl
+        sample_label_ext_v2_nl = "full"
+
+    print(f"   ✅ Dataset final para modelar: {len(df_for_model_ext_v2_nl):,} filas ({sample_label_ext_v2_nl})")
+
+    if EXPORT_MATCHED_SAMPLE_FILE_EXT_V2_NL:
+        MATCHED_SAMPLE_PATH_EXT_V2_NL.parent.mkdir(parents=True, exist_ok=True)
+        print(f"💾 Guardando matched sample: {MATCHED_SAMPLE_PATH_EXT_V2_NL}")
+        df_for_model_ext_v2_nl.write_parquet(MATCHED_SAMPLE_PATH_EXT_V2_NL)
+        print("✅ Matched sample guardado.")
+````
+
+````{python}
+#|label: estimate-nested-ext-v2-generic-larch
+#|eval: false
+print("label: estimate-nested-ext-v2-generic-larch")
+
+if "df_for_model_ext_v2_nl" not in globals():
+    raise RuntimeError("Ejecuta primero 'prepare-data-nested-ext-v2-larch'.")
+if "sample_label_ext_v2_nl" not in globals():
+    sample_label_ext_v2_nl = (
+        f"sample{int(SAMPLE_FRACTION_EXT_V2_NL*100)}pct" if APPLY_SAMPLING_EXT_V2_NL else "full"
+    )
+
+spec_key = "generic"
+SPEC_CONFIGS_EXTENDED_V2_NL = build_spec_configs_extended_v2_nl(include_mode_dummies=False)
+mode_tag = "noModeDummies"
+output_dir_ext_v2 = os.path.join(
+    BASE_OUTPUT_DIR_EXT_V2_NL,
+    f"{PARTITION_LABEL_EXT_V2_NL}-nested-ext-v2-{spec_key}-{mode_tag}-{sample_label_ext_v2_nl}",
+)
+
+print(f"\n🔬 Estimando nested logit EXT v2 ({spec_key})...")
+print(f"   Output: {output_dir_ext_v2}")
+
+model_nl_ext_v2_generic, params_df_nl_ext_v2_generic, stats_df_nl_ext_v2_generic = estimate_nested_logit_larch_extended_v2(
+    df_pl=df_for_model_ext_v2_nl,
+    partition_label=PARTITION_LABEL_EXT_V2_NL,
+    output_dir=output_dir_ext_v2,
+    alt_mapping=ALT_MAPPING_NESTED,
+    specification=spec_key,
+)
+
+display(stats_df_nl_ext_v2_generic)
+display(params_df_nl_ext_v2_generic)
+````
+
+````{python}
+#|label: estimate-nested-ext-v2-specific-larch
+#|eval: false
+print("label: estimate-nested-ext-v2-specific-larch")
+
+if "df_for_model_ext_v2_nl" not in globals():
+    raise RuntimeError("Ejecuta primero 'prepare-data-nested-ext-v2-larch'.")
+if "sample_label_ext_v2_nl" not in globals():
+    sample_label_ext_v2_nl = (
+        f"sample{int(SAMPLE_FRACTION_EXT_V2_NL*100)}pct" if APPLY_SAMPLING_EXT_V2_NL else "full"
+    )
+
+spec_key = "specific"
+SPEC_CONFIGS_EXTENDED_V2_NL = build_spec_configs_extended_v2_nl(include_mode_dummies=False)
+mode_tag = "noModeDummies"
+output_dir_ext_v2 = os.path.join(
+    BASE_OUTPUT_DIR_EXT_V2_NL,
+    f"{PARTITION_LABEL_EXT_V2_NL}-nested-ext-v2-{spec_key}-{mode_tag}-{sample_label_ext_v2_nl}",
+)
+
+print(f"\n🔬 Estimando nested logit EXT v2 ({spec_key})...")
+print(f"   Output: {output_dir_ext_v2}")
+
+model_nl_ext_v2_specific, params_df_nl_ext_v2_specific, stats_df_nl_ext_v2_specific = estimate_nested_logit_larch_extended_v2(
+    df_pl=df_for_model_ext_v2_nl,
+    partition_label=PARTITION_LABEL_EXT_V2_NL,
+    output_dir=output_dir_ext_v2,
+    alt_mapping=ALT_MAPPING_NESTED,
+    specification=spec_key,
+)
+
+display(stats_df_nl_ext_v2_specific)
+display(params_df_nl_ext_v2_specific)
+````
+
+````{python}
+#|label: estimate-nested-ext-v2-both-mode-dummy-variants-larch
+#|eval: false
+print("label: estimate-nested-ext-v2-both-mode-dummy-variants-larch")
+
+if "df_for_model_ext_v2_nl" not in globals():
+    raise RuntimeError("Ejecuta primero 'prepare-data-nested-ext-v2-larch'.")
+
+for include_modes in MODE_DUMMY_VARIANTS_EXT_V2_NL:
+    SPEC_CONFIGS_EXTENDED_V2_NL = build_spec_configs_extended_v2_nl(include_mode_dummies=include_modes)
+    mode_tag = "modeDummies" if include_modes else "noModeDummies"
+
+    for spec_key in SPECS_EXT_V2_NL_TO_RUN:
+        output_dir_ext_v2 = os.path.join(
+            BASE_OUTPUT_DIR_EXT_V2_NL,
+            f"{PARTITION_LABEL_EXT_V2_NL}-nested-ext-v2-{spec_key}-{mode_tag}-{sample_label_ext_v2_nl}",
+        )
+        print(f"\n🔬 Estimando nested logit EXT v2 ({spec_key}, {mode_tag})...")
+        print(f"   Output: {output_dir_ext_v2}")
+
+        model, params_df, stats_df = estimate_nested_logit_larch_extended_v2(
+            df_pl=df_for_model_ext_v2_nl,
+            partition_label=PARTITION_LABEL_EXT_V2_NL,
+            output_dir=output_dir_ext_v2,
+            alt_mapping=ALT_MAPPING_NESTED,
+            specification=spec_key,
+        )
+        display(stats_df)
+        display(params_df)
+````
+
 ## Estimación de Prueba - Una Partición
 
 Esta celda permite probar la estimación del modelo nested logit baseline en una sola partición antes de ejecutar el proceso secuencial completo.
 
 ````{python}
 #|label: test-estimation-single-partition
+print("label: test-estimation-single-partition")
 
 # --- Configuración para la prueba ---
 TEST_YEAR = 2025
@@ -1038,10 +1874,10 @@ print("="*80)
 try:
     # 1. Cargar datos
     print(f"\n📂 Paso 1: Cargando datos de la partición {TEST_PARTITION_LABEL}...")
-    input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={TEST_YEAR}/iso_week={TEST_WEEK}/*.parquet"
-    print(f"   Ruta: {input_path_glob}")
+    input_path = get_week_input_path(TEST_YEAR, TEST_WEEK)
+    print(f"   Ruta: {input_path}")
     
-    lf_data = read_parquet_portable(input_path_glob)
+    lf_data = read_parquet_portable(input_path)
     n_rows_initial = lf_data.select(pl.len()).collect().item()
     print(f"   ✅ Datos cargados: {n_rows_initial:,} filas")
     
@@ -1156,23 +1992,35 @@ Esta celda recorre múltiples combinaciones de semana ISO, fracción de muestreo
 
 ````{python}
 #|label: sequential-estimation
+print("label: sequential-estimation")
 
-SEQUENTIAL_RUNS = [
-    # (year, iso_week, sample_fraction, specification, seed)
-    (2025, 15, 0.20, "generic", 42),
-    (2025, 15, 0.50, "generic", 42),
-    (2025, 15, 1.00, "generic", 42),
-    (2025, 15, 0.20, "specific", 42),
-    (2025, 15, 0.50, "specific", 42),
-    (2025, 15, 1.00, "specific", 42),
-    
-    (2025, 17, 0.20, "generic", 42),
-    (2025, 17, 0.50, "generic", 42),
-    (2025, 17, 1.00, "generic", 42),
-    (2025, 17, 0.20, "specific", 42),
-    (2025, 17, 0.50, "specific", 42),
-    (2025, 17, 1.00, "specific", 42),
-]
+if USE_V2_PARQUET_BASE:
+    SEQUENTIAL_RUNS = [
+        # (year, iso_week, sample_fraction, specification, seed)
+        (2025, 17, 0.20, "generic", 42),
+        (2025, 17, 0.50, "generic", 42),
+        (2025, 17, 1.00, "generic", 42),
+        (2025, 17, 0.20, "specific", 42),
+        (2025, 17, 0.50, "specific", 42),
+        (2025, 17, 1.00, "specific", 42),
+    ]
+else:
+    SEQUENTIAL_RUNS = [
+        # (year, iso_week, sample_fraction, specification, seed)
+        (2025, 15, 0.20, "generic", 42),
+        (2025, 15, 0.50, "generic", 42),
+        (2025, 15, 1.00, "generic", 42),
+        (2025, 15, 0.20, "specific", 42),
+        (2025, 15, 0.50, "specific", 42),
+        (2025, 15, 1.00, "specific", 42),
+        
+        (2025, 17, 0.20, "generic", 42),
+        (2025, 17, 0.50, "generic", 42),
+        (2025, 17, 1.00, "generic", 42),
+        (2025, 17, 0.20, "specific", 42),
+        (2025, 17, 0.50, "specific", 42),
+        (2025, 17, 1.00, "specific", 42),
+    ]
 
 print("=" * 80)
 print("--- ESTIMACIÓN SECUENCIAL: Nested Logit QR vs Bip ---")
@@ -1188,13 +2036,13 @@ for year, iso_week, sample_frac, spec, seed in SEQUENTIAL_RUNS:
 
     output_dir = os.path.join(
         BASE_OUTPUT_DIR,
-        f"{partition_label}-nested-base-{spec_key}-{sample_label}"
+        f"{partition_label}-nested-base{OUTPUT_SUFFIX_BASE}-{spec_key}-{sample_label}"
     )
 
     print(f"\n➡️ Partición: {partition_label} | Muestra: {sample_label} | Spec: {spec_key}")
 
-    input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={iso_week}/*.parquet"
-    lf_data = read_parquet_portable(input_path_glob)
+    input_path = get_week_input_path(year, iso_week)
+    lf_data = read_parquet_portable(input_path)
     n_rows_initial = lf_data.select(pl.len()).collect().item()
     print(f"   📂 Datos cargados: {n_rows_initial:,} filas")
 
@@ -1240,11 +2088,15 @@ Esta celda permite inspeccionar la cobertura `id_tarjeta` ↔ `tipo_app` para cu
 
 ````{python}
 #|label: coverage-check
+print("label: coverage-check")
 
-VERIFICATION_RUNS = [
-    (2025, 15),
-    (2025, 17),
-]
+if USE_V2_PARQUET_BASE:
+    VERIFICATION_RUNS = [(2025, 17)]
+else:
+    VERIFICATION_RUNS = [
+        (2025, 15),
+        (2025, 17),
+    ]
 
 print("=" * 80)
 print("--- COBERTURA CARACTERIZACIÓN vs PARTICIÓN ---")
@@ -1252,7 +2104,7 @@ print("=" * 80)
 
 for year, iso_week in VERIFICATION_RUNS:
     partition_label = f"{year}-W{iso_week:02d}"
-    input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={iso_week}/*.parquet"
+    input_path_glob = get_week_input_path(year, iso_week)
     print(f"\n➡️ Partición: {partition_label}")
     lf_data = read_parquet_portable(input_path_glob)
     n_rows = lf_data.select(pl.len()).collect().item()
@@ -1273,11 +2125,15 @@ Esta celda revisa si, dentro de la partición seleccionada, están presentes tod
 
 ````{python}
 #|label: representation-check
+print("label: representation-check")
 
-REPRESENTATION_RUNS = [
-    (2025, 15),
-    (2025, 17),
-]
+if USE_V2_PARQUET_BASE:
+    REPRESENTATION_RUNS = [(2025, 17)]
+else:
+    REPRESENTATION_RUNS = [
+        (2025, 15),
+        (2025, 17),
+    ]
 
 CHECK_DUMMIES = ["DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
 
@@ -1287,7 +2143,7 @@ print("=" * 80)
 
 for year, iso_week in REPRESENTATION_RUNS:
     partition_label = f"{year}-W{iso_week:02d}"
-    input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={iso_week}/*.parquet"
+    input_path_glob = get_week_input_path(year, iso_week)
     print(f"\n➡️ Partición: {partition_label}")
 
     lf_data = read_parquet_portable(input_path_glob)
@@ -1347,6 +2203,7 @@ Esta celda lee los CSV generados por la estimación secuencial (`params_nl_*.csv
 
 ````{python}
 #|label: compare-results
+print("label: compare-results")
 
 RESULTS_TO_COMPARE = [
     ("2025-W17", "generic", "20pct"),
@@ -1453,4 +2310,492 @@ if stat_frames:
                 print(pivot)
 else:
     print("No se encontraron estadísticas para las combinaciones solicitadas.")
+````
+
+## Resultados — Nested Logit Extendido v2 (Larch)
+
+Estas celdas cargan automáticamente los outputs generados por:
+
+- `#|label: estimate-nested-ext-v2-generic-larch`
+- `#|label: estimate-nested-ext-v2-specific-larch`
+- `#|label: estimate-nested-ext-v2-both-mode-dummy-variants-larch`
+
+Buscan carpetas del tipo:
+
+`<BASE_OUTPUT_DIR>/<partition>-nested-ext-v2-<spec>-<modeTag>-<sampleLabel>/`
+
+donde:
+
+- `spec ∈ {generic, specific}`
+- `modeTag ∈ {noModeDummies, modeDummies}`
+- `sampleLabel ∈ {sample20pct, sample50pct, full, ...}`
+
+````{python}
+#|label: load-results-nested-ext-v2-larch
+print("label: load-results-nested-ext-v2-larch")
+
+import re
+from pathlib import Path
+
+RESULTS_ROOT_NL_LARCH = Path(BASE_OUTPUT_DIR)
+
+pattern = re.compile(
+    r"^(?P<partition>\d{4}-W\d{2})-nested-ext-v2-"
+    r"(?P<spec>generic|specific)-"
+    r"(?P<mode>noModeDummies|modeDummies)-"
+    # sample labels:
+    # - sample20pct / sample50pct / full
+    # - optional '-matched' for exact cross-framework comparability
+    # - optional '-benchbest' / '-benchmu1' / '-benchrun-*' produced by the benchmark runner
+    r"(?P<sample>(?:sample\d+pct|full)(?:-matched)?(?:-bench(?:best|mu1))?(?:-benchrun-[^/]+)?)$"
+)
+
+rows_stats = []
+rows_params = []
+
+for d in sorted(RESULTS_ROOT_NL_LARCH.iterdir()):
+    if not d.is_dir():
+        continue
+    m = pattern.match(d.name)
+    if not m:
+        continue
+
+    partition = m.group("partition")
+    spec = m.group("spec")
+    mode = m.group("mode")
+    sample = m.group("sample")
+
+    params_path = d / f"params_nl_ext_v2_{spec}_{partition}.csv"
+    stats_path = d / f"stats_nl_ext_v2_{spec}_{partition}.csv"
+
+    if not params_path.exists() or not stats_path.exists():
+        print(f"⚠️ Faltan CSV en {d.name}")
+        continue
+
+    stats_df = pd.read_csv(stats_path)
+    if len(stats_df):
+        r0 = stats_df.iloc[0].to_dict()
+        rows_stats.append(
+            {
+                "Partition": partition,
+                "Spec": spec,
+                "ModeDummies": mode,
+                "Sample": sample,
+                "LL_Init": r0.get("Init log likelihood"),
+                "LL_Final": r0.get("Final log likelihood"),
+                "Rho_Adj_Init": r0.get("Rho-square-bar for the init. model"),
+                "K_Params": r0.get("Number of estimated parameters"),
+                "AIC": r0.get("Akaike Information Criterion"),
+                "BIC": r0.get("Bayesian Information Criterion"),
+                "Time_s": r0.get("Wall-clock seconds"),
+                "Folder": d.name,
+            }
+        )
+
+    params_df = pd.read_csv(params_path)
+    for _, r in params_df.iterrows():
+        pname = str(r.get("Name"))
+        clean = pname.replace(f"_{partition}", "")
+        rows_params.append(
+            {
+                "Partition": partition,
+                "Spec": spec,
+                "ModeDummies": mode,
+                "Sample": sample,
+                "Param": clean,
+                "ParamRaw": pname,
+                "Value": r.get("Value"),
+                "Robust t-stat.": r.get("Robust t-stat."),
+                "Folder": d.name,
+            }
+        )
+
+df_stats_nl_ext_v2_larch = pd.DataFrame(rows_stats)
+df_params_nl_ext_v2_larch = pd.DataFrame(rows_params)
+
+if len(df_stats_nl_ext_v2_larch):
+    print("✅ Cargados resultados Nested Extendido v2 (Larch).")
+    display(df_stats_nl_ext_v2_larch.sort_values(["Partition", "Spec", "Sample", "ModeDummies"]))
+else:
+    print("⚠️ No se detectaron resultados v2 en BASE_OUTPUT_DIR (nested-ext-v2-*).")
+````
+
+````{python}
+#|label: display-nested-ext-v2-params-larch-generic
+print("label: display-nested-ext-v2-params-larch-generic")
+
+if "df_params_nl_ext_v2_larch" in locals() and len(df_params_nl_ext_v2_larch):
+    df_g = df_params_nl_ext_v2_larch[df_params_nl_ext_v2_larch["Spec"] == "generic"].copy()
+    if len(df_g) == 0:
+        print("⚠️ No hay parámetros v2 generic (Larch).")
+    else:
+        for (partition, sample), df_sub in df_g.groupby(["Partition", "Sample"]):
+            pivot = df_sub.pivot_table(
+                index="Param",
+                columns="ModeDummies",
+                values="Value",
+                aggfunc="first",
+            ).sort_index()
+            print(f"\nTabla Larch v2 (generic): Betas — {partition} ({sample})")
+            display(pivot)
+else:
+    print("⚠️ No hay params v2 cargados (`df_params_nl_ext_v2_larch`). Ejecuta `load-results-nested-ext-v2-larch`.")
+````
+
+### Comparación Cross-Framework (Larch vs Biogeme) — Nested Extendido v2
+
+Esta celda usa el comparador del repo (`03_models/compare_nested_ext_v2_frameworks.py`) para revisar:
+
+- `LL_final`, AIC/BIC y `Rho-square-bar`
+- el **parámetro del nido** bajo una comparación consistente (`μ ↔ λ`)
+- alertas de posible no-convergencia en Larch vía `Final gradient norm`
+
+#### ¿Qué significa “matched”?
+
+En este repositorio usamos **matched sample** para decir: *un archivo parquet ya muestreado y con features listos*,
+de modo que **Biogeme y Larch estiman sobre exactamente las mismas filas** (eliminamos diferencias por muestreo).
+
+Ejemplo: `tmp/matched_samples/nested_ext_v2_2025-W17_sample20pct-matched.parquet`.
+
+#### Corrida “óptima” en Larch (benchmark)
+
+En nested logit, el óptimo puede depender de método e inicialización de `MU_QR`. Para robustez:
+
+1) correr un benchmark multi-start/multi-method (genera `...-benchbest/`), y
+2) cargar esa carpeta como “Larch óptimo” y compararla contra Biogeme.
+
+````{python}
+#|label: run-benchmark-nested-ext-v2-larch
+#|eval: false
+print("label: run-benchmark-nested-ext-v2-larch")
+
+# Ejecuta el benchmark desde el script del repo (recomendado), y deja outputs en:
+#   `<BASE_OUTPUT_DIR>/<partition>-nested-ext-v2-<spec>-<mode>-<sample>-benchbest/`
+#
+# Nota: se corre como subprocess y fuerza threads a 1 para evitar crashes tipo "heap corruption"
+# cuando se ejecutan muchas optimizaciones seguidas.
+
+import os
+import subprocess
+from pathlib import Path
+
+BENCH_PARTITION = "2025-W17"
+BENCH_SPEC = "specific"
+BENCH_MODE = "noModeDummies"
+BENCH_SAMPLE = "sample20pct-matched"
+BENCH_OVERWRITE = True  # True => reescribe carpetas existentes
+
+LARCH_METHODS = "slsqp,trust-constr"
+LARCH_MU_STARTS = "0.2,0.35,0.5,0.65,0.8,0.9"
+LARCH_MAXITER = "400"
+
+SCRIPT = PROJECT_ROOT / "tmp" / "validation" / "nested_ext_v2_validations.py"
+if not SCRIPT.exists():
+    raise FileNotFoundError(f"No existe el script: {SCRIPT}")
+
+matched_path = PROJECT_ROOT / "tmp" / "matched_samples" / f"nested_ext_v2_{BENCH_PARTITION}_{BENCH_SAMPLE}.parquet"
+if not matched_path.exists():
+    print(f"⚠️ No existe matched sample: {matched_path}")
+    print("➡️  Creándolo automáticamente con el script del repo...")
+    export_cmd = [
+        sys.executable,
+        "-Xfrozen_modules=off",
+        str(SCRIPT),
+        "--export-matched-sample",
+        "--partition",
+        BENCH_PARTITION,
+        "--sample",
+        BENCH_SAMPLE,
+    ]
+    print("$ " + " ".join(export_cmd))
+    subprocess.run(export_cmd, check=True, cwd=str(PROJECT_ROOT), env=os.environ)
+    if not matched_path.exists():
+        raise FileNotFoundError(f"No se pudo crear matched sample: {matched_path}")
+
+# Preferimos usar el mismo python del kernel (asumiendo que el notebook se corre dentro de larch-env).
+py = sys.executable
+
+env = dict(os.environ)
+env.setdefault("NUMBA_CACHE_DIR", str(PROJECT_ROOT / "tmp" / "numba_cache"))
+env.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / "tmp" / "mplcache"))
+env.setdefault("XDG_CACHE_HOME", str(PROJECT_ROOT / "tmp"))
+env.setdefault("XDG_CONFIG_HOME", str(PROJECT_ROOT / "tmp"))
+env.setdefault("OMP_NUM_THREADS", "1")
+env.setdefault("MKL_NUM_THREADS", "1")
+env.setdefault("OPENBLAS_NUM_THREADS", "1")
+env.setdefault("NUMEXPR_MAX_THREADS", "1")
+env.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
+cmd = [
+    py,
+    "-Xfrozen_modules=off",
+    str(SCRIPT),
+    "--benchmark-larch",
+    "--partition", BENCH_PARTITION,
+    "--spec", BENCH_SPEC,
+    "--mode", BENCH_MODE,
+    "--sample", BENCH_SAMPLE,
+    "--matched-sample-path", str(matched_path),
+    "--larch-output-root", str(Path(BASE_OUTPUT_DIR)),
+    "--larch-methods", LARCH_METHODS,
+    "--larch-mu-starts", LARCH_MU_STARTS,
+    "--larch-maxiter", LARCH_MAXITER,
+    "--larch-quiet",
+]
+if BENCH_OVERWRITE:
+    cmd.append("--overwrite")
+
+print("$ " + " ".join(cmd))
+subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT), env=env)
+print("✅ Benchmark terminado. Ahora puedes cargar `...-benchbest` en las celdas siguientes.")
+````
+
+````{python}
+#|label: diagnose-se-nested-ext-v2-larch
+#|eval: false
+print("label: diagnose-se-nested-ext-v2-larch")
+
+# Recalcula SE/t-stats en Larch (robust y no-robust) para la corrida seleccionada,
+# y escribe archivos de diagnóstico dentro de la carpeta del run:
+#   - `se_diagnostics_<spec>_<partition>.csv`
+#   - `se_diagnostics_<spec>_<partition>.json`
+#
+# Útil si betas/LL coinciden con Biogeme pero los SE/t-stat difieren.
+
+import os
+import subprocess
+from pathlib import Path
+
+DIAG_PARTITION = "2025-W17"
+DIAG_SPEC = "specific"
+DIAG_MODE = "noModeDummies"
+DIAG_SAMPLE = "sample20pct-matched-benchbest"  # carpeta Larch a diagnosticar
+
+SCRIPT = PROJECT_ROOT / "tmp" / "validation" / "nested_ext_v2_validations.py"
+matched_path = PROJECT_ROOT / "tmp" / "matched_samples" / f"nested_ext_v2_{DIAG_PARTITION}_sample20pct-matched.parquet"
+if not matched_path.exists():
+    raise FileNotFoundError(f"Matched sample no existe: {matched_path}")
+
+env = dict(os.environ)
+env.setdefault("NUMBA_CACHE_DIR", str(PROJECT_ROOT / "tmp" / "numba_cache"))
+env.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / "tmp" / "mplcache"))
+env.setdefault("XDG_CACHE_HOME", str(PROJECT_ROOT / "tmp"))
+env.setdefault("XDG_CONFIG_HOME", str(PROJECT_ROOT / "tmp"))
+env.setdefault("OMP_NUM_THREADS", "1")
+env.setdefault("MKL_NUM_THREADS", "1")
+env.setdefault("OPENBLAS_NUM_THREADS", "1")
+env.setdefault("NUMEXPR_MAX_THREADS", "1")
+env.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
+cmd = [
+    sys.executable,
+    "-Xfrozen_modules=off",
+    str(SCRIPT),
+    "--diagnose-larch-se",
+    "--partition",
+    DIAG_PARTITION,
+    "--spec",
+    DIAG_SPEC,
+    "--mode",
+    DIAG_MODE,
+    "--sample",
+    DIAG_SAMPLE,
+    "--matched-sample-path",
+    str(matched_path),
+    "--larch-output-root",
+    str(Path(BASE_OUTPUT_DIR)),
+]
+
+print("$ " + " ".join(cmd))
+subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT), env=env)
+print("✅ Diagnóstico SE terminado. Revisa la carpeta del run para los archivos `se_diagnostics_*`.")
+````
+
+````{python}
+#|label: inspect-benchmark-runs-nested-ext-v2-larch
+print("label: inspect-benchmark-runs-nested-ext-v2-larch")
+
+from pathlib import Path
+import pandas as pd
+
+# Muestra (si existe) el resumen de corridas del benchmark.
+# Esto deja explícito "cómo" se eligió el óptimo: el mejor `Final log likelihood` entre métodos/inicializaciones.
+
+INSPECT_PARTITION = "2025-W17"
+INSPECT_SPEC = "specific"
+INSPECT_MODE = "noModeDummies"
+INSPECT_SAMPLE = "sample20pct-matched"
+
+bench_dir = Path(BASE_OUTPUT_DIR) / f"{INSPECT_PARTITION}-nested-ext-v2-{INSPECT_SPEC}-{INSPECT_MODE}-{INSPECT_SAMPLE}-bench"
+csv_path = bench_dir / f"runs_{INSPECT_SPEC}_{INSPECT_PARTITION}.csv"
+
+print("\n=== Benchmark runs (Larch) ===")
+print(f"- Folder: {bench_dir}")
+print(f"- CSV: {csv_path}")
+
+if not csv_path.exists():
+    print("⚠️ No existe el CSV del benchmark. Ejecuta antes `run-benchmark-nested-ext-v2-larch`.")
+else:
+    df_runs = pd.read_csv(csv_path)
+    if "ll_final" in df_runs.columns:
+        # LL is negative; "best" means highest (closest to 0).
+        if "grad_norm" in df_runs.columns:
+            df_runs = df_runs.sort_values(["ll_final", "grad_norm"], ascending=[False, True])
+        else:
+            df_runs = df_runs.sort_values("ll_final", ascending=False)
+    cols = [c for c in ["method", "mu_init", "mu_hat", "ll_final", "grad_norm", "elapsed_s", "folder"] if c in df_runs.columns]
+    display(df_runs[cols].head(12))
+````
+
+````{python}
+#|label: display-nested-ext-v2-optimal-run-larch
+print("label: display-nested-ext-v2-optimal-run-larch")
+
+from pathlib import Path
+import pandas as pd
+
+# --- Selección de corrida "óptima" (por benchmark) ---
+# Recomendación actual: usar la carpeta agregadora `...-benchbest` generada por:
+#   `python3 tmp/validation/nested_ext_v2_validations.py --benchmark-larch ...`
+OPT_PARTITION = "2025-W17"
+OPT_SPEC = "specific"  # "generic" | "specific"
+OPT_MODE = "noModeDummies"  # "noModeDummies" | "modeDummies"
+OPT_LARCH_SAMPLE = "sample20pct-matched-benchbest"
+
+RESULTS_ROOT_NL_LARCH = Path(BASE_OUTPUT_DIR)
+opt_dir = RESULTS_ROOT_NL_LARCH / f"{OPT_PARTITION}-nested-ext-v2-{OPT_SPEC}-{OPT_MODE}-{OPT_LARCH_SAMPLE}"
+
+params_path = opt_dir / f"params_nl_ext_v2_{OPT_SPEC}_{OPT_PARTITION}.csv"
+stats_path = opt_dir / f"stats_nl_ext_v2_{OPT_SPEC}_{OPT_PARTITION}.csv"
+
+print("\n=== Larch (corrida óptima) — Nested Extendido v2 ===")
+print(f"- Folder: {opt_dir}")
+if not params_path.exists() or not stats_path.exists():
+    raise FileNotFoundError(f"Faltan CSV de la corrida óptima.\n- params: {params_path}\n- stats: {stats_path}")
+
+df_stats_opt = pd.read_csv(stats_path)
+df_params_opt = pd.read_csv(params_path)
+
+print("\nStats (Larch optimal):")
+display(df_stats_opt)
+
+print("\nParams (Larch optimal):")
+with pd.option_context("display.max_rows", 200, "display.max_columns", 10):
+    display(df_params_opt)
+````
+
+````{python}
+#|label: compare-nested-ext-v2-larch-vs-biogeme
+print("label: compare-nested-ext-v2-larch-vs-biogeme")
+
+import runpy
+from pathlib import Path
+import pandas as pd
+
+COMPARE_PARTITION = "2025-W17"
+COMPARE_SPEC = "specific"  # "generic" | "specific"
+COMPARE_MODE = "noModeDummies"  # "noModeDummies" | "modeDummies"
+COMPARE_BIOGEME_SAMPLE = "sample20pct-matched"
+COMPARE_LARCH_SAMPLE = "sample20pct-matched-benchbest"
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "03_models").is_dir() and (PROJECT_ROOT / "config").is_dir():
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+
+cmp_path = PROJECT_ROOT / "03_models" / "compare_nested_ext_v2_frameworks.py"
+if not cmp_path.exists():
+    raise FileNotFoundError(f"No existe el comparador: {cmp_path}")
+
+mod = runpy.run_path(str(cmp_path))
+RunKey = mod["RunKey"]
+compare = mod["compare"]
+compare_two = mod.get("compare_two", None)
+
+key_b = RunKey(
+    partition=COMPARE_PARTITION,
+    spec=COMPARE_SPEC,
+    mode=COMPARE_MODE,
+    sample=COMPARE_BIOGEME_SAMPLE,
+)
+key_l = RunKey(
+    partition=COMPARE_PARTITION,
+    spec=COMPARE_SPEC,
+    mode=COMPARE_MODE,
+    sample=COMPARE_LARCH_SAMPLE,
+)
+
+if COMPARE_BIOGEME_SAMPLE != COMPARE_LARCH_SAMPLE and compare_two is not None:
+    out = compare_two(key_b, key_l)
+else:
+    out = compare(key_b)
+
+print("\n=== Stats (Larch vs Biogeme) ===")
+display(pd.DataFrame([out["stats"]]))
+
+print("\n=== Nest parameter (μ/λ normalizado) ===")
+display(pd.DataFrame([out["nest"]]))
+
+print("\n=== Params (Larch vs Biogeme) ===")
+with pd.option_context("display.max_rows", 200, "display.max_columns", 30):
+    display(out["params"])
+````
+
+````{python}
+#|label: display-nested-ext-v2-params-larch-specific
+print("label: display-nested-ext-v2-params-larch-specific")
+
+if "df_params_nl_ext_v2_larch" in locals() and len(df_params_nl_ext_v2_larch):
+    SHOW_ALL_SPECIFIC_PARAMS = False
+    df_s = df_params_nl_ext_v2_larch[df_params_nl_ext_v2_larch["Spec"] == "specific"].copy()
+    if len(df_s) == 0:
+        print("⚠️ No hay parámetros v2 specific (Larch).")
+    else:
+        if SHOW_ALL_SPECIFIC_PARAMS:
+            df_show = df_s
+            title = "Tabla Larch v2 (specific, ALL)"
+        else:
+            key_params = [
+                "MU_QR",
+                "ASC_QR_RED",
+                "ASC_QR_OTHER",
+                # Temporales
+                "B_QR_RED_PM_LAB",
+                "B_QR_OTHER_PM_LAB",
+                "B_QR_RED_PT_LAB",
+                "B_QR_OTHER_PT_LAB",
+                "B_QR_RED_LJ_LAB",
+                "B_QR_OTHER_LJ_LAB",
+                "B_QR_RED_VIE_LAB",
+                "B_QR_OTHER_VIE_LAB",
+                # Atributos de viaje
+                "B_QR_RED_T_VEHICULO",
+                "B_QR_OTHER_T_VEHICULO",
+                "B_QR_RED_N_TRASBORDOS",
+                "B_QR_OTHER_N_TRASBORDOS",
+                "B_QR_RED_T_ESPERA_TRASB",
+                "B_QR_OTHER_T_ESPERA_TRASB",
+                "B_QR_RED_T_ESPERA_INI",
+                "B_QR_OTHER_T_ESPERA_INI",
+                # Dummies modales
+                "B_QR_RED_SOLO_METRO",
+                "B_QR_OTHER_SOLO_METRO",
+                "B_QR_RED_METRO_BUS",
+                "B_QR_OTHER_METRO_BUS",
+            ]
+            df_show = df_s[df_s["Param"].isin(key_params)].copy()
+            title = "Tabla Larch v2 (specific, key+core)"
+
+        for (partition, sample), df_sub in df_show.groupby(["Partition", "Sample"]):
+            pivot = df_sub.pivot_table(
+                index="Param",
+                columns="ModeDummies",
+                values="Value",
+                aggfunc="first",
+            ).sort_index()
+            print(f"\n{title}: Betas — {partition} ({sample})")
+            display(pivot)
+else:
+    print("⚠️ No hay params v2 cargados (`df_params_nl_ext_v2_larch`). Ejecuta `load-results-nested-ext-v2-larch`.")
 ````

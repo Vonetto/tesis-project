@@ -95,6 +95,11 @@ else:
 # Usaremos 'viajes_filtrados' como base, ya que contiene todos los viajes válidos
 INPUT_DATASET_PATH = f"{SILVER_BASE_PATH}/viajes_filtrados"
 
+# --- Config dataset (v1 vs v2) ---
+USE_V2_PARQUET = True
+V2_PARQUET_PATH = PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet"
+OUTPUT_SUFFIX = "-v2" if USE_V2_PARQUET else ""
+
 # --- Partición para Análisis Inicial ---
 YEAR_ANALISIS = 2025
 WEEK_ANALISIS = 17
@@ -114,7 +119,9 @@ FEATURE_TO_PARAM = {v: k for k, v in PARAM_TO_FEATURE.items()}
 # Info de entorno
 print(f"🧮 Larch version: {getattr(lx, '__version__', 'dev')}")
 
-print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f"\n📁 Dataset de entrada: {'parquet v2' if USE_V2_PARQUET else INPUT_DATASET_PATH}")
+if USE_V2_PARQUET:
+    print(f"   - V2 parquet: {V2_PARQUET_PATH}")
 print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
 ````
 
@@ -616,12 +623,15 @@ def estimate_logit_larch(
 #|label: load-data
 print(f"Cargando partición {PARTITION_LABEL} desde {INPUT_DATASET_PATH}...")
 
-partition_path_glob = (
-    f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
-)
+if USE_V2_PARQUET:
+    input_path = str(V2_PARQUET_PATH)
+else:
+    input_path = (
+        f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
+    )
 
 try:
-    lf_data = read_parquet_portable(partition_path_glob)
+    lf_data = read_parquet_portable(input_path)
 
     schema = lf_data.collect_schema()
     n_rows = lf_data.select(pl.len()).collect().item()
@@ -632,7 +642,7 @@ try:
     print(f"   Columnas clave presentes: {[c for c in relevant_cols if c in schema.names()]}")
 except Exception as e:
     print(f"❌ Error al cargar la partición: {e}")
-    print(f"   Verifica que la ruta y partición existan: {partition_path_glob}")
+    print(f"   Verifica que la ruta exista: {input_path}")
     lf_data = None
 ```
 
@@ -828,7 +838,7 @@ La especificación replicará la lógica utilizada antes con Biogeme y `statsmod
 #|label: estimate-baseline-2025W17-larch
 
 BASE_OUTPUT_DIR_LARCH = "model_outputs_larch"
-results_folder_larch = os.path.join(BASE_OUTPUT_DIR_LARCH, "W17-baseline")
+results_folder_larch = os.path.join(BASE_OUTPUT_DIR_LARCH, f"W17-baseline{OUTPUT_SUFFIX}")
 
 if pandas_df is not None:
     print(f"🚀 Estimando modelo Logit (larch) para {PARTITION_LABEL}...")
@@ -890,7 +900,10 @@ else:
 #|label: setup-sequential-run-larch
 
 BASE_OUTPUT_DIR_LARCH = "model_outputs_larch"
-PARTICIONES_A_PROCESAR = [(2025, 17), (2025, 18)]  # puedes extender esta lista
+if USE_V2_PARQUET:
+    PARTICIONES_A_PROCESAR = [(2025, 17)]
+else:
+    PARTICIONES_A_PROCESAR = [(2025, 17), (2025, 18)]  # puedes extender esta lista
 APPLY_SAMPLING = False
 SAMPLE_FRACTION = 0.20
 SEED = 42
@@ -914,14 +927,18 @@ for year, week in PARTICIONES_A_PROCESAR:
     partition_label = f"{year}-W{week}"
     print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} ---\n{'='*60}")
 
-    output_dir_partition = os.path.join(BASE_OUTPUT_DIR_LARCH, f"W{week}-baseline")
+    sample_suffix = f"-{SAMPLE_FRACTION:g}" if APPLY_SAMPLING else ""
+    output_dir_partition = os.path.join(BASE_OUTPUT_DIR_LARCH, f"W{week}-baseline{OUTPUT_SUFFIX}{sample_suffix}")
     os.makedirs(output_dir_partition, exist_ok=True)
     print(f"   Resultados se guardarán en: {output_dir_partition}")
 
     try:
-        input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
-        lf_data_seq = read_parquet_portable(input_path_glob)
-        print(f"   Cargando datos desde: {input_path_glob}")
+        if USE_V2_PARQUET:
+            input_path = str(V2_PARQUET_PATH)
+        else:
+            input_path = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+        lf_data_seq = read_parquet_portable(input_path)
+        print(f"   Cargando datos desde: {input_path}")
 
         lf_model_ready_seq = prepare_features(lf_data_seq)  # mismo helper que para Biogeme
         df_model_data_seq = lf_model_ready_seq.collect()
@@ -1048,7 +1065,7 @@ A continuación se presentan y analizan los resultados del modelo logit simple e
 import os
 import pandas as pd
 
-results_folder_larch = "model_outputs_larch/W17-baseline"
+results_folder_larch = f"model_outputs_larch/W17-baseline{OUTPUT_SUFFIX}"
 partition_label = "2025-W17"
 
 try:
@@ -1143,18 +1160,18 @@ partition_label = "2025-W17"
 
 # Rutas Biogeme (se asume que ya existen)
 # El notebook está en 03_models/larch_logit/, así que necesitamos subir un nivel
-results_folder_bio = "../biogeme-logit/model_outputs/W17-baseline"
-results_folder_statsmodels = "../statsmodels_logit/model_outputs/W17-baseline"
+baseline_folder = f"W17-baseline{OUTPUT_SUFFIX}"
+results_folder_bio = f"../biogeme-logit/model_outputs/{baseline_folder}"
 params_bio = os.path.join(results_folder_bio, f"params_{partition_label}.csv")
 stats_bio = os.path.join(results_folder_bio, f"stats_{partition_label}.csv")
 
 # Rutas larch
-results_folder_larch = "model_outputs_larch/W17-baseline"
+results_folder_larch = f"model_outputs_larch/{baseline_folder}"
 params_larch = os.path.join(results_folder_larch, f"params_{partition_label}.csv")
 stats_larch = os.path.join(results_folder_larch, f"stats_{partition_label}.csv")
 
 # Rutas statsmodels
-results_folder_statsmodels = "../statsmodels_logit/model_outputs_sm/W17-baseline"
+results_folder_statsmodels = f"../statsmodels_logit/model_outputs_sm/{baseline_folder}"
 params_sm = os.path.join(results_folder_statsmodels, f"params_{partition_label}.csv")
 stats_sm = os.path.join(results_folder_statsmodels, f"stats_{partition_label}.csv")
 
@@ -1272,4 +1289,3 @@ Con esto se puede:
 2. Usar `larch` como alternativa eficiente para modelos logit binarios simples, manteniendo la flexibilidad de Polars y tu pipeline actual.
 
 ```
-

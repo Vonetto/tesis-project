@@ -80,6 +80,12 @@ from biogeme.expressions import Beta, Variable
 
 
 
+# --- Config dataset (v1 vs v2) ---
+# v2: parquet corregido (sin look-ahead; con tiempos recalculados)
+USE_V2_PARQUET = True
+V2_PARQUET_PATH = PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet"
+OUTPUT_SUFFIX = "-v2" if USE_V2_PARQUET else ""
+
 # --- Parámetros ---
 if USE_LOCAL_PATHS:
     SILVER_BASE_PATH = LOCAL_SILVER_PATH
@@ -94,7 +100,9 @@ YEAR_ANALISIS = 2025
 WEEK_ANALISIS = 17
 PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
 
-print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f"\n📁 Dataset de entrada: {'parquet v2' if USE_V2_PARQUET else INPUT_DATASET_PATH}")
+if USE_V2_PARQUET:
+    print(f"   - V2 parquet: {V2_PARQUET_PATH}")
 print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
 ```
 
@@ -250,11 +258,14 @@ def prepare_features_extended(lazy_frame):
 #|label: load-data
 print(f"Cargando partición {PARTITION_LABEL} desde {INPUT_DATASET_PATH}...")
 
-partition_path_glob = f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
+if USE_V2_PARQUET:
+    input_path = str(V2_PARQUET_PATH)
+else:
+    input_path = f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
 
 try:
     # Usamos read_parquet_portable para cargar de forma perezosa (LazyFrame)
-    lf_data = read_parquet_portable(partition_path_glob)
+    lf_data = read_parquet_portable(input_path)
 
     # Verificamos el esquema y contamos filas (esto sí ejecuta parte de la query)
     schema = lf_data.collect_schema()
@@ -268,7 +279,7 @@ try:
 
 except Exception as e:
     print(f"❌ Error al cargar la partición: {e}")
-    print(f"   Verifica que la ruta y partición existan: {partition_path_glob}")
+    print(f"   Verifica que la ruta exista: {input_path}")
     lf_data = None
 ```
 
@@ -663,14 +674,17 @@ import time
 
 # --- 1. CONFIGURACIÓN DE LA EJECUCIÓN ---
 # Define aquí las particiones que quieres procesar
-PARTICIONES_A_PROCESAR = [
-    (2025, 17), 
-    (2025, 18)  
-]
+if USE_V2_PARQUET:
+    PARTICIONES_A_PROCESAR = [(2025, 17)]
+else:
+    PARTICIONES_A_PROCESAR = [
+        (2025, 17), 
+        (2025, 18)  
+    ]
 
 # Define si quieres aplicar muestreo o usar el dataset completo
 APPLY_SAMPLING = False
-SAMPLE_FRACTION = 0.20  # 20% de la partición
+SAMPLE_FRACTION = 0.10  # 10% de la partición
 SEED = 42               # Para reproducibilidad del muestreo
 
 # Directorio base para los resultados
@@ -715,7 +729,8 @@ for year, week in PARTICIONES_A_PROCESAR:
     run_start_time = time.perf_counter()
 
     # a. Definir y crear directorio de salida único
-    output_dir_partition = os.path.join(BASE_OUTPUT_DIR, f"W{week}-baseline")
+    sample_suffix = f"-{SAMPLE_FRACTION:g}" if APPLY_SAMPLING else ""
+    output_dir_partition = os.path.join(BASE_OUTPUT_DIR, f"W{week}-baseline{OUTPUT_SUFFIX}{sample_suffix}")
     os.makedirs(output_dir_partition, exist_ok=True)
     print(f"   Resultados se guardarán en: {output_dir_partition}")
 
@@ -724,9 +739,12 @@ for year, week in PARTICIONES_A_PROCESAR:
 
     try:
         # b. Cargar datos
-        input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
-        lf_data = read_parquet_portable(input_path_glob)
-        print(f"   Cargando datos desde: {input_path_glob}")
+        if USE_V2_PARQUET:
+            input_path = str(V2_PARQUET_PATH)
+        else:
+            input_path = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+        lf_data = read_parquet_portable(input_path)
+        print(f"   Cargando datos desde: {input_path}")
 
         # c. Preparar features (usando la función helper del modelo simple)
         lf_model_ready = prepare_features(lf_data)
@@ -1315,7 +1333,7 @@ import os
 
 # --- Configuración ---
 # Apuntar a la carpeta de resultados de la semana de estudio
-results_folder = "model_outputs/W17-baseline"
+results_folder = f"model_outputs/W17-baseline{OUTPUT_SUFFIX}"
 partition_label = "2025-W17"
 
 # --- Cargar Archivos ---
@@ -1403,12 +1421,15 @@ Para validar la eficiencia de usar una muestra en lugar del dataset completo, se
 #| label: load-and-compare-sample-results
 
 # --- Cargar resultados de la muestra ---
-results_folder_sample = "model_outputs/W17-baseline-0.2"
+SAMPLE_FRACTION_FOR_COMPARISON = 0.10
+results_folder_sample = f"model_outputs/W17-baseline{OUTPUT_SUFFIX}-{SAMPLE_FRACTION_FOR_COMPARISON:g}"
 df_params_sample = None
 df_stats_sample = None
 try:
     params_file_sample = os.path.join(results_folder_sample, f"params_{partition_label}.csv")
     stats_file_sample = os.path.join(results_folder_sample, f"stats_{partition_label}.csv")
+    if not (os.path.exists(params_file_sample) and os.path.exists(stats_file_sample)):
+        raise FileNotFoundError(f"Missing sample results: {params_file_sample} / {stats_file_sample}")
     df_params_sample = pd.read_csv(params_file_sample, index_col=0)
     df_stats_sample = pd.read_csv(stats_file_sample)
     df_params_sample['Name'] = df_params_sample['Name'].str.replace(f'_{partition_label}', '', regex=False)
@@ -1431,7 +1452,11 @@ try:
     't-stat (Muestra 20%)': '{:.1f}'
     }).highlight_null(color='transparent'))
 except FileNotFoundError:
-    print(f"ERROR: No se encontraron los archivos de resultados en la carpeta de la muestra '{results_folder_sample}'.")
+    print(
+        f"⚠️ No se encontraron resultados de muestra en '{results_folder_sample}'. "
+        f"Si quieres esta comparación, ejecuta la estimación con `APPLY_SAMPLING=True` "
+        f"y `SAMPLE_FRACTION={SAMPLE_FRACTION_FOR_COMPARISON}` para generar esa carpeta."
+    )
 
 
 ```
@@ -1465,5 +1490,3 @@ Los sólidos resultados de este modelo base validan la metodología y abren dos 
 1.  **Validación Temporal con Muestreo**: La estabilidad de los resultados en esta semana sugiere que se puede aplicar un **muestreo estratificado** para analizar eficientemente un mayor número de particiones semanales. Como se verificó en análisis previos, una muestra del 20% de los datos arroja coeficientes y una bondad de ajuste casi idénticos al modelo completo, demostrando ser una estrategia válida y eficiente.
 
 2.  **Enriquecimiento del Modelo**: El siguiente paso es construir un **modelo extendido** que incorpore **atributos del viaje** (ej. tiempo de viaje, número de trasbordos, modo de transporte). Esto permitirá responder preguntas más profundas, como por ejemplo: ¿La preferencia por QR cambia si el viaje es más largo, más complejo o si implica una combinación de bus y metro?
-
-
