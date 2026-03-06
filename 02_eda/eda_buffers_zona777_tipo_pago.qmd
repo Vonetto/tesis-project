@@ -759,3 +759,101 @@ for ax, tp in zip(axes, TIPOS_PAGO, strict=True):
 
 plt.show()
 ```
+
+## Join Censo 2024 → Buffers
+
+```{python}
+#| label: join-censo-buffers
+from lib.censo2024_join_buffers import run as join_censo_buffers
+
+CENSO_PATH = PROJECT_ROOT / "02_eda/tmp/censo2024_zona777/censo2024_zona777_agg_final.parquet"
+OUT_JOIN_DIR = PROJECT_ROOT / "02_eda/tmp/buffers_zona777_censo2024"
+
+if not CENSO_PATH.exists():
+    raise FileNotFoundError(f"No existe: {CENSO_PATH}")
+
+diag = join_censo_buffers(
+    buffers_inicio=PATH_INICIO,
+    buffers_od=PATH_OD,
+    censo_parquet=CENSO_PATH,
+    out_dir=OUT_JOIN_DIR,
+)
+
+print("Join outputs:")
+print(diag)
+```
+
+## Mini‑EDA Censo en buffers
+
+```{python}
+#| label: mini-eda-censo-buffers
+import polars as pl
+from IPython.display import display
+
+JOIN_INICIO = OUT_JOIN_DIR / f"{PATH_INICIO.stem}_censo.parquet"
+JOIN_OD = OUT_JOIN_DIR / f"{PATH_OD.stem}_censo.parquet"
+
+if not JOIN_INICIO.exists():
+    raise FileNotFoundError(f"No existe: {JOIN_INICIO}")
+if not JOIN_OD.exists():
+    raise FileNotFoundError(f"No existe: {JOIN_OD}")
+
+df_inicio_censo = pl.read_parquet(JOIN_INICIO)
+df_od_censo = pl.read_parquet(JOIN_OD)
+
+# Selección de variables censo para resumen (5 variables)
+CENSO_SUMMARY = [
+    "censo_prom_edad",
+    "censo_share_inmigrantes",
+    "censo_share_internet",
+    "censo_share_ocupado",
+    "censo_share_hacinamiento",
+]
+
+def _summarize(df: pl.DataFrame, cols: list[str]) -> pl.DataFrame:
+    cols = [c for c in cols if c in df.columns]
+    if not cols:
+        raise ValueError("No hay columnas censo disponibles para resumir.")
+    aggs = []
+    for c in cols:
+        aggs += [
+            pl.mean(c).alias(f"{c}_mean"),
+            pl.median(c).alias(f"{c}_median"),
+        ]
+    return df.group_by("tipo_pago").agg(aggs).sort("tipo_pago")
+
+print("Resumen Censo — Buffer A (inicio) por tipo_pago")
+display(_summarize(df_inicio_censo, CENSO_SUMMARY))
+
+print("Resumen Censo — Buffer OD (origen) por tipo_pago")
+display(_summarize(df_od_censo, [f"censo_o_{c.split('censo_')[1]}" for c in CENSO_SUMMARY]))
+
+print("Resumen Censo — Buffer OD (destino) por tipo_pago")
+display(_summarize(df_od_censo, [f"censo_d_{c.split('censo_')[1]}" for c in CENSO_SUMMARY]))
+```
+
+```{python}
+#| label: missing-zones-censo
+# Missing zonas (censo_n_per nulo)
+def _missing_zones(df, col, zone_col):
+    missing = (
+        df.filter(pl.col(col).is_null())
+        .select(pl.col(zone_col).cast(pl.Int64, strict=False))
+        .unique()
+        .sort(zone_col)
+    )
+    return missing
+
+missing_inicio = _missing_zones(df_inicio_censo, "censo_n_per", "zona_inicio_viaje")
+missing_od_o = _missing_zones(df_od_censo, "censo_o_n_per", "zona_inicio_viaje")
+missing_od_d = _missing_zones(df_od_censo, "censo_d_n_per", "zona_fin_viaje")
+
+print("Missing zonas — Buffer A (inicio):", missing_inicio.height)
+display(missing_inicio)
+
+print("Missing zonas — Buffer OD (origen):", missing_od_o.height)
+display(missing_od_o)
+
+print("Missing zonas — Buffer OD (destino):", missing_od_d.height)
+display(missing_od_d)
+```
