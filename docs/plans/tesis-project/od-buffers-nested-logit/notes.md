@@ -443,3 +443,36 @@
 ### Decision operativa
 - Se deja registrado que el trabajo de correcciones/parsimonia actual queda **estacionado, no descartado**.
 - La siguiente etapa activa es construir y evaluar una especificacion enriquecida antes de seguir afinando nested, signos o colinealidad residual.
+
+## 2026-03-06 — Ordenamiento de ramas, commits y merge
+
+### Commits modulares creados en `feature/buffers`
+- `32c41d1` — `feat(biogeme): migrate core QR notebooks to v2 time dummies`
+- `bc2e598` — `docs(planning): record OD-buffers modeling decisions`
+- `7ade5c3` — `feat(od-buffers): add alt-specific OD buffers model pipeline`
+- `60df84c` — `feat(refinement): add OD-buffers MNL diagnostics notebook`
+- `f8b563d` — `feat(censo): add zona777 census utilities and EDA notebooks`
+- `0d42d21` — `docs(planning): add historical thesis workstream plans`
+- `aefc3ca` — `chore(gitignore): ignore local planning and model output directories`
+
+### Decisiones sobre ramas
+- `feature/buffers` se toma como rama canonica/base para el trabajo consolidado hasta esta etapa.
+- Se auditó `feature/logit-model` y se decidió **no mergearla**:
+  - divergía de `feature/buffers`,
+  - arrastraba una estructura antigua/paralela de notebooks,
+  - cualquier rescate futuro desde esa rama debe hacerse **archivo por archivo** o con `cherry-pick` muy selectivo, no con merge completo.
+
+### Integracion a `develop`
+- Se hizo merge de `feature/buffers` a `develop` con commit:
+  - `19b0ba9` — `Merge branch 'feature/buffers' into develop`
+- Con esto, `develop` queda como baseline consolidado de:
+  - migracion V2,
+  - OD-buffers alt-specific,
+  - benchmark MNL / refinement,
+  - utilidades y EDA inicial de Censo,
+  - documentacion de decisiones.
+
+### Nueva rama activa
+- Se creó `feature/od-buffers-enriched-controls` desde `feature/buffers`.
+- Luego se fast-forwardeó con `develop`, quedando alineada al merge commit `19b0ba9`.
+- Esta rama pasa a ser la rama activa para la siguiente etapa: enriquecimiento del modelo con nuevas variables de control y comparacion 2024/2025.
