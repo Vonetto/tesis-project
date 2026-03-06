@@ -69,6 +69,14 @@ temp/
 *.tmp
 *.log
 
+# --- Planning / local agent state ---
+.planning/
+docs/agent_onboarding.md
+
+# --- Model outputs / legacy worktrees ---
+03_models/biogeme-logit/
+03_models/larch_logit/model_outputs_nl_larch/
+
 # --- Papers (comentar si quieres versionarlos) ---
 papers/
 /.quarto/
