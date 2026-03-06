@@ -1,0 +1,859 @@
+---
+title: "EDA — Buffers zona777 × tipo_pago (Top por n_viajes)"
+freeze: auto
+params:
+  partition: "2025-W17"
+  buffers_dir: "tmp/aggregates"
+  shap_path: "/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+---
+
+```{python}
+#| echo: false
+import os
+import sys
+from pathlib import Path
+
+# Make project importable (config/, lib/)
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
+
+try:
+    params  # injected by Quarto
+except NameError:
+    params = {
+        "partition": os.getenv("PARTITION", "2025-W17"),
+        "buffers_dir": os.getenv("BUFFERS_DIR", "tmp/aggregates"),
+        "shap_path": os.getenv(
+            "ZONAS777_SHP",
+            "/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp",
+        ),
+    }
+
+PARTITION = str(params["partition"])
+BUFFERS_DIR = Path(params["buffers_dir"])
+if not BUFFERS_DIR.is_absolute():
+    BUFFERS_DIR = PROJECT_ROOT / BUFFERS_DIR
+
+PATH_INICIO = BUFFERS_DIR / f"buffers_zona777_inicio_tipo_pago_{PARTITION}.parquet"
+PATH_OD = BUFFERS_DIR / f"buffers_zona777_od_tipo_pago_{PARTITION}.parquet"
+SHAPE_PATH = Path(str(params["shap_path"]))
+
+print("Partition:", PARTITION)
+print("Buffers dir:", BUFFERS_DIR)
+print("Inicio parquet:", PATH_INICIO)
+print("OD parquet:", PATH_OD)
+print("Zonas777 shap:", SHAPE_PATH)
+```
+
+## Carga (lazy)
+
+```{python}
+import polars as pl
+from IPython.display import display
+
+if not PATH_INICIO.exists():
+    raise FileNotFoundError(f"No existe: {PATH_INICIO}")
+if not PATH_OD.exists():
+    raise FileNotFoundError(f"No existe: {PATH_OD}")
+
+lf_inicio = pl.scan_parquet(PATH_INICIO)
+lf_od = pl.scan_parquet(PATH_OD)
+
+print("Rows INICIO:", lf_inicio.select(pl.len()).collect(engine="streaming").item())
+print("Rows OD:", lf_od.select(pl.len()).collect(engine="streaming").item())
+```
+
+## Rankings robustos (con umbral n)
+
+```{python}
+N_TOP = 20
+
+TIPOS_PAGO = ["BIP", "QR_OTHER", "QR_RED"]
+
+def top_zonas_inicio_by_n(
+    lf: pl.LazyFrame,
+    tipo_pago: str,
+    n_top: int,
+) -> pl.DataFrame:
+    return (
+        lf.with_columns(
+            (
+                (pl.col("n_viajes") / pl.col("n_viajes").sum().over("zona_inicio_viaje") * 100)
+                .round(3)
+                .alias("pct_del_total_zona_inicio")
+            )
+        ).filter(pl.col("tipo_pago") == tipo_pago)
+        .select(
+            [
+                pl.col("zona_inicio_viaje"),
+                pl.col("tipo_pago"),
+                pl.col("n_viajes"),
+                pl.col("pct_del_total_zona_inicio"),
+                pl.col("t_espera_inicial_seg_mean"),
+                pl.col("t_espera_inicial_seg_p90"),
+                pl.col("t_espera_trasbordo_seg_mean"),
+                pl.col("t_espera_trasbordo_seg_p90"),
+                pl.col("t_vehiculo_total_seg_final_mean"),
+                pl.col("t_vehiculo_total_seg_final_p90"),
+                pl.col("n_etapas_mean"),
+                pl.col("n_etapas_p90"),
+            ]
+        )
+        .sort("n_viajes", descending=True)
+        .head(n_top)
+        .collect(engine="streaming")
+    )
+
+def top_od_by_metric(
+    lf: pl.LazyFrame,
+    tipo_pago: str,
+    n_top: int,
+) -> pl.DataFrame:
+    return (
+        lf.with_columns(
+            (
+                (pl.col("n_viajes") / pl.col("n_viajes").sum().over(["zona_inicio_viaje", "zona_fin_viaje"]) * 100)
+                .round(3)
+                .alias("pct_del_total_od")
+            )
+        ).filter(pl.col("tipo_pago") == tipo_pago)
+        .select(
+            [
+                pl.col("zona_inicio_viaje"),
+                pl.col("zona_fin_viaje"),
+                pl.col("tipo_pago"),
+                pl.col("n_viajes"),
+                pl.col("pct_del_total_od"),
+                pl.col("t_espera_inicial_seg_mean"),
+                pl.col("t_espera_inicial_seg_p90"),
+                pl.col("t_espera_trasbordo_seg_mean"),
+                pl.col("t_espera_trasbordo_seg_p90"),
+                
+                pl.col("t_vehiculo_total_seg_final_mean"),
+                pl.col("t_vehiculo_total_seg_final_p90"),
+                pl.col("n_etapas_mean"),
+                pl.col("n_etapas_p90"),
+            ]
+        )
+        .sort("n_viajes", descending=True)
+        .head(n_top)
+        .collect(engine="streaming")
+    )
+```
+
+## Buffer A — `zona_inicio_viaje × tipo_pago`
+
+```{python}
+print(f"\n=== Buffer A (Inicio) | Top {N_TOP} por n_viajes ===")
+for tp in TIPOS_PAGO:
+    df = top_zonas_inicio_by_n(lf_inicio, tp, N_TOP)
+    print(f"\n-- {tp} --")
+    display(df)
+```
+
+## Buffer OD — `(zona_inicio_viaje, zona_fin_viaje) × tipo_pago`
+
+```{python}
+print(f"\n=== Buffer B (OD) | Top {N_TOP} por n_viajes ===")
+for tp in TIPOS_PAGO:
+    df = top_od_by_metric(lf_od, tp, N_TOP)
+    print(f"\n-- {tp} --")
+    display(df)
+```
+
+## Choropleths (Zonas777) — Buffer A (Inicio) por tipo_pago
+
+```{python}
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import numpy as np
+
+if not SHAPE_PATH.exists():
+    raise FileNotFoundError(f"No existe shap: {SHAPE_PATH}")
+
+gdf_zonas = gpd.read_file(SHAPE_PATH)
+if "ZONA777" not in gdf_zonas.columns:
+    raise ValueError(f"El shapefile no tiene columna 'ZONA777'. Columnas: {list(gdf_zonas.columns)}")
+
+# Cargamos el buffer INICIO a memoria (es chico: ~2.4k filas)
+df_inicio = pl.read_parquet(PATH_INICIO)
+
+# Join key: buffers guardan zona como string; shap la guarda como numérica.
+df_inicio = df_inicio.with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+df_inicio_pd = df_inicio.filter(pl.col("ZONA777").is_not_null()).to_pandas()
+
+gdf_zonas = gdf_zonas.copy()
+gdf_zonas["ZONA777"] = gdf_zonas["ZONA777"].astype(int)
+
+print("Zonas shap:", len(gdf_zonas))
+print("Zonas buffers (inicio) con join key:", df_inicio_pd["ZONA777"].nunique())
+```
+
+## Diagnóstico: zonas “sin dato” (achuradas)
+
+```{python}
+from collections import defaultdict
+
+def missing_zonas_for_metric(value_col: str) -> dict[str, list[int]]:
+    missing_by_tipo = {}
+    for tp in TIPOS_PAGO:
+        df_tp = df_inicio_pd[df_inicio_pd["tipo_pago"] == tp][["ZONA777", value_col]].copy()
+        df_tp = df_tp.rename(columns={value_col: "value"})
+        merged = gdf_zonas.merge(df_tp, on="ZONA777", how="left")
+        missing = merged.loc[merged["value"].isna(), "ZONA777"].tolist()
+        missing_by_tipo[tp] = missing
+    return missing_by_tipo
+
+def print_missing_summary(value_col: str, max_list: int = 25):
+    miss = missing_zonas_for_metric(value_col)
+    print(f"\n=== Missing zones for {value_col} (hachurado) ===")
+    for tp, arr in miss.items():
+        print(f"- {tp}: {len(arr)} zonas sin dato (de {len(gdf_zonas)})")
+        if arr:
+            print(f"  ejemplos: {arr[:max_list]}")
+
+# Revisa las 6 métricas que estamos mapeando
+for col in [
+    "t_espera_inicial_seg_median",
+    "t_espera_inicial_seg_p90",
+    "t_espera_trasbordo_seg_median",
+    "t_espera_trasbordo_seg_p90",
+    "t_vehiculo_total_seg_final_median",
+    "t_vehiculo_total_seg_final_p90",
+]:
+    print_missing_summary(col, max_list=20)
+```
+
+```{python}
+# Tabla de diagnóstico: para las zonas faltantes (ej. espera inicial median),
+# verificamos si tienen viajes en la semana y en qué tipo_pago.
+miss_base = missing_zonas_for_metric("t_espera_inicial_seg_median")
+zones_union = sorted(set(sum(miss_base.values(), [])))
+
+if zones_union:
+    df_counts = (
+        pl.from_pandas(df_inicio_pd)
+        .group_by(["ZONA777", "tipo_pago"])
+        .agg(pl.col("n_viajes").sum().alias("n_viajes"))
+        .pivot(values="n_viajes", index="ZONA777", on="tipo_pago")
+        .fill_null(0)
+        .with_columns(
+            (
+                pl.col("BIP").fill_null(0)
+                + pl.col("QR_OTHER").fill_null(0)
+                + pl.col("QR_RED").fill_null(0)
+            ).alias("TOTAL")
+        )
+        .filter(pl.col("ZONA777").is_in(zones_union))
+        .sort("TOTAL", descending=True)
+    )
+    print("\n=== Diagnóstico zonas achuradas (basado en espera inicial median) ===")
+    display(df_counts)
+else:
+    print("No hay zonas achuradas para este diagnóstico.")
+```
+
+```{python}
+def plot_small_multiples_zona777(
+    df_inicio_pd,
+    gdf_zonas: gpd.GeoDataFrame,
+    value_col: str,
+    title: str,
+    cmap: str = "YlOrRd",
+    clip_quantiles: tuple[float, float] | None = (0.02, 0.98),
+):
+    # Build a geodataframe per tipo_pago, each with a 'value' column
+    layers = {}
+    for tp in TIPOS_PAGO:
+        df_tp = df_inicio_pd[df_inicio_pd["tipo_pago"] == tp][["ZONA777", value_col]].copy()
+        df_tp = df_tp.rename(columns={value_col: "value"})
+        layers[tp] = gdf_zonas.merge(df_tp, on="ZONA777", how="left")
+
+    # Shared color scale
+    all_vals = np.concatenate([layers[tp]["value"].to_numpy(dtype=float, na_value=np.nan) for tp in TIPOS_PAGO])
+    all_vals = all_vals[~np.isnan(all_vals)]
+    if all_vals.size == 0:
+        raise ValueError(f"No hay valores para plotear: {value_col}")
+
+    if clip_quantiles:
+        q0, q1 = clip_quantiles
+        vmin = float(np.quantile(all_vals, q0))
+        vmax = float(np.quantile(all_vals, q1))
+    else:
+        vmin = float(np.min(all_vals))
+        vmax = float(np.max(all_vals))
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 6), constrained_layout=True)
+    fig.suptitle(title, fontsize=14)
+
+    for ax, tp in zip(axes, TIPOS_PAGO, strict=True):
+        layers[tp].plot(
+            column="value",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            linewidth=0.2,
+            edgecolor="#666666",
+            missing_kwds={"color": "#eeeeee", "edgecolor": "#bbbbbb", "hatch": "///", "label": "Sin dato"},
+            ax=ax,
+        )
+        ax.set_title(tp)
+        ax.set_axis_off()
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    sm._A = []  # required for older matplotlib colorbar
+    cbar = fig.colorbar(sm, ax=axes, shrink=0.85, location="right")
+    cbar.set_label("segundos")
+    plt.show()
+```
+
+### Espera inicial (median → p90)
+
+```{python}
+plot_small_multiples_zona777(
+    df_inicio_pd=df_inicio_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_espera_inicial_seg_median",
+    title=f"Zonas777 — Espera inicial (median, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+
+plot_small_multiples_zona777(
+    df_inicio_pd=df_inicio_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_espera_inicial_seg_p90",
+    title=f"Zonas777 — Espera inicial (p90, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+```
+
+### Espera trasbordo (median → p90)
+
+```{python}
+plot_small_multiples_zona777(
+    df_inicio_pd=df_inicio_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_espera_trasbordo_seg_median",
+    title=f"Zonas777 — Espera trasbordo (median, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+
+plot_small_multiples_zona777(
+    df_inicio_pd=df_inicio_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_espera_trasbordo_seg_p90",
+    title=f"Zonas777 — Espera trasbordo (p90, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+```
+
+### Tiempo en vehículo (median → p90)
+
+```{python}
+plot_small_multiples_zona777(
+    df_inicio_pd=df_inicio_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_vehiculo_total_seg_final_median",
+    title=f"Zonas777 — Tiempo en vehículo (median, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+
+plot_small_multiples_zona777(
+    df_inicio_pd=df_inicio_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_vehiculo_total_seg_final_p90",
+    title=f"Zonas777 — Tiempo en vehículo (p90, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+```
+
+## Choropleths (Zonas777) — Buffer OD (Destino dominante por origen) por tipo_pago
+
+```{python}
+# Para mapear el buffer OD en choropleths, resumimos OD a nivel de origen (ZONA777)
+# tomando el destino con mayor n_viajes ("destino dominante") por (origen, tipo_pago).
+
+df_od = pl.read_parquet(PATH_OD).with_columns(
+    [
+        pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"),
+        pl.col("zona_fin_viaje").cast(pl.Int64, strict=False).alias("ZONA777_FIN"),
+    ]
+)
+df_od = df_od.filter(pl.col("ZONA777").is_not_null() & pl.col("ZONA777_FIN").is_not_null())
+
+df_od_dom = (
+    df_od.sort(["tipo_pago", "ZONA777", "n_viajes"], descending=[False, False, True])
+    .group_by(["tipo_pago", "ZONA777"], maintain_order=True)
+    .first()
+)
+
+df_od_dom_pd = df_od_dom.to_pandas()
+print("OD rows:", df_od.height)
+print("OD destino dominante rows (tipo_pago × ZONA777):", df_od_dom.height)
+```
+
+### Espera inicial (median → p90) — OD destino dominante
+
+```{python}
+plot_small_multiples_zona777(
+    df_inicio_pd=df_od_dom_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_espera_inicial_seg_median",
+    title=f"Zonas777 (OD destino dominante) — Espera inicial (median, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+
+plot_small_multiples_zona777(
+    df_inicio_pd=df_od_dom_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_espera_inicial_seg_p90",
+    title=f"Zonas777 (OD destino dominante) — Espera inicial (p90, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+```
+
+### Espera trasbordo (median → p90) — OD destino dominante
+
+```{python}
+plot_small_multiples_zona777(
+    df_inicio_pd=df_od_dom_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_espera_trasbordo_seg_median",
+    title=f"Zonas777 (OD destino dominante) — Espera trasbordo (median, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+
+plot_small_multiples_zona777(
+    df_inicio_pd=df_od_dom_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_espera_trasbordo_seg_p90",
+    title=f"Zonas777 (OD destino dominante) — Espera trasbordo (p90, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+```
+
+### Tiempo en vehículo (median → p90) — OD destino dominante
+
+```{python}
+plot_small_multiples_zona777(
+    df_inicio_pd=df_od_dom_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_vehiculo_total_seg_final_median",
+    title=f"Zonas777 (OD destino dominante) — Tiempo en vehículo (median, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+
+plot_small_multiples_zona777(
+    df_inicio_pd=df_od_dom_pd,
+    gdf_zonas=gdf_zonas,
+    value_col="t_vehiculo_total_seg_final_p90",
+    title=f"Zonas777 (OD destino dominante) — Tiempo en vehículo (p90, seg) — {PARTITION}",
+    cmap="YlOrRd",
+)
+```
+
+## Mapa de adopción QR (share) — Buffer A (Inicio)
+
+```{python}
+# Construimos shares por zona (origen) desde el buffer inicio:
+# - share_qr = (QR_RED + QR_OTHER) / TOTAL
+# - share_qr_red = QR_RED / TOTAL
+
+df_share = (
+    pl.read_parquet(PATH_INICIO)
+    .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+    .filter(pl.col("ZONA777").is_not_null())
+    .select(["ZONA777", "tipo_pago", "n_viajes"])
+    .group_by(["ZONA777", "tipo_pago"])
+    .agg(pl.col("n_viajes").sum().alias("n_viajes"))
+    .pivot(values="n_viajes", index="ZONA777", on="tipo_pago")
+    .fill_null(0)
+    .with_columns(
+        [
+            (pl.col("BIP") + pl.col("QR_OTHER") + pl.col("QR_RED")).alias("TOTAL"),
+        ]
+    )
+    .with_columns(
+        [
+            pl.when(pl.col("TOTAL") > 0)
+            .then((pl.col("QR_OTHER") + pl.col("QR_RED")) / pl.col("TOTAL"))
+            .otherwise(None)
+            .alias("share_qr"),
+            pl.when(pl.col("TOTAL") > 0)
+            .then(pl.col("QR_RED") / pl.col("TOTAL"))
+            .otherwise(None)
+            .alias("share_qr_red"),
+            pl.when(pl.col("TOTAL") > 0)
+            .then(pl.col("QR_OTHER") / pl.col("TOTAL"))
+            .otherwise(None)
+            .alias("share_qr_other"),
+        ]
+    )
+)
+
+df_share_pd = df_share.to_pandas()
+print("Zonas con share:", len(df_share_pd))
+display(df_share.sort("TOTAL", descending=True).head(10))
+```
+
+```{python}
+def plot_single_choropleth_zona777(
+    gdf_base: gpd.GeoDataFrame,
+    df_values_pd,
+    value_col: str,
+    title: str,
+    cmap: str = "Blues",
+    clip_quantiles: tuple[float, float] | None = (0.01, 0.99),
+):
+    dfv = df_values_pd[["ZONA777", value_col]].copy().rename(columns={value_col: "value"})
+    g = gdf_base.merge(dfv, on="ZONA777", how="left")
+
+    vals = g["value"].to_numpy(dtype=float, na_value=np.nan)
+    vals = vals[~np.isnan(vals)]
+    if vals.size == 0:
+        raise ValueError(f"No hay valores para plotear: {value_col}")
+
+    if clip_quantiles:
+        q0, q1 = clip_quantiles
+        vmin = float(np.quantile(vals, q0))
+        vmax = float(np.quantile(vals, q1))
+    else:
+        vmin = float(np.min(vals))
+        vmax = float(np.max(vals))
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 7), constrained_layout=True)
+    g.plot(
+        column="value",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        linewidth=0.2,
+        edgecolor="#666666",
+        missing_kwds={"color": "#eeeeee", "edgecolor": "#bbbbbb", "hatch": "///", "label": "Sin dato"},
+        ax=ax,
+    )
+    ax.set_title(title)
+    ax.set_axis_off()
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    sm._A = []
+    cbar = fig.colorbar(sm, ax=ax, shrink=0.85, location="right")
+    cbar.set_label("share (0–1)")
+    plt.show()
+```
+
+```{python}
+plot_single_choropleth_zona777(
+    gdf_base=gdf_zonas,
+    df_values_pd=df_share_pd,
+    value_col="share_qr",
+    title=f"Zonas777 — Share QR total (QR_RED + QR_OTHER) — {PARTITION}",
+    cmap="Blues",
+    clip_quantiles=None,
+)
+
+plot_single_choropleth_zona777(
+    gdf_base=gdf_zonas,
+    df_values_pd=df_share_pd,
+    value_col="share_qr_red",
+    title=f"Zonas777 — Share QR_RED — {PARTITION}",
+    cmap="Blues",
+    clip_quantiles=None,
+)
+
+plot_single_choropleth_zona777(
+    gdf_base=gdf_zonas,
+    df_values_pd=df_share_pd,
+    value_col="share_qr_other",
+    title=f"Zonas777 — Share QR_OTHER — {PARTITION}",
+    cmap="Blues",
+    clip_quantiles=None,
+)
+
+```
+
+## Mapa de adopción QR (share) — Buffer B (OD, agregado por origen)
+
+```{python}
+# A partir del buffer OD, agregamos por origen (ZONA777) sumando todos los destinos.
+# Esto sirve para ver "share de pago" condicionado a que el viaje sea OD (con zona_fin presente).
+
+df_share_od = (
+    pl.read_parquet(PATH_OD)
+    .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+    .filter(pl.col("ZONA777").is_not_null())
+    .select(["ZONA777", "tipo_pago", "n_viajes"])
+    .group_by(["ZONA777", "tipo_pago"])
+    .agg(pl.col("n_viajes").sum().alias("n_viajes"))
+    .pivot(values="n_viajes", index="ZONA777", on="tipo_pago")
+    .fill_null(0)
+    .with_columns((pl.col("BIP") + pl.col("QR_OTHER") + pl.col("QR_RED")).alias("TOTAL"))
+    .with_columns(
+        [
+            pl.when(pl.col("TOTAL") > 0)
+            .then((pl.col("QR_OTHER") + pl.col("QR_RED")) / pl.col("TOTAL"))
+            .otherwise(None)
+            .alias("share_qr"),
+            pl.when(pl.col("TOTAL") > 0)
+            .then(pl.col("QR_RED") / pl.col("TOTAL"))
+            .otherwise(None)
+            .alias("share_qr_red"),
+            pl.when(pl.col("TOTAL") > 0)
+            .then(pl.col("QR_OTHER") / pl.col("TOTAL"))
+            .otherwise(None)
+            .alias("share_qr_other"),
+        ]
+    )
+)
+
+df_share_od_pd = df_share_od.to_pandas()
+print("Zonas con share (OD->origen):", len(df_share_od_pd))
+display(df_share_od.sort("TOTAL", descending=True).head(10))
+```
+
+```{python}
+plot_single_choropleth_zona777(
+    gdf_base=gdf_zonas,
+    df_values_pd=df_share_od_pd,
+    value_col="share_qr",
+    title=f"Zonas777 (OD agregado por origen) — Share QR total — {PARTITION}",
+    cmap="Blues",
+    clip_quantiles=None,
+)
+
+plot_single_choropleth_zona777(
+    gdf_base=gdf_zonas,
+    df_values_pd=df_share_od_pd,
+    value_col="share_qr_red",
+    title=f"Zonas777 (OD agregado por origen) — Share QR_RED — {PARTITION}",
+    cmap="Blues",
+    clip_quantiles=None,
+)
+
+plot_single_choropleth_zona777(
+    gdf_base=gdf_zonas,
+    df_values_pd=df_share_od_pd,
+    value_col="share_qr_other",
+    title=f"Zonas777 (OD agregado por origen) — Share QR_OTHER — {PARTITION}",
+    cmap="Blues",
+    clip_quantiles=None,
+)
+```
+
+## Top OD flows (líneas entre centroides) — por `tipo_pago`
+
+Este gráfico muestra los **top-N pares OD** (por `n_viajes`) como líneas entre centroides de zonas.
+- Grosor ∝ `n_viajes`
+- Color = `tipo_pago`
+
+```{python}
+import numpy as np
+import polars as pl
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+
+TOP_N_FLOWS = 120  # recomendado: 50–200
+LINE_MIN_LW = 0.6
+LINE_MAX_LW = 4.0
+FLOW_ALPHA = 0.55
+BASE_EDGE = "#dddddd"
+
+COLOR_BY_TIPO = {
+    "BIP": "#1f77b4",
+    "QR_OTHER": "#ff7f0e",
+    "QR_RED": "#d62728",
+}
+
+if "gdf_zonas" not in globals():
+    raise RuntimeError("Falta `gdf_zonas` (shap cargado). Ejecuta primero la sección de choropleths.")
+
+# CRS handling: shap viene sin CRS, pero coordenadas parecen lon/lat.
+gdf_base = gdf_zonas.copy()
+if gdf_base.crs is None:
+    gdf_base = gdf_base.set_crs("EPSG:4326", allow_override=True)
+gdf_proj = gdf_base.to_crs("EPSG:3857")
+
+centroids = gdf_proj[["ZONA777", "geometry"]].copy()
+centroids["pt"] = centroids.geometry.centroid
+centroid_map = dict(zip(centroids["ZONA777"].astype(int), centroids["pt"]))
+
+def _lw_scale(values: np.ndarray, lw_min: float, lw_max: float) -> np.ndarray:
+    vmin = float(values.min())
+    vmax = float(values.max())
+    if vmax <= vmin:
+        return np.full_like(values, lw_max, dtype=float)
+    return lw_min + (values - vmin) * (lw_max - lw_min) / (vmax - vmin)
+
+# Top-N por tipo desde el buffer OD
+df_flows = (
+    pl.scan_parquet(PATH_OD)
+    .with_columns(
+        [
+            pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("Z_ORIG"),
+            pl.col("zona_fin_viaje").cast(pl.Int64, strict=False).alias("Z_DEST"),
+        ]
+    )
+    .filter(pl.col("Z_ORIG").is_not_null() & pl.col("Z_DEST").is_not_null())
+    .group_by(["tipo_pago", "Z_ORIG", "Z_DEST"])
+    .agg(pl.col("n_viajes").sum().alias("n_viajes"))
+    .sort(["tipo_pago", "n_viajes"], descending=[False, True])
+    .group_by("tipo_pago", maintain_order=True)
+    .head(TOP_N_FLOWS)
+    .collect(engine="streaming")
+)
+
+print("Top flows rows:", df_flows.height)
+display(df_flows.head(10))
+```
+
+```{python}
+fig, axes = plt.subplots(1, 3, figsize=(18, 7), constrained_layout=True)
+fig.suptitle(f"Top {TOP_N_FLOWS} OD flows por tipo_pago — {PARTITION}", fontsize=14)
+
+for ax, tp in zip(axes, TIPOS_PAGO, strict=True):
+    gdf_proj.plot(ax=ax, facecolor="white", edgecolor=BASE_EDGE, linewidth=0.2)
+
+    dft = df_flows.filter(pl.col("tipo_pago") == tp).to_pandas()
+    if dft.empty:
+        ax.set_title(f"{tp} (sin datos)")
+        ax.set_axis_off()
+        continue
+
+    # Build segments
+    segments = []
+    widths = []
+    for _, row in dft.iterrows():
+        o = centroid_map.get(int(row["Z_ORIG"]))
+        d = centroid_map.get(int(row["Z_DEST"]))
+        if o is None or d is None:
+            continue
+        segments.append([(o.x, o.y), (d.x, d.y)])
+        widths.append(float(row["n_viajes"]))
+
+    if not segments:
+        ax.set_title(f"{tp} (sin centroides)")
+        ax.set_axis_off()
+        continue
+
+    widths = _lw_scale(np.array(widths, dtype=float), LINE_MIN_LW, LINE_MAX_LW)
+    lc = LineCollection(
+        segments,
+        colors=COLOR_BY_TIPO.get(tp, "black"),
+        linewidths=widths,
+        alpha=FLOW_ALPHA,
+    )
+    ax.add_collection(lc)
+    ax.set_title(tp)
+    ax.set_axis_off()
+
+plt.show()
+```
+
+## Join Censo 2024 → Buffers
+
+```{python}
+#| label: join-censo-buffers
+from lib.censo2024_join_buffers import run as join_censo_buffers
+
+CENSO_PATH = PROJECT_ROOT / "02_eda/tmp/censo2024_zona777/censo2024_zona777_agg_final.parquet"
+OUT_JOIN_DIR = PROJECT_ROOT / "02_eda/tmp/buffers_zona777_censo2024"
+
+if not CENSO_PATH.exists():
+    raise FileNotFoundError(f"No existe: {CENSO_PATH}")
+
+diag = join_censo_buffers(
+    buffers_inicio=PATH_INICIO,
+    buffers_od=PATH_OD,
+    censo_parquet=CENSO_PATH,
+    out_dir=OUT_JOIN_DIR,
+)
+
+print("Join outputs:")
+print(diag)
+```
+
+## Mini‑EDA Censo en buffers
+
+```{python}
+#| label: mini-eda-censo-buffers
+import polars as pl
+from IPython.display import display
+
+JOIN_INICIO = OUT_JOIN_DIR / f"{PATH_INICIO.stem}_censo.parquet"
+JOIN_OD = OUT_JOIN_DIR / f"{PATH_OD.stem}_censo.parquet"
+
+if not JOIN_INICIO.exists():
+    raise FileNotFoundError(f"No existe: {JOIN_INICIO}")
+if not JOIN_OD.exists():
+    raise FileNotFoundError(f"No existe: {JOIN_OD}")
+
+df_inicio_censo = pl.read_parquet(JOIN_INICIO)
+df_od_censo = pl.read_parquet(JOIN_OD)
+
+# Selección de variables censo para resumen (5 variables)
+CENSO_SUMMARY = [
+    "censo_prom_edad",
+    "censo_share_inmigrantes",
+    "censo_share_internet",
+    "censo_share_ocupado",
+    "censo_share_hacinamiento",
+]
+
+def _summarize(df: pl.DataFrame, cols: list[str]) -> pl.DataFrame:
+    cols = [c for c in cols if c in df.columns]
+    if not cols:
+        raise ValueError("No hay columnas censo disponibles para resumir.")
+    aggs = []
+    for c in cols:
+        aggs += [
+            pl.mean(c).alias(f"{c}_mean"),
+            pl.median(c).alias(f"{c}_median"),
+        ]
+    return df.group_by("tipo_pago").agg(aggs).sort("tipo_pago")
+
+print("Resumen Censo — Buffer A (inicio) por tipo_pago")
+display(_summarize(df_inicio_censo, CENSO_SUMMARY))
+
+print("Resumen Censo — Buffer OD (origen) por tipo_pago")
+display(_summarize(df_od_censo, [f"censo_o_{c.split('censo_')[1]}" for c in CENSO_SUMMARY]))
+
+print("Resumen Censo — Buffer OD (destino) por tipo_pago")
+display(_summarize(df_od_censo, [f"censo_d_{c.split('censo_')[1]}" for c in CENSO_SUMMARY]))
+```
+
+```{python}
+#| label: missing-zones-censo
+# Missing zonas (censo_n_per nulo)
+def _missing_zones(df, col, zone_col):
+    missing = (
+        df.filter(pl.col(col).is_null())
+        .select(pl.col(zone_col).cast(pl.Int64, strict=False))
+        .unique()
+        .sort(zone_col)
+    )
+    return missing
+
+missing_inicio = _missing_zones(df_inicio_censo, "censo_n_per", "zona_inicio_viaje")
+missing_od_o = _missing_zones(df_od_censo, "censo_o_n_per", "zona_inicio_viaje")
+missing_od_d = _missing_zones(df_od_censo, "censo_d_n_per", "zona_fin_viaje")
+
+print("Missing zonas — Buffer A (inicio):", missing_inicio.height)
+display(missing_inicio)
+
+print("Missing zonas — Buffer OD (origen):", missing_od_o.height)
+display(missing_od_o)
+
+print("Missing zonas — Buffer OD (destino):", missing_od_d.height)
+display(missing_od_d)
+```

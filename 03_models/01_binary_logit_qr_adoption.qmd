@@ -80,6 +80,21 @@ from biogeme.expressions import Beta, Variable
 
 
 
+# --- Config dataset (v1 vs v2) ---
+# v2: parquet corregido (sin look-ahead; con tiempos recalculados)
+USE_V2_PARQUET = True
+V2_PARQUET_FILENAME = "viajes_con_te_calculado_2025-W17.parquet"
+_v2_override = os.getenv("V2_PARQUET_PATH_OVERRIDE", "").strip()
+if _v2_override:
+    V2_PARQUET_PATH = Path(_v2_override)
+else:
+    _v2_candidates = [
+        PROJECT_ROOT / "tmp" / V2_PARQUET_FILENAME,
+        PROJECT_ROOT.parent / "tesis-project" / "tmp" / V2_PARQUET_FILENAME,
+    ]
+    V2_PARQUET_PATH = next((p for p in _v2_candidates if p.exists()), _v2_candidates[0])
+OUTPUT_SUFFIX = "-v2" if USE_V2_PARQUET else ""
+
 # --- Parámetros ---
 if USE_LOCAL_PATHS:
     SILVER_BASE_PATH = LOCAL_SILVER_PATH
@@ -94,7 +109,11 @@ YEAR_ANALISIS = 2025
 WEEK_ANALISIS = 17
 PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
 
-print(f"\n📁 Dataset de entrada: {INPUT_DATASET_PATH}")
+print(f"\n📁 Dataset de entrada: {'parquet v2' if USE_V2_PARQUET else INPUT_DATASET_PATH}")
+if USE_V2_PARQUET:
+    print(f"   - V2 parquet: {V2_PARQUET_PATH}")
+    if not V2_PARQUET_PATH.exists():
+        print("   ⚠️ V2 parquet no encontrado. Puedes definir V2_PARQUET_PATH_OVERRIDE.")
 print(f"📊 Partición para análisis inicial: {PARTITION_LABEL}")
 ```
 
@@ -118,16 +137,13 @@ def prepare_features(lazy_frame):
         (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
     ]).with_columns([
         pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
-        pl.col("hora").is_in(HORAS_Punta_TARDE).alias("punta_tarde"),
-        (pl.col("dia_semana") == 5).alias("es_viernes"),
-        pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
     ]).with_columns([
-        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
-        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
-        (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
-        (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LAB_PM"),
+        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LAB_PT"),
+            (~pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_NO_LAB"),
     ])
-    cols_modelo = ["choice", "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+    cols_modelo = ["choice", "DUMMY_LAB_PM", "DUMMY_LAB_PT", "DUMMY_NO_LAB"]
     return lf_prep.select(cols_modelo)
 
 # --- Helper para Muestreo Estratificado ---
@@ -189,14 +205,11 @@ def prepare_features_extended(lazy_frame):
             (pl.col("tipodia").cast(pl.Int8, strict=False) == 0).alias("is_laboral"),
         ]).with_columns([
             pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
-            pl.col("hora").is_in(HORAS_Punta_TARDE).alias("punta_tarde"),
-            (pl.col("dia_semana") == 5).alias("es_viernes"),
-            pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue"),
+            pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
         ]).with_columns([
-            (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
-            (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
-            (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
-            (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB"),
+            (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LAB_PM"),
+            (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LAB_PT"),
+            (~pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_NO_LAB"),
         ])
     
         # 2. Ingeniería de variables de viaje
@@ -214,23 +227,26 @@ def prepare_features_extended(lazy_frame):
         cols_modos = [f"tipo_transporte_{i}" for i in range(1, 5)]
         for col in cols_modos:
             lf_prep_ext = lf_prep_ext.with_columns([
-                pl.when(pl.col(col).cast(pl.Utf8) == '4').then(pl.lit('2'))
-                  .when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))
+                pl.when(pl.col(col).cast(pl.Utf8) == '3').then(pl.lit('1'))
                   .otherwise(pl.col(col).cast(pl.Utf8))
                   .alias(col)
             ])
         
+        bus_flags = [pl.col(c).fill_null("0") == "1" for c in cols_modos]
+        metro_flags = [pl.col(c).fill_null("0") == "2" for c in cols_modos]
+        metrotren_flags = [pl.col(c).fill_null("0") == "4" for c in cols_modos]
         lf_prep_ext = lf_prep_ext.with_columns([
-            pl.any_horizontal([pl.col(c) == '1' for c in cols_modos]).alias("usa_bus"),
-            pl.any_horizontal([pl.col(c) == '2' for c in cols_modos]).alias("usa_metro"),
+            pl.any_horizontal(bus_flags).alias("usa_bus"),
+            pl.any_horizontal(metro_flags).alias("usa_metro"),
+            pl.any_horizontal(metrotren_flags).alias("usa_metrotren"),
         ]).with_columns([
-            (pl.col("usa_metro") & ~pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
-            (pl.col("usa_metro") & pl.col("usa_bus")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
+            (pl.col("usa_metro") & ~pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_SOLO_METRO"),
+            (pl.col("usa_metro") & pl.col("usa_bus") & ~pl.col("usa_metrotren")).cast(pl.Int8).alias("DUMMY_METRO_BUS"),
         ])
     
         # 4. Seleccionar columnas finales
         cols_modelo_ext = [
-            "choice", "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB",
+            "choice", "DUMMY_LAB_PM", "DUMMY_LAB_PT", "DUMMY_NO_LAB",
             "VAR_T_VEHICULO_MIN", "VAR_N_TRASBORDOS", "VAR_T_CAMINATA_MIN",
             "VAR_T_ESPERA_TRASBORDO_MIN", "VAR_T_ESPERA_INICIAL_MIN",
             "DUMMY_SOLO_METRO", "DUMMY_METRO_BUS"
@@ -247,11 +263,14 @@ def prepare_features_extended(lazy_frame):
 #|label: load-data
 print(f"Cargando partición {PARTITION_LABEL} desde {INPUT_DATASET_PATH}...")
 
-partition_path_glob = f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
+if USE_V2_PARQUET:
+    input_path = str(V2_PARQUET_PATH)
+else:
+    input_path = f"{INPUT_DATASET_PATH}/iso_year={YEAR_ANALISIS}/iso_week={WEEK_ANALISIS}/*.parquet"
 
 try:
     # Usamos read_parquet_portable para cargar de forma perezosa (LazyFrame)
-    lf_data = read_parquet_portable(partition_path_glob)
+    lf_data = read_parquet_portable(input_path)
 
     # Verificamos el esquema y contamos filas (esto sí ejecuta parte de la query)
     schema = lf_data.collect_schema()
@@ -265,7 +284,7 @@ try:
 
 except Exception as e:
     print(f"❌ Error al cargar la partición: {e}")
-    print(f"   Verifica que la ruta y partición existan: {partition_path_glob}")
+    print(f"   Verifica que la ruta exista: {input_path}")
     lf_data = None
 ```
 
@@ -416,21 +435,18 @@ if lf_data is not None:
     # 3. Crear variables intermedias para dummies
     lf_prep = lf_prep.with_columns([
         pl.col("hora").is_in(HORAS_PUNTA_MANANA).alias("punta_manana"),
-        pl.col("hora").is_in(HORAS_Punta_TARDE).alias("punta_tarde"),
-        (pl.col("dia_semana") == 5).alias("es_viernes"), # Viernes=5
-        pl.col("dia_semana").is_between(1, 4, closed='both').alias("es_lun_jue") # Lunes=1 a Jueves=4
+        pl.col("hora").is_in(HORAS_PUNTA_TARDE).alias("punta_tarde"),
     ])
     
     # 4. Crear las dummies finales (casteadas a Int8 para Biogeme)
     lf_prep = lf_prep.with_columns([
-        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PM_LAB"),
-        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_PT_LAB"),
-        (pl.col("es_lun_jue") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LJ_LAB"),
-        (pl.col("es_viernes") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_VIE_LAB")
+        (pl.col("punta_manana") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LAB_PM"),
+        (pl.col("punta_tarde") & pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_LAB_PT"),
+            (~pl.col("is_laboral")).cast(pl.Int8).alias("DUMMY_NO_LAB"),
     ])
     
     # 5. Seleccionar solo las columnas necesarias para el modelo
-    cols_modelo = ["choice", "DUMMY_PM_LAB", "DUMMY_PT_LAB", "DUMMY_LJ_LAB", "DUMMY_VIE_LAB"]
+    cols_modelo = ["choice", "DUMMY_LAB_PM", "DUMMY_LAB_PT", "DUMMY_NO_LAB"]
     lf_model_ready = lf_prep.select(cols_modelo)
     
     # 6. Ejecutar la consulta (collect) para materializar los datos de esta partición
@@ -475,10 +491,10 @@ El modelo utiliza las siguientes variables y parámetros:
 *   **$V_{QR}$**: Utilidad de elegir pago con QR.
 *   **$V_{Bip}$**: Utilidad de elegir pago con Tarjeta Bip!.
 *   **$ASC_{QR}$**: Constante Específica de la Alternativa QR. Captura la preferencia intrínseca por el QR en comparación con la Tarjeta Bip! (que se normaliza a 0).
-*   **$\beta_{PM}$**: Coeficiente para la variable `DUMMY_PM_LAB` (efecto de la punta mañana).
-*   **$\beta_{PT}$**: Coeficiente para la variable `DUMMY_PT_LAB` (efecto de la punta tarde).
-*   **$\beta_{LJ}$**: Coeficiente para la variable `DUMMY_LJ_LAB` (efecto de Lunes a Jueves).
-*   **$\beta_{VIE}$**: Coeficiente para la variable `DUMMY_VIE_LAB` (efecto de Viernes).
+*   **$\beta_{LAB\_PM}$**: Coeficiente para la variable `DUMMY_LAB_PM` (punta mañana laboral).
+*   **$\beta_{LAB\_PT}$**: Coeficiente para la variable `DUMMY_LAB_PT` (punta tarde laboral).
+*   **$\beta_{NO\_LAB}$**: Coeficiente para la variable `DUMMY_NO_LAB` (no laboral).
+*   Base omitida: `LAB_VALLE` (laboral fuera de punta).
 
 #### Ecuaciones de Utilidad
 
@@ -488,7 +504,7 @@ $V_{Bip} = 0$
 
 La utilidad de elegir QR se modela como una función lineal de las variables explicativas:
 
-$V_{QR} = ASC_{QR} + \beta_{PM} \cdot DUMMY\_PM\_LAB + \beta_{PT} \cdot DUMMY\_PT\_LAB + \beta_{LJ} \cdot DUMMY\_LJ\_LAB + \beta_{VIE} \cdot DUMMY\_VIE\_LAB$
+$V_{QR} = ASC_{QR} + \beta_{LAB\_PM} \cdot DUMMY\_LAB\_PM + \beta_{LAB\_PT} \cdot DUMMY\_LAB\_PT + \beta_{NO\_LAB} \cdot DUMMY\_NO\_LAB$
 
 La probabilidad de que un individuo elija QR se calcula entonces mediante la fórmula del Logit:
 
@@ -498,6 +514,7 @@ A continuación, se implementa esta especificación en Biogeme.
 
 ```{python}
 #| label: define-logit-model
+print("label: define-logit-model")
 
 if 'biodb' in locals() and biodb is not None:
     print("Especificando el modelo Logit Binario en Biogeme...")
@@ -505,10 +522,9 @@ if 'biodb' in locals() and biodb is not None:
     # 1. Definir las Variables de Biogeme a partir de las columnas del DataFrame
     #    (Asegúrate de que los nombres coincidan EXACTAMENTE con las columnas de pandas_df)
     print("   Definiendo variables...")
-    PM_LAB = Variable('DUMMY_PM_LAB')
-    PT_LAB = Variable('DUMMY_PT_LAB')
-    LJ_LAB = Variable('DUMMY_LJ_LAB')
-    VIE_LAB = Variable('DUMMY_VIE_LAB')
+    PM_LAB = Variable('DUMMY_LAB_PM')
+    PT_LAB = Variable('DUMMY_LAB_PT')
+    NO_LAB = Variable('DUMMY_NO_LAB')
 
     CHOICE = Variable('choice') # La variable dependiente
 
@@ -518,10 +534,9 @@ if 'biodb' in locals() and biodb is not None:
     # (Nombre, Valor Inicial, Límite Inf, Límite Sup, Fijo=0 -> Estimar)
     # --- 2. Definir los PARÁMETROS (Betas a estimar) ---
     ASC_QR = Beta('ASC_QR', 0, None, None, 0) # Constante para QR
-    B_PM_LAB = Beta('B_PM_LAB', 0, None, None, 0) # Hora punta mañana laboral
-    B_PT_LAB = Beta('B_PT_LAB', 0, None, None, 0) # Hora punta tarde laboral
-    B_LJ_LAB = Beta('B_LJ_LAB', 0, None, None, 0) # Lunes a Jueves laboral
-    B_VIE_LAB = Beta('B_VIE_LAB', 0, None, None, 0) # Viernes laboral
+    B_LAB_PM = Beta('B_LAB_PM', 0, None, None, 0) # Hora punta mañana laboral
+    B_LAB_PT = Beta('B_LAB_PT', 0, None, None, 0) # Hora punta tarde laboral
+    B_NO_LAB = Beta('B_NO_LAB', 0, None, None, 0) # No laboral (base omitida: LAB_VALLE)
 
     # --- 3. Formular las Funciones de Utilidad (V) ---
     # Normalizamos la utilidad de Bip! (choice=0) a cero
@@ -529,7 +544,7 @@ if 'biodb' in locals() and biodb is not None:
     V_BIP = 0
     
     # Alternativa 1: Pago QR
-    V_QR = ASC_QR + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB
+    V_QR = ASC_QR + B_LAB_PM * PM_LAB + B_LAB_PT * PT_LAB + B_NO_LAB * NO_LAB
 
     # 4. Asociar cada función de utilidad con su ID en la columna 'CHOICE'
     print("   Asociando funciones de utilidad con ID de elección...")
@@ -654,20 +669,24 @@ if 'biodb' in locals() and biodb is not None:
 ```{python}
 #|label: setup-sequential-run
 
+print("label: setup-sequential-run")
 import pandas as pd
 import gc
 import time
 
 # --- 1. CONFIGURACIÓN DE LA EJECUCIÓN ---
 # Define aquí las particiones que quieres procesar
-PARTICIONES_A_PROCESAR = [
-    (2025, 17), 
-    (2025, 18)  
-]
+if USE_V2_PARQUET:
+    PARTICIONES_A_PROCESAR = [(2025, 17)]
+else:
+    PARTICIONES_A_PROCESAR = [
+        (2025, 17), 
+        (2025, 18)  
+    ]
 
 # Define si quieres aplicar muestreo o usar el dataset completo
-APPLY_SAMPLING = False
-SAMPLE_FRACTION = 0.20  # 20% de la partición
+APPLY_SAMPLING = True
+SAMPLE_FRACTION = 0.30  # 10% de la partición
 SEED = 42               # Para reproducibilidad del muestreo
 
 # Directorio base para los resultados
@@ -687,6 +706,7 @@ if APPLY_SAMPLING:
 #|label: sequential-estimation
 #|eval: false
 
+print("label: sequential-estimation")
 from biogeme.version import get_text as biogeme_version_text
 import biogeme.results_processing as br
 from biogeme.results_processing import get_pandas_estimated_parameters
@@ -709,9 +729,11 @@ print("--- Iniciando Proceso de Estimación Secuencial ---")
 for year, week in PARTICIONES_A_PROCESAR:
     partition_label = f"{year}-W{week}"
     print(f"\n{'='*60}\n--- Procesando Partición: {partition_label} ---\n{'='*60}")
+    run_start_time = time.perf_counter()
 
     # a. Definir y crear directorio de salida único
-    output_dir_partition = os.path.join(BASE_OUTPUT_DIR, f"W{week}-baseline")
+    sample_suffix = f"-{SAMPLE_FRACTION:g}" if APPLY_SAMPLING else ""
+    output_dir_partition = os.path.join(BASE_OUTPUT_DIR, f"W{week}-baseline{OUTPUT_SUFFIX}{sample_suffix}")
     os.makedirs(output_dir_partition, exist_ok=True)
     print(f"   Resultados se guardarán en: {output_dir_partition}")
 
@@ -720,9 +742,12 @@ for year, week in PARTICIONES_A_PROCESAR:
 
     try:
         # b. Cargar datos
-        input_path_glob = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
-        lf_data = read_parquet_portable(input_path_glob)
-        print(f"   Cargando datos desde: {input_path_glob}")
+        if USE_V2_PARQUET:
+            input_path = str(V2_PARQUET_PATH)
+        else:
+            input_path = f"{INPUT_DATASET_PATH}/iso_year={year}/iso_week={week}/*.parquet"
+        lf_data = read_parquet_portable(input_path)
+        print(f"   Cargando datos desde: {input_path}")
 
         # c. Preparar features (usando la función helper del modelo simple)
         lf_model_ready = prepare_features(lf_data)
@@ -742,19 +767,17 @@ for year, week in PARTICIONES_A_PROCESAR:
         # e. Setup Biogeme (se define todo dentro del bucle para evitar fugas de estado)
         print("   Definiendo especificación del modelo (Betas, Variables, Utilidad)...")
         ASC_QR = Beta(f'ASC_QR_{partition_label}', 0, None, None, 0)
-        B_PM_LAB = Beta(f'B_PM_LAB_{partition_label}', 0, None, None, 0)
-        B_PT_LAB = Beta(f'B_PT_LAB_{partition_label}', 0, None, None, 0)
-        B_LJ_LAB = Beta(f'B_LJ_LAB_{partition_label}', 0, None, None, 0)
-        B_VIE_LAB = Beta(f'B_VIE_LAB_{partition_label}', 0, None, None, 0)
+        B_LAB_PM = Beta(f'B_LAB_PM_{partition_label}', 0, None, None, 0)
+        B_LAB_PT = Beta(f'B_LAB_PT_{partition_label}', 0, None, None, 0)
+        B_NO_LAB = Beta(f'B_NO_LAB_{partition_label}', 0, None, None, 0)
 
-        PM_LAB = Variable('DUMMY_PM_LAB')
-        PT_LAB = Variable('DUMMY_PT_LAB')
-        LJ_LAB = Variable('DUMMY_LJ_LAB')
-        VIE_LAB = Variable('DUMMY_VIE_LAB')
+        PM_LAB = Variable('DUMMY_LAB_PM')
+        PT_LAB = Variable('DUMMY_LAB_PT')
+        NO_LAB = Variable('DUMMY_NO_LAB')
         CHOICE = Variable('choice')
 
         V_BIP = 0
-        V_QR = ASC_QR + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB
+        V_QR = ASC_QR + B_LAB_PM * PM_LAB + B_LAB_PT * PT_LAB + B_NO_LAB * NO_LAB
         V = {0: V_BIP, 1: V_QR}
         av = {0: 1, 1: 1}
         logprob = models.loglogit(V, av, CHOICE)
@@ -771,10 +794,13 @@ for year, week in PARTICIONES_A_PROCESAR:
         print("   Estimando el modelo...")
         results = biogeme_model.estimate()
         print("   ✅ Estimación completada!")
+        elapsed_seconds = time.perf_counter() - run_start_time
+        print(f"   ⏱️ Tiempo total partición {partition_label}: {elapsed_seconds:.1f} s")
 
         # g. Guardar resultados en CSV
         params_df = get_pandas_estimated_parameters(estimation_results=results)
         stats_dict = results.get_general_statistics()
+        stats_dict["Wall-clock seconds"] = elapsed_seconds
         params_df.to_csv(f'params_{partition_label}.csv')
         pd.DataFrame([stats_dict]).to_csv(f'stats_{partition_label}.csv', index=False)
         print(f"   📁 Resultados guardados en formato CSV y HTML.")
@@ -855,21 +881,21 @@ print(f"\n{'='*60}\n--- Proceso Finalizado ---\n{'='*60}")
 #        
 #        # Parámetros (Betas) a estimar - con nombres únicos por partición
 #        ASC_QR = Beta(f'ASC_QR_{partition_label}', 0, None, None, 0)
-#        B_PM_LAB = Beta(f'B_PM_LAB_{partition_label}', 0, None, None, 0)
-#        B_PT_LAB = Beta(f'B_PT_LAB_{partition_label}', 0, None, None, 0)
-#        B_LJ_LAB = Beta(f'B_LJ_LAB_{partition_label}', 0, None, None, 0)
-#        B_VIE_LAB = Beta(f'B_VIE_LAB_{partition_label}', 0, None, None, 0)
+#        B_LAB_PM = Beta(f'B_LAB_PM_{partition_label}', 0, None, None, 0)
+#        B_LAB_PT = Beta(f'B_LAB_PT_{partition_label}', 0, None, None, 0)
+#        B_LAB_VALLE = Beta(f'B_LAB_VALLE_{partition_label}', 0, None, None, 0)
+#        B_NO_LAB = Beta(f'B_NO_LAB_{partition_label}', 0, None, None, 0)
 #
 #        # Variables del dataset
-#        PM_LAB = Variable('DUMMY_PM_LAB')
-#        PT_LAB = Variable('DUMMY_PT_LAB')
-#        LJ_LAB = Variable('DUMMY_LJ_LAB')
-#        VIE_LAB = Variable('DUMMY_VIE_LAB')
+#        PM_LAB = Variable('DUMMY_LAB_PM')
+#        PT_LAB = Variable('DUMMY_LAB_PT')
+#        LJ_LAB = Variable('DUMMY_LAB_VALLE')
+#        NO_LAB = Variable('DUMMY_NO_LAB')
 #        CHOICE = Variable('choice')
 #
 #        # Funciones de Utilidad
 #        V_BIP = 0
-#        V_QR = ASC_QR + B_PM_LAB * PM_LAB + B_PT_LAB * PT_LAB + B_LJ_LAB * LJ_LAB + B_VIE_LAB * VIE_LAB
+#        V_QR = ASC_QR + B_LAB_PM * PM_LAB + B_LAB_PT * PT_LAB + B_NO_LAB * NO_LAB
 #        
 #        V = {0: V_BIP, 1: V_QR}
 #        av = {0: 1, 1: 1}
@@ -1082,10 +1108,10 @@ print(f"\n{'='*60}\n--- Proceso Finalizado ---\n{'='*60}")
 #    print("📊 Estadísticas por año:")
 #    yearly_stats = df_pivot_analysis.groupby('year').agg({
 #        'ASC_QR': ['mean', 'std', 'min', 'max'],
-#        'B_PM_LAB': ['mean', 'std', 'min', 'max'],
-#        'B_PT_LAB': ['mean', 'std', 'min', 'max'],
-#        'B_LJ_LAB': ['mean', 'std', 'min', 'max'],
-#        'B_VIE_LAB': ['mean', 'std', 'min', 'max']
+#        'B_LAB_PM': ['mean', 'std', 'min', 'max'],
+#        'B_LAB_PT': ['mean', 'std', 'min', 'max'],
+#        'B_LAB_VALLE': ['mean', 'std', 'min', 'max'],
+#        'B_NO_LAB': ['mean', 'std', 'min', 'max']
 #    }).round(4)
 #    print(yearly_stats)
 #    
@@ -1097,7 +1123,7 @@ print(f"\n{'='*60}\n--- Proceso Finalizado ---\n{'='*60}")
 #    fig.suptitle('Evolución Temporal de Parámetros del Modelo Logit QR vs Bip', fontsize=16, fontweight='bold')
 #    
 #    # Parámetros a graficar
-#    params = ['ASC_QR', 'B_PM_LAB', 'B_PT_LAB', 'B_LJ_LAB', 'B_VIE_LAB']
+#    params = ['ASC_QR', 'B_LAB_PM', 'B_LAB_PT', 'B_LAB_VALLE', 'B_NO_LAB']
 #    param_names = ['Constante QR', 'Punta Mañana', 'Punta Tarde', 'Lun-Jue', 'Viernes']
 #    colors = ['red', 'blue', 'green', 'orange', 'purple']
 #    
@@ -1118,7 +1144,7 @@ print(f"\n{'='*60}\n--- Proceso Finalizado ---\n{'='*60}")
 #        ax.legend()
 #        
 #        # Agregar línea horizontal en y=0 si es relevante
-#        if param in ['B_LJ_LAB', 'B_VIE_LAB']:
+#        if param in ['B_LAB_VALLE', 'B_NO_LAB']:
 #            ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
 #    
 #    # Subplot adicional para Rho-cuadrado ajustado
@@ -1267,12 +1293,12 @@ print(f"\n{'='*60}\n--- Proceso Finalizado ---\n{'='*60}")
 #    
 #    print(f"\n🔍 HALLAZGOS PRINCIPALES:")
 #    print(f"   1. HORAS PUNTA: QR es consistentemente más preferido (coef. positivos)")
-#    print(f"      - Mañana: promedio {df_pivot['B_PM_LAB'].mean():.3f}")
-#    print(f"      - Tarde: promedio {df_pivot['B_PT_LAB'].mean():.3f}")
+#    print(f"      - Mañana: promedio {df_pivot['B_LAB_PM'].mean():.3f}")
+#    print(f"      - Tarde: promedio {df_pivot['B_LAB_PT'].mean():.3f}")
 #    
 #    print(f"   2. DÍAS LABORALES: Bip es más preferido (coef. negativos)")
-#    print(f"      - Lun-Jue: promedio {df_pivot['B_LJ_LAB'].mean():.3f}")
-#    print(f"      - Viernes: promedio {df_pivot['B_VIE_LAB'].mean():.3f}")
+#    print(f"      - Lun-Jue: promedio {df_pivot['B_LAB_VALLE'].mean():.3f}")
+#    print(f"      - Viernes: promedio {df_pivot['B_NO_LAB'].mean():.3f}")
 #    
 #    print(f"   3. EVOLUCIÓN TEMPORAL: Mejora en preferencia por QR")
 #    print(f"      - ASC_QR 2024: {df_pivot_analysis[df_pivot_analysis['year']==2024]['ASC_QR'].mean():.3f}")
@@ -1308,7 +1334,7 @@ import os
 
 # --- Configuración ---
 # Apuntar a la carpeta de resultados de la semana de estudio
-results_folder = "model_outputs/W17-baseline"
+results_folder = f"model_outputs/W17-baseline{OUTPUT_SUFFIX}"
 partition_label = "2025-W17"
 
 # --- Cargar Archivos ---
@@ -1396,12 +1422,15 @@ Para validar la eficiencia de usar una muestra en lugar del dataset completo, se
 #| label: load-and-compare-sample-results
 
 # --- Cargar resultados de la muestra ---
-results_folder_sample = "model_outputs/W17-baseline-0.2"
+SAMPLE_FRACTION_FOR_COMPARISON = 0.30
+results_folder_sample = f"model_outputs/W17-baseline{OUTPUT_SUFFIX}-{SAMPLE_FRACTION_FOR_COMPARISON:g}"
 df_params_sample = None
 df_stats_sample = None
 try:
     params_file_sample = os.path.join(results_folder_sample, f"params_{partition_label}.csv")
     stats_file_sample = os.path.join(results_folder_sample, f"stats_{partition_label}.csv")
+    if not (os.path.exists(params_file_sample) and os.path.exists(stats_file_sample)):
+        raise FileNotFoundError(f"Missing sample results: {params_file_sample} / {stats_file_sample}")
     df_params_sample = pd.read_csv(params_file_sample, index_col=0)
     df_stats_sample = pd.read_csv(stats_file_sample)
     df_params_sample['Name'] = df_params_sample['Name'].str.replace(f'_{partition_label}', '', regex=False)
@@ -1424,7 +1453,11 @@ try:
     't-stat (Muestra 20%)': '{:.1f}'
     }).highlight_null(color='transparent'))
 except FileNotFoundError:
-    print(f"ERROR: No se encontraron los archivos de resultados en la carpeta de la muestra '{results_folder_sample}'.")
+    print(
+        f"⚠️ No se encontraron resultados de muestra en '{results_folder_sample}'. "
+        f"Si quieres esta comparación, ejecuta la estimación con `APPLY_SAMPLING=True` "
+        f"y `SAMPLE_FRACTION={SAMPLE_FRACTION_FOR_COMPARISON}` para generar esa carpeta."
+    )
 
 
 ```
@@ -1440,16 +1473,15 @@ except FileNotFoundError:
 
 ### Interpretación y Conclusiones
 
-Los resultados del modelo nos permiten extraer conclusiones claras sobre el comportamiento de los usuarios:
+Este modelo estima la probabilidad de usar QR vs Bip!, usando como categoría temporal de referencia `LAB_VALLE` (día laboral fuera de punta).
 
-1.  **Preferencia Base por la Tarjeta Bip!**: El coeficiente de la constante (`ASC_QR`) es **-1.506**, un valor fuertemente negativo y significativo. Esto indica que, en la situación base (un viaje en fin de semana), existe una **fuerte preferencia inherente por usar la tarjeta Bip!** sobre el código QR.
+1.  **Preferencia base por Bip!**: El coeficiente `ASC_QR` es negativo (`-1.697`), lo que indica que en la condición base (`LAB_VALLE`) existe menor propensión a usar QR que Bip!.
 
-2.  **El Efecto de la Rutina**: Los coeficientes para los días laborales fuera de punta (`B_LJ_LAB` y `B_VIE_LAB`) son también negativos. Esto sugiere que los viajeros habituales en sus trayectos cotidianos (commuters) son **aún más propensos a usar la tarjeta Bip!**, probablemente por hábito e inercia.
+2.  **Efecto temporal sobre la adopción de QR**: Los coeficientes `B_LAB_PM` (`0.127`), `B_LAB_PT` (`0.243`) y `B_NO_LAB` (`0.190`) son positivos y significativos. Esto implica mayor propensión a QR en punta mañana laboral, punta tarde laboral y no laboral, siempre en comparación con `LAB_VALLE`.
 
-3.  **El QR como Alternativa de Conveniencia**: Los coeficientes para las horas punta (`B_PM_LAB` y `B_PT_LAB`) son **positivos y significativos**. Esto revela el hallazgo más importante: durante los períodos de mayor congestión, **la probabilidad de usar QR aumenta considerablemente**. Los usuarios valoran el QR como una alternativa más conveniente o rápida cuando el sistema está bajo estrés.
+3.  **Magnitud relativa de los efectos**: El mayor efecto temporal estimado es `LAB_PT`, seguido por `NO_LAB`, y luego `LAB_PM`. El orden de mayor propensión a QR es: `LAB_PT > NO_LAB > LAB_PM > LAB_VALLE`.
 
-
-En resumen, el modelo simple captura una dinámica de comportamiento dual: la **tarjeta Bip! domina por hábito** en los viajes regulares, mientras que el **código QR se posiciona como una herramienta de conveniencia** valorada en las situaciones de mayor demanda.
+4.  **Lectura general**: El QR aumenta su uso fuera de la condición base laboral valle, especialmente en punta tarde. Estos resultados describen asociaciones robustas en los datos observados, no efectos causales por sí solos.
 
 ### Próximos Pasos
 
@@ -1458,5 +1490,3 @@ Los sólidos resultados de este modelo base validan la metodología y abren dos 
 1.  **Validación Temporal con Muestreo**: La estabilidad de los resultados en esta semana sugiere que se puede aplicar un **muestreo estratificado** para analizar eficientemente un mayor número de particiones semanales. Como se verificó en análisis previos, una muestra del 20% de los datos arroja coeficientes y una bondad de ajuste casi idénticos al modelo completo, demostrando ser una estrategia válida y eficiente.
 
 2.  **Enriquecimiento del Modelo**: El siguiente paso es construir un **modelo extendido** que incorpore **atributos del viaje** (ej. tiempo de viaje, número de trasbordos, modo de transporte). Esto permitirá responder preguntas más profundas, como por ejemplo: ¿La preferencia por QR cambia si el viaje es más largo, más complejo o si implica una combinación de bus y metro?
-
-

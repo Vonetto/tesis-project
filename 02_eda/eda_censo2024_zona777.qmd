@@ -1,0 +1,189 @@
+---
+title: "EDA — Censo 2024 → Zonas777"
+format: html
+---
+
+## Setup
+
+```{python}
+#| label: setup
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path.cwd()
+if not (PROJECT_ROOT / "lib").exists() and (PROJECT_ROOT.parent / "lib").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+BASE_ZIP = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/Base_manzana_entidad_CPV24.zip")
+CARTO_MZ = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/cartografia_parquet/Cartografia_censo2024_Pais_Manzanas.parquet")
+ZONAS777_SHP = Path("/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp")
+
+OUT_DIR = PROJECT_ROOT / "02_eda/tmp/censo2024_zona777"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+print("BASE_ZIP:", BASE_ZIP)
+print("CARTO_MZ:", CARTO_MZ)
+print("ZONAS777_SHP:", ZONAS777_SHP)
+print("OUT_DIR:", OUT_DIR)
+```
+
+## Run join + aggregation (centroid) — bbox vs region filters
+
+```{python}
+#| label: run-join-aggregation
+from lib.censo2024_zona777 import JoinConfig, run
+
+for mode in ["bbox", "region", "intersects"]:
+    print(f"\n--- filter_mode={mode} ---")
+    cfg = JoinConfig(
+        base_zip=BASE_ZIP,
+        base_csv_name="Base_manzana_entidad_CPV24.csv",
+        carto_parquet=CARTO_MZ,
+        zonas777_shp=ZONAS777_SHP,
+        out_dir=OUT_DIR,
+        use_centroid=True,
+        compute_intersects=True,
+        filter_mode=mode,
+    )
+
+    df_agg, diag = run(cfg)
+    print("Diagnostics:", diag)
+    print(df_agg.head())
+
+print("\n--- area-weighted (intersects) ---")
+cfg_area = JoinConfig(
+    base_zip=BASE_ZIP,
+    base_csv_name="Base_manzana_entidad_CPV24.csv",
+    carto_parquet=CARTO_MZ,
+    zonas777_shp=ZONAS777_SHP,
+    out_dir=OUT_DIR,
+    use_centroid=False,
+    compute_intersects=True,
+    filter_mode="intersects",
+    area_weighted=True,
+)
+df_agg_area, diag_area = run(cfg_area)
+print("Diagnostics:", diag_area)
+print(df_agg_area.head())
+```
+
+## Outputs
+
+```{python}
+#| label: outputs
+from pathlib import Path
+
+print("Aggregated parquet (bbox):", OUT_DIR / "censo2024_zona777_agg_bbox.parquet")
+print("Diagnostics json (bbox):", OUT_DIR / "censo2024_zona777_diag_bbox.json")
+print("Aggregated parquet (region):", OUT_DIR / "censo2024_zona777_agg_region.parquet")
+print("Diagnostics json (region):", OUT_DIR / "censo2024_zona777_diag_region.json")
+print("Aggregated parquet (intersects):", OUT_DIR / "censo2024_zona777_agg_intersects.parquet")
+print("Diagnostics json (intersects):", OUT_DIR / "censo2024_zona777_diag_intersects.json")
+print("Aggregated parquet (intersects area):", OUT_DIR / "censo2024_zona777_agg_intersects_area.parquet")
+print("Diagnostics json (intersects area):", OUT_DIR / "censo2024_zona777_diag_intersects_area.json")
+```
+
+## Quick checks
+
+```{python}
+#| label: quick-checks
+import pandas as pd
+
+for mode in ["bbox", "region", "intersects", "intersects_area"]:
+    parquet_path = OUT_DIR / f"censo2024_zona777_agg_{mode}.parquet"
+    df = pd.read_parquet(parquet_path)
+    print(f"{mode} rows:", len(df), "cols:", df.columns[:10].tolist())
+
+    # basic sanity: shares in [0,1]
+    share_cols = [c for c in df.columns if c.startswith("share_")]
+    if share_cols:
+        print(df[share_cols].describe())
+```
+
+**Nota sobre `share_*` > 1**  
+Algunos `share_*` pueden superar 1 porque el numerador no siempre es un subconjunto estricto del denominador.  
+Ejemplos: `share_internet`, `share_serv_tel_movil`, `share_serv_compu` cuentan **servicios/dispositivos**, y un hogar puede tener múltiples.  
+En área‑weighted también puede aparecer >1 por redondeos y denominadores muy pequeños.
+
+## Variables disponibles en el parquet final
+
+```{python}
+#| label: final-vars-inventory
+import pandas as pd
+
+FINAL_PATH = OUT_DIR / "censo2024_zona777_agg_final.parquet"
+if not FINAL_PATH.exists():
+    # Fallback razonable si aún no se ha copiado/renombrado el final
+    FINAL_PATH = OUT_DIR / "censo2024_zona777_agg_intersects_area.parquet"
+
+df_final = pd.read_parquet(FINAL_PATH)
+all_cols = df_final.columns.tolist()
+
+count_cols = [c for c in all_cols if c.startswith("n_")]
+mean_cols = [c for c in all_cols if c.startswith("prom_")]
+share_cols = [c for c in all_cols if c.startswith("share_")]
+other_cols = [c for c in all_cols if c not in (["ZONA777"] + count_cols + mean_cols + share_cols)]
+
+print("Parquet final:", FINAL_PATH)
+print("N filas (zonas):", len(df_final))
+print("N columnas:", len(all_cols))
+
+inventory = pd.DataFrame({
+    "grupo": (
+        ["id"] * 1
+        + ["count"] * len(count_cols)
+        + ["mean"] * len(mean_cols)
+        + ["share"] * len(share_cols)
+        + ["other"] * len(other_cols)
+    ),
+    "variable": (
+        ["ZONA777"]
+        + count_cols
+        + mean_cols
+        + share_cols
+        + other_cols
+    ),
+})
+
+display(inventory)
+```
+
+## Variables socio seleccionadas para el modelo
+
+```{python}
+#| label: model-socio-vars
+
+MODEL_SOCIO_VARS = [
+    "prom_edad",
+    "prom_escolaridad18",
+    "share_inmigrantes",
+    "share_ocupado",
+    "share_internet",
+    "share_hacinamiento",
+]
+
+model_vars_df = pd.DataFrame({
+    "variable": MODEL_SOCIO_VARS,
+    "presente_en_parquet_final": [v in df_final.columns for v in MODEL_SOCIO_VARS],
+    "grupo": [
+        "mean",
+        "mean",
+        "share",
+        "share",
+        "share",
+        "share",
+    ],
+    "uso_actual": [
+        "socio origen (Option1 V2)",
+        "socio origen (Option1 V2)",
+        "socio origen (Option1 V2)",
+        "socio origen (Option1 V2)",
+        "socio origen (Option1 V2)",
+        "socio origen (Option1 V2)",
+    ],
+})
+
+display(model_vars_df)
+```

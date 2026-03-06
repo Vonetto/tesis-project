@@ -1,0 +1,1393 @@
+---
+TITLE: "Tesis — 05 | Nested Logit con Buffers OD"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Estimar Nested Logit con buffers **OD** (BIP / QR_RED / QR_OTHER), usando una especificación única y limpia:
+
+- **Principal: Opción 1 + V2** (observación = viaje; atributos `OD × tipo_pago`; dummies exclusivas).
+
+::: {.callout-note}
+## ✅ Decisiones validadas con profesora
+- **Buffers**: usar **Origen-Destino (OD)**.
+- **Unidad de estimación principal**: **Opción 1** (viaje individual + contexto OD).
+- **Dummies temporales**: usar **V2** (exclusivas), con base `LAB_VALLE` (dummy omitida).
+- **Atributos de alternativa**: construirlos por **`OD × tipo_pago`**.
+- **Muestra del modelo**: usar solo OD con las **3 alternativas observadas**.
+- **Leave-one-out**: aplicarlo en la **alternativa elegida** para evitar endogeneidad mecánica.
+- **Coeficientes de tiempos/esperas/transbordos**: **distintos por alternativa**.
+- **Socio-demográficas**: probar ambas variantes (**solo origen** y **OD origen+destino**), priorizando origen.
+- En este notebook se deja **solo el flujo principal** para evitar confusión.
+:::
+
+::: {.callout-warning}
+## ⚠️ Nota importante: caminata (no incluida)
+En el modelo extendido **no se usa tiempo de caminata** porque no contamos con una medición confiable. Incluir caminata podría sesgar los betas de espera/trasbordo.
+:::
+
+---
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+import os
+import sys
+import gc
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import polars as pl
+
+# Asegurar imports del repo (config/, lib/)
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró el directorio raíz del proyecto con 'config' y 'lib'.")
+
+# Biogeme
+import biogeme.biogeme_logging as blog
+import biogeme.database as db
+import biogeme.biogeme as bio
+import biogeme.results_processing as br
+from biogeme import models, nests
+from biogeme.expressions import Beta, Variable
+
+logger = blog.get_screen_logger(level=blog.INFO)
+
+# Helpers OD buffers
+from lib.od_buffers_nested_logit import (
+    OdContextConfig,
+    resolve_caracterizacion_path,
+    load_caracterizacion,
+    build_od_alt_specific_context_table,
+    build_trip_dataset_with_alt_specific_context,
+    read_parquet_portable,
+)
+
+# Directorios
+MODELS_DIR = PROJECT_ROOT / "03_models"
+NOTEBOOK_TMP_DIR = MODELS_DIR / "tmp" / "od_buffers_nested_logit"
+NOTEBOOK_TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+def remove_biogeme_iter_file(model_name: str, project_root: Path):
+    """Borra archivos .iter del modelo para forzar corrida limpia sin warm-start."""
+    iter_name = f"__{model_name}.iter"
+    candidates = [
+        Path.cwd() / iter_name,
+        project_root / iter_name,
+        (project_root / "03_models") / iter_name,
+    ]
+    removed = []
+    seen = set()
+    for p in candidates:
+        if p in seen:
+            continue
+        seen.add(p)
+        if p.exists():
+            p.unlink()
+            removed.append(str(p))
+    if removed:
+        print("🧹 Iter eliminado:")
+        for r in removed:
+            print("   -", r)
+    else:
+        print(f"ℹ️ No se encontró iter previo para {model_name}")
+
+
+def read_biogeme_iter_file(model_name: str, project_root: Path) -> dict[str, float]:
+    """Carga un archivo .iter de Biogeme como starting_values."""
+    iter_name = f"__{model_name}.iter"
+    candidates = [
+        Path.cwd() / iter_name,
+        project_root / iter_name,
+        (project_root / "03_models") / iter_name,
+    ]
+    seen = set()
+    for p in candidates:
+        if p in seen:
+            continue
+        seen.add(p)
+        if not p.exists():
+            continue
+        values = {}
+        for raw in p.read_text().splitlines():
+            line = raw.strip()
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = float(value.strip())
+        print(f"♻️ Iter cargado desde: {p} ({len(values)} parámetros)")
+        return values
+    print(f"ℹ️ No se encontró iter previo para {model_name}")
+    return {}
+
+
+def estimate_nested_option1_alt_specific(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    socio_cols: list[str] | None = None,
+    clean_run_no_iter: bool = False,
+    project_root: Path | None = None,
+    starting_values: dict[str, float] | None = None,
+    quick: bool = False,
+):
+    database = db.Database(model_name, pandas_df)
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+
+    CHOICE = Variable("choice_nested")
+
+    # Dummies V2 (base temporal = LAB_VALLE en BIP)
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+
+    # Atributos alternativo-específicos (OD x tipo_pago)
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+
+    TET_BIP = Variable("TET_BIP")
+    TET_QR_RED = Variable("TET_QR_RED")
+    TET_QR_OTHER = Variable("TET_QR_OTHER")
+
+    NTR_BIP = Variable("NTR_BIP")
+    NTR_QR_RED = Variable("NTR_QR_RED")
+    NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    MU_QR = Beta(f"MU_QR_{partition}", 1.5, 1, 100, 0)
+    nest_bip = nests.OneNestForNestedLogit(1.0, [CHOICE_BIP], name="BIP")
+    nest_qr = nests.OneNestForNestedLogit(MU_QR, [CHOICE_QR_RED, CHOICE_QR_OTHER], name="QR")
+    NESTS = nests.NestsForNestedLogit(
+        choice_set=[CHOICE_BIP, CHOICE_QR_RED, CHOICE_QR_OTHER],
+        tuple_of_nests=(nest_bip, nest_qr),
+    )
+
+    ASC_QR_RED = Beta(f"ASC_QR_RED_{partition}", 0, None, None, 0)
+    ASC_QR_OTHER = Beta(f"ASC_QR_OTHER_{partition}", 0, None, None, 0)
+
+    # Variables case-specific: deben entrar diferencialmente por alternativa.
+    B_QR_RED_LAB_PM = Beta(f"B_QR_RED_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PM = Beta(f"B_QR_OTHER_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PT = Beta(f"B_QR_RED_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PT = Beta(f"B_QR_OTHER_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_RED_NO_LAB = Beta(f"B_QR_RED_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_NO_LAB = Beta(f"B_QR_OTHER_NO_LAB_{partition}", 0, None, None, 0)
+
+    # Coeficientes alternativo-específicos para atributos que cambian por elección.
+    B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_VEH = Beta(f"B_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+
+    B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+
+    B_BIP_T_ESPERA_TRASB = Beta(f"B_BIP_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_TRASB = Beta(f"B_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+
+    B_BIP_N_TRASB = Beta(f"B_BIP_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_N_TRASB = Beta(f"B_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_N_TRASB = Beta(f"B_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+
+    SOCIO_RED_TERM = 0
+    SOCIO_OTHER_TERM = 0
+    for col in socio_cols or []:
+        bname = col.replace("censo_o_", "").replace("_z", "").upper()
+        beta_red = Beta(f"B_QR_RED_SOC_O_{bname}_{partition}", 0, None, None, 0)
+        beta_other = Beta(f"B_QR_OTHER_SOC_O_{bname}_{partition}", 0, None, None, 0)
+        var = Variable(col)
+        SOCIO_RED_TERM = SOCIO_RED_TERM + beta_red * var
+        SOCIO_OTHER_TERM = SOCIO_OTHER_TERM + beta_other * var
+
+    V_BIP = (
+        B_BIP_T_VEH * TVH_BIP
+        + B_BIP_T_ESPERA_INI * TEI_BIP
+        + B_BIP_T_ESPERA_TRASB * TET_BIP
+        + B_BIP_N_TRASB * NTR_BIP
+    )
+    V_QR_RED = (
+        ASC_QR_RED
+        + B_QR_RED_LAB_PM * LAB_PM
+        + B_QR_RED_LAB_PT * LAB_PT
+        + B_QR_RED_NO_LAB * NO_LAB
+        + B_QR_RED_T_VEH * TVH_QR_RED
+        + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+        + B_QR_RED_N_TRASB * NTR_QR_RED
+        + SOCIO_RED_TERM
+    )
+    V_QR_OTHER = (
+        ASC_QR_OTHER
+        + B_QR_OTHER_LAB_PM * LAB_PM
+        + B_QR_OTHER_LAB_PT * LAB_PT
+        + B_QR_OTHER_NO_LAB * NO_LAB
+        + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+        + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+        + SOCIO_OTHER_TERM
+    )
+
+    V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+    logprob = models.lognested(V, None, NESTS, CHOICE)
+
+    if clean_run_no_iter and not starting_values and project_root is not None:
+        remove_biogeme_iter_file(model_name, project_root)
+
+    biogeme = bio.BIOGEME(database, logprob)
+    biogeme.model_name = model_name
+    if quick:
+        results = biogeme.quick_estimate()
+    else:
+        results = biogeme.estimate(starting_values=starting_values or None)
+
+    stats = results.get_general_statistics()
+    params = br.get_pandas_estimated_parameters(results)
+    return stats, params
+
+
+def estimate_mnl_option1_alt_specific(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    socio_cols: list[str] | None = None,
+    clean_run_no_iter: bool = False,
+    project_root: Path | None = None,
+    starting_values: dict[str, float] | None = None,
+    quick: bool = False,
+):
+    database = db.Database(model_name, pandas_df)
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+
+    CHOICE = Variable("choice_nested")
+
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+
+    TET_BIP = Variable("TET_BIP")
+    TET_QR_RED = Variable("TET_QR_RED")
+    TET_QR_OTHER = Variable("TET_QR_OTHER")
+
+    NTR_BIP = Variable("NTR_BIP")
+    NTR_QR_RED = Variable("NTR_QR_RED")
+    NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    ASC_QR_RED = Beta(f"ASC_QR_RED_{partition}", 0, None, None, 0)
+    ASC_QR_OTHER = Beta(f"ASC_QR_OTHER_{partition}", 0, None, None, 0)
+
+    B_QR_RED_LAB_PM = Beta(f"B_QR_RED_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PM = Beta(f"B_QR_OTHER_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PT = Beta(f"B_QR_RED_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PT = Beta(f"B_QR_OTHER_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_RED_NO_LAB = Beta(f"B_QR_RED_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_NO_LAB = Beta(f"B_QR_OTHER_NO_LAB_{partition}", 0, None, None, 0)
+
+    B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_VEH = Beta(f"B_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+
+    B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+
+    B_BIP_T_ESPERA_TRASB = Beta(f"B_BIP_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_TRASB = Beta(f"B_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+
+    B_BIP_N_TRASB = Beta(f"B_BIP_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_N_TRASB = Beta(f"B_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_N_TRASB = Beta(f"B_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+
+    SOCIO_RED_TERM = 0
+    SOCIO_OTHER_TERM = 0
+    for col in socio_cols or []:
+        bname = col.replace("censo_o_", "").replace("_z", "").upper()
+        beta_red = Beta(f"B_QR_RED_SOC_O_{bname}_{partition}", 0, None, None, 0)
+        beta_other = Beta(f"B_QR_OTHER_SOC_O_{bname}_{partition}", 0, None, None, 0)
+        var = Variable(col)
+        SOCIO_RED_TERM = SOCIO_RED_TERM + beta_red * var
+        SOCIO_OTHER_TERM = SOCIO_OTHER_TERM + beta_other * var
+
+    V_BIP = (
+        B_BIP_T_VEH * TVH_BIP
+        + B_BIP_T_ESPERA_INI * TEI_BIP
+        + B_BIP_T_ESPERA_TRASB * TET_BIP
+        + B_BIP_N_TRASB * NTR_BIP
+    )
+    V_QR_RED = (
+        ASC_QR_RED
+        + B_QR_RED_LAB_PM * LAB_PM
+        + B_QR_RED_LAB_PT * LAB_PT
+        + B_QR_RED_NO_LAB * NO_LAB
+        + B_QR_RED_T_VEH * TVH_QR_RED
+        + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+        + B_QR_RED_N_TRASB * NTR_QR_RED
+        + SOCIO_RED_TERM
+    )
+    V_QR_OTHER = (
+        ASC_QR_OTHER
+        + B_QR_OTHER_LAB_PM * LAB_PM
+        + B_QR_OTHER_LAB_PT * LAB_PT
+        + B_QR_OTHER_NO_LAB * NO_LAB
+        + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+        + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+        + SOCIO_OTHER_TERM
+    )
+
+    V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+    logprob = models.loglogit(V, None, CHOICE)
+
+    if clean_run_no_iter and not starting_values and project_root is not None:
+        remove_biogeme_iter_file(model_name, project_root)
+
+    biogeme = bio.BIOGEME(database, logprob)
+    biogeme.model_name = model_name
+    if quick:
+        results = biogeme.quick_estimate()
+    else:
+        results = biogeme.estimate(starting_values=starting_values or None)
+
+    stats = results.get_general_statistics()
+    params = br.get_pandas_estimated_parameters(results)
+    return stats, params
+
+print("✅ Setup listo")
+```
+
+---
+
+## 2) Configuración
+
+```{python}
+#| label: config
+
+print("label: config")
+# Partición a usar
+PARTITION = "2025-W17"
+PARQUET_PATH = PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet"
+
+# Caracterización (para separar QR_RED vs QR_OTHER)
+CARACTERIZACION_PATH = resolve_caracterizacion_path(None)
+
+# Sampling (None = full)
+SAMPLE_FRACTION = 0.1
+SEED = 42
+CLEAN_RUN_NO_ITER = True  # elimina __<model>.iter antes de estimar
+
+# OD context (flujo principal)
+TIME_DUMMY_VARIANT = "v2"
+OD_MEAN_MODE = "leave_one_out"  # leave_one_out solo para la alternativa elegida
+REQUIRE_ALL_THREE_ALTS = True
+DROP_CHOSEN_SINGLETONS = True
+
+print("--- Configuración ---")
+print("Partition:", PARTITION)
+print("Parquet:", PARQUET_PATH)
+print("Caracterización:", CARACTERIZACION_PATH)
+print("Sample fraction:", SAMPLE_FRACTION)
+print("Clean run (sin iter):", CLEAN_RUN_NO_ITER)
+print("Time dummy variant:", TIME_DUMMY_VARIANT)
+print("OD mean mode:", OD_MEAN_MODE)
+print("Require all 3 alternatives:", REQUIRE_ALL_THREE_ALTS)
+print("Drop chosen singletons:", DROP_CHOSEN_SINGLETONS)
+print("Main spec:", "Option1 + V2 + OD x tipo_pago + atributos alternativo-específicos")
+```
+
+---
+
+## 2.1) Runner — ejecutar todo en secuencia (opcional)
+
+```{python}
+#| label: run-all
+#| eval: false
+
+print("label: run-all")
+
+# Switches principales (flujo único)
+RUN_BUILD_CONTEXT = True
+RUN_CHECK_BASE_V2 = True
+RUN_ESTIMATE_OPTION1_V2 = True
+RUN_ESTIMATE_OPTION1_V2_MNL = True
+
+print("Run profile:")
+print("  - option1_v2 (principal):", RUN_ESTIMATE_OPTION1_V2)
+print("  - option1_v2_mnl (benchmark principal):", RUN_ESTIMATE_OPTION1_V2_MNL)
+
+def _banner(msg):
+    print("\n" + "=" * 80)
+    print(msg)
+    print("=" * 80)
+
+sample_tag = "full" if SAMPLE_FRACTION is None else f"sample{int(SAMPLE_FRACTION*100)}pct"
+
+# Cargar caracterización una sola vez si existe
+if "df_caract" not in locals() or df_caract is None:
+    try:
+        df_caract = load_caracterizacion(CARACTERIZACION_PATH)
+        print(f"✅ Caracterización cargada: {len(df_caract):,} usuarios")
+    except Exception as e:
+        print(f"⚠️ No se pudo cargar caracterización: {e}")
+        df_caract = None
+
+def _build_context(lf_local):
+    cfg_local = OdContextConfig(
+        include_time_dummies=False,
+        time_dummy_variant="v2",
+        mean_mode=OD_MEAN_MODE,
+        require_all_alternatives=REQUIRE_ALL_THREE_ALTS,
+    )
+    return build_od_alt_specific_context_table(lf_local, df_caract if "df_caract" in locals() else None, config=cfg_local)
+
+def _maybe_sample(df_pl):
+    if SAMPLE_FRACTION is not None:
+        return df_pl.sample(fraction=SAMPLE_FRACTION, seed=SEED)
+    return df_pl
+
+def _estimate_option1_v2(df_pl):
+    pandas_df = df_pl.to_pandas()
+    model_name = f"nested_logit_od_context_v2_{PARTITION}_{sample_tag}"
+    print("Model name (nested):", model_name)
+    return estimate_nested_option1_alt_specific(
+        pandas_df,
+        partition=PARTITION,
+        model_name=model_name,
+        socio_cols=None,
+        clean_run_no_iter=CLEAN_RUN_NO_ITER,
+        project_root=PROJECT_ROOT,
+    )
+
+def _estimate_option1_v2_mnl(df_pl):
+    pandas_df = df_pl.to_pandas()
+    model_name = f"mnl_od_context_v2_{PARTITION}_{sample_tag}"
+    print("Model name (mnl):", model_name)
+    return estimate_mnl_option1_alt_specific(
+        pandas_df,
+        partition=PARTITION,
+        model_name=model_name,
+        socio_cols=None,
+        clean_run_no_iter=CLEAN_RUN_NO_ITER,
+        project_root=PROJECT_ROOT,
+    )
+
+# 1) Contexto OD
+lf = read_parquet_portable(str(PARQUET_PATH))
+if RUN_BUILD_CONTEXT:
+    _banner("Construcción OD x tipo_pago context")
+    df_od_context = _build_context(lf)
+    df_od_context.write_parquet(NOTEBOOK_TMP_DIR / f"od_context_{PARTITION}.parquet")
+else:
+    od_path = NOTEBOOK_TMP_DIR / f"od_context_{PARTITION}.parquet"
+    if od_path.exists():
+        df_od_context = pl.read_parquet(od_path)
+        print(f"ℹ️ Usando OD context existente: {od_path}")
+    else:
+        raise FileNotFoundError(f"No existe OD context en {od_path}. Activa RUN_BUILD_CONTEXT.")
+
+# 2) Option 1 V2 (principal)
+if RUN_ESTIMATE_OPTION1_V2:
+    _banner("Option1 | V2 | dataset alternativo-específico")
+    df_trips_v2 = build_trip_dataset_with_alt_specific_context(
+        lf,
+        df_caract if "df_caract" in locals() else None,
+        df_od_context,
+        mean_mode=OD_MEAN_MODE,
+        time_dummy_variant="v2",
+        drop_chosen_singletons=DROP_CHOSEN_SINGLETONS,
+    )
+    df_trips_v2 = _maybe_sample(df_trips_v2)
+    df_trips_v2.write_parquet(NOTEBOOK_TMP_DIR / f"trips_context_v2_{PARTITION}.parquet")
+    if RUN_CHECK_BASE_V2:
+        _banner("Option1 | V2 | check base")
+        cols = ["DUMMY_LAB_PM", "DUMMY_LAB_PT", "DUMMY_NO_LAB"]
+        df_flags = (
+            df_trips_v2
+            .with_columns((pl.sum_horizontal([pl.col(c) for c in cols]) == 0).alias("BASE_V2"))
+            .select(cols + ["BASE_V2"])
+            .group_by(cols + ["BASE_V2"])
+            .agg(pl.len().alias("n"))
+            .sort("n", descending=True)
+        )
+        with pl.Config(tbl_cols=-1, tbl_rows=15, tbl_width_chars=1000):
+            print(df_flags)
+    _banner("Option1 | V2 | estimate")
+    stats, params = _estimate_option1_v2(df_trips_v2)
+    OUTPUT_DIR_OPT1_V2 = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-{sample_tag}"
+    OUTPUT_DIR_OPT1_V2.mkdir(parents=True, exist_ok=True)
+    params.to_csv(OUTPUT_DIR_OPT1_V2 / f"params_nested_logit_od_context_{PARTITION}.csv", index=False)
+    pd.DataFrame([stats]).to_csv(OUTPUT_DIR_OPT1_V2 / f"stats_nested_logit_od_context_{PARTITION}.csv", index=False)
+    print("✅ Resultados guardados en:", OUTPUT_DIR_OPT1_V2)
+    display(pd.DataFrame([stats]))
+    display(params.head(20))
+    del df_trips_v2, stats, params
+
+# 3) MNL con misma utilidad
+if RUN_ESTIMATE_OPTION1_V2_MNL:
+    _banner("Option1 | V2 | MNL benchmark")
+    trips_path = NOTEBOOK_TMP_DIR / f"trips_context_v2_{PARTITION}.parquet"
+    if "df_trips_v2" not in locals():
+        if trips_path.exists():
+            df_trips_v2 = pl.read_parquet(trips_path)
+        else:
+            raise FileNotFoundError(f"No existe dataset trips_context_v2 en {trips_path}")
+    stats_mnl, params_mnl = _estimate_option1_v2_mnl(df_trips_v2)
+    OUTPUT_DIR_OPT1_V2_MNL = NOTEBOOK_TMP_DIR / f"{PARTITION}-mnl-option1-v2-{sample_tag}"
+    OUTPUT_DIR_OPT1_V2_MNL.mkdir(parents=True, exist_ok=True)
+    params_mnl.to_csv(OUTPUT_DIR_OPT1_V2_MNL / f"params_mnl_od_context_{PARTITION}.csv", index=False)
+    pd.DataFrame([stats_mnl]).to_csv(OUTPUT_DIR_OPT1_V2_MNL / f"stats_mnl_od_context_{PARTITION}.csv", index=False)
+    print("✅ Resultados MNL guardados en:", OUTPUT_DIR_OPT1_V2_MNL)
+    display(pd.DataFrame([stats_mnl]))
+    display(params_mnl.head(20))
+    del df_trips_v2, stats_mnl, params_mnl
+    gc.collect()
+
+_banner("Load results (manual: run load-results cell)")
+```
+
+---
+
+## 3) Construcción de contexto OD × tipo_pago
+
+```{python}
+#| label: build-od-context
+
+print("label: build-od-context")
+lf = read_parquet_portable(str(PARQUET_PATH))
+
+cfg = OdContextConfig(
+    include_time_dummies=False,
+    time_dummy_variant="v2",
+    mean_mode=OD_MEAN_MODE,
+    require_all_alternatives=REQUIRE_ALL_THREE_ALTS,
+)
+
+if "df_caract" not in locals() or df_caract is None:
+    try:
+        df_caract = load_caracterizacion(CARACTERIZACION_PATH)
+        print(f"✅ Caracterización cargada: {len(df_caract):,} usuarios")
+    except Exception as e:
+        print(f"⚠️ No se pudo cargar caracterización: {e}")
+        df_caract = None
+
+df_od_context = build_od_alt_specific_context_table(lf, df_caract, config=cfg)
+
+PATH_OD_CONTEXT = NOTEBOOK_TMP_DIR / f"od_context_{PARTITION}.parquet"
+df_od_context.write_parquet(PATH_OD_CONTEXT)
+
+print("✅ OD context guardado en:", PATH_OD_CONTEXT)
+with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000):
+    print(df_od_context.head(5))
+```
+
+---
+
+## 4) Opción 1 — Viaje individual + atributos OD × tipo_pago (principal)
+
+### 4.1) Dataset de viajes con atributos alternativo-específicos
+
+```{python}
+#| label: build-option1-dataset-v2
+
+print("label: build-option1-dataset-v2")
+# Reutilizar caracterización si ya está cargada
+if "df_caract" not in locals() or df_caract is None:
+    try:
+        df_caract = load_caracterizacion(CARACTERIZACION_PATH)
+        print(f"✅ Caracterización cargada: {len(df_caract):,} usuarios")
+    except Exception as e:
+        print(f"⚠️ No se pudo cargar caracterización: {e}")
+        df_caract = None
+
+lf = read_parquet_portable(str(PARQUET_PATH))
+
+df_trips_v2 = build_trip_dataset_with_alt_specific_context(
+    lf,
+    df_caract,
+    df_od_context,
+    mean_mode="leave_one_out",
+    time_dummy_variant="v2",
+    drop_chosen_singletons=DROP_CHOSEN_SINGLETONS,
+)
+
+if SAMPLE_FRACTION is not None:
+    df_trips_v2 = df_trips_v2.sample(fraction=SAMPLE_FRACTION, seed=SEED)
+
+PATH_TRIPS_CONTEXT_V2 = NOTEBOOK_TMP_DIR / f"trips_context_v2_{PARTITION}.parquet"
+df_trips_v2.write_parquet(PATH_TRIPS_CONTEXT_V2)
+
+print("✅ Dataset Option1 V2 guardado en:", PATH_TRIPS_CONTEXT_V2)
+with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000):
+    print(df_trips_v2.head(5))
+```
+
+---
+
+### 4.2) Smoke test de validez de especificación
+
+```{python}
+#| label: smoke-test-option1-v2-spec
+#| eval: false
+
+print("label: smoke-test-option1-v2-spec")
+
+required_trip_cols = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_LAB_VALLE",
+    "DUMMY_NO_LAB",
+    "N_BIP",
+    "N_QR_RED",
+    "N_QR_OTHER",
+    "N_CHOSEN_ALT",
+    "TVH_BIP", "TVH_QR_RED", "TVH_QR_OTHER",
+    "TEI_BIP", "TEI_QR_RED", "TEI_QR_OTHER",
+    "TET_BIP", "TET_QR_RED", "TET_QR_OTHER",
+    "NTR_BIP", "NTR_QR_RED", "NTR_QR_OTHER",
+]
+missing_trip_cols = [c for c in required_trip_cols if c not in df_trips_v2.columns]
+if missing_trip_cols:
+    raise RuntimeError(f"Faltan columnas críticas en df_trips_v2: {missing_trip_cols}")
+
+required_context_cols = ["n_alternatives_observed", "N_BIP", "N_QR_RED", "N_QR_OTHER"]
+missing_context_cols = [c for c in required_context_cols if c not in df_od_context.columns]
+if missing_context_cols:
+    raise RuntimeError(f"Faltan columnas críticas en df_od_context: {missing_context_cols}")
+
+print("\n=== Smoke test | OD context ===")
+od_summary = {
+    "n_od_context": int(df_od_context.height),
+    "all_od_have_3_alternatives": bool(
+        df_od_context.select((pl.col("n_alternatives_observed") == 3).all()).item()
+    ),
+    "od_with_any_zero_alt_count": int(
+        df_od_context.filter(
+            (pl.col("N_BIP") <= 0) | (pl.col("N_QR_RED") <= 0) | (pl.col("N_QR_OTHER") <= 0)
+        ).height
+    ),
+}
+print(od_summary)
+
+print("\n=== Smoke test | Dataset ===")
+df_dataset_checks = df_trips_v2.select(
+    [
+        pl.len().alias("n_rows"),
+        pl.col("choice_nested").is_in([0, 1, 2]).all().alias("choice_in_valid_set"),
+        pl.all_horizontal(
+            [
+                pl.col("TVH_BIP").is_not_null(),
+                pl.col("TVH_QR_RED").is_not_null(),
+                pl.col("TVH_QR_OTHER").is_not_null(),
+                pl.col("TEI_BIP").is_not_null(),
+                pl.col("TEI_QR_RED").is_not_null(),
+                pl.col("TEI_QR_OTHER").is_not_null(),
+                pl.col("TET_BIP").is_not_null(),
+                pl.col("TET_QR_RED").is_not_null(),
+                pl.col("TET_QR_OTHER").is_not_null(),
+                pl.col("NTR_BIP").is_not_null(),
+                pl.col("NTR_QR_RED").is_not_null(),
+                pl.col("NTR_QR_OTHER").is_not_null(),
+            ]
+        ).mean().alias("share_rows_without_missing_alt_attrs"),
+        (
+            pl.sum_horizontal(["DUMMY_LAB_PM", "DUMMY_LAB_PT", "DUMMY_LAB_VALLE", "DUMMY_NO_LAB"]) == 1
+        ).mean().alias("share_rows_with_exactly_one_time_regime"),
+        (
+            (pl.col("N_BIP") > 0) & (pl.col("N_QR_RED") > 0) & (pl.col("N_QR_OTHER") > 0)
+        ).mean().alias("share_rows_with_all_alt_counts_positive"),
+        (
+            (pl.col("TVH_BIP") != pl.col("TVH_QR_RED")) |
+            (pl.col("TVH_BIP") != pl.col("TVH_QR_OTHER")) |
+            (pl.col("TVH_QR_RED") != pl.col("TVH_QR_OTHER"))
+        ).mean().alias("share_rows_with_tvh_variation_across_alts"),
+        (
+            (pl.col("TEI_BIP") != pl.col("TEI_QR_RED")) |
+            (pl.col("TEI_BIP") != pl.col("TEI_QR_OTHER")) |
+            (pl.col("TEI_QR_RED") != pl.col("TEI_QR_OTHER"))
+        ).mean().alias("share_rows_with_tei_variation_across_alts"),
+        (
+            (pl.col("TET_BIP") != pl.col("TET_QR_RED")) |
+            (pl.col("TET_BIP") != pl.col("TET_QR_OTHER")) |
+            (pl.col("TET_QR_RED") != pl.col("TET_QR_OTHER"))
+        ).mean().alias("share_rows_with_tet_variation_across_alts"),
+        (
+            (pl.col("NTR_BIP") != pl.col("NTR_QR_RED")) |
+            (pl.col("NTR_BIP") != pl.col("NTR_QR_OTHER")) |
+            (pl.col("NTR_QR_RED") != pl.col("NTR_QR_OTHER"))
+        ).mean().alias("share_rows_with_ntr_variation_across_alts"),
+    ]
+)
+with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000):
+    print(df_dataset_checks)
+
+print("\n=== Smoke test | Distribución de choice ===")
+with pl.Config(tbl_cols=-1, tbl_rows=-1, tbl_width_chars=1000):
+    print(
+        df_trips_v2.group_by("choice_nested")
+        .agg(pl.len().alias("n"))
+        .sort("choice_nested")
+    )
+
+print("\n=== Smoke test | Ejemplos de atributos por alternativa ===")
+with pl.Config(tbl_cols=-1, tbl_rows=8, tbl_width_chars=1200):
+    print(
+        df_trips_v2.select(
+            [
+                "zona_inicio_viaje",
+                "zona_fin_viaje",
+                "choice_nested",
+                "TVH_BIP", "TVH_QR_RED", "TVH_QR_OTHER",
+                "TEI_BIP", "TEI_QR_RED", "TEI_QR_OTHER",
+                "TET_BIP", "TET_QR_RED", "TET_QR_OTHER",
+                "NTR_BIP", "NTR_QR_RED", "NTR_QR_OTHER",
+            ]
+        ).head(8)
+    )
+
+RUN_ESTIMATION_SMOKE = True
+SMOKE_N_ROWS = 50000
+if RUN_ESTIMATION_SMOKE:
+    print("\n=== Smoke test | Micro-estimación ===")
+    df_smoke = df_trips_v2.sample(n=min(SMOKE_N_ROWS, df_trips_v2.height), seed=SEED)
+    smoke_stats, smoke_params = estimate_nested_option1_alt_specific(
+        df_smoke.to_pandas(),
+        partition=f"{PARTITION}-SMOKE",
+        model_name=f"nested_logit_od_context_v2_smoke_{PARTITION}",
+        socio_cols=None,
+        clean_run_no_iter=True,
+        project_root=PROJECT_ROOT,
+        quick=True,
+    )
+    display(pd.DataFrame([smoke_stats]))
+    display(smoke_params[["Name", "Value"]].head(12))
+    print("✅ Smoke estimation corrió sin error.")
+```
+
+---
+
+### 4.3) Verificación de base de dummies (V2)
+
+```{python}
+#| label: check-time-dummy-base-v2
+#| eval: false
+
+print("label: check-time-dummy-base-v2")
+cols = ["DUMMY_LAB_PM", "DUMMY_LAB_PT", "DUMMY_NO_LAB"]
+
+if "df_trips_v2" in locals() and all(c in df_trips_v2.columns for c in cols):
+    df_flags = (
+        df_trips_v2
+        .with_columns(
+            (pl.sum_horizontal([pl.col(c) for c in cols]) == 0).alias("BASE_V2")
+        )
+        .select(cols + ["BASE_V2"])
+        .group_by(cols + ["BASE_V2"])
+        .agg(pl.len().alias("n"))
+        .sort("n", descending=True)
+    )
+    with pl.Config(tbl_cols=-1, tbl_rows=15, tbl_width_chars=1000):
+        print(df_flags)
+else:
+    print("⚠️ No están todas las columnas V2 en df_trips_v2:", cols)
+```
+
+---
+
+### 4.4) Nested Logit — Opción 1 (atributos alternativo-específicos)
+
+```{python}
+#| label: estimate-option1-v2
+#| eval: false
+
+print("=== Opción 1 | Nested Logit (specific, V2 dummies) ===")
+
+pandas_df = df_trips_v2.to_pandas()
+sample_tag = "full" if SAMPLE_FRACTION is None else f"sample{int(SAMPLE_FRACTION*100)}pct"
+model_name = f"nested_logit_od_context_v2_{PARTITION}_{sample_tag}"
+print("Model name (nested):", model_name)
+stats, params = estimate_nested_option1_alt_specific(
+    pandas_df,
+    partition=PARTITION,
+    model_name=model_name,
+    socio_cols=None,
+    clean_run_no_iter=CLEAN_RUN_NO_ITER,
+    project_root=PROJECT_ROOT,
+)
+
+OUTPUT_DIR_OPT1_V2 = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-{sample_tag}"
+OUTPUT_DIR_OPT1_V2.mkdir(parents=True, exist_ok=True)
+
+params_path_opt1_v2 = OUTPUT_DIR_OPT1_V2 / f"params_nested_logit_od_context_{PARTITION}.csv"
+stats_path_opt1_v2 = OUTPUT_DIR_OPT1_V2 / f"stats_nested_logit_od_context_{PARTITION}.csv"
+params.to_csv(params_path_opt1_v2, index=False)
+pd.DataFrame([stats]).to_csv(stats_path_opt1_v2, index=False)
+
+display(pd.DataFrame([stats]))
+display(params)
+print("✅ Resultados guardados en:", OUTPUT_DIR_OPT1_V2)
+print("   -", params_path_opt1_v2.name)
+print("   -", stats_path_opt1_v2.name)
+```
+
+### 4.5) MNL — Opción 1 (misma utilidad, benchmark principal)
+
+```{python}
+#| label: estimate-mnl-option1-v2
+#| eval: false
+
+print("=== Opción 1 | MNL (misma utilidad, V2 dummies) ===")
+
+pandas_df = df_trips_v2.to_pandas()
+sample_tag = "full" if SAMPLE_FRACTION is None else f"sample{int(SAMPLE_FRACTION*100)}pct"
+model_name = f"mnl_od_context_v2_{PARTITION}_{sample_tag}"
+print("Model name (mnl):", model_name)
+stats_mnl, params_mnl = estimate_mnl_option1_alt_specific(
+    pandas_df,
+    partition=PARTITION,
+    model_name=model_name,
+    socio_cols=None,
+    clean_run_no_iter=CLEAN_RUN_NO_ITER,
+    project_root=PROJECT_ROOT,
+)
+
+OUTPUT_DIR_OPT1_V2_MNL = NOTEBOOK_TMP_DIR / f"{PARTITION}-mnl-option1-v2-{sample_tag}"
+OUTPUT_DIR_OPT1_V2_MNL.mkdir(parents=True, exist_ok=True)
+
+params_path_opt1_v2_mnl = OUTPUT_DIR_OPT1_V2_MNL / f"params_mnl_od_context_{PARTITION}.csv"
+stats_path_opt1_v2_mnl = OUTPUT_DIR_OPT1_V2_MNL / f"stats_mnl_od_context_{PARTITION}.csv"
+params_mnl.to_csv(params_path_opt1_v2_mnl, index=False)
+pd.DataFrame([stats_mnl]).to_csv(stats_path_opt1_v2_mnl, index=False)
+
+display(pd.DataFrame([stats_mnl]))
+display(params_mnl)
+print("✅ Resultados MNL guardados en:", OUTPUT_DIR_OPT1_V2_MNL)
+print("   -", params_path_opt1_v2_mnl.name)
+print("   -", stats_path_opt1_v2_mnl.name)
+```
+
+---
+
+## 5) Resultados (carga rápida)
+
+```{python}
+#| label: load-results
+
+print("label: load-results")
+import pandas as pd
+import os
+from pathlib import Path
+
+def _load_results(folder, params_file, stats_file, param_clean_fn=None):
+    params_path = os.path.join(folder, params_file)
+    stats_path = os.path.join(folder, stats_file)
+    if not (os.path.exists(params_path) and os.path.exists(stats_path)):
+        return None
+    df_params = pd.read_csv(params_path)
+    df_stats = pd.read_csv(stats_path)
+    if param_clean_fn is not None and "Name" in df_params.columns:
+        df_params["Param"] = df_params["Name"].apply(param_clean_fn)
+    return {"params": df_params, "stats": df_stats}
+
+sample_tag = "full" if SAMPLE_FRACTION is None else f"sample{int(SAMPLE_FRACTION*100)}pct"
+OPTION1_V2_DIR = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-{sample_tag}"
+OPTION1_V2_MNL_DIR = NOTEBOOK_TMP_DIR / f"{PARTITION}-mnl-option1-v2-{sample_tag}"
+result_opt1_v2 = _load_results(
+    str(OPTION1_V2_DIR),
+    f"params_nested_logit_od_context_{PARTITION}.csv",
+    f"stats_nested_logit_od_context_{PARTITION}.csv",
+    param_clean_fn=lambda x: x.replace(f"_{PARTITION}", "")
+)
+result_opt1_v2_mnl = _load_results(
+    str(OPTION1_V2_MNL_DIR),
+    f"params_mnl_od_context_{PARTITION}.csv",
+    f"stats_mnl_od_context_{PARTITION}.csv",
+    param_clean_fn=lambda x: x.replace(f"_{PARTITION}", "")
+)
+
+if result_opt1_v2 is not None:
+    print(f"✅ Opción 1 V2 ({sample_tag}) cargada desde {OPTION1_V2_DIR}")
+else:
+    print(f"⚠️ Opción 1 V2 no encontrada en {OPTION1_V2_DIR}")
+
+if result_opt1_v2_mnl is not None:
+    print(f"✅ Opción 1 V2 MNL ({sample_tag}) cargada desde {OPTION1_V2_MNL_DIR}")
+else:
+    print(f"⚠️ Opción 1 V2 MNL no encontrada en {OPTION1_V2_MNL_DIR}")
+
+print("\n--- Stats (Opción 1 V2 MNL, principal) ---")
+if result_opt1_v2_mnl is not None:
+    display(result_opt1_v2_mnl["stats"])
+else:
+    print("No hay stats de Opción 1 V2 MNL.")
+
+print("\n--- Params (Opción 1 V2 MNL, principal) ---")
+if result_opt1_v2_mnl is not None:
+    display(result_opt1_v2_mnl["params"])
+else:
+    print("No hay params de Opción 1 V2 MNL.")
+
+print("\n--- Stats (Opción 1 V2 nested, contraste) ---")
+if result_opt1_v2 is not None:
+    display(result_opt1_v2["stats"])
+else:
+    print("No hay stats de Opción 1 V2.")
+
+print("\n--- Params (Opción 1 V2 nested, contraste) ---")
+if result_opt1_v2 is not None:
+    display(result_opt1_v2["params"])
+else:
+    print("No hay params de Opción 1 V2.")
+```
+
+### 5.1) Comparación MNL vs nested
+
+```{python}
+#| label: compare-option1-v2-mnl-vs-nested
+
+print("label: compare-option1-v2-mnl-vs-nested")
+
+if result_opt1_v2_mnl is None or result_opt1_v2 is None:
+    print("⚠️ Faltan resultados de MNL o nested para comparar.")
+else:
+    s_mnl = result_opt1_v2_mnl["stats"].iloc[0]
+    s_nl = result_opt1_v2["stats"].iloc[0]
+
+    mu_nested = np.nan
+    if "params" in result_opt1_v2 and "Param" in result_opt1_v2["params"].columns:
+        row_mu = result_opt1_v2["params"].loc[result_opt1_v2["params"]["Param"] == "MU_QR", "Value"]
+        if not row_mu.empty:
+            mu_nested = row_mu.iloc[0]
+
+    comparison = pd.DataFrame(
+        [
+            {
+                "Model": "MNL",
+                "Sample size": s_mnl.get("Sample size"),
+                "Final log likelihood": s_mnl.get("Final log likelihood"),
+                "Rho-square": s_mnl.get("Rho-square for the init. model"),
+                "Estimated parameters": s_mnl.get("Number of estimated parameters"),
+                "Nested parameter": np.nan,
+            },
+            {
+                "Model": "Nested",
+                "Sample size": s_nl.get("Sample size"),
+                "Final log likelihood": s_nl.get("Final log likelihood"),
+                "Rho-square": s_nl.get("Rho-square for the init. model"),
+                "Estimated parameters": s_nl.get("Number of estimated parameters"),
+                "Nested parameter": mu_nested,
+            },
+        ]
+    )
+    display(comparison)
+```
+
+---
+
+## 6) Interpretación y Cierre (Option1 V2)
+
+### 6.1) Lectura sustantiva de resultados
+
+Con la especificación corregida de `Option1 V2`, la lectura principal cambia respecto de la versión reducida anterior:
+
+1. Cada observación sigue siendo un viaje, pero los atributos usados en la utilidad ahora son **promedios por `OD × tipo_pago`**, es decir, valores específicos para `BIP`, `QR_RED` y `QR_OTHER`.
+2. `V_BIP` ya no se normaliza completamente a cero: se fija solo la constante base, pero BIP sí tiene tiempos/esperas/transbordos propios.
+3. Los coeficientes de tiempos/esperas/transbordos pasan a ser **alternativo-específicos** (`B_BIP_*`, `B_QR_RED_*`, `B_QR_OTHER_*`), alineándose con la decisión metodológica tomada tras la reunión.
+4. Las dummies temporales (`LAB_PM`, `LAB_PT`, `NO_LAB`) siguen entrando como efectos diferenciales para `QR_RED` y `QR_OTHER` respecto de BIP, porque son variables case-specific y no se identifican si se incluyen libres en las tres utilidades.
+5. El subconjunto estimado se restringe a OD con las 3 alternativas observadas, y además se eliminan los pocos viajes donde la alternativa elegida tiene solo una observación dentro del OD para poder aplicar `leave_one_out` limpiamente.
+
+Nota técnica:
+- Los resultados posteriores deben interpretarse como elección entre alternativas con atributos específicos por pago, no como una regresión reducida sobre el viaje realizado.
+
+### 6.2) ¿Qué aporta usar buffers OD respecto al nested anterior?
+
+La diferencia metodológica clave respecto del nested anterior es que aquí las alternativas se construyen con atributos promedio por `OD × tipo_pago`:
+
+- Nested anterior: compara alternativas usando atributos del viaje observado o atributos no plenamente alternativo-específicos.
+- Este notebook (`Option1 V2` corregido): compara `BIP`, `QR_RED` y `QR_OTHER` con sus propios valores de:
+  - tiempo en vehículo,
+  - espera inicial,
+  - espera en trasbordo,
+  - número de trasbordos.
+
+Con esto se logra:
+
+1. Formular una utilidad consistente con la idea de buffers por alternativa.
+2. Permitir que, para un mismo OD, `BIP`, `QR_RED` y `QR_OTHER` tengan condiciones distintas.
+3. Interpretar el modelo como una elección entre alternativas con atributos propios, no solo como una asociación entre uso QR y contexto del corredor.
+
+Importante:
+- Si se comparan métricas de ajuste entre notebooks, usar siempre la misma muestra y configuración; de lo contrario, comparar directamente `LL`/`Rho` puede ser engañoso.
+
+### 6.3) Resumen automático de parámetros clave
+
+```{python}
+#| label: final-summary-option1-v2
+
+print("label: final-summary-option1-v2")
+
+if "result_opt1_v2" not in locals() or result_opt1_v2 is None:
+    print("⚠️ Primero ejecuta la celda `load-results`.")
+else:
+    s = result_opt1_v2["stats"].copy()
+    p = result_opt1_v2["params"].copy()
+
+    key_stats = [
+        "Number of estimated parameters",
+        "Sample size",
+        "Final log likelihood",
+        "Rho-square for the init. model",
+        "Rho-square-bar for the init. model",
+        "Final gradient norm",
+    ]
+    print("\n=== Stats clave ===")
+    display(s[[c for c in key_stats if c in s.columns]])
+
+    key_params = [
+        "MU_QR",
+        "ASC_QR_RED", "ASC_QR_OTHER",
+        "B_QR_RED_LAB_PM", "B_QR_RED_LAB_PT", "B_QR_RED_NO_LAB",
+        "B_QR_OTHER_LAB_PM", "B_QR_OTHER_LAB_PT", "B_QR_OTHER_NO_LAB",
+        "B_BIP_T_VEH", "B_BIP_T_ESPERA_INI", "B_BIP_T_ESPERA_TRASB", "B_BIP_N_TRASB",
+        "B_QR_RED_T_VEH", "B_QR_RED_T_ESPERA_INI", "B_QR_RED_T_ESPERA_TRASB", "B_QR_RED_N_TRASB",
+        "B_QR_OTHER_T_VEH", "B_QR_OTHER_T_ESPERA_INI", "B_QR_OTHER_T_ESPERA_TRASB", "B_QR_OTHER_N_TRASB",
+    ]
+
+    if "Param" not in p.columns and "Name" in p.columns:
+        p["Param"] = p["Name"].astype(str).str.replace(f"_{PARTITION}$", "", regex=True)
+
+    cols = [c for c in ["Param", "Value", "Robust std err.", "Robust t-stat.", "Robust p-value"] if c in p.columns]
+    pkey = p[p["Param"].isin(key_params)][cols].copy()
+    display(pkey)
+```
+
+---
+
+## 7) Socio-demo en Option1 V2 (origen)
+
+### 7.1) Configuración socio-demo (origen)
+
+```{python}
+#| label: socio-config
+
+print("label: socio-config")
+
+CENSO_ZONA777_PATH = (
+    PROJECT_ROOT
+    / "02_eda"
+    / "tmp"
+    / "censo2024_zona777"
+    / "censo2024_zona777_agg_final.parquet"
+)
+
+# Variables origen a incorporar (subset inicial, interpretable y acotado)
+SOCIO_ORIGIN_FEATURES = [
+    "prom_edad",
+    "prom_escolaridad18",
+    "share_inmigrantes",
+    "share_ocupado",
+    "share_internet",
+    "share_hacinamiento",
+]
+
+SOCIO_FILL_STRATEGY = "median"  # "median" o "zero"
+SOCIO_STANDARDIZE = True
+SOCIO_RESUME_FROM_ITER = True
+SOCIO_ESTIMATION_MODE = "full"  # "full" o "quick"
+
+print("Censo path:", CENSO_ZONA777_PATH)
+print("Features origen:", SOCIO_ORIGIN_FEATURES)
+print("Fill strategy:", SOCIO_FILL_STRATEGY)
+print("Standardize:", SOCIO_STANDARDIZE)
+print("Resume from iter:", SOCIO_RESUME_FROM_ITER)
+print("Estimation mode:", SOCIO_ESTIMATION_MODE)
+```
+
+### 7.2) Construir dataset Option1 V2 + socio (origen)
+
+```{python}
+#| label: build-option1-v2-socio-origen
+
+print("label: build-option1-v2-socio-origen")
+
+if not CENSO_ZONA777_PATH.exists():
+    raise FileNotFoundError(f"No existe Censo final en: {CENSO_ZONA777_PATH}")
+
+# 1) Cargar (o reconstruir) trips_context_v2 con zona_inicio_viaje disponible
+PATH_TRIPS_CONTEXT_V2 = NOTEBOOK_TMP_DIR / f"trips_context_v2_{PARTITION}.parquet"
+
+if PATH_TRIPS_CONTEXT_V2.exists():
+    df_trips_v2 = pl.read_parquet(PATH_TRIPS_CONTEXT_V2)
+    print(f"ℹ️ Usando trips_context_v2 existente: {PATH_TRIPS_CONTEXT_V2}")
+else:
+    print("ℹ️ No existe trips_context_v2; se construirá desde parquet base.")
+    if "df_caract" not in locals() or df_caract is None:
+        try:
+            df_caract = load_caracterizacion(CARACTERIZACION_PATH)
+            print(f"✅ Caracterización cargada: {len(df_caract):,} usuarios")
+        except Exception as e:
+            print(f"⚠️ No se pudo cargar caracterización: {e}")
+            df_caract = None
+
+    if "df_od_context" not in locals():
+        od_path = NOTEBOOK_TMP_DIR / f"od_context_{PARTITION}.parquet"
+        if od_path.exists():
+            df_od_context = pl.read_parquet(od_path)
+            print(f"ℹ️ Usando OD context existente: {od_path}")
+        else:
+            lf = read_parquet_portable(str(PARQUET_PATH))
+            cfg = OdContextConfig(
+                include_time_dummies=False,
+                time_dummy_variant="v2",
+                mean_mode=OD_MEAN_MODE,
+                require_all_alternatives=REQUIRE_ALL_THREE_ALTS,
+            )
+            df_od_context = build_od_alt_specific_context_table(lf, df_caract if "df_caract" in locals() else None, config=cfg)
+            df_od_context.write_parquet(od_path)
+            print(f"✅ OD context generado en: {od_path}")
+
+    lf = read_parquet_portable(str(PARQUET_PATH))
+    df_trips_v2 = build_trip_dataset_with_alt_specific_context(
+        lf,
+        df_caract if "df_caract" in locals() else None,
+        df_od_context,
+        mean_mode=OD_MEAN_MODE,
+        time_dummy_variant="v2",
+        drop_chosen_singletons=DROP_CHOSEN_SINGLETONS,
+    )
+    if SAMPLE_FRACTION is not None:
+        df_trips_v2 = df_trips_v2.sample(fraction=SAMPLE_FRACTION, seed=SEED)
+    df_trips_v2.write_parquet(PATH_TRIPS_CONTEXT_V2)
+    print(f"✅ trips_context_v2 reconstruido en: {PATH_TRIPS_CONTEXT_V2}")
+
+if "zona_inicio_viaje" not in df_trips_v2.columns:
+    raise RuntimeError(
+        "df_trips_v2 no trae zona_inicio_viaje. "
+        "Re-ejecuta setup con la versión actualizada de lib/od_buffers_nested_logit.py."
+    )
+
+# 2) Cargar Censo y preparar columnas de origen
+df_censo = pl.read_parquet(CENSO_ZONA777_PATH)
+missing = [c for c in SOCIO_ORIGIN_FEATURES if c not in df_censo.columns]
+if missing:
+    raise ValueError(f"Faltan columnas socio en Censo: {missing}")
+
+df_censo_o = (
+    df_censo
+    .select(["ZONA777"] + SOCIO_ORIGIN_FEATURES)
+    .rename({c: f"censo_o_{c}" for c in SOCIO_ORIGIN_FEATURES})
+    .with_columns(pl.col("ZONA777").cast(pl.Int64, strict=False))
+)
+
+df_trips_v2_socio = (
+    df_trips_v2
+    .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+    .join(df_censo_o, on="ZONA777", how="left")
+    .drop("ZONA777")
+)
+
+socio_cols = [f"censo_o_{c}" for c in SOCIO_ORIGIN_FEATURES]
+any_missing = df_trips_v2_socio.select(
+    pl.any_horizontal([pl.col(c).is_null() for c in socio_cols]).mean().alias("pct_rows_any_missing_socio")
+).item()
+print(f"ℹ️ pct filas con algún socio faltante (pre-fill): {any_missing:.4%}")
+
+if SOCIO_FILL_STRATEGY == "median":
+    for c in socio_cols:
+        med = df_trips_v2_socio.select(pl.col(c).median()).item()
+        if med is None:
+            med = 0.0
+        df_trips_v2_socio = df_trips_v2_socio.with_columns(pl.col(c).fill_null(pl.lit(float(med))))
+elif SOCIO_FILL_STRATEGY == "zero":
+    df_trips_v2_socio = df_trips_v2_socio.with_columns([pl.col(c).fill_null(0.0) for c in socio_cols])
+else:
+    raise ValueError(f"SOCIO_FILL_STRATEGY no soportado: {SOCIO_FILL_STRATEGY}")
+
+SOCIO_FEATURES_MODEL = socio_cols.copy()
+if SOCIO_STANDARDIZE:
+    socio_z_cols = []
+    for c in socio_cols:
+        mu = df_trips_v2_socio.select(pl.col(c).mean()).item()
+        sd = df_trips_v2_socio.select(pl.col(c).std()).item()
+        if sd is None or sd == 0:
+            sd = 1.0
+        zc = f"{c}_z"
+        df_trips_v2_socio = df_trips_v2_socio.with_columns(
+            ((pl.col(c) - pl.lit(float(mu))) / pl.lit(float(sd))).alias(zc)
+        )
+        socio_z_cols.append(zc)
+    SOCIO_FEATURES_MODEL = socio_z_cols
+
+PATH_TRIPS_CONTEXT_V2_SOCIO = NOTEBOOK_TMP_DIR / f"trips_context_v2_socio_origen_{PARTITION}.parquet"
+df_trips_v2_socio.write_parquet(PATH_TRIPS_CONTEXT_V2_SOCIO)
+
+print("✅ Dataset Option1 V2 + socio origen guardado en:", PATH_TRIPS_CONTEXT_V2_SOCIO)
+print("Features socio usadas en modelo:", SOCIO_FEATURES_MODEL)
+with pl.Config(tbl_cols=-1, tbl_rows=5, tbl_width_chars=1000):
+    print(df_trips_v2_socio.select(["choice_nested", "zona_inicio_viaje"] + SOCIO_FEATURES_MODEL).head(5))
+```
+
+### 7.3) Estimar Nested Logit — Option1 V2 + socio (origen)
+
+```{python}
+#| label: estimate-option1-v2-socio-origen
+#| eval: false
+
+print("label: estimate-option1-v2-socio-origen")
+print("=== Opción 1 V2 + Socio (Origen) | Nested Logit specific ===")
+
+if "read_biogeme_iter_file" not in globals():
+    def read_biogeme_iter_file(model_name: str, project_root: Path) -> dict[str, float]:
+        """Carga un archivo .iter de Biogeme como starting_values."""
+        iter_name = f"__{model_name}.iter"
+        candidates = [
+            Path.cwd() / iter_name,
+            project_root / iter_name,
+            (project_root / "03_models") / iter_name,
+        ]
+        seen = set()
+        for p in candidates:
+            if p in seen:
+                continue
+            seen.add(p)
+            if not p.exists():
+                continue
+            values = {}
+            for raw in p.read_text().splitlines():
+                line = raw.strip()
+                if not line or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                values[key.strip()] = float(value.strip())
+            print(f"♻️ Iter cargado desde: {p} ({len(values)} parámetros)")
+            return values
+        print(f"ℹ️ No se encontró iter previo para {model_name}")
+        return {}
+
+pandas_df = df_trips_v2_socio.to_pandas()
+model_name = f"nested_logit_od_context_v2_socio_origen_{PARTITION}"
+starting_values = {}
+if SOCIO_RESUME_FROM_ITER:
+    starting_values = read_biogeme_iter_file(model_name, PROJECT_ROOT)
+elif CLEAN_RUN_NO_ITER:
+    remove_biogeme_iter_file(model_name, PROJECT_ROOT)
+stats_socio, params_socio = estimate_nested_option1_alt_specific(
+    pandas_df,
+    partition=PARTITION,
+    model_name=model_name,
+    socio_cols=SOCIO_FEATURES_MODEL,
+    clean_run_no_iter=(CLEAN_RUN_NO_ITER and not SOCIO_RESUME_FROM_ITER),
+    project_root=PROJECT_ROOT,
+    starting_values=starting_values,
+    quick=(SOCIO_ESTIMATION_MODE == "quick"),
+)
+
+sample_tag = "full" if SAMPLE_FRACTION is None else f"sample{int(SAMPLE_FRACTION*100)}pct"
+OUTPUT_DIR_OPT1_V2_SOCIO = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-socio-origen-{sample_tag}"
+OUTPUT_DIR_OPT1_V2_SOCIO.mkdir(parents=True, exist_ok=True)
+
+params_path = OUTPUT_DIR_OPT1_V2_SOCIO / f"params_nested_logit_od_context_v2_socio_origen_{PARTITION}.csv"
+stats_path = OUTPUT_DIR_OPT1_V2_SOCIO / f"stats_nested_logit_od_context_v2_socio_origen_{PARTITION}.csv"
+params_socio.to_csv(params_path, index=False)
+pd.DataFrame([stats_socio]).to_csv(stats_path, index=False)
+
+display(pd.DataFrame([stats_socio]))
+display(params_socio)
+print("✅ Resultados socio-origen guardados en:", OUTPUT_DIR_OPT1_V2_SOCIO)
+print("   -", params_path.name)
+print("   -", stats_path.name)
+```
+
+### 7.4) Cargar y comparar: baseline vs socio-origen
+
+```{python}
+#| label: compare-option1-v2-vs-socio-origen
+
+print("label: compare-option1-v2-vs-socio-origen")
+
+sample_tag = "full" if SAMPLE_FRACTION is None else f"sample{int(SAMPLE_FRACTION*100)}pct"
+
+base_dir = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-{sample_tag}"
+socio_dir = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-socio-origen-{sample_tag}"
+socio_dir.mkdir(parents=True, exist_ok=True)
+
+base_stats_path = base_dir / f"stats_nested_logit_od_context_{PARTITION}.csv"
+base_params_path = base_dir / f"params_nested_logit_od_context_{PARTITION}.csv"
+socio_stats_path = socio_dir / f"stats_nested_logit_od_context_v2_socio_origen_{PARTITION}.csv"
+socio_params_path = socio_dir / f"params_nested_logit_od_context_v2_socio_origen_{PARTITION}.csv"
+
+if (not socio_stats_path.exists()) and ("stats_socio" in globals()) and ("params_socio" in globals()):
+    print("ℹ️ No estaban los CSV socio en disco; persistiendo resultados desde memoria.")
+    params_socio.to_csv(socio_params_path, index=False)
+    pd.DataFrame([stats_socio]).to_csv(socio_stats_path, index=False)
+    print("✅ CSV socio persistidos en:", socio_dir)
+
+if not (base_stats_path.exists() and socio_stats_path.exists()):
+    print("⚠️ Faltan resultados para comparar.")
+    print("  base:", base_stats_path.exists(), " socio:", socio_stats_path.exists())
+else:
+    sb = pd.read_csv(base_stats_path).iloc[0]
+    ss = pd.read_csv(socio_stats_path).iloc[0]
+
+    cmp_stats = pd.DataFrame([
+        {"model": "baseline_option1_v2", "ll_final": sb.get("Final log likelihood"), "rho_init": sb.get("Rho-square for the init. model"), "grad_norm": sb.get("Final gradient norm"), "k": sb.get("Number of estimated parameters")},
+        {"model": "socio_origen_option1_v2", "ll_final": ss.get("Final log likelihood"), "rho_init": ss.get("Rho-square for the init. model"), "grad_norm": ss.get("Final gradient norm"), "k": ss.get("Number of estimated parameters")},
+    ])
+    display(cmp_stats)
+
+if socio_params_path.exists():
+    ps = pd.read_csv(socio_params_path)
+    if "Name" in ps.columns:
+        ps["Param"] = ps["Name"].astype(str).str.replace(f"_{PARTITION}$", "", regex=True)
+    socio_beta = ps[
+        ps["Param"].str.startswith("B_QR_RED_SOC_O_") | ps["Param"].str.startswith("B_QR_OTHER_SOC_O_")
+    ].copy() if "Param" in ps.columns else pd.DataFrame()
+    if len(socio_beta):
+        cols = [c for c in ["Param", "Value", "Robust std err.", "Robust t-stat.", "Robust p-value"] if c in socio_beta.columns]
+        display(socio_beta[cols].sort_values("Param"))
+    else:
+        print("ℹ️ No se encontraron betas socio en params.")
+else:
+    print("⚠️ No existe params socio para mostrar betas.")
+```
