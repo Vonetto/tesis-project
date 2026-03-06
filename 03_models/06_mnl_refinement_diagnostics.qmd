@@ -1,0 +1,998 @@
+---
+title: "Tesis — 06 | MNL Refinement Diagnostics (OD Buffers)"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Este notebook separa el trabajo de **refinamiento del MNL alt-specific** para:
+
+1. Diagnosticar identificación/colinealidad.
+2. Probar simplificaciones parsimoniosas por bloques.
+3. Comparar resultados entre **Biogeme** y **Larch** sin mezclar con notebooks principales.
+
+Enfoque metodológico:
+- no podar por "signo esperado";
+- refinar por identificación, estabilidad y parsimonia.
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+
+import gc
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import polars as pl
+
+
+def resolve_project_root(start: Path | None = None) -> Path:
+    current = (start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / "config").exists() and (candidate / "lib").exists():
+            return candidate
+    raise RuntimeError("No se pudo resolver PROJECT_ROOT.")
+
+
+PROJECT_ROOT = resolve_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lib.od_buffers_nested_logit import (
+    OdContextConfig,
+    build_od_alt_specific_context_table,
+    build_trip_dataset_with_alt_specific_context,
+    load_caracterizacion,
+    read_parquet_portable,
+    resolve_caracterizacion_path,
+)
+
+# Biogeme
+import biogeme.database as db
+import biogeme.biogeme as bio
+import biogeme.results_processing as br
+from biogeme import models, nests
+from biogeme.expressions import Beta, Variable
+
+# Larch
+import larch as lx
+from larch import P, X
+from scipy.stats import norm
+
+SEED = 42
+
+
+def format_sample_tag(sample_fraction: float | None) -> str:
+    if sample_fraction is None:
+        return "full"
+    pct = int(round(sample_fraction * 100))
+    return f"sample{pct}pct"
+
+
+def maybe_sample_df(df: pl.DataFrame, sample_fraction: float | None) -> pl.DataFrame:
+    if sample_fraction is None:
+        return df
+    return df.sample(fraction=sample_fraction, shuffle=True, seed=SEED)
+
+
+def remove_biogeme_iter_file(model_name: str, project_root: Path):
+    iter_name = f"__{model_name}.iter"
+    candidates = [
+        Path.cwd() / iter_name,
+        project_root / iter_name,
+        (project_root / "03_models") / iter_name,
+    ]
+    removed = []
+    seen = set()
+    for p in candidates:
+        if p in seen:
+            continue
+        seen.add(p)
+        if p.exists():
+            p.unlink()
+            removed.append(str(p))
+    if removed:
+        print("🧹 Iter eliminado:")
+        for r in removed:
+            print("   -", r)
+    else:
+        print(f"ℹ️ No se encontró iter previo para {model_name}")
+
+
+def build_biogeme_mnl(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    mode: str,
+    use_tet: bool,
+    use_ntr: bool,
+    structure: str = "mnl",
+    clean_run_no_iter: bool,
+    project_root: Path,
+):
+    database = db.Database(model_name, pandas_df)
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+    CHOICE = Variable("choice_nested")
+
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+
+    if use_tet:
+        TET_BIP = Variable("TET_BIP")
+        TET_QR_RED = Variable("TET_QR_RED")
+        TET_QR_OTHER = Variable("TET_QR_OTHER")
+    if use_ntr:
+        NTR_BIP = Variable("NTR_BIP")
+        NTR_QR_RED = Variable("NTR_QR_RED")
+        NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    ASC_QR_RED = Beta(f"ASC_QR_RED_{partition}", 0, None, None, 0)
+    ASC_QR_OTHER = Beta(f"ASC_QR_OTHER_{partition}", 0, None, None, 0)
+
+    B_QR_RED_LAB_PM = Beta(f"B_QR_RED_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PM = Beta(f"B_QR_OTHER_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PT = Beta(f"B_QR_RED_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PT = Beta(f"B_QR_OTHER_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_RED_NO_LAB = Beta(f"B_QR_RED_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_NO_LAB = Beta(f"B_QR_OTHER_NO_LAB_{partition}", 0, None, None, 0)
+
+    if mode == "alt_specific":
+        B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
+        B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+        B_QR_OTHER_T_VEH = Beta(f"B_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+
+        B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+        B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+        B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+
+        V_BIP = B_BIP_T_VEH * TVH_BIP + B_BIP_T_ESPERA_INI * TEI_BIP
+        V_QR_RED = (
+            ASC_QR_RED
+            + B_QR_RED_LAB_PM * LAB_PM
+            + B_QR_RED_LAB_PT * LAB_PT
+            + B_QR_RED_NO_LAB * NO_LAB
+            + B_QR_RED_T_VEH * TVH_QR_RED
+            + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        )
+        V_QR_OTHER = (
+            ASC_QR_OTHER
+            + B_QR_OTHER_LAB_PM * LAB_PM
+            + B_QR_OTHER_LAB_PT * LAB_PT
+            + B_QR_OTHER_NO_LAB * NO_LAB
+            + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+            + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        )
+
+        if use_tet:
+            B_BIP_T_ESPERA_TRASB = Beta(f"B_BIP_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+            B_QR_RED_T_ESPERA_TRASB = Beta(f"B_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+            B_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+            V_BIP += B_BIP_T_ESPERA_TRASB * TET_BIP
+            V_QR_RED += B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+            V_QR_OTHER += B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+
+        if use_ntr:
+            B_BIP_N_TRASB = Beta(f"B_BIP_N_TRASB_{partition}", 0, None, None, 0)
+            B_QR_RED_N_TRASB = Beta(f"B_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+            B_QR_OTHER_N_TRASB = Beta(f"B_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+            V_BIP += B_BIP_N_TRASB * NTR_BIP
+            V_QR_RED += B_QR_RED_N_TRASB * NTR_QR_RED
+            V_QR_OTHER += B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+
+    elif mode == "generic":
+        B_T_VEH = Beta(f"B_T_VEH_{partition}", 0, None, None, 0)
+        B_T_ESPERA_INI = Beta(f"B_T_ESPERA_INI_{partition}", 0, None, None, 0)
+        V_BIP = B_T_VEH * TVH_BIP + B_T_ESPERA_INI * TEI_BIP
+        V_QR_RED = (
+            ASC_QR_RED
+            + B_QR_RED_LAB_PM * LAB_PM
+            + B_QR_RED_LAB_PT * LAB_PT
+            + B_QR_RED_NO_LAB * NO_LAB
+            + B_T_VEH * TVH_QR_RED
+            + B_T_ESPERA_INI * TEI_QR_RED
+        )
+        V_QR_OTHER = (
+            ASC_QR_OTHER
+            + B_QR_OTHER_LAB_PM * LAB_PM
+            + B_QR_OTHER_LAB_PT * LAB_PT
+            + B_QR_OTHER_NO_LAB * NO_LAB
+            + B_T_VEH * TVH_QR_OTHER
+            + B_T_ESPERA_INI * TEI_QR_OTHER
+        )
+
+        if use_tet:
+            B_T_ESPERA_TRASB = Beta(f"B_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+            V_BIP += B_T_ESPERA_TRASB * TET_BIP
+            V_QR_RED += B_T_ESPERA_TRASB * TET_QR_RED
+            V_QR_OTHER += B_T_ESPERA_TRASB * TET_QR_OTHER
+        if use_ntr:
+            B_N_TRASB = Beta(f"B_N_TRASB_{partition}", 0, None, None, 0)
+            V_BIP += B_N_TRASB * NTR_BIP
+            V_QR_RED += B_N_TRASB * NTR_QR_RED
+            V_QR_OTHER += B_N_TRASB * NTR_QR_OTHER
+
+    elif mode == "mixed_tei_specific":
+        B_T_VEH = Beta(f"B_T_VEH_{partition}", 0, None, None, 0)
+        B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+        B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+        B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+
+        V_BIP = B_T_VEH * TVH_BIP + B_BIP_T_ESPERA_INI * TEI_BIP
+        V_QR_RED = (
+            ASC_QR_RED
+            + B_QR_RED_LAB_PM * LAB_PM
+            + B_QR_RED_LAB_PT * LAB_PT
+            + B_QR_RED_NO_LAB * NO_LAB
+            + B_T_VEH * TVH_QR_RED
+            + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        )
+        V_QR_OTHER = (
+            ASC_QR_OTHER
+            + B_QR_OTHER_LAB_PM * LAB_PM
+            + B_QR_OTHER_LAB_PT * LAB_PT
+            + B_QR_OTHER_NO_LAB * NO_LAB
+            + B_T_VEH * TVH_QR_OTHER
+            + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        )
+
+        if use_tet:
+            B_T_ESPERA_TRASB = Beta(f"B_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+            V_BIP += B_T_ESPERA_TRASB * TET_BIP
+            V_QR_RED += B_T_ESPERA_TRASB * TET_QR_RED
+            V_QR_OTHER += B_T_ESPERA_TRASB * TET_QR_OTHER
+        if use_ntr:
+            B_N_TRASB = Beta(f"B_N_TRASB_{partition}", 0, None, None, 0)
+            V_BIP += B_N_TRASB * NTR_BIP
+            V_QR_RED += B_N_TRASB * NTR_QR_RED
+            V_QR_OTHER += B_N_TRASB * NTR_QR_OTHER
+
+    elif mode == "diff_vs_bip":
+        dTVH_RED = TVH_QR_RED - TVH_BIP
+        dTVH_OTHER = TVH_QR_OTHER - TVH_BIP
+        dTEI_RED = TEI_QR_RED - TEI_BIP
+        dTEI_OTHER = TEI_QR_OTHER - TEI_BIP
+
+        B_D_QR_RED_T_VEH = Beta(f"B_D_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+        B_D_QR_OTHER_T_VEH = Beta(f"B_D_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+        B_D_QR_RED_T_ESPERA_INI = Beta(f"B_D_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+        B_D_QR_OTHER_T_ESPERA_INI = Beta(f"B_D_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+
+        V_BIP = 0
+        V_QR_RED = (
+            ASC_QR_RED
+            + B_QR_RED_LAB_PM * LAB_PM
+            + B_QR_RED_LAB_PT * LAB_PT
+            + B_QR_RED_NO_LAB * NO_LAB
+            + B_D_QR_RED_T_VEH * dTVH_RED
+            + B_D_QR_RED_T_ESPERA_INI * dTEI_RED
+        )
+        V_QR_OTHER = (
+            ASC_QR_OTHER
+            + B_QR_OTHER_LAB_PM * LAB_PM
+            + B_QR_OTHER_LAB_PT * LAB_PT
+            + B_QR_OTHER_NO_LAB * NO_LAB
+            + B_D_QR_OTHER_T_VEH * dTVH_OTHER
+            + B_D_QR_OTHER_T_ESPERA_INI * dTEI_OTHER
+        )
+
+        if use_tet:
+            dTET_RED = TET_QR_RED - TET_BIP
+            dTET_OTHER = TET_QR_OTHER - TET_BIP
+            B_D_QR_RED_T_ESPERA_TRASB = Beta(f"B_D_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+            B_D_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_D_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+            V_QR_RED += B_D_QR_RED_T_ESPERA_TRASB * dTET_RED
+            V_QR_OTHER += B_D_QR_OTHER_T_ESPERA_TRASB * dTET_OTHER
+        if use_ntr:
+            dNTR_RED = NTR_QR_RED - NTR_BIP
+            dNTR_OTHER = NTR_QR_OTHER - NTR_BIP
+            B_D_QR_RED_N_TRASB = Beta(f"B_D_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+            B_D_QR_OTHER_N_TRASB = Beta(f"B_D_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+            V_QR_RED += B_D_QR_RED_N_TRASB * dNTR_RED
+            V_QR_OTHER += B_D_QR_OTHER_N_TRASB * dNTR_OTHER
+
+    else:
+        raise ValueError(f"Mode no soportado: {mode}")
+
+    V = {
+        CHOICE_BIP: V_BIP,
+        CHOICE_QR_RED: V_QR_RED,
+        CHOICE_QR_OTHER: V_QR_OTHER,
+    }
+
+    if structure == "nested":
+        MU_QR = Beta(f"MU_QR_{partition}", 1.5, 1.0, None, 0)
+        nest_bip = nests.OneNestForNestedLogit(1.0, [CHOICE_BIP], name="BIP")
+        nest_qr = nests.OneNestForNestedLogit(MU_QR, [CHOICE_QR_RED, CHOICE_QR_OTHER], name="QR")
+        NESTS = nests.NestsForNestedLogit(
+            choice_set=[CHOICE_BIP, CHOICE_QR_RED, CHOICE_QR_OTHER],
+            tuple_of_nests=(nest_bip, nest_qr),
+        )
+        logprob = models.lognested(V, None, NESTS, CHOICE)
+    else:
+        logprob = models.loglogit(V, None, CHOICE)
+
+    if clean_run_no_iter:
+        remove_biogeme_iter_file(model_name, project_root)
+
+    b = bio.BIOGEME(database, logprob)
+    b.model_name = model_name
+    results = b.estimate()
+    stats_raw = results.get_general_statistics()
+    stats_row = {}
+    for k, v in stats_raw.items():
+        key = " | ".join(str(x) for x in k) if isinstance(k, tuple) else str(k)
+        if isinstance(v, (list, tuple, np.ndarray)):
+            stats_row[key] = v[0] if len(v) > 0 else np.nan
+        else:
+            stats_row[key] = v
+    stats = pd.DataFrame([stats_row])
+    params = br.get_pandas_estimated_parameters(results)
+    return stats, params
+
+
+def prepare_larch_dataframe(df: pl.DataFrame) -> pd.DataFrame:
+    remap = {0: 1, 1: 2, 2: 3}
+    out = (
+        df.with_columns(
+            pl.col("choice_nested").replace(remap).cast(pl.Int16).alias("choice_larch")
+        )
+        .drop("choice_nested")
+    )
+    pdf = out.to_pandas()
+    for col in pdf.columns:
+        if col == "choice_larch":
+            pdf[col] = pdf[col].astype("int32")
+        elif pd.api.types.is_integer_dtype(pdf[col]):
+            pdf[col] = pdf[col].astype("int32")
+        elif pd.api.types.is_float_dtype(pdf[col]):
+            pdf[col] = pdf[col].astype("float64")
+    return pdf
+
+
+def build_larch_stats_frame(model: lx.Model, n_obs: int) -> pd.DataFrame:
+    stats_raw = model.estimation_statistics_raw(compute_loglike_null=True)
+    stats = {
+        "Number of estimated parameters": len(model.pf),
+        "Number of free parameters": int((model.pf["holdfast"] == 0).sum()),
+        "Sample size": int(n_obs),
+    }
+    for key, value in stats_raw.items():
+        if isinstance(key, tuple):
+            label = " | ".join(str(k) for k in key)
+        else:
+            label = str(key)
+        stats[label] = value
+    return pd.DataFrame([stats])
+
+
+def build_larch_params_frame(model: lx.Model) -> pd.DataFrame:
+    pf = model.pf.copy().reset_index().rename(columns={"param_name": "Param", "value": "Value"})
+    robust_std_err = np.asarray(model.parameters["robust_std_err"].values, dtype=float)
+    robust_t = np.where(
+        np.isfinite(robust_std_err) & (robust_std_err > 0),
+        pf["Value"].to_numpy(dtype=float) / robust_std_err,
+        np.nan,
+    )
+    robust_p = np.where(np.isfinite(robust_t), 2 * norm.sf(np.abs(robust_t)), np.nan)
+    pf["Robust std err."] = robust_std_err
+    pf["Robust t-stat."] = robust_t
+    pf["Robust p-value"] = robust_p
+    return pf[["Param", "Value", "Robust std err.", "Robust t-stat.", "Robust p-value"]]
+
+
+def build_larch_mnl(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    mode: str,
+    use_tet: bool,
+    use_ntr: bool,
+    structure: str = "mnl",
+    max_cap: float = 20.0,
+    method: str = "slsqp",
+    quiet: bool = True,
+):
+    alts = {1: "BIP", 2: "QR_RED", 3: "QR_OTHER"}
+    ds = lx.Dataset.construct.from_idco(pandas_df, alts=alts)
+    m = lx.Model(ds)
+    m.compute_engine = "numba"
+    m.choice_co_code = "choice_larch"
+    m.availability_co_vars = {1: 1, 2: 1, 3: 1}
+    m.initialize_graph(alternative_codes=[1, 2, 3], alternative_names=["BIP", "QR_RED", "QR_OTHER"])
+
+    if structure == "nested":
+        m.graph.new_node(parameter="Mu_QR", children=[2, 3], name="QR")
+
+    if mode == "alt_specific":
+        m.utility_co[1] = (
+            P.B_BIP_T_VEH * X.TVH_BIP
+            + P.B_BIP_T_ESPERA_INI * X.TEI_BIP
+        )
+        m.utility_co[2] = (
+            P.ASC_QR_RED
+            + P.B_QR_RED_LAB_PM * X.DUMMY_LAB_PM
+            + P.B_QR_RED_LAB_PT * X.DUMMY_LAB_PT
+            + P.B_QR_RED_NO_LAB * X.DUMMY_NO_LAB
+            + P.B_QR_RED_T_VEH * X.TVH_QR_RED
+            + P.B_QR_RED_T_ESPERA_INI * X.TEI_QR_RED
+        )
+        m.utility_co[3] = (
+            P.ASC_QR_OTHER
+            + P.B_QR_OTHER_LAB_PM * X.DUMMY_LAB_PM
+            + P.B_QR_OTHER_LAB_PT * X.DUMMY_LAB_PT
+            + P.B_QR_OTHER_NO_LAB * X.DUMMY_NO_LAB
+            + P.B_QR_OTHER_T_VEH * X.TVH_QR_OTHER
+            + P.B_QR_OTHER_T_ESPERA_INI * X.TEI_QR_OTHER
+        )
+        if use_tet:
+            m.utility_co[1] += P.B_BIP_T_ESPERA_TRASB * X.TET_BIP
+            m.utility_co[2] += P.B_QR_RED_T_ESPERA_TRASB * X.TET_QR_RED
+            m.utility_co[3] += P.B_QR_OTHER_T_ESPERA_TRASB * X.TET_QR_OTHER
+        if use_ntr:
+            m.utility_co[1] += P.B_BIP_N_TRASB * X.NTR_BIP
+            m.utility_co[2] += P.B_QR_RED_N_TRASB * X.NTR_QR_RED
+            m.utility_co[3] += P.B_QR_OTHER_N_TRASB * X.NTR_QR_OTHER
+
+    elif mode == "generic":
+        m.utility_co[1] = P.B_T_VEH * X.TVH_BIP + P.B_T_ESPERA_INI * X.TEI_BIP
+        m.utility_co[2] = (
+            P.ASC_QR_RED
+            + P.B_QR_RED_LAB_PM * X.DUMMY_LAB_PM
+            + P.B_QR_RED_LAB_PT * X.DUMMY_LAB_PT
+            + P.B_QR_RED_NO_LAB * X.DUMMY_NO_LAB
+            + P.B_T_VEH * X.TVH_QR_RED
+            + P.B_T_ESPERA_INI * X.TEI_QR_RED
+        )
+        m.utility_co[3] = (
+            P.ASC_QR_OTHER
+            + P.B_QR_OTHER_LAB_PM * X.DUMMY_LAB_PM
+            + P.B_QR_OTHER_LAB_PT * X.DUMMY_LAB_PT
+            + P.B_QR_OTHER_NO_LAB * X.DUMMY_NO_LAB
+            + P.B_T_VEH * X.TVH_QR_OTHER
+            + P.B_T_ESPERA_INI * X.TEI_QR_OTHER
+        )
+        if use_tet:
+            m.utility_co[1] += P.B_T_ESPERA_TRASB * X.TET_BIP
+            m.utility_co[2] += P.B_T_ESPERA_TRASB * X.TET_QR_RED
+            m.utility_co[3] += P.B_T_ESPERA_TRASB * X.TET_QR_OTHER
+        if use_ntr:
+            m.utility_co[1] += P.B_N_TRASB * X.NTR_BIP
+            m.utility_co[2] += P.B_N_TRASB * X.NTR_QR_RED
+            m.utility_co[3] += P.B_N_TRASB * X.NTR_QR_OTHER
+
+    elif mode == "mixed_tei_specific":
+        m.utility_co[1] = P.B_T_VEH * X.TVH_BIP + P.B_BIP_T_ESPERA_INI * X.TEI_BIP
+        m.utility_co[2] = (
+            P.ASC_QR_RED
+            + P.B_QR_RED_LAB_PM * X.DUMMY_LAB_PM
+            + P.B_QR_RED_LAB_PT * X.DUMMY_LAB_PT
+            + P.B_QR_RED_NO_LAB * X.DUMMY_NO_LAB
+            + P.B_T_VEH * X.TVH_QR_RED
+            + P.B_QR_RED_T_ESPERA_INI * X.TEI_QR_RED
+        )
+        m.utility_co[3] = (
+            P.ASC_QR_OTHER
+            + P.B_QR_OTHER_LAB_PM * X.DUMMY_LAB_PM
+            + P.B_QR_OTHER_LAB_PT * X.DUMMY_LAB_PT
+            + P.B_QR_OTHER_NO_LAB * X.DUMMY_NO_LAB
+            + P.B_T_VEH * X.TVH_QR_OTHER
+            + P.B_QR_OTHER_T_ESPERA_INI * X.TEI_QR_OTHER
+        )
+        if use_tet:
+            m.utility_co[1] += P.B_T_ESPERA_TRASB * X.TET_BIP
+            m.utility_co[2] += P.B_T_ESPERA_TRASB * X.TET_QR_RED
+            m.utility_co[3] += P.B_T_ESPERA_TRASB * X.TET_QR_OTHER
+        if use_ntr:
+            m.utility_co[1] += P.B_N_TRASB * X.NTR_BIP
+            m.utility_co[2] += P.B_N_TRASB * X.NTR_QR_RED
+            m.utility_co[3] += P.B_N_TRASB * X.NTR_QR_OTHER
+
+    elif mode == "diff_vs_bip":
+        m.utility_co[1] = 0
+        m.utility_co[2] = (
+            P.ASC_QR_RED
+            + P.B_QR_RED_LAB_PM * X.DUMMY_LAB_PM
+            + P.B_QR_RED_LAB_PT * X.DUMMY_LAB_PT
+            + P.B_QR_RED_NO_LAB * X.DUMMY_NO_LAB
+            + P.B_D_QR_RED_T_VEH * (X.TVH_QR_RED - X.TVH_BIP)
+            + P.B_D_QR_RED_T_ESPERA_INI * (X.TEI_QR_RED - X.TEI_BIP)
+        )
+        m.utility_co[3] = (
+            P.ASC_QR_OTHER
+            + P.B_QR_OTHER_LAB_PM * X.DUMMY_LAB_PM
+            + P.B_QR_OTHER_LAB_PT * X.DUMMY_LAB_PT
+            + P.B_QR_OTHER_NO_LAB * X.DUMMY_NO_LAB
+            + P.B_D_QR_OTHER_T_VEH * (X.TVH_QR_OTHER - X.TVH_BIP)
+            + P.B_D_QR_OTHER_T_ESPERA_INI * (X.TEI_QR_OTHER - X.TEI_BIP)
+        )
+        if use_tet:
+            m.utility_co[2] += P.B_D_QR_RED_T_ESPERA_TRASB * (X.TET_QR_RED - X.TET_BIP)
+            m.utility_co[3] += P.B_D_QR_OTHER_T_ESPERA_TRASB * (X.TET_QR_OTHER - X.TET_BIP)
+        if use_ntr:
+            m.utility_co[2] += P.B_D_QR_RED_N_TRASB * (X.NTR_QR_RED - X.NTR_BIP)
+            m.utility_co[3] += P.B_D_QR_OTHER_N_TRASB * (X.NTR_QR_OTHER - X.NTR_BIP)
+
+    else:
+        raise ValueError(f"Mode no soportado: {mode}")
+
+    m.set_cap(max_cap)
+    m.maximize_loglike(method=method, quiet=quiet)
+    m.calculate_parameter_covariance(robust=True)
+    stats = build_larch_stats_frame(m, n_obs=len(pandas_df))
+    params = build_larch_params_frame(m)
+    return stats, params
+
+
+print("✅ Setup listo")
+print("Larch version:", lx.__version__)
+```
+
+## 2) Configuración
+
+```{python}
+#| label: config
+print("label: config")
+
+PARTITION = "2025-W17"
+PARQUET_PATH = PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet"
+CARACTERIZACION_PATH = resolve_caracterizacion_path(None)
+
+SAMPLE_FRACTION = 0.6
+CLEAN_RUN_NO_ITER = True
+TIME_DUMMY_VARIANT = "v2"
+OD_MEAN_MODE = "leave_one_out"
+REQUIRE_ALL_THREE_ALTS = True
+DROP_CHOSEN_SINGLETONS = True
+
+RUN_BIOGEME = True
+RUN_LARCH = True
+
+LARCH_METHOD = "slsqp"
+LARCH_MAX_CAP = 20.0
+
+VARIANTS = {
+    "generic_mnl": {"mode": "generic", "use_tet": True, "use_ntr": True, "structure": "mnl"},
+    "generic_nested": {"mode": "generic", "use_tet": True, "use_ntr": True, "structure": "nested"},
+    "mixed_tei_mnl": {"mode": "mixed_tei_specific", "use_tet": True, "use_ntr": True, "structure": "mnl"},
+    "mixed_tei_nested": {"mode": "mixed_tei_specific", "use_tet": True, "use_ntr": True, "structure": "nested"},
+}
+
+NOTEBOOK_TMP_DIR = PROJECT_ROOT / "03_models" / "tmp" / "od_buffers_nested_logit"
+NOTEBOOK_TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+REFINE_OUT_DIR = PROJECT_ROOT / "03_models" / "tmp" / "mnl_refinement"
+REFINE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+sample_tag = format_sample_tag(SAMPLE_FRACTION)
+
+print("--- Configuración ---")
+print("Partition:", PARTITION)
+print("Parquet:", PARQUET_PATH)
+print("Caracterización:", CARACTERIZACION_PATH)
+print("Sample fraction:", SAMPLE_FRACTION)
+print("Time dummy variant:", TIME_DUMMY_VARIANT)
+print("OD mean mode:", OD_MEAN_MODE)
+print("Require all 3 alternatives:", REQUIRE_ALL_THREE_ALTS)
+print("Drop chosen singletons:", DROP_CHOSEN_SINGLETONS)
+print("Run Biogeme:", RUN_BIOGEME)
+print("Run Larch:", RUN_LARCH)
+print("Variants:", VARIANTS)
+```
+
+## 3) Construcción de datos (mismo pipeline del modelo principal)
+
+```{python}
+#| label: build-data
+print("label: build-data")
+
+lf = read_parquet_portable(str(PARQUET_PATH))
+df_caract = load_caracterizacion(CARACTERIZACION_PATH)
+cfg = OdContextConfig(
+    time_dummy_variant=TIME_DUMMY_VARIANT,
+    mean_mode=OD_MEAN_MODE,
+    require_all_alternatives=REQUIRE_ALL_THREE_ALTS,
+)
+
+df_od_context = build_od_alt_specific_context_table(
+    lf,
+    df_caracterizacion=df_caract,
+    config=cfg,
+)
+
+df_trips = build_trip_dataset_with_alt_specific_context(
+    lf,
+    df_caracterizacion=df_caract,
+    df_od_alt_context=df_od_context,
+    time_dummy_variant=TIME_DUMMY_VARIANT,
+    mean_mode=OD_MEAN_MODE,
+    drop_chosen_singletons=DROP_CHOSEN_SINGLETONS,
+)
+df_trips = maybe_sample_df(df_trips, SAMPLE_FRACTION)
+
+print("Rows:", df_trips.height)
+print("Cols:", len(df_trips.columns))
+display(df_trips.head(5))
+```
+
+## 4) Diagnóstico de colinealidad / dispersión
+
+```{python}
+#| label: diagnostics-collinearity
+print("label: diagnostics-collinearity")
+
+metrics = ["TVH", "TEI", "TET", "NTR"]
+alts = ["BIP", "QR_RED", "QR_OTHER"]
+
+print("=== Correlaciones cross-alternative (misma métrica) ===")
+for m in metrics:
+    cols = [f"{m}_{a}" for a in alts]
+    corr = df_trips.select(cols).to_pandas().corr()
+    print(f"\n{m}")
+    print(corr)
+
+print("\n=== Correlaciones within-alternative ===")
+for a in alts:
+    cols = [f"{m}_{a}" for m in metrics]
+    corr = df_trips.select(cols).to_pandas().corr()
+    print(f"\n{a}")
+    print(corr)
+
+rows = []
+for m in metrics:
+    cols = [f"{m}_{a}" for a in alts]
+    vals = df_trips.select(cols)
+    rng = vals.max_horizontal() - vals.min_horizontal()
+    mean_lvl = vals.mean_horizontal()
+    rel = (rng / (mean_lvl.abs() + 1e-9)).fill_nan(None)
+    rows.append(
+        {
+            "metric": m,
+            "mean_range": float(rng.mean()),
+            "median_range": float(rng.median()),
+            "mean_level": float(mean_lvl.mean()),
+            "mean_rel_range": float(rel.mean()),
+        }
+    )
+
+print("\n=== Dispersión relativa dentro del choice set ===")
+display(pd.DataFrame(rows))
+```
+
+## 5) Estimación de variantes (Biogeme y/o Larch)
+
+```{python}
+#| label: estimate-variants
+print("label: estimate-variants")
+
+df_pandas_biogeme = df_trips.to_pandas()
+df_pandas_larch = prepare_larch_dataframe(df_trips)
+
+framework_results = []
+
+for variant_name, spec in VARIANTS.items():
+    print(f"\n--- Variant: {variant_name} ---")
+    mode = spec["mode"]
+    use_tet = spec["use_tet"]
+    use_ntr = spec["use_ntr"]
+    structure = spec.get("structure", "mnl")
+
+    if RUN_BIOGEME:
+        model_name = f"mnl_refine_{PARTITION}_{variant_name}_{sample_tag}"
+        out_dir = REFINE_OUT_DIR / "biogeme" / f"{PARTITION}-{variant_name}-{sample_tag}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stats_b, params_b = build_biogeme_mnl(
+            df_pandas_biogeme,
+            partition=PARTITION,
+            model_name=model_name,
+            mode=mode,
+            use_tet=use_tet,
+            use_ntr=use_ntr,
+            structure=structure,
+            clean_run_no_iter=CLEAN_RUN_NO_ITER,
+            project_root=PROJECT_ROOT,
+        )
+        stats_b.to_csv(out_dir / f"stats_{PARTITION}.csv", index=False)
+        params_b.to_csv(out_dir / f"params_{PARTITION}.csv", index=False)
+        framework_results.append(
+            {
+                "framework": "biogeme",
+                "variant": variant_name,
+                "stats_path": str(out_dir / f"stats_{PARTITION}.csv"),
+                "params_path": str(out_dir / f"params_{PARTITION}.csv"),
+            }
+        )
+        print("✅ Biogeme guardado en:", out_dir)
+
+    if RUN_LARCH:
+        out_dir = REFINE_OUT_DIR / "larch" / f"{PARTITION}-{variant_name}-{sample_tag}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stats_l, params_l = build_larch_mnl(
+            df_pandas_larch,
+            partition=PARTITION,
+            mode=mode,
+            use_tet=use_tet,
+            use_ntr=use_ntr,
+            structure=structure,
+            max_cap=LARCH_MAX_CAP,
+            method=LARCH_METHOD,
+            quiet=True,
+        )
+        stats_l.to_csv(out_dir / f"stats_{PARTITION}.csv", index=False)
+        params_l.to_csv(out_dir / f"params_{PARTITION}.csv", index=False)
+        framework_results.append(
+            {
+                "framework": "larch",
+                "variant": variant_name,
+                "stats_path": str(out_dir / f"stats_{PARTITION}.csv"),
+                "params_path": str(out_dir / f"params_{PARTITION}.csv"),
+            }
+        )
+        print("✅ Larch guardado en:", out_dir)
+
+if framework_results:
+    results_index = pd.DataFrame(framework_results)
+    display(results_index)
+else:
+    print("ℹ️ No se ejecutó ninguna estimación (RUN_BIOGEME/RUN_LARCH = False).")
+```
+
+## 6) Carga y comparación de variantes
+
+```{python}
+#| label: load-and-compare
+print("label: load-and-compare")
+
+records = []
+for fw in ["biogeme", "larch"]:
+    for variant_name in VARIANTS.keys():
+        out_dir = REFINE_OUT_DIR / fw / f"{PARTITION}-{variant_name}-{sample_tag}"
+        stats_path = out_dir / f"stats_{PARTITION}.csv"
+        params_path = out_dir / f"params_{PARTITION}.csv"
+        if not (stats_path.exists() and params_path.exists()):
+            continue
+
+        s = pd.read_csv(stats_path).iloc[0]
+        if fw == "biogeme":
+            ll = s.get("Final log likelihood", np.nan)
+            rho = s.get("Rho-square for the init. model", np.nan)
+            k = s.get("Number of estimated parameters", np.nan)
+            n = s.get("Sample size", np.nan)
+        else:
+            ll = s.get("Log Likelihood at Convergence | Aggregate", np.nan)
+            rho = s.get("Rho Squared w.r.t. Null Parameters | Aggregate", np.nan)
+            k = s.get("Number of estimated parameters", np.nan)
+            n = s.get("Sample size", np.nan)
+
+        aic = 2 * k - 2 * ll if np.isfinite(ll) and np.isfinite(k) else np.nan
+        bic = k * np.log(n) - 2 * ll if np.isfinite(ll) and np.isfinite(k) and np.isfinite(n) and n > 0 else np.nan
+
+        records.append(
+            {
+                "framework": fw,
+                "variant": variant_name,
+                "sample_size": n,
+                "k_params": k,
+                "final_ll": ll,
+                "rho": rho,
+                "AIC": aic,
+                "BIC": bic,
+                "stats_path": str(stats_path),
+                "params_path": str(params_path),
+            }
+        )
+
+if not records:
+    print("⚠️ No se encontraron resultados para comparar.")
+else:
+    comp = pd.DataFrame(records).sort_values(["framework", "variant"]).reset_index(drop=True)
+    display_cols = ["framework", "variant", "sample_size", "k_params", "final_ll", "rho", "AIC", "BIC"]
+    display(comp[display_cols])
+```
+
+## 6.1) Comparación de parámetros por variante
+
+```{python}
+#| label: compare-params-by-variant
+print("label: compare-params-by-variant")
+
+if 'comp' not in locals() or comp.empty:
+    print("⚠️ Ejecuta primero `load-and-compare` con resultados disponibles.")
+else:
+    rows = []
+    for _, r in comp.iterrows():
+        params_path = Path(r["params_path"])
+        p = pd.read_csv(params_path)
+        if "Name" in p.columns and "Param" not in p.columns:
+            p["Param"] = p["Name"].str.replace(f"_{PARTITION}", "", regex=False)
+        p = p[["Param", "Value", "Robust p-value"]].copy()
+        p["framework"] = r["framework"]
+        p["variant"] = r["variant"]
+        rows.append(p)
+
+    pp = pd.concat(rows, ignore_index=True)
+    pp["sig_5pct"] = pp["Robust p-value"] < 0.05
+
+    # Tabla compacta de valores
+    val_tab = (
+        pp.pivot_table(
+            index=["framework", "Param"],
+            columns="variant",
+            values="Value",
+            aggfunc="first",
+        )
+        .reset_index()
+    )
+    print("=== Valores por parámetro y variante ===")
+    display(val_tab)
+
+    # Tabla compacta de significancia
+    sig_tab = (
+        pp.pivot_table(
+            index=["framework", "Param"],
+            columns="variant",
+            values="sig_5pct",
+            aggfunc="first",
+        )
+        .reset_index()
+    )
+    print("=== Significancia (p < 0.05) por parámetro y variante ===")
+    display(sig_tab)
+```
+
+## 6.2) Diagnósticos de identificación y estabilidad
+
+```{python}
+#| label: identification-diagnostics
+print("label: identification-diagnostics")
+
+if 'comp' not in locals() or comp.empty:
+    print("⚠️ Ejecuta primero `load-and-compare` con resultados disponibles.")
+else:
+    # --- A) % de parámetros significativos por variante/framework ---
+    sig_rows = []
+    for _, r in comp.iterrows():
+        p = pd.read_csv(Path(r["params_path"]))
+        p_col = "Robust p-value" if "Robust p-value" in p.columns else "Rob. p-value"
+        if p_col not in p.columns:
+            continue
+        n_params = len(p)
+        n_sig_05 = (p[p_col] < 0.05).sum()
+        n_sig_01 = (p[p_col] < 0.01).sum()
+        sig_rows.append({
+            "framework": r["framework"],
+            "variant": r["variant"],
+            "k_params": n_params,
+            "n_sig_05": int(n_sig_05),
+            "pct_sig_05": round(n_sig_05 / n_params * 100, 1) if n_params > 0 else 0,
+            "n_sig_01": int(n_sig_01),
+            "pct_sig_01": round(n_sig_01 / n_params * 100, 1) if n_params > 0 else 0,
+        })
+
+    if sig_rows:
+        sig_df = pd.DataFrame(sig_rows).sort_values(["framework", "variant"]).reset_index(drop=True)
+        print("=== Identificación: % de parámetros significativos ===")
+        display(sig_df)
+    else:
+        print("⚠️ No se pudieron calcular diagnósticos de significancia.")
+
+    # --- B) Estabilidad cross-framework ---
+    frameworks_present = comp["framework"].unique()
+    if len(frameworks_present) >= 2:
+        print("\n=== Estabilidad cross-framework (Biogeme vs Larch) ===")
+        stability_rows = []
+        for variant_name in comp["variant"].unique():
+            fw_params = {}
+            for fw in frameworks_present:
+                row = comp[(comp["framework"] == fw) & (comp["variant"] == variant_name)]
+                if row.empty:
+                    continue
+                p = pd.read_csv(Path(row.iloc[0]["params_path"]))
+                name_col = "Param" if "Param" in p.columns else "Name"
+                if name_col not in p.columns:
+                    continue
+                p["param_clean"] = p[name_col].str.replace(f"_{PARTITION}", "", regex=False)
+                fw_params[fw] = p.set_index("param_clean")["Value"]
+
+            if len(fw_params) < 2:
+                continue
+            fws = list(fw_params.keys())
+            merged = pd.DataFrame({
+                fws[0]: fw_params[fws[0]],
+                fws[1]: fw_params[fws[1]],
+            }).dropna()
+            if merged.empty:
+                continue
+
+            abs_diff = (merged[fws[0]] - merged[fws[1]]).abs()
+            denom = merged.abs().mean(axis=1).replace(0, np.nan)
+            rel_diff = (abs_diff / denom).dropna()
+
+            stability_rows.append({
+                "variant": variant_name,
+                "n_common_params": len(merged),
+                "mean_abs_diff": round(abs_diff.mean(), 6),
+                "max_abs_diff": round(abs_diff.max(), 6),
+                "mean_rel_diff_pct": round(rel_diff.mean() * 100, 2),
+                "max_rel_diff_pct": round(rel_diff.max() * 100, 2),
+                "params_rel_diff_gt_10pct": int((rel_diff > 0.10).sum()),
+            })
+
+        if stability_rows:
+            stab_df = pd.DataFrame(stability_rows)
+            display(stab_df)
+
+            print("\n=== Detalle: parámetros con mayor diferencia relativa (>5%) ===")
+            for variant_name in comp["variant"].unique():
+                fw_params = {}
+                for fw in frameworks_present:
+                    row = comp[(comp["framework"] == fw) & (comp["variant"] == variant_name)]
+                    if row.empty:
+                        continue
+                    p = pd.read_csv(Path(row.iloc[0]["params_path"]))
+                    name_col = "Param" if "Param" in p.columns else "Name"
+                    if name_col not in p.columns:
+                        continue
+                    p["param_clean"] = p[name_col].str.replace(f"_{PARTITION}", "", regex=False)
+                    fw_params[fw] = p.set_index("param_clean")["Value"]
+                if len(fw_params) < 2:
+                    continue
+                fws = list(fw_params.keys())
+                merged = pd.DataFrame({fws[0]: fw_params[fws[0]], fws[1]: fw_params[fws[1]]}).dropna()
+                if merged.empty:
+                    continue
+                abs_diff = (merged[fws[0]] - merged[fws[1]]).abs()
+                denom = merged.abs().mean(axis=1).replace(0, np.nan)
+                rel_diff = (abs_diff / denom).dropna()
+                unstable = rel_diff[rel_diff > 0.05].sort_values(ascending=False)
+                if not unstable.empty:
+                    print(f"\n  {variant_name}: {len(unstable)} parámetros con rel_diff > 5%")
+                    detail = pd.DataFrame({
+                        fws[0]: merged.loc[unstable.index, fws[0]],
+                        fws[1]: merged.loc[unstable.index, fws[1]],
+                        "rel_diff_pct": (rel_diff.loc[unstable.index] * 100).round(2),
+                    })
+                    display(detail)
+        else:
+            print("⚠️ No hay variantes con resultados en ambos frameworks.")
+    else:
+        print("ℹ️ Solo un framework disponible — no se puede comparar estabilidad cross-framework.")
+        print("   Activa RUN_LARCH=True para habilitar este diagnóstico.")
+```
+
+## 7) Guía de decisión (parsimonia)
+
+Criterios de selección **objetivos** (sin imponer signos a priori):
+
+1. **Identificación**: preferir la variante con mayor % de parámetros significativos (p < 0.05). Si un modelo tiene muchos coeficientes no significativos, está sobre-parametrizado para lo que los datos pueden separar.
+2. **Estabilidad cross-framework**: si ambos frameworks están disponibles, preferir la variante con menor diferencia relativa entre Biogeme y Larch. Un modelo bien identificado debería dar valores casi idénticos en ambos.
+3. **Parsimonia (AIC/BIC)**: entre variantes con identificación comparable, preferir la de menor AIC/BIC. Esto penaliza parámetros que no aportan ajuste.
+4. **Ajuste (Rho^2 / LL)**: verificar que la simplificación no degrade el ajuste de manera material. Una caída de Rho^2 < 0.005 suele ser aceptable si mejora los otros criterios.
+
+Orden sugerido de evaluación:
+
+1. `full` vs `no_ntr` vs `no_tet` — evaluar si reducir el bloque de trasbordo mejora identificación sin perder ajuste.
+2. `generic` y `mixed_tei_specific` — evaluar si reducir colinealidad cross-alternative mejora significancia y estabilidad.
+3. `diff_vs_bip` — evaluar si la reparametrización relativa produce un modelo bien identificado con interpretación distinta.
