@@ -31,17 +31,22 @@ while PROJECT_ROOT != PROJECT_ROOT.parent:
 
 from config import USE_LOCAL_PATHS, LOCAL_SILVER_PATH, GCS_SILVER_PATH
 from lib.datalake import read_parquet_portable
-from lib.transbordos_metro.metro_graph_builder import normalize_station_name, shortest_path_with_line
+from lib.transbordos_metro.metro_graph_builder import (
+    base_line_code,
+    matching_line_ids,
+    normalize_station_name,
+    shortest_path_same_line,
+    shortest_path_with_line,
+)
 ```
 
 # Parámetros
 
 ```{python}
 #| label: params
-YEAR_ANALISIS = 2025
+YEAR_ANALISIS = 2024
 WEEK_ANALISIS = 17
 PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
-GTFS_VERSION = "GTFS_20250412"  # la que aplica a 2025-04-21 (semana 17)
 
 RECON_PATH = PROJECT_ROOT / "01_processing" / "tmp" / f"etapas_reconstruidas_{PARTITION_LABEL}.parquet"
 if not RECON_PATH.exists():
@@ -50,7 +55,6 @@ if not RECON_PATH.exists():
     if alt_path.exists():
         RECON_PATH = alt_path
 print("Partición reconstruida:", RECON_PATH)
-print("GTFS:", GTFS_VERSION)
 ```
 
 # Carga de datos: viajes (Lazy)
@@ -82,16 +86,149 @@ else:
 
 ```{python}
 #| label: load-gtfs
-GTFS_DIR = PROJECT_ROOT / "config" / "GTFS" / GTFS_VERSION
-routes = pl.read_csv(GTFS_DIR / "routes.txt", schema_overrides={"route_id": pl.Utf8, "route_type": pl.Int64})
-trips = pl.read_csv(GTFS_DIR / "trips.txt", schema_overrides={"route_id": pl.Utf8, "trip_id": pl.Utf8, "direction_id": pl.Int64})
-freq = pl.read_csv(GTFS_DIR / "frequencies.txt", schema_overrides={"trip_id": pl.Utf8, "start_time": pl.Utf8, "end_time": pl.Utf8, "headway_secs": pl.Int64})
-stop_times = pl.read_csv(GTFS_DIR / "stop_times.txt", schema_overrides={"trip_id": pl.Utf8, "stop_id": pl.Utf8, "arrival_time": pl.Utf8, "departure_time": pl.Utf8})
-stops = pl.read_csv(GTFS_DIR / "stops.txt", schema_overrides={"stop_id": pl.Utf8, "stop_name": pl.Utf8, "parent_station": pl.Utf8})
+from datetime import date
+from lib.gtfs_manifest import build_manifest, pick_version_for_date
+
+manifest_gtfs = build_manifest(PROJECT_ROOT / "config" / "GTFS")
+week_service_dates = [date.fromisocalendar(YEAR_ANALISIS, WEEK_ANALISIS, d) for d in range(1, 8)]
+versions_in_week = {d: pick_version_for_date(d, manifest_gtfs) for d in week_service_dates}
+missing_versions = [d for d, v in versions_in_week.items() if v is None]
+if missing_versions:
+    raise ValueError(f"No hay GTFS válido para todas las fechas de {PARTITION_LABEL}: {missing_versions}")
+
+week_gtfs_folders = sorted({v.folder for v in versions_in_week.values() if v is not None})
+if len(week_gtfs_folders) != 1:
+    raise ValueError(
+        f"La semana {PARTITION_LABEL} cruza múltiples versiones GTFS {week_gtfs_folders}. "
+        "Este notebook actualmente asume una sola versión por semana."
+    )
+
+service_date = week_service_dates[0]
+version_for_date = versions_in_week[service_date]
+GTFS_DIR = version_for_date.path
+print(f"GTFS seleccionado para {PARTITION_LABEL}: {version_for_date.folder} (vigente desde {version_for_date.valid_from} hasta {version_for_date.valid_to})")
+
+def read_gtfs_csv(path: Path, schema_overrides: dict[str, pl.DataType]) -> pl.DataFrame:
+    # Algunos GTFS mezclan valores numericos y alfanumericos (ej. route_short_name = "105c"),
+    # por eso forzamos texto en columnas clave y ampliamos la inferencia de schema.
+    return pl.read_csv(
+        path,
+        schema_overrides=schema_overrides,
+        infer_schema_length=10000,
+        truncate_ragged_lines=True,
+    )
+
+routes = read_gtfs_csv(
+    GTFS_DIR / "routes.txt",
+    schema_overrides={
+        "route_id": pl.Utf8,
+        "route_short_name": pl.Utf8,
+        "route_long_name": pl.Utf8,
+        "route_desc": pl.Utf8,
+        "route_type": pl.Int64,
+        "route_color": pl.Utf8,
+        "route_text_color": pl.Utf8,
+    },
+)
+trips = read_gtfs_csv(
+    GTFS_DIR / "trips.txt",
+    schema_overrides={
+        "route_id": pl.Utf8,
+        "trip_id": pl.Utf8,
+        "service_id": pl.Utf8,
+        "trip_headsign": pl.Utf8,
+        "trip_short_name": pl.Utf8,
+        "direction_id": pl.Int64,
+        "block_id": pl.Utf8,
+        "shape_id": pl.Utf8,
+    },
+)
+freq = read_gtfs_csv(
+    GTFS_DIR / "frequencies.txt",
+    schema_overrides={
+        "trip_id": pl.Utf8,
+        "start_time": pl.Utf8,
+        "end_time": pl.Utf8,
+        "headway_secs": pl.Int64,
+    },
+)
+calendar = read_gtfs_csv(
+    GTFS_DIR / "calendar.txt",
+    schema_overrides={
+        "service_id": pl.Utf8,
+        "monday": pl.Int64,
+        "tuesday": pl.Int64,
+        "wednesday": pl.Int64,
+        "thursday": pl.Int64,
+        "friday": pl.Int64,
+        "saturday": pl.Int64,
+        "sunday": pl.Int64,
+        "start_date": pl.Int64,
+        "end_date": pl.Int64,
+    },
+)
+calendar_dates_path = GTFS_DIR / "calendar_dates.txt"
+if calendar_dates_path.exists():
+    calendar_dates = read_gtfs_csv(
+        calendar_dates_path,
+        schema_overrides={
+            "service_id": pl.Utf8,
+            "date": pl.Int64,
+            "exception_type": pl.Int64,
+        },
+    )
+else:
+    calendar_dates = pl.DataFrame(
+        schema={
+            "service_id": pl.Utf8,
+            "date": pl.Int64,
+            "exception_type": pl.Int64,
+        }
+    )
+stop_times = read_gtfs_csv(
+    GTFS_DIR / "stop_times.txt",
+    schema_overrides={
+        "trip_id": pl.Utf8,
+        "arrival_time": pl.Utf8,
+        "departure_time": pl.Utf8,
+        "stop_id": pl.Utf8,
+    },
+)
+stops = read_gtfs_csv(
+    GTFS_DIR / "stops.txt",
+    schema_overrides={
+        "stop_id": pl.Utf8,
+        "stop_code": pl.Utf8,
+        "stop_name": pl.Utf8,
+        "stop_lat": pl.Float64,
+        "stop_lon": pl.Float64,
+        "stop_desc": pl.Utf8,
+        "zone_id": pl.Utf8,
+        "stop_url": pl.Utf8,
+        "parent_station": pl.Utf8,
+        "platform_code": pl.Utf8,
+        "wheelchair_boarding": pl.Utf8,
+    },
+)
 
 routes_metro = routes.filter(pl.col("route_type") == 1)
 metro_route_ids = routes_metro["route_id"].to_list()
 print("Rutas Metro en GTFS:", metro_route_ids)
+
+DAY_COLS = {
+    0: "monday",
+    1: "tuesday",
+    2: "wednesday",
+    3: "thursday",
+    4: "friday",
+    5: "saturday",
+    6: "sunday",
+}
+
+def yyyymmdd(d: date) -> int:
+    return int(d.strftime("%Y%m%d"))
+
+PARTITION_START_DATE = date.fromisocalendar(YEAR_ANALISIS, WEEK_ANALISIS, 1)
 ```
 
 ## Carga del grafo Metro
@@ -100,8 +237,6 @@ print("Rutas Metro en GTFS:", metro_route_ids)
 #| label: load-metro-graph
 import pickle
 import networkx as nx
-from datetime import date
-from lib.gtfs_manifest import build_manifest, pick_version_for_date
 
 GRAPH_DIR = PROJECT_ROOT / "01_processing" / "metro_graphs"
 GRAPH_MANIFEST = GRAPH_DIR / "manifest_graphs.parquet"
@@ -114,14 +249,7 @@ def load_graph_by_folder(folder: str) -> nx.Graph:
     with open(path, "rb") as f:
         return pickle.load(f)
 
-manifest_gtfs = build_manifest(PROJECT_ROOT / "config" / "GTFS")
 print(f"GTFS en manifest: {[m.folder for m in manifest_gtfs]}")
-
-# Seleccionar y cargar el grafo según la fecha de la partición
-service_date = date.fromisocalendar(YEAR_ANALISIS, WEEK_ANALISIS, 1)
-version_for_date = pick_version_for_date(service_date, manifest_gtfs)
-if version_for_date is None:
-    raise ValueError(f"No GTFS válido para {service_date}")
 
 G_metro = load_graph_by_folder(version_for_date.folder)
 print(f"✅ Grafo cargado ({version_for_date.folder}) para {service_date}: {G_metro.number_of_nodes()} nodos, {G_metro.number_of_edges()} aristas.")
@@ -141,26 +269,21 @@ else:
     freq_buses = pl.DataFrame()
 
 # Crear diccionario de frecuencias para búsqueda rápida O(1)
-# Clave: (Paradero, ServicioSentido, Hora_int) -> Valor: freq_buses_h
-# Hora_int: 0..23
+# Clave: (Paradero, ServicioSentido, Fecha, Hora_int) -> Valor: freq_buses_h
+# La fecha es crítica para no colapsar silenciosamente los 7 días de la semana.
 freq_bus_dict = {}
 if not freq_buses.is_empty():
-    # Asumimos que hour_start es datetime, extraemos la hora
-    # Ojo: hour_start en el parquet generado en 05 es datetime.
-    # Vamos a iterar y llenar el dict.
     print("Construyendo índice de frecuencias de buses...")
     for row in freq_buses.select(["Paradero", "ServicioSentido", "hour_start", "freq_buses_h"]).iter_rows():
         par, srv, h_dt, f = row
         if h_dt is not None:
-            h_int = h_dt.hour
-            freq_bus_dict[(par, srv, h_int)] = f
+            freq_bus_dict[(par, srv, h_dt.date(), h_dt.hour)] = f
     print(f"✅ Índice de frecuencias construido: {len(freq_bus_dict):,} entradas")
 
-def get_bus_freq(paradero, servicio, hora_time):
-    if not paradero or not servicio or hora_time is None:
+def get_bus_freq(paradero, servicio, hora_dt):
+    if not paradero or not servicio or hora_dt is None:
         return None
-    h_int = hora_time.hour
-    return freq_bus_dict.get((paradero, servicio, h_int))
+    return freq_bus_dict.get((paradero, servicio, hora_dt.date(), hora_dt.hour))
 
 def wt_bus_seconds(freq_h):
     if freq_h is None or freq_h <= 0:
@@ -176,6 +299,19 @@ def wt_bus_seconds(freq_h):
 # trips de metro
 trips_metro = trips.filter(pl.col("route_id").is_in(metro_route_ids))
 stop_times_metro = stop_times.join(trips_metro, on="trip_id", how="inner").join(stops, on="stop_id", how="left")
+route_base_by_id = {
+    row["route_id"]: row["route_short_name"]
+    for row in routes_metro.select(["route_id", "route_short_name"]).iter_rows(named=True)
+}
+trip_ids_by_route_service_dir = {
+    (row["route_id"], row["service_id"], row["direction_id"]): row["trip_id"]
+    for row in (
+        trips_metro
+        .group_by(["route_id", "service_id", "direction_id"])
+        .agg(pl.col("trip_id"))
+        .iter_rows(named=True)
+    )
+}
 
 # Función para normalizar stop_name a estación (sin "Dirección")
 def station_from_stop_name(name: str) -> str:
@@ -226,7 +362,7 @@ from datetime import time
 
 def variants_covering(station_sub, station_baj, line_base, direction):
     """Devuelve lista de route_id (variante) que cubren ambas estaciones en la dirección dada."""
-    candidates = [r for r in metro_route_ids if r.startswith(line_base)]
+    candidates = matching_line_ids(line_base, metro_route_ids)
     vals = []
     for rid in candidates:
         stations_list = variant_cov.filter(
@@ -263,67 +399,126 @@ def valid_directions_by_order(station_sub, station_baj, line_base):
 
 ```{python}
 #| label: headway-equivalent
-def headway_equiv_minutes(station_sub, station_baj, line_base, directions, hora: time):
-    """Devuelve headway equivalente (min) y variantes usadas, considerando solo directions válidas."""
-    variants_all = []
-    for d in directions:
-        variants_all.extend(variants_covering(station_sub, station_baj, line_base, d))
-    variants_all = list(set(variants_all))
-    if not variants_all:
-        return None, []
+from functools import lru_cache
+
+@lru_cache(maxsize=16)
+def active_service_ids_for_date(service_date: date) -> frozenset[str]:
+    day_col = DAY_COLS[service_date.weekday()]
+    active = set(
+        calendar.filter(
+            (pl.col(day_col) == 1)
+            & (pl.col("start_date") <= yyyymmdd(service_date))
+            & (pl.col("end_date") >= yyyymmdd(service_date))
+        )["service_id"].to_list()
+    )
+    if calendar_dates.height > 0:
+        exceptions = calendar_dates.filter(pl.col("date") == yyyymmdd(service_date))
+        added = set(exceptions.filter(pl.col("exception_type") == 1)["service_id"].to_list())
+        removed = set(exceptions.filter(pl.col("exception_type") == 2)["service_id"].to_list())
+        active = (active | added) - removed
+    return frozenset(active)
+
+def variant_headway_minutes(route_trip_ids: list[str], hora: time):
+    """Headway equivalente (min) para una variante/dirección específica."""
+    if not route_trip_ids:
+        return None
     freq_ok = freq.filter(
-        pl.col("trip_id").is_in(
-            trips_metro.filter(pl.col("route_id").is_in(variants_all))["trip_id"].to_list()
-        )
+        pl.col("trip_id").is_in(route_trip_ids)
         & (pl.col("start_time") <= hora)
         & (pl.col("end_time") > hora)
     )
-    # si no hay franja que contenga la hora, usar la franja más cercana (snap)
     if freq_ok.is_empty():
-        freq_route = freq.filter(pl.col("trip_id").is_in(
-            trips_metro.filter(pl.col("route_id").is_in(variants_all))["trip_id"].to_list()
-        ))
+        freq_route = freq.filter(pl.col("trip_id").is_in(route_trip_ids))
         if freq_route.is_empty():
-            return None, variants_all
-        # distancia en segundos a start_time y end_time
+            return None
+
         def dist_to_interval(row):
             st, et = row["start_time"], row["end_time"]
             if hora < st:
-                return (st.hour*3600+st.minute*60+st.second) - (hora.hour*3600+hora.minute*60+hora.second)
+                return (st.hour * 3600 + st.minute * 60 + st.second) - (
+                    hora.hour * 3600 + hora.minute * 60 + hora.second
+                )
             if hora > et:
-                return (hora.hour*3600+hora.minute*60+hora.second) - (et.hour*3600+et.minute*60+et.second)
+                return (hora.hour * 3600 + hora.minute * 60 + hora.second) - (
+                    et.hour * 3600 + et.minute * 60 + et.second
+                )
             return 0
-        freq_route = freq_route.with_columns(
-            pl.struct(["start_time","end_time"]).map_elements(dist_to_interval, return_dtype=pl.Int64).alias("dist_sec")
-        ).sort("dist_sec")
-        freq_ok = freq_route.head(1)
-    # ---
+
+        freq_ok = (
+            freq_route.with_columns(
+                pl.struct(["start_time", "end_time"])
+                .map_elements(dist_to_interval, return_dtype=pl.Int64)
+                .alias("dist_sec")
+            )
+            .sort("dist_sec")
+            .head(1)
+        )
     if freq_ok.is_empty():
-        return None, variants_all
-    h_list = freq_ok["headway_min"].to_list()
-    h_list = [h for h in h_list if h and h>0]
+        return None
+    h_list = [h for h in freq_ok["headway_min"].to_list() if h and h > 0]
     if not h_list:
-        return None, variants_all
-    freq_sum = sum(1.0/h for h in h_list)
+        return None
+    freq_sum = sum(1.0 / h for h in h_list)
     if freq_sum == 0:
-        return None, variants_all
+        return None
+    return 1.0 / freq_sum
+
+def active_variant_records(station_sub, station_baj, line_decl, directions, hora: time, service_date: date):
+    """Variantes activas que cubren la etapa, con su headway equivalente individual."""
+    variants_dir = []
+    for d in directions:
+        variants_dir.extend((rid, d) for rid in variants_covering(station_sub, station_baj, line_decl, d))
+    variants_dir = list(set(variants_dir))
+    if not variants_dir:
+        return []
+    active_services = active_service_ids_for_date(service_date)
+    if not active_services:
+        return []
+    records = []
+    for rid, direction in variants_dir:
+        trip_ids = []
+        for service_id in active_services:
+            trip_ids.extend(trip_ids_by_route_service_dir.get((rid, service_id, direction), []))
+        trip_ids = list(set(trip_ids))
+        headway_min = variant_headway_minutes(trip_ids, hora)
+        if headway_min is None:
+            continue
+        records.append(
+            {
+                "route_id": rid,
+                "direction": direction,
+                "headway_min": headway_min,
+            }
+        )
+    return records
+
+def headway_equiv_minutes(station_sub, station_baj, line_decl, directions, hora: time, service_date: date):
+    """Devuelve headway equivalente (min) y variantes activas usadas."""
+    records = active_variant_records(station_sub, station_baj, line_decl, directions, hora, service_date)
+    if not records:
+        return None, []
+    freq_sum = sum(1.0 / rec["headway_min"] for rec in records if rec["headway_min"] > 0)
+    if freq_sum == 0:
+        return None, []
     h_eq = 1.0 / freq_sum
-    return h_eq, variants_all
+    return h_eq, sorted({rec["route_id"] for rec in records})
 ```
 
 ## Aplicar a viajes Metro: nuevas columnas `te*_calculado`
 
 ```{python}
 #| label: compute-te
-from datetime import time as dtime, datetime
+from datetime import time as dtime, datetime, timedelta
 
 def parse_time_str(s):
     """Parsea un string de tiempo, manejando el formato 24:00:00."""
     if s is None:
         return None
+    if isinstance(s, datetime):
+        return s.time()
     try:
         # Reemplazar "24:00:00" que es inválido por un valor manejable
-        if s.startswith("24:"):
+        if isinstance(s, str) and s.startswith("24:"):
             s = f"00:{s[3:]}"
         
         # Intentar parsear el tiempo
@@ -337,36 +532,186 @@ def parse_time_str(s):
         except Exception:
             return None
 
-def te_best_direction(sub, baj, srv, hora_str):
+def parse_stage_datetime(value, default_date=None):
+    """Parsea timestamps de etapas preservando fecha cuando existe."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if hasattr(value, "year") and hasattr(value, "month") and hasattr(value, "day") and not isinstance(value, str):
+        return datetime.combine(value, dtime(0, 0, 0))
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    if "T" in raw or " " in raw[:19]:
+        try:
+            return datetime.fromisoformat(raw.replace("T", " "))
+        except Exception:
+            pass
+
+    rolled_day = False
+    if raw.startswith("24:"):
+        raw = f"00:{raw[3:]}"
+        rolled_day = True
+
+    clock = parse_time_str(raw)
+    if clock is None or default_date is None:
+        return None
+
+    dt_value = datetime.combine(default_date, clock)
+    if rolled_day:
+        dt_value += timedelta(days=1)
+    return dt_value
+
+TRANSFER_FALLBACK_SECONDS = 170.0
+
+def observed_transfer_seconds_from_row(row, stage_num):
+    if stage_num <= 1:
+        return None
+    raw = row.get(f"tc{stage_num - 1}")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+def observed_duration_seconds(start_value, end_value, default_date):
+    start_dt = parse_stage_datetime(start_value, default_date)
+    if start_dt is None:
+        return None
+    end_dt = parse_stage_datetime(end_value, start_dt.date())
+    if end_dt is None:
+        return None
+    if end_dt < start_dt and " " not in str(end_value) and "T" not in str(end_value):
+        end_dt += timedelta(days=1)
+    delta = (end_dt - start_dt).total_seconds()
+    return delta if delta >= 0 else None
+
+def parse_service_date(value):
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s).date()
+    except Exception:
+        pass
+    try:
+        return date.fromisoformat(s[:10])
+    except Exception:
+        return None
+
+def infer_service_date_from_row(row):
+    for col in ("fecha", "tiempo_subida_1", "tiempo_inicio_viaje"):
+        parsed = parse_service_date(row.get(col))
+        if parsed is not None:
+            return parsed
+    return PARTITION_START_DATE
+
+def structural_variants_covering(sub_n, baj_n, srv):
+    line_decl = str(srv).strip().upper()
+    variants = set()
+    for d in (0, 1):
+        variants.update(variants_covering(sub_n, baj_n, line_decl, d))
+    return sorted(variants)
+
+def stage_variant_context(sub, baj, srv, hora_str, service_date):
+    """Resolve active/structural variants for one Metro stage."""
+    if not all([sub, baj, srv, hora_str]) or service_date is None:
+        return None
+
+    hora_viaje = parse_time_str(hora_str)
+    if hora_viaje is None:
+        return None
+
+    sub_n = normalize_station_name(sub)
+    baj_n = normalize_station_name(baj)
+    line_decl = str(srv).strip().upper()
+    structural_variants = structural_variants_covering(sub_n, baj_n, line_decl)
+    valid_dirs = valid_directions_by_order(sub_n, baj_n, line_decl)
+    if not valid_dirs:
+        valid_dirs = [d for d in (0, 1) if variants_covering(sub_n, baj_n, line_decl, d)]
+    active_records = (
+        active_variant_records(sub_n, baj_n, line_decl, valid_dirs, hora_viaje, service_date)
+        if valid_dirs
+        else []
+    )
+    return {
+        "sub_n": sub_n,
+        "baj_n": baj_n,
+        "line_decl": line_decl,
+        "hora_viaje": hora_viaje,
+        "valid_dirs": valid_dirs,
+        "structural_variants": structural_variants,
+        "active_records": active_records,
+    }
+
+def te_best_direction(sub, baj, srv, hora_str, service_date):
     """
     Calcula el tiempo de espera (headway/2) para una etapa de metro,
     encontrando la dirección y variantes correctas.
     """
-    if not all([sub, baj, srv, hora_str]):
+    ctx = stage_variant_context(sub, baj, srv, hora_str, service_date)
+    if ctx is None:
         return None
-    
-    hora_viaje = parse_time_str(hora_str)
-    if hora_viaje is None:
+    if not ctx["valid_dirs"]:
         return None
-        
-    sub_n = normalize_station_name(sub)
-    baj_n = normalize_station_name(baj)
-    line_base = str(srv).strip().upper()
-
-    # Determinar direcciones válidas basadas en el orden de las estaciones
-    valid_dirs = valid_directions_by_order(sub_n, baj_n, line_base)
-    if not valid_dirs:
-        # Fallback: si el orden falla, buscar cualquier dirección que contenga ambas estaciones
-        valid_dirs = [d for d in (0, 1) if variants_covering(sub_n, baj_n, line_base, d)]
-
-    if not valid_dirs:
-        return None
-
-    # Calcular headway equivalente considerando todas las direcciones válidas
-    h_eq, _ = headway_equiv_minutes(sub_n, baj_n, line_base, valid_dirs, hora_viaje)
-    
+    h_eq, _ = headway_equiv_minutes(
+        ctx["sub_n"],
+        ctx["baj_n"],
+        ctx["line_decl"],
+        ctx["valid_dirs"],
+        ctx["hora_viaje"],
+        service_date,
+    )
     # El tiempo de espera es la mitad del headway equivalente, en segundos
     return h_eq / 2 * 60 if h_eq is not None else None
+
+def metro_variant_conflict(sub, baj, srv, hora_str, service_date):
+    """Flag Metro stages that only work in the aggregated line, not in an active real variant."""
+    ctx = stage_variant_context(sub, baj, srv, hora_str, service_date)
+    if ctx is None:
+        return False
+    line_decl = ctx["line_decl"]
+    # Only flag commercial lines with multiple GTFS variants.
+    if len(matching_line_ids(line_decl, metro_route_ids)) <= 1:
+        return False
+    return bool(ctx["structural_variants"]) and not bool(ctx["active_records"])
+
+def tv_best_variant_seconds(sub, baj, srv, hora_str, service_date):
+    """Frequency-weighted in-vehicle time across active variants covering the stage."""
+    ctx = stage_variant_context(sub, baj, srv, hora_str, service_date)
+    if ctx is None or not ctx["active_records"]:
+        return None
+
+    weighted = []
+    for rec in ctx["active_records"]:
+        dist_min, _ = shortest_path_same_line(
+            G_metro,
+            sub,
+            rec["route_id"],
+            baj,
+        )
+        if dist_min is None or rec["headway_min"] <= 0:
+            continue
+        lambda_i = 1.0 / rec["headway_min"]
+        weighted.append((lambda_i, dist_min * 60.0))
+
+    if not weighted:
+        return None
+    lambda_sum = sum(w for w, _ in weighted)
+    if lambda_sum == 0:
+        return None
+    return sum(w * tv for w, tv in weighted) / lambda_sum
 
 def add_te_calculado(df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -377,14 +722,14 @@ def add_te_calculado(df: pl.DataFrame) -> pl.DataFrame:
     """
     # El tiempo de referencia para todo el viaje es el inicio de la primera etapa.
     hora_referencia_col = "tiempo_subida_1" 
-    from datetime import datetime, date, timedelta
-    
     result_rows = []
     # Usamos iter_rows ya que la lógica de encadenamiento de tiempos es secuencial por fila
     for row in df.iter_rows(named=True):
+        service_date = infer_service_date_from_row(row)
         waits = [None] * 6  # te0_calculado..te5_calculado en segundos (etapas 1-6)
         travel_times_veh = [None] * 6 # tv1_calculado..tv6_calculado en segundos (etapas 1-6)
-        times_imputed = [None] * 6  # tiempo_subida_i imputado/observado como datetime.time
+        stage_datetimes = [None] * 6  # tiempo_subida_i observado/imputado como datetime
+        variant_conflicts = [False] * 6
 
         # --- Lógica para la etapa 1 (índice 0 en waits/travel_times_veh) ---
         srv1 = row.get("srv_1")
@@ -392,31 +737,51 @@ def add_te_calculado(df: pl.DataFrame) -> pl.DataFrame:
         
         if srv1:
             # Hora de referencia es la observada para la etapa 1
-            t1 = parse_time_str(row.get(hora_referencia_col))
-            times_imputed[0] = t1
+            t1_dt = parse_stage_datetime(row.get(hora_referencia_col), service_date)
+            stage_datetimes[0] = t1_dt
             
             if tipo1 == "2" or srv1 in ("L1","L2","L3","L4","L4A","L5","L6"): # Metro
                 # Calcular te0_calculado (espera antes de etapa 1)
-                waits[0] = te_best_direction(row.get("paradero_subida_1"), row.get("paradero_bajada_1"), srv1, row.get(hora_referencia_col))
+                hora_stage = t1_dt.time().replace(microsecond=0).isoformat() if t1_dt is not None else None
+                current_service_date = t1_dt.date() if t1_dt is not None else service_date
+                waits[0] = te_best_direction(
+                    row.get("paradero_subida_1"),
+                    row.get("paradero_bajada_1"),
+                    srv1,
+                    hora_stage,
+                    current_service_date,
+                )
+                variant_conflicts[0] = metro_variant_conflict(
+                    row.get("paradero_subida_1"),
+                    row.get("paradero_bajada_1"),
+                    srv1,
+                    hora_stage,
+                    current_service_date,
+                )
                 
                 # Calcular tv1_calculado (tiempo en vehículo etapa 1)
                 try:
-                    dist_min, _ = shortest_path_with_line(G_metro, row.get("paradero_subida_1"), srv1, row.get("paradero_bajada_1"))
-                    travel_times_veh[0] = dist_min * 60 if dist_min is not None else None
+                    travel_times_veh[0] = tv_best_variant_seconds(
+                        row.get("paradero_subida_1"),
+                        row.get("paradero_bajada_1"),
+                        srv1,
+                        hora_stage,
+                        current_service_date,
+                    )
                 except Exception:
                     travel_times_veh[0] = None
             
             elif tipo1 in ("1", "3"): # Bus
                 # Calcular te0_calculado usando frecuencias
-                f = get_bus_freq(row.get("paradero_subida_1"), srv1, t1)
+                f = get_bus_freq(row.get("paradero_subida_1"), srv1, t1_dt)
                 waits[0] = wt_bus_seconds(f)
                 
                 # Calcular tv1_calculado usando observado (si existe)
-                ts = parse_time_str(row.get("tiempo_subida_1"))
-                tb = parse_time_str(row.get("tiempo_bajada_1"))
-                if ts and tb:
-                    d1 = datetime.combine(date.min, tb) - datetime.combine(date.min, ts)
-                    travel_times_veh[0] = d1.total_seconds()
+                travel_times_veh[0] = observed_duration_seconds(
+                    row.get("tiempo_subida_1"),
+                    row.get("tiempo_bajada_1"),
+                    service_date,
+                )
 
         # --- Lógica para etapas 2 a 6 (índices 1 a 5 en waits/travel_times_veh) ---
         for i in range(2, 7): # i representa el número de etapa (2, 3, 4, 5, 6)
@@ -428,45 +793,63 @@ def add_te_calculado(df: pl.DataFrame) -> pl.DataFrame:
                 continue
 
             # Hora de la etapa actual: observada o imputada
-            obs_time = parse_time_str(row.get(f"tiempo_subida_{i}"))
-            if obs_time is not None:
-                times_imputed[idx_calc] = obs_time
-            elif times_imputed[idx_calc-1] is not None:
-                # Imputar hora de subida a la etapa 'i': hora_subida_anterior + espera_anterior + tiempo_vehiculo_anterior
-                prev_time = times_imputed[idx_calc-1]
-                prev_wait = waits[idx_calc-1] or 0.0 # esperar anterior (teN-1_calculado)
+            default_stage_date = stage_datetimes[idx_calc - 1].date() if stage_datetimes[idx_calc - 1] is not None else service_date
+            obs_dt = parse_stage_datetime(row.get(f"tiempo_subida_{i}"), default_stage_date)
+            if obs_dt is not None:
+                stage_datetimes[idx_calc] = obs_dt
+            elif stage_datetimes[idx_calc - 1] is not None:
+                # Imputar hora de subida a la etapa 'i' desde el embarque anterior:
+                # tiempo en vehiculo previo + transferencia observada (si existe) o fallback.
+                prev_dt = stage_datetimes[idx_calc - 1]
                 prev_travel = travel_times_veh[idx_calc-1] or 0.0 # tiempo vehículo anterior (tvN-1_calculado)
-
-                # Suma prev_wait y prev_travel (ambos en segundos)
-                add_seconds = prev_wait + prev_travel
-                
-                dummy_dt = datetime.combine(date(2000,1,1), prev_time) + timedelta(seconds=add_seconds)
-                times_imputed[idx_calc] = dummy_dt.time()
+                transfer_seconds = observed_transfer_seconds_from_row(row, i) or TRANSFER_FALLBACK_SECONDS
+                add_seconds = prev_travel + transfer_seconds
+                stage_datetimes[idx_calc] = prev_dt + timedelta(seconds=add_seconds)
             
             # Hora para buscar frecuencia/headway
-            current_time = times_imputed[idx_calc]
+            current_dt = stage_datetimes[idx_calc]
             hour_str_for_te = None
-            if current_time:
-                hour_str_for_te = current_time.replace(microsecond=0).isoformat()
+            current_service_date = service_date
+            if current_dt is not None:
+                hour_str_for_te = current_dt.time().replace(microsecond=0).isoformat()
+                current_service_date = current_dt.date()
             
             if tipo == "2" or srv in ("L1","L2","L3","L4","L4A","L5","L6"): # Metro
-                waits[idx_calc] = te_best_direction(row.get(f"paradero_subida_{i}"), row.get(f"paradero_bajada_{i}"), srv, hour_str_for_te)
+                waits[idx_calc] = te_best_direction(
+                    row.get(f"paradero_subida_{i}"),
+                    row.get(f"paradero_bajada_{i}"),
+                    srv,
+                    hour_str_for_te,
+                    current_service_date,
+                )
+                variant_conflicts[idx_calc] = metro_variant_conflict(
+                    row.get(f"paradero_subida_{i}"),
+                    row.get(f"paradero_bajada_{i}"),
+                    srv,
+                    hour_str_for_te,
+                    current_service_date,
+                )
                 try:
-                    dist_min, _ = shortest_path_with_line(G_metro, row.get(f"paradero_subida_{i}"), srv, row.get(f"paradero_bajada_{i}"))
-                    travel_times_veh[idx_calc] = dist_min * 60 if dist_min is not None else None
+                    travel_times_veh[idx_calc] = tv_best_variant_seconds(
+                        row.get(f"paradero_subida_{i}"),
+                        row.get(f"paradero_bajada_{i}"),
+                        srv,
+                        hour_str_for_te,
+                        current_service_date,
+                    )
                 except Exception:
                     travel_times_veh[idx_calc] = None
             
             elif tipo in ("1", "3"): # Bus
-                f = get_bus_freq(row.get(f"paradero_subida_{i}"), srv, current_time)
+                f = get_bus_freq(row.get(f"paradero_subida_{i}"), srv, current_dt)
                 waits[idx_calc] = wt_bus_seconds(f)
                 
                 # TV Bus para propagar
-                ts = parse_time_str(row.get(f"tiempo_subida_{i}"))
-                tb = parse_time_str(row.get(f"tiempo_bajada_{i}"))
-                if ts and tb:
-                     d = datetime.combine(date.min, tb) - datetime.combine(date.min, ts)
-                     travel_times_veh[idx_calc] = d.total_seconds()
+                travel_times_veh[idx_calc] = observed_duration_seconds(
+                    row.get(f"tiempo_subida_{i}"),
+                    row.get(f"tiempo_bajada_{i}"),
+                    current_service_date,
+                )
 
         # --- Construir la fila con los nuevos valores ---
         new_row = dict(row) # Copia la fila original
@@ -488,6 +871,8 @@ def add_te_calculado(df: pl.DataFrame) -> pl.DataFrame:
         new_row["tv4_calculado"] = to_float_or_none(travel_times_veh[3])  # tiempo vehículo etapa 4
         new_row["tv5_calculado"] = to_float_or_none(travel_times_veh[4])  # tiempo vehículo etapa 5
         new_row["tv6_calculado"] = to_float_or_none(travel_times_veh[5])  # tiempo vehículo etapa 6
+        for idx_flag in range(6):
+            new_row[f"metro_variant_conflict_{idx_flag+1}"] = bool(variant_conflicts[idx_flag])
 
         result_rows.append(new_row)
 
@@ -495,6 +880,8 @@ def add_te_calculado(df: pl.DataFrame) -> pl.DataFrame:
     te_tv_schema = {
         "te0_calculado": pl.Float64, "te1_calculado": pl.Float64, "te2_calculado": pl.Float64, "te3_calculado": pl.Float64, "te4_calculado": pl.Float64, "te5_calculado": pl.Float64,
         "tv1_calculado": pl.Float64, "tv2_calculado": pl.Float64, "tv3_calculado": pl.Float64, "tv4_calculado": pl.Float64, "tv5_calculado": pl.Float64, "tv6_calculado": pl.Float64,
+        "metro_variant_conflict_1": pl.Boolean, "metro_variant_conflict_2": pl.Boolean, "metro_variant_conflict_3": pl.Boolean,
+        "metro_variant_conflict_4": pl.Boolean, "metro_variant_conflict_5": pl.Boolean, "metro_variant_conflict_6": pl.Boolean,
     }
     
     # Obtener schema original y actualizar con las nuevas columnas
@@ -535,8 +922,10 @@ for row in dbg.iter_rows(named=True):
     sub = row["paradero_subida_1"]; baj = row["paradero_bajada_1"]; srv = row["srv_1"]; hora = row["tiempo_subida_1"]
     sub_n = normalize_station_name(sub); baj_n = normalize_station_name(baj)
     h = parse_time_str(hora)
+    service_date = infer_service_date_from_row(row)
     dirs = valid_directions_by_order(sub_n, baj_n, srv)
     print(f"\nPK={row['pk_viaje']} {sub} -> {baj} ({srv}) hora={hora}")
+    print("  service_date", service_date, "active_services", sorted(active_service_ids_for_date(service_date)))
     print("  dirs_valid", dirs)
     for d in (0,1):
         vars_d = variants_covering(sub_n, baj_n, srv, d)
@@ -545,19 +934,9 @@ for row in dbg.iter_rows(named=True):
     print("  directions used:", directions)
     if h is None or not directions:
         print("  parse_time None o sin dirs -> te=None"); continue
-    freq_ok = freq.filter(
-        pl.col("trip_id").is_in(trips_metro.filter(pl.col("route_id").is_in(variants_covering(sub_n,baj_n,srv, directions[0])) )["trip_id"].to_list())
-        & (pl.col("start_time") <= h)
-        & (pl.col("end_time") > h)
-    )
-    print("  freq_ok rows:", freq_ok.height)
-    if freq_ok.is_empty():
-        print("  freq_ok vacío -> te=None"); continue
-    h_list = [x for x in freq_ok["headway_min"].to_list() if x and x>0]
-    print("  headways:", h_list)
-    freq_sum = sum(1.0/x for x in h_list)
-    h_eq = 1.0/freq_sum if freq_sum else None
-    print("  h_eq:", h_eq, "te:", h_eq/2 if h_eq else None)
+    h_eq, variants_used = headway_equiv_minutes(sub_n, baj_n, srv, directions, h, service_date)
+    print("  variants_used:", variants_used)
+    print("  h_eq:", h_eq, "te_seconds:", (h_eq / 2 * 60) if h_eq else None)
 
 
 ```
@@ -614,6 +993,78 @@ else:
 #| label: output
 OUT_PATH = PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{PARTITION_LABEL}.parquet"
 
+def filter_model_ready_rows(df: pl.DataFrame, max_stages: int = 6) -> tuple[pl.DataFrame, dict[str, int]]:
+    schema_names = set(df.columns)
+    block_exprs = []
+    missing_service_terms = []
+    for stage_num in range(1, max_stages + 1):
+        present_checks = []
+        for base in (
+            "srv", "tipo_transporte", "paradero_subida", "paradero_bajada",
+            "tiempo_subida", "tiempo_bajada", "zona_subida", "zona_bajada",
+        ):
+            col = f"{base}_{stage_num}"
+            if col in schema_names:
+                present_checks.append(pl.col(col).is_not_null())
+        block_expr = pl.any_horizontal(present_checks) if present_checks else pl.lit(False)
+        block_name = f"__block_{stage_num}"
+        block_exprs.append(block_expr.alias(block_name))
+        srv_col = f"srv_{stage_num}"
+        if srv_col in schema_names:
+            missing_service_terms.append(pl.col(block_name) & pl.col(srv_col).is_null())
+
+    contig_terms = []
+    for stage_num in range(1, max_stages):
+        later = [pl.col(f"__block_{j}") for j in range(stage_num + 1, max_stages + 1)]
+        contig_terms.append((~pl.col(f"__block_{stage_num}")) & pl.any_horizontal(later))
+    block_count_expr = sum(pl.col(f"__block_{i}").cast(pl.Int8) for i in range(1, max_stages + 1))
+    orig_gt4_expr = (pl.col("n_etapas") > 4) if "n_etapas" in schema_names else pl.lit(False)
+    recon_gt4_expr = (pl.col("n_etapas_recon") > 4) if "n_etapas_recon" in schema_names else pl.lit(False)
+
+    audited = (
+        df.with_columns(block_exprs)
+        .with_columns([
+            (pl.any_horizontal(missing_service_terms) if missing_service_terms else pl.lit(False)).alias("__drop_missing_stage_service"),
+            (pl.any_horizontal(contig_terms) if contig_terms else pl.lit(False)).alias("__drop_non_contiguous_stage_blocks"),
+            ((block_count_expr != pl.col("n_etapas_recon")) if "n_etapas_recon" in schema_names else pl.lit(False)).alias("__drop_block_count_mismatch"),
+            orig_gt4_expr.alias("__drop_orig_gt4"),
+            recon_gt4_expr.alias("__drop_recon_gt4"),
+        ])
+    )
+    stats = audited.select([
+        pl.len().alias("rows_in"),
+        pl.col("__drop_missing_stage_service").sum().alias("drop_missing_stage_service"),
+        pl.col("__drop_non_contiguous_stage_blocks").sum().alias("drop_non_contiguous_stage_blocks"),
+        pl.col("__drop_block_count_mismatch").sum().alias("drop_block_count_mismatch"),
+        pl.col("__drop_orig_gt4").sum().alias("drop_orig_gt4"),
+        pl.col("__drop_recon_gt4").sum().alias("drop_recon_gt4"),
+        (
+            pl.col("__drop_missing_stage_service")
+            | pl.col("__drop_non_contiguous_stage_blocks")
+            | pl.col("__drop_block_count_mismatch")
+            | pl.col("__drop_orig_gt4")
+            | pl.col("__drop_recon_gt4")
+        ).sum().alias("rows_dropped"),
+    ]).row(0, named=True)
+    helper_cols = [f"__block_{i}" for i in range(1, max_stages + 1)] + [
+        "__drop_missing_stage_service",
+        "__drop_non_contiguous_stage_blocks",
+        "__drop_block_count_mismatch",
+        "__drop_orig_gt4",
+        "__drop_recon_gt4",
+    ]
+    filtered = audited.filter(
+        ~(
+            pl.col("__drop_missing_stage_service")
+            | pl.col("__drop_non_contiguous_stage_blocks")
+            | pl.col("__drop_block_count_mismatch")
+            | pl.col("__drop_orig_gt4")
+            | pl.col("__drop_recon_gt4")
+        )
+    ).drop(helper_cols)
+    stats["rows_out"] = filtered.height
+    return filtered, {k: int(v) for k, v in stats.items()}
+
 # Procesamiento en batches para no explotar memoria y ver progreso
 batch_size = 200_000
 total_rows = lf_viajes.select(pl.len()).collect().item()
@@ -621,12 +1072,28 @@ print(f"Procesando en batches de {batch_size} filas (total {total_rows:,})...")
 
 result_batches = []
 offset = 0
+rows_dropped_total = 0
+rows_dropped_missing_stage_service = 0
+rows_dropped_non_contiguous_stage_blocks = 0
+rows_dropped_block_count_mismatch = 0
+rows_dropped_orig_gt4 = 0
+rows_dropped_recon_gt4 = 0
 while offset < total_rows:
     batch = lf_viajes.slice(offset, batch_size).collect()
     batch_out = add_te_calculado(batch)
+    batch_out, filter_stats = filter_model_ready_rows(batch_out)
     result_batches.append(batch_out)
+    rows_dropped_total += filter_stats["rows_dropped"]
+    rows_dropped_missing_stage_service += filter_stats["drop_missing_stage_service"]
+    rows_dropped_non_contiguous_stage_blocks += filter_stats["drop_non_contiguous_stage_blocks"]
+    rows_dropped_block_count_mismatch += filter_stats["drop_block_count_mismatch"]
+    rows_dropped_orig_gt4 += filter_stats["drop_orig_gt4"]
+    rows_dropped_recon_gt4 += filter_stats["drop_recon_gt4"]
     offset += batch_size
-    print(f"  avance: {min(offset, total_rows):,}/{total_rows:,}")
+    print(
+        f"  avance: {min(offset, total_rows):,}/{total_rows:,} | "
+        f"drop batch={filter_stats['rows_dropped']:,}"
+    )
     # muestra rápida de un viaje metro en este batch
     batch_metro = batch_out.filter(pl.col("tipo_transporte_1")=="2").select([
         "pk_viaje","n_etapas_recon","paradero_inicio_viaje","paradero_fin_viaje","paradero_subida_1","paradero_bajada_1","srv_1","tiempo_subida_1", "tv1_calculado",
@@ -641,6 +1108,17 @@ while offset < total_rows:
 df_full = pl.concat(result_batches, how="vertical")
 df_full.write_parquet(OUT_PATH)
 print("Escrito:", OUT_PATH, "filas:", df_full.height)
+print(
+    "Filtrado filas no model-ready:",
+    rows_dropped_total,
+    (
+        f"(missing_srv={rows_dropped_missing_stage_service}, "
+        f"non_contiguous={rows_dropped_non_contiguous_stage_blocks}, "
+        f"block_mismatch={rows_dropped_block_count_mismatch}, "
+        f"orig_gt4={rows_dropped_orig_gt4}, "
+        f"recon_gt4={rows_dropped_recon_gt4})"
+    ),
+)
 
 ```
 
@@ -1803,48 +2281,13 @@ else:
     print("\nEstadísticas de tc_estimado:")
     print(df_calc["tc_estimado"].describe())
 
-    # 4. Aplicar Cambios al DataFrame Principal (df_val)
-    print("\n--- Aplicando correcciones a df_val ---")
-    
-    # NO Imputar nulos (se dejan como null si no hay info)
+    # 4. NO sobrescribir el parquet canonico de modelacion.
+    # Esta seccion queda solo como analisis exploratorio de tc Metro-Metro.
+    print("\n--- Omitiendo aplicacion de tc*_calculado sobre el parquet final ---")
+    print("La estimacion de caminatas internas queda documentada, pero no modifica")
+    print("`viajes_con_te_calculado_*.parquet`, que sigue siendo el artefacto canonico")
+    print("usado por el script optimizado y por los modelos.")
     print(f"Se mantienen {df_calc['tc_estimado'].null_count():,} valores nulos en la estimación.")
-    
-    df_calc_clean = df_calc.select(["pk_viaje", "etapa_origen", "tc_estimado"])
-
-    # Actualizar columnas tc2, tc3, etc.
-    # tc_{i+1} corresponde al transbordo después de la etapa i
-    
-    for i in range(1, 6):
-        source_col = f"tc{i+1}"
-        target_col = f"tc{i+1}_calculado"
-        
-        if source_col not in df_val.columns: continue
-        
-        # Inicializar columna calculada con la original si no existe
-        if target_col not in df_val.columns:
-            print(f"Creando columna {target_col} a partir de {source_col}...")
-            df_val = df_val.with_columns(pl.col(source_col).alias(target_col))
-        
-        # Filtrar actualizaciones para esta etapa
-        df_update = df_calc_clean.filter(pl.col("etapa_origen") == i).select(["pk_viaje", "tc_estimado"])
-        
-        if df_update.height == 0: continue
-        
-        print(f"Actualizando {target_col} para {df_update.height:,} viajes (Metro-Metro)...")
-        
-        # Join y Coalesce
-        # Renombramos tc_estimado para evitar colisiones en iteraciones futuras si no se dropea bien
-        df_val = df_val.join(df_update, on="pk_viaje", how="left", suffix="_update")
-        
-        df_val = df_val.with_columns(
-            pl.coalesce([pl.col("tc_estimado"), pl.col(target_col)]).alias(target_col)
-        ).drop("tc_estimado")
-
-    # Guardar resultado final (Sobrescribiendo el archivo original)
-    out_path = PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{PARTITION_LABEL}.parquet"
-    print(f"\nGuardando resultado final (actualizando) en: {out_path}")
-    df_val.write_parquet(out_path)
-    print("✅ Proceso completado.")
 
 ```
 
@@ -1856,14 +2299,16 @@ En este notebook se abordó el recálculo de los tiempos de espera y viaje para 
 
 Adicionalmente, se implementó una lógica para estimar los **tiempos de caminata** en transbordos internos (Metro-Metro), los cuales no estaban explícitos en los datos originales. La metodología aplicada fue:
 
+**Estado actual del flujo:** esta parte queda solo como análisis exploratorio. No sobrescribe el parquet canónico `viajes_con_te_calculado_*.parquet`, porque la versión productiva del flujo corre mediante `scripts/recalculo_tiempos_espera_optimized.py` y no incorpora `tc*_calculado` al artefacto usado por modelos.
+
 1.  **Fuente Oficial:** Se priorizó el uso de una tabla de tiempos de transbordo oficiales de Metro.
 2.  **Estimación Proxy:** Para combinaciones sin dato oficial, se utilizó la fórmula: $$ 0.75 \times (\text{Tiempo Egreso Origen} + \text{Tiempo Acceso Destino}) $$
 
 **Nota Importante:** Esta corrección de tiempos de caminata se aplicó exclusivamente a transbordos **Metro-Metro**. La imputación para transbordos que involucran buses (Bus-Bus, Bus-Metro, Metro-Bus) se ha dejado **pausada** debido a la alta prevalencia de valores nulos en los datos observados para estos modos, lo que impedía una estimación confiable en esta etapa.
 
-**Estructura de las columnas `tc*_calculado`:**
+**Estructura experimental de las columnas `tc*_calculado`:**
 
-Las columnas de tiempo de caminata (`tc2_calculado`, `tc3_calculado`, etc.) se generaron para **todos los viajes** en el dataset. La lógica de construcción fue:
+Si esta rama se exportara por separado, las columnas de tiempo de caminata (`tc2_calculado`, `tc3_calculado`, etc.) se generarían para **todos los viajes** en el dataset. La lógica de construcción sería:
 
 1.  **Inicialización:** Se copiaron los valores originales de `tc` (si existían).
 2.  **Actualización Metro-Metro:** Se sobrescribieron únicamente los valores correspondientes a transbordos entre líneas de Metro con la estimación descrita arriba.
@@ -1871,9 +2316,9 @@ Las columnas de tiempo de caminata (`tc2_calculado`, `tc3_calculado`, etc.) se g
 
 ## Detalles del Archivo Generado
 
-*   **Nombre del archivo:** `viajes_con_te_calculado_2025-W17.parquet`
-*   **Ubicación:** Se guarda en la carpeta `tmp` dentro de la raíz del proyecto.
-*   **Ruta completa:** `tmp/viajes_con_te_calculado_2025-W17.parquet`
+*   **Artefacto canónico de modelación:** `viajes_con_te_calculado_<PARTITION>.parquet`
+*   **Origen productivo:** `scripts/recalculo_tiempos_espera_optimized.py`
+*   **Nota:** este notebook ya no sobrescribe ese parquet con `tc*_calculado`; la lógica de caminatas queda como análisis exploratorio.
 *   **Columnas agregadas:**
     *   **Tiempos de Espera (te):** `te0_calculado`, `te1_calculado`, `te2_calculado`, `te3_calculado`, `te4_calculado`, `te5_calculado`.
     *   **Tiempos de Viaje en Vehículo (tv):** `tv1_calculado`, `tv2_calculado`, `tv3_calculado`, `tv4_calculado`, `tv5_calculado`, `tv6_calculado`.

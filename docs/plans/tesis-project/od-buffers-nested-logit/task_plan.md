@@ -39,7 +39,36 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
 - [ ] Construir primer bloque de variables de demanda por zona/OD y franja horaria.
 - [ ] Construir primer bloque de variables de oferta de servicio por zona (paraderos, lineas, cercania a metro).
 - [ ] Retomar e integrar socio-demo en el modelo principal, comenzando por origen.
-- [ ] Evaluar factibilidad de apilar `W17-2024` con `W17-2025` y definir una `dummy` de anio.
+- [x] Evaluar factibilidad de apilar `W17-2024` con `W17-2025` y definir una `dummy` de anio.
+- [x] Identificar y corregir dos bugs del pipeline Metro antes del pooling interanual:
+  - normalizacion de nombres de estaciones de combinacion en `04_transbordos_metro.qmd` / `metro_graph_builder.py`
+  - filtrado de `service_id` por fecha real en `06_recalculo_tiempos_espera.qmd`
+- [x] Corregir errores silenciosos adicionales del pipeline 04/05/06:
+  - preservar fecha en la espera bus del paso `06`
+  - impedir transbordos en `tv*_calculado` Metro de una etapa individual
+  - limpiar timestamps/zonas stale en etapas reconstruidas y arreglar `metro_any`
+- [x] Auditar `n_eventos` vs `n_buses_unicos` en `05_transbordos_bus.qmd`.
+- [x] Hacer una segunda pasada tecnica sobre `04/05/06` para buscar bugs silenciosos adicionales y cerrar correcciones estructurales:
+  - separar `direction_id` en el calculo de headways Metro del paso `06`
+  - fijar rutas de salida ambiguas en `04_transbordos_metro.qmd`
+- [x] Hacer una tercera pasada tecnica sobre GTFS/versionado y supuestos temporales:
+  - eliminar desalineacion potencial entre `GTFS_VERSION` manual y `manifest` en `06`
+  - impedir que `gtfs_manifest` extienda snapshots mas alla de `feed_end_date`
+  - agregar guard explicito para semanas ISO que crucen multiples versiones GTFS
+- [ ] Definir si `05_transbordos_bus.qmd` debe:
+  - mantener `n_eventos`,
+  - deduplicar eventos exactos / casi exactos,
+  - o migrar a una frecuencia depurada.
+- [x] Corregir el tratamiento de variantes Metro `R/V` en el paso `06`:
+  - mantener `te` sobre variantes activas reales,
+  - calcular `tv` solo sobre variantes activas reales y no sobre la linea agregada sintetica,
+  - marcar `metro_variant_conflict_i` cuando una etapa solo existe en la agregacion base.
+- [x] Reprocesar `W17-2024` con grafo Metro regenerado y tiempos de espera recalculados.
+- [x] Reprocesar `W17-2025` al menos en el paso `06_recalculo_tiempos_espera.qmd` para corregir el filtro de calendario.
+- [x] Extraer el paso pesado equivalente a `06_recalculo_tiempos_espera.qmd` a un runner externo optimizado:
+  - crear script CLI fuera del notebook;
+  - conservar la logica metodologica vigente;
+  - agregar caches/indices para que `W17-2024` y `W17-2025` sean corribles en tiempos razonables.
 - [ ] Re-estimar el benchmark MNL enriquecido y revisar si mejora interpretabilidad/estabilidad.
 - [ ] Solo despues del enriquecimiento, decidir si vale la pena reintentar nested y/o retomar la comparacion `full` vs `generic` vs `mixed_tei_specific`.
 
@@ -49,4 +78,4 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
 - Reintento del nested sobre variantes parsimoniosas queda diferido hasta despues del enriquecimiento del modelo.
 
 ## Status
-- Current: la rama de refinamiento por colinealidad queda estacionada con evidencia ya documentada (`MU=1`, MNL como benchmark). El foco activo pasa a enriquecer la especificacion con nuevas variables de control y comparacion interanual.
+- Current: `W17-2024` y `W17-2025` ya quedaron reprocesadas y validadas con el pipeline corregido. La rama de limpieza del pipeline queda cerrada a nivel de outputs finales de modelacion; el foco activo vuelve al enriquecimiento de la especificacion y la reestimacion de modelos con comparacion interanual.

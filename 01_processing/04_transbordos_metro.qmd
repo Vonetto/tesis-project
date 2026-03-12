@@ -124,7 +124,14 @@ except Exception as e:
 # La función normalize_station_name se mantiene igual que antes.
 def normalize_station_name(name: str) -> str:
     if not isinstance(name, str): return ""
-    base_name = re.sub(r" (L\d[A]?)$", "", name.strip()).upper()
+    base_name = name.strip()
+    base_name = re.sub(
+        r"\s+\((?:L\d[A]?(?:[\s\-/]+L\d[A]?)+)\)$",
+        "",
+        base_name,
+        flags=re.IGNORECASE,
+    )
+    base_name = re.sub(r"\s+\(?L\d[A]?\)?$", "", base_name, flags=re.IGNORECASE).upper()
     no_tildes = ''.join(c for c in unicodedata.normalize('NFD', base_name) if unicodedata.category(c) != 'Mn')
     text = no_tildes
     text = re.sub(r"\bU\s*\.?\s*L\s*\.?\s*A\b", "U L A", text)
@@ -201,12 +208,25 @@ def load_graph_by_folder(folder: str) -> nx.Graph:
 manifest_gtfs = build_manifest(PROJECT_ROOT / "config" / "GTFS")
 print(f"GTFS en manifest: {[m.folder for m in manifest_gtfs]}")
 
-# Seleccionar y cargar el grafo según la fecha de la partición
+# Seleccionar y cargar el grafo según la fecha de la partición.
+# Este notebook asume una sola versión GTFS por semana; si una semana cruza
+# un cambio de snapshot, debe reprocesarse con una lógica más fina por fecha.
 from datetime import date
-service_date = date.fromisocalendar(YEAR_ANALISIS, WEEK_ANALISIS, 1)
-version_for_date = pick_version_for_date(service_date, manifest_gtfs)
-if version_for_date is None:
-    raise ValueError(f"No GTFS válido para {service_date}")
+week_service_dates = [date.fromisocalendar(YEAR_ANALISIS, WEEK_ANALISIS, d) for d in range(1, 8)]
+versions_in_week = {d: pick_version_for_date(d, manifest_gtfs) for d in week_service_dates}
+missing_versions = [d for d, v in versions_in_week.items() if v is None]
+if missing_versions:
+    raise ValueError(f"No hay GTFS válido para todas las fechas de {PARTITION_LABEL}: {missing_versions}")
+
+week_gtfs_folders = sorted({v.folder for v in versions_in_week.values() if v is not None})
+if len(week_gtfs_folders) != 1:
+    raise ValueError(
+        f"La semana {PARTITION_LABEL} cruza múltiples versiones GTFS {week_gtfs_folders}. "
+        "Este notebook actualmente asume una sola versión por semana."
+    )
+
+service_date = week_service_dates[0]
+version_for_date = versions_in_week[service_date]
 
 G_metro = load_graph_by_folder(version_for_date.folder)
 print(f"✅ Grafo cargado ({version_for_date.folder}) para {service_date}: {G_metro.number_of_nodes()} nodos, {G_metro.number_of_edges()} aristas. Penalización transferencia = {TRANSFER_PENALTY_MIN} min")
@@ -303,11 +323,11 @@ else:
 
     # Validación cruzada vs GTFS (solo estaciones de Metro: rutas route_type=1 presentes en stop_times)
     gtfs_path = PROJECT_ROOT / "config" / "GTFS" / version_for_date.folder
-    routes_metro = pl.read_csv(gtfs_path / "routes.txt", schema_overrides={"route_id": pl.Utf8, "route_type": pl.Int8}).filter(pl.col("route_type") == 1)["route_id"].to_list()
+    routes_metro = pl.read_csv(gtfs_path / "routes.txt", schema_overrides={"route_id": pl.Utf8, "route_short_name": pl.Utf8, "route_type": pl.Int8}, truncate_ragged_lines=True).filter(pl.col("route_type") == 1)["route_id"].to_list()
     trips_metro = pl.read_csv(gtfs_path / "trips.txt", schema_overrides={"route_id": pl.Utf8, "trip_id": pl.Utf8}).filter(pl.col("route_id").is_in(routes_metro))["trip_id"].to_list()
     stop_times = pl.read_csv(gtfs_path / "stop_times.txt", schema_overrides={"trip_id": pl.Utf8, "stop_id": pl.Utf8})
     stops_in_metro = stop_times.filter(pl.col("trip_id").is_in(trips_metro))["stop_id"].unique().to_list()
-    df_gtfs_stops = pl.read_csv(gtfs_path / "stops.txt", schema_overrides={"stop_id": pl.Utf8, "stop_name": pl.Utf8})
+    df_gtfs_stops = pl.read_csv(gtfs_path / "stops.txt", schema_overrides={"stop_id": pl.Utf8, "stop_name": pl.Utf8, "wheelchair_boarding": pl.Utf8}, truncate_ragged_lines=True)
     gtfs_stations = set()
     for s in df_gtfs_stops.filter(pl.col("stop_id").is_in(stops_in_metro))["stop_name"]:
         if s is None:
@@ -902,8 +922,9 @@ from pathlib import Path
 import polars as pl
 from lib.transbordos_metro.metro_graph_builder import shortest_path_with_line, normalize_station_name
 
-OUT_PATH = Path("tmp") / f"etapas_reconstruidas_{PARTITION_LABEL}.parquet"
-MAX_ETAPAS = 6  # Aumentado de 4 a 6 para evitar truncamiento excesivo
+OUT_PATH = PROJECT_ROOT / "01_processing" / "tmp" / f"etapas_reconstruidas_{PARTITION_LABEL}.parquet"
+MAX_ETAPAS_INPUT = 4  # Etapas observadas disponibles en el schema original.
+MAX_ETAPAS_RECON = 6  # Buffer técnico para no truncar de más al expandir Metro.
 
 # ------------------------------------------------------------------
 # 1) Combos inválidos únicos (posible_sin_transfer = False)
@@ -985,8 +1006,13 @@ print(f"Cache de reconstrucción generado para {len(recon_cache):,} combos invá
 # ------------------------------------------------------------------
 # 3) Separar viajes buenos/malos
 # ------------------------------------------------------------------
+tipo_cols_existing = [
+    f"tipo_transporte_{i}"
+    for i in range(1, MAX_ETAPAS_RECON + 1)
+    if f"tipo_transporte_{i}" in lf_data.collect_schema().names()
+]
 lf_metro_any = lf_data.with_columns(
-    metro_any=pl.any_horizontal([(pl.col(f"tipo_transporte_{i}").cast(pl.Utf8) == "2") for i in range(1, 5)])
+    metro_any=pl.any_horizontal([(pl.col(col).cast(pl.Utf8) == "2") for col in tipo_cols_existing])
 )
 lf_with_flag = lf_metro_any.join(
     lf_invalid_pks.lazy().with_columns(pl.lit(True).alias("transbordo_interno_no_id")),
@@ -1014,7 +1040,7 @@ schema_dict.update({
 })
 
 # Agregar columnas para etapas 5 y 6 al esquema si no existen
-for i in range(5, MAX_ETAPAS + 1):
+for i in range(5, MAX_ETAPAS_RECON + 1):
     schema_dict[f"paradero_subida_{i}"] = pl.Utf8
     schema_dict[f"paradero_bajada_{i}"] = pl.Utf8
     schema_dict[f"srv_{i}"] = pl.Utf8
@@ -1066,7 +1092,7 @@ for row in df_bad.iter_rows(named=True):
     tiempo_total = 0.0
     torniq_flag = False
 
-    for i in range(1, 5):
+    for i in range(1, MAX_ETAPAS_INPUT + 1):
         tipo = row.get(f"tipo_transporte_{i}")
         srv = row.get(f"srv_{i}")
         sub = row.get(f"paradero_subida_{i}")
@@ -1076,21 +1102,57 @@ for row in df_bad.iter_rows(named=True):
             continue
 
         if str(tipo) != "2":
-            legs_out.append((sub, baj, srv, str(tipo) if tipo is not None else None))
+            legs_out.append(
+                {
+                    "paradero_subida": sub,
+                    "paradero_bajada": baj,
+                    "srv": srv,
+                    "tipo": str(tipo) if tipo is not None else None,
+                    "tiempo_subida": row.get(f"tiempo_subida_{i}"),
+                    "tiempo_bajada": row.get(f"tiempo_bajada_{i}"),
+                    "zona_subida": row.get(f"zona_subida_{i}"),
+                    "zona_bajada": row.get(f"zona_bajada_{i}"),
+                }
+            )
             continue
 
         key = (sub, baj, srv)
         rec = recon_cache.get(key)
         if rec is None:
-            legs_out.append((sub, baj, srv, "2"))
+            legs_out.append(
+                {
+                    "paradero_subida": sub,
+                    "paradero_bajada": baj,
+                    "srv": srv,
+                    "tipo": "2",
+                    "tiempo_subida": row.get(f"tiempo_subida_{i}"),
+                    "tiempo_bajada": row.get(f"tiempo_bajada_{i}"),
+                    "zona_subida": row.get(f"zona_subida_{i}"),
+                    "zona_bajada": row.get(f"zona_bajada_{i}"),
+                }
+            )
         else:
             tiempo_total += rec["tiempo_imputado"]
             torniq_flag = torniq_flag or rec["torniquete_cambio_detectado"]
-            legs_out.extend([(s, b, srv_leg, "2") for (s, b, srv_leg, _w) in rec["legs"]])
+            n_rec_legs = len(rec["legs"])
+            for idx_rec, (s, b, srv_leg, _w) in enumerate(rec["legs"]):
+                legs_out.append(
+                    {
+                        "paradero_subida": s,
+                        "paradero_bajada": b,
+                        "srv": srv_leg,
+                        "tipo": "2",
+                        # Mantener solo anclas observadas del segmento original:
+                        # la salida observada en la primera pierna y la llegada observada en la última.
+                        "tiempo_subida": row.get(f"tiempo_subida_{i}") if idx_rec == 0 else None,
+                        "tiempo_bajada": row.get(f"tiempo_bajada_{i}") if idx_rec == n_rec_legs - 1 else None,
+                        "zona_subida": row.get(f"zona_subida_{i}") if idx_rec == 0 else None,
+                        "zona_bajada": row.get(f"zona_bajada_{i}") if idx_rec == n_rec_legs - 1 else None,
+                    }
+                )
 
-    # Calcular n_etapas_recon ANTES de truncar para saber si hubo corte
+    legs_out = legs_out[:MAX_ETAPAS_RECON]
     n_etapas_recon = len(legs_out)
-    legs_out = legs_out[:MAX_ETAPAS]
     
     # mantener todas las columnas originales con casteo al dtype original
     out = {c: _cast_value(row[c], orig_schema[c]) for c in orig_cols}
@@ -1100,18 +1162,26 @@ for row in df_bad.iter_rows(named=True):
     out["torniquete_cambio_detectado"] = torniq_flag
     out["metro_any"] = True
 
-    for j in range(1, MAX_ETAPAS + 1):
+    for j in range(1, MAX_ETAPAS_RECON + 1):
         if j <= len(legs_out):
-            s, b, srv, tipo = legs_out[j - 1]
-            out[f"paradero_subida_{j}"] = s
-            out[f"paradero_bajada_{j}"] = b
-            out[f"srv_{j}"] = srv
-            out[f"tipo_transporte_{j}"] = str(tipo) if tipo is not None else None
+            leg = legs_out[j - 1]
+            out[f"paradero_subida_{j}"] = leg["paradero_subida"]
+            out[f"paradero_bajada_{j}"] = leg["paradero_bajada"]
+            out[f"srv_{j}"] = leg["srv"]
+            out[f"tipo_transporte_{j}"] = str(leg["tipo"]) if leg["tipo"] is not None else None
+            out[f"tiempo_subida_{j}"] = leg["tiempo_subida"]
+            out[f"tiempo_bajada_{j}"] = leg["tiempo_bajada"]
+            out[f"zona_subida_{j}"] = leg["zona_subida"]
+            out[f"zona_bajada_{j}"] = leg["zona_bajada"]
         else:
             out[f"paradero_subida_{j}"] = None
             out[f"paradero_bajada_{j}"] = None
             out[f"srv_{j}"] = None
             out[f"tipo_transporte_{j}"] = None
+            out[f"tiempo_subida_{j}"] = None
+            out[f"tiempo_bajada_{j}"] = None
+            out[f"zona_subida_{j}"] = None
+            out[f"zona_bajada_{j}"] = None
 
     recon_rows.append(out)
 
@@ -1122,14 +1192,16 @@ df_bad_recon = pl.DataFrame(recon_rows, schema=schema_dict, strict=False, orient
 # ------------------------------------------------------------------
 # Asegurar que df_good tenga también las columnas de etapa 5 y 6 (vacías)
 cols_extra_etapas = []
-for i in range(5, MAX_ETAPAS + 1):
+for i in range(5, MAX_ETAPAS_RECON + 1):
     cols_extra_etapas.extend([
         pl.lit(None).cast(pl.Utf8).alias(f"paradero_subida_{i}"),
         pl.lit(None).cast(pl.Utf8).alias(f"paradero_bajada_{i}"),
         pl.lit(None).cast(pl.Utf8).alias(f"srv_{i}"),
         pl.lit(None).cast(pl.Utf8).alias(f"tipo_transporte_{i}"),
-        # Agregar otras si es necesario para mantener simetría estricta, 
-        # pero estas son las que validamos.
+        pl.lit(None).cast(pl.Utf8).alias(f"tiempo_subida_{i}"),
+        pl.lit(None).cast(pl.Utf8).alias(f"tiempo_bajada_{i}"),
+        pl.lit(None).cast(pl.Utf8).alias(f"zona_subida_{i}"),
+        pl.lit(None).cast(pl.Utf8).alias(f"zona_bajada_{i}"),
     ])
 
 df_good = (
@@ -1139,7 +1211,9 @@ df_good = (
         n_etapas_recon=pl.col("n_etapas"),
         torniquete_cambio_detectado=pl.lit(False),
         transbordo_interno_no_id=pl.lit(False), # Asegurar que este flag exista
-        metro_any=pl.col("tipo_transporte_1") == "2" # Aproximación inicial, se refina luego si se quiere
+        metro_any=pl.col("metro_any").fill_null(
+            pl.any_horizontal([(pl.col(f"tipo_transporte_{i}").cast(pl.Utf8) == "2") for i in range(1, MAX_ETAPAS_INPUT + 1)])
+        )
     )
     .with_columns(cols_extra_etapas)
     .collect()
@@ -1308,7 +1382,8 @@ print(ti_out)
 # 6) Consistencia de etapas añadidas en viajes corregidos
 def count_metro_legs(lf):
     exprs = []
-    for i in range(1, 5):
+    max_stage = MAX_ETAPAS_RECON if f"tipo_transporte_{MAX_ETAPAS_RECON}" in lf.collect_schema().names() else MAX_ETAPAS_INPUT
+    for i in range(1, max_stage + 1):
         exprs.append(
             (pl.col(f"tipo_transporte_{i}") == "2")
             & pl.col(f"paradero_subida_{i}").is_not_null()

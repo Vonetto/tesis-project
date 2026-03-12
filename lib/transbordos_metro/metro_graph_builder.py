@@ -15,6 +15,7 @@ import datetime as dt
 from itertools import combinations
 from pathlib import Path
 from typing import Optional, Tuple
+import re
 
 import networkx as nx
 import polars as pl
@@ -36,7 +37,16 @@ def normalize_station_name(name: str) -> str:
     if not isinstance(name, str):
         return ""
 
-    base_name = re.sub(r" (L\d[A]?)$", "", name.strip())
+    base_name = name.strip()
+    # Primero quitar etiquetas completas de combinación del tipo "SANTA ANA (L2 L5)".
+    base_name = re.sub(
+        r"\s*\((?:L\d[A]?(?:[\s\-/]+L\d[A]?)+)\)$",
+        "",
+        base_name,
+        flags=re.IGNORECASE,
+    )
+    # Luego quitar sufijos simples: "ESTACION (L1)" o "ESTACION L1".
+    base_name = re.sub(r"\s+\(?L\d[A]?\)?$", "", base_name, flags=re.IGNORECASE)
     upper_name = base_name.upper()
     no_tildes = "".join(
         c for c in unicodedata.normalize("NFD", upper_name) if unicodedata.category(c) != "Mn"
@@ -49,10 +59,13 @@ def normalize_station_name(name: str) -> str:
     text = text.replace("PLAZA MAIPU", "PLAZA DE MAIPU")
     text = text.replace("UNION LATINO AMERICANA", "U L A")
     text = text.replace("U.L.A.", "U L A")
+    text = text.replace("MONSENOR EYZAGUIRRE", "MONS EYZAGUIRRE")
     text = text.replace("PDTE. PEDRO AGUIPRRE CERDA", "PDTE PEDRO AGUIRRE CERDA")
     text = re.sub(r"-", " ", text)
-    text = re.sub(r"[.'’]", "", text)
+    text = re.sub(r"[`.'’]", "", text)
     text = re.sub(r"\s+", " ", text).strip()
+    if text == "MATTA":
+        text = "AVENIDA MATTA"
     if re.search(r"\bCAL Y CANTO\b", text) and not re.search(r"\bPUENTE\b", text):
         text = re.sub(r"\bCAL Y CANTO\b", "PUENTE CAL Y CANTO", text)
     text = re.sub(r"\bCHILEESPANA\b", "CHILE ESPANA", text)
@@ -62,12 +75,51 @@ def normalize_station_name(name: str) -> str:
 # ----------------------
 # Viaje en stop_times    
 # ----------------------
+def base_line_code(line_id: str) -> str:
+    """Return the commercial/base line code, keeping branch variants separate.
+
+    Examples:
+    - ``L2R`` -> ``L2``
+    - ``L5V`` -> ``L5``
+    - ``L4A`` -> ``L4A`` (not a peak variant)
+    """
+
+    line_id = (line_id or "").strip().upper()
+    if re.fullmatch(r"L\d+A?[RV]", line_id):
+        return line_id[:-1]
+    return line_id
+
+
+def matching_line_ids(line_decl: str, available_line_ids: list[str]) -> list[str]:
+    """Expand a declared commercial line to candidate GTFS route_ids.
+
+    ``L2`` matches ``L2``, ``L2R`` and ``L2V``.
+    Explicit variants such as ``L2R`` only match themselves.
+    """
+
+    line_decl = (line_decl or "").strip().upper()
+    if not line_decl:
+        return []
+    # Variantes explicitas de punta (ej. L2R, L5V) se respetan tal cual.
+    if line_decl in available_line_ids and line_decl != base_line_code(line_decl):
+        return [line_decl]
+
+    decl_base = base_line_code(line_decl)
+    return sorted(
+        {
+            line_id
+            for line_id in available_line_ids
+            if line_id == decl_base or base_line_code(line_id) == decl_base
+        }
+    )
+
+
 def compute_travel_times(gtfs_dir: Path) -> pl.DataFrame:
     """Compute average in-vehicle travel time (seconds) between consecutive stops.
 
     Returns a Polars DataFrame with columns:
         from_stop_id, to_stop_id, from_stop_name, to_stop_name,
-        line, avg_travel_secs
+        line, line_base, avg_travel_secs
     """
 
     # Load core tables
@@ -88,7 +140,11 @@ def compute_travel_times(gtfs_dir: Path) -> pl.DataFrame:
         pl.col("departure_time").str.to_time("%H:%M:%S").alias("dep_t"),
     )
 
-    stops = pl.read_csv(gtfs_dir / "stops.txt", schema_overrides={"stop_id": pl.Utf8, "stop_name": pl.Utf8})
+    stops = pl.read_csv(
+        gtfs_dir / "stops.txt",
+        schema_overrides={"stop_id": pl.Utf8, "stop_name": pl.Utf8, "wheelchair_boarding": pl.Utf8},
+        truncate_ragged_lines=True,
+    )
 
     metro_trips = trips.join(routes, on="route_id", how="inner")
     st_metro = stop_times.join(metro_trips, on="trip_id", how="inner")
@@ -106,11 +162,17 @@ def compute_travel_times(gtfs_dir: Path) -> pl.DataFrame:
         .filter(pl.col("to_stop_id").is_not_null() & (pl.col("travel_secs") > 0))
     )
 
-    # Aggregate average per leg and line
+    # Aggregate average per leg and GTFS route_id (keep R/V variants separate)
     df_edges = (
-        df_travel.group_by(["stop_id", "to_stop_id", "route_short_name"])
+        df_travel.group_by(["stop_id", "to_stop_id", "route_id", "route_short_name"])
         .agg(pl.col("travel_secs").mean().alias("avg_travel_secs"))
-        .rename({"stop_id": "from_stop_id", "route_short_name": "line"})
+        .rename(
+            {
+                "stop_id": "from_stop_id",
+                "route_id": "line",
+                "route_short_name": "line_base",
+            }
+        )
     )
 
     # Attach stop names (for readability / normalization)
@@ -153,6 +215,8 @@ def build_weighted_graph(
         weight_min = (row["avg_travel_secs"] or 0) / 60.0
         if weight_min <= 0:
             continue
+        G.add_node(u, base_line=base_line_code(line))
+        G.add_node(v, base_line=base_line_code(line))
         G.add_edge(u, v, type="travel", line=line, weight=weight_min)
 
     # Aristas de transferencia entre copias de una estación (distintas líneas)
@@ -179,7 +243,12 @@ def shortest_path_with_line(G: nx.Graph, origen: str, linea_origen: str, destino
     d_station = normalize_station_name(_clean_stop_name(destino))
     line_init = (linea_origen or "").strip().upper()
 
-    start_nodes = [(o_station, line_init)] if (o_station, line_init) in G else []
+    available_line_ids = sorted({node[1] for node in G.nodes})
+    start_nodes = [
+        (o_station, line_id)
+        for line_id in matching_line_ids(line_init, available_line_ids)
+        if (o_station, line_id) in G
+    ]
     if not start_nodes:
         return None, None
 
@@ -199,6 +268,36 @@ def shortest_path_with_line(G: nx.Graph, origen: str, linea_origen: str, destino
             except nx.NetworkXNoPath:
                 continue
     return best, best_path
+
+
+def shortest_path_same_line(G: nx.Graph, origen: str, linea: str, destino: str):
+    """Shortest in-vehicle path restricted to a single line.
+
+    Unlike ``shortest_path_with_line``, this helper does not allow transfer edges.
+    It is intended for calculating the in-vehicle time of one declared Metro stage,
+    not for reconstructing a full trip across lines.
+    """
+
+    o_station = normalize_station_name(_clean_stop_name(origen))
+    d_station = normalize_station_name(_clean_stop_name(destino))
+    line = (linea or "").strip().upper()
+
+    start = (o_station, line)
+    end = (d_station, line)
+    if start not in G or end not in G:
+        return None, None
+
+    line_nodes = [node for node in G.nodes if node[1] == line]
+    if not line_nodes:
+        return None, None
+
+    G_line = G.subgraph(line_nodes)
+    try:
+        dist = nx.shortest_path_length(G_line, start, end, weight="weight")
+        path = nx.shortest_path(G_line, start, end, weight="weight")
+    except nx.NetworkXNoPath:
+        return None, None
+    return dist, path
 
 
 def build_graph_for_version(

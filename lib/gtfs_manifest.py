@@ -83,12 +83,16 @@ def build_manifest(gtfs_root: Path | str = "config/GTFS") -> List[GtfsVersion]:
     if not rows:
         return []
 
-    # Sort by start date and adjust valid_to as day before the next start
+    # Sort by start date and adjust valid_to as day before the next start,
+    # but never extend a feed beyond its own declared feed_end_date.
     df = pl.DataFrame(rows).sort("valid_from")
     df = df.with_columns(
         pl.col("valid_from").shift(-1).alias("next_start")
     ).with_columns(
-        pl.when(pl.col("next_start").is_not_null())
+        pl.when(
+            pl.col("next_start").is_not_null()
+            & ((pl.col("next_start") - pl.duration(days=1)) < pl.col("original_valid_to"))
+        )
         .then(pl.col("next_start") - pl.duration(days=1))
         .otherwise(pl.col("original_valid_to"))
         .alias("valid_to")
@@ -130,4 +134,3 @@ def manifest_as_df(manifest: Iterable[GtfsVersion]) -> pl.DataFrame:
         }
         for m in manifest
     ])
-
