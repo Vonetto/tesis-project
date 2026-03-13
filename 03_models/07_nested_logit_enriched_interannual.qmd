@@ -1,0 +1,580 @@
+---
+TITLE: "Tesis — 07 | Nested Logit Enriquecido Interanual"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Construir la primera versión del modelo OD-buffers **enriquecido e interanual** usando como base:
+
+- `2024-W17`
+- `2025-W17`
+
+Manteniendo la misma metodología del flujo OD-buffers principal y agregando primero:
+
+- `dummy_anio`
+- espacio para controles de demanda/oferta
+
+::: {.callout-note}
+## Alcance de esta versión
+- Se preserva la metodología base del notebook de OD-buffers:
+  - unidad de observación = viaje
+  - atributos alternativo-específicos `OD × tipo_pago`
+  - muestra restringida a OD con las 3 alternativas observadas
+  - `leave-one-out` en la alternativa elegida
+- `n_trasbordos` se deriva desde `n_etapas_recon - 1`
+- En esta primera versión **no** se incorporan aún variables socio-demográficas
+- El modelo objetivo inicial sigue siendo **Nested Logit**
+:::
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+import gc
+import sys
+from datetime import date
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import polars as pl
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró la raíz del proyecto.")
+
+import biogeme.biogeme_logging as blog
+import biogeme.database as db
+import biogeme.biogeme as bio
+from biogeme.results_processing import pandas_output as br
+from biogeme import models, nests
+from biogeme.expressions import Beta, Variable
+
+from lib.od_buffers_nested_logit import (
+    OdContextConfig,
+    build_od_alt_specific_context_table,
+    build_trip_dataset_with_alt_specific_context,
+    load_caracterizacion,
+    read_parquet_portable,
+    resolve_caracterizacion_path,
+)
+
+logger = blog.get_screen_logger(level=blog.INFO)
+
+MODELS_DIR = PROJECT_ROOT / "03_models"
+NOTEBOOK_TMP_DIR = MODELS_DIR / "tmp" / "nested_enriched_interannual"
+NOTEBOOK_TMP_DIR.mkdir(parents=True, exist_ok=True)
+```
+
+## 2) Configuración
+
+```{python}
+#| label: config
+print("label: config")
+PARTITIONS = ["2024-W17", "2025-W17"]
+
+PARQUET_BY_PARTITION = {
+    "2024-W17": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2024-W17.parquet",
+    "2025-W17": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet",
+}
+
+OD_CONFIG = OdContextConfig(
+    include_time_dummies=False,
+    time_dummy_variant="v2",
+    mean_mode="leave_one_out",
+    require_all_alternatives=True,
+)
+
+OUT_OD_CONTEXT = NOTEBOOK_TMP_DIR / "od_context_pooled_2024_2025.parquet"
+OUT_TRIPS_CONTEXT = NOTEBOOK_TMP_DIR / "trips_context_pooled_2024_2025.parquet"
+MODEL_PARTITION = "pooled_2024_2025"
+MODEL_NAME_SMOKE = "nested_enriched_interannual_smoke"
+MODEL_NAME_FULL = "nested_enriched_interannual_full"
+SAMPLE_FRACTION_ESTIMATION = 0.25
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+def year_from_partition(partition: str) -> int:
+    return int(partition.split("-W")[0])
+
+
+def build_partition_trip_context(partition: str) -> tuple[pl.DataFrame, pl.DataFrame]:
+    parquet_path = PARQUET_BY_PARTITION[partition]
+    if not parquet_path.exists():
+        raise FileNotFoundError(f"No existe parquet final para {partition}: {parquet_path}")
+
+    print(f"\n📦 Partición {partition}")
+    print(f"   parquet: {parquet_path}")
+
+    lf = read_parquet_portable(str(parquet_path))
+
+    caract_path = resolve_caracterizacion_path(None, partition)
+    df_caract = load_caracterizacion(caract_path)
+    print(f"   caracterización: {caract_path}")
+    print(f"   usuarios caracterización: {df_caract.height:,}")
+
+    df_od_alt = build_od_alt_specific_context_table(
+        lf,
+        df_caracterizacion=df_caract,
+        config=OD_CONFIG,
+    )
+    print(f"   OD alt-specific: {df_od_alt.height:,} filas")
+
+    df_trips = build_trip_dataset_with_alt_specific_context(
+        lf,
+        df_caracterizacion=df_caract,
+        df_od_alt_context=df_od_alt,
+        time_dummy_variant=OD_CONFIG.time_dummy_variant,
+        mean_mode=OD_CONFIG.mean_mode,
+        drop_chosen_singletons=True,
+    )
+
+    df_trips = df_trips.with_columns(
+        [
+            pl.lit(partition).alias("partition"),
+            pl.lit(year_from_partition(partition)).alias("year"),
+            (pl.lit(year_from_partition(partition)) == 2025).cast(pl.Int8).alias("DUMMY_ANIO_2025"),
+        ]
+    )
+
+    # Guardrail metodológico explícito.
+    if "NTR_BIP" not in df_trips.columns:
+        raise ValueError("Falta NTR_BIP en dataset alt-specific; revisar construcción de n_trasbordos.")
+
+    print(f"   trips alt-specific: {df_trips.height:,} filas")
+    return df_od_alt, df_trips
+
+
+def add_origin_demand_controls(df_trips: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
+    required = {
+        "zona_inicio_viaje",
+        "partition",
+        "DUMMY_LAB_PM",
+        "DUMMY_LAB_PT",
+        "DUMMY_LAB_VALLE",
+        "DUMMY_NO_LAB",
+    }
+    missing = sorted(required - set(df_trips.columns))
+    if missing:
+        raise ValueError(f"Faltan columnas para construir control de demanda: {missing}")
+
+    df = (
+        df_trips.with_columns(
+            pl.when(pl.col("DUMMY_LAB_PM") == 1)
+            .then(pl.lit("LAB_PM"))
+            .when(pl.col("DUMMY_LAB_PT") == 1)
+            .then(pl.lit("LAB_PT"))
+            .when(pl.col("DUMMY_LAB_VALLE") == 1)
+            .then(pl.lit("LAB_VALLE"))
+            .otherwise(pl.lit("NO_LAB"))
+            .alias("franja_v2")
+        )
+    )
+
+    df_demand = (
+        df.group_by(["partition", "zona_inicio_viaje", "franja_v2"])
+        .agg(pl.len().alias("N_VIAJES_ZONA_INICIO_FRANJA"))
+        .with_columns(
+            pl.col("N_VIAJES_ZONA_INICIO_FRANJA").log1p().alias("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+        )
+        .sort(["partition", "zona_inicio_viaje", "franja_v2"])
+    )
+
+    df = df.join(df_demand, on=["partition", "zona_inicio_viaje", "franja_v2"], how="left")
+    return df, df_demand
+
+
+def stratified_sample_partition_choice(
+    df: pl.DataFrame,
+    *,
+    fraction: float | None,
+    seed: int = 42,
+) -> pl.DataFrame:
+    if fraction is None:
+        return df
+    if not (0 < fraction <= 1):
+        raise ValueError(f"SAMPLE_FRACTION_ESTIMATION debe estar en (0,1], recibido: {fraction}")
+
+    sampled = (
+        df.group_by("partition", "choice_nested", maintain_order=True)
+        .map_groups(lambda g: g.sample(fraction=fraction, shuffle=True, seed=seed))
+        .sort(["partition", "choice_nested"])
+    )
+    return sampled
+
+
+def remove_biogeme_iter_file(model_name: str, project_root: Path) -> None:
+    candidates = [
+        project_root / f"{model_name}.iter",
+        project_root / f"__{model_name}.iter",
+        Path.cwd() / f"{model_name}.iter",
+        Path.cwd() / f"__{model_name}.iter",
+    ]
+    seen = set()
+    for iter_path in candidates:
+        if iter_path in seen:
+            continue
+        seen.add(iter_path)
+        if iter_path.exists():
+            iter_path.unlink()
+            print(f"🗑️ Iter eliminado: {iter_path}")
+
+
+def estimate_nested_option1_alt_specific_enriched(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    clean_run_no_iter: bool = False,
+    project_root: Path | None = None,
+    quick: bool = False,
+):
+    database = db.Database(model_name, pandas_df)
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+
+    CHOICE = Variable("choice_nested")
+
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+    DUMMY_ANIO_2025 = Variable("DUMMY_ANIO_2025")
+    LOG_DEMAND = Variable("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+
+    TET_BIP = Variable("TET_BIP")
+    TET_QR_RED = Variable("TET_QR_RED")
+    TET_QR_OTHER = Variable("TET_QR_OTHER")
+
+    NTR_BIP = Variable("NTR_BIP")
+    NTR_QR_RED = Variable("NTR_QR_RED")
+    NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    MU_QR = Beta(f"MU_QR_{partition}", 1.5, 1, 100, 0)
+    nest_bip = nests.OneNestForNestedLogit(1.0, [CHOICE_BIP], name="BIP")
+    nest_qr = nests.OneNestForNestedLogit(MU_QR, [CHOICE_QR_RED, CHOICE_QR_OTHER], name="QR")
+    NESTS = nests.NestsForNestedLogit(
+        choice_set=[CHOICE_BIP, CHOICE_QR_RED, CHOICE_QR_OTHER],
+        tuple_of_nests=(nest_bip, nest_qr),
+    )
+
+    ASC_QR_RED = Beta(f"ASC_QR_RED_{partition}", 0, None, None, 0)
+    ASC_QR_OTHER = Beta(f"ASC_QR_OTHER_{partition}", 0, None, None, 0)
+
+    B_QR_RED_LAB_PM = Beta(f"B_QR_RED_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PM = Beta(f"B_QR_OTHER_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PT = Beta(f"B_QR_RED_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PT = Beta(f"B_QR_OTHER_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_RED_NO_LAB = Beta(f"B_QR_RED_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_NO_LAB = Beta(f"B_QR_OTHER_NO_LAB_{partition}", 0, None, None, 0)
+
+    B_QR_RED_ANIO_2025 = Beta(f"B_QR_RED_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_OTHER_ANIO_2025 = Beta(f"B_QR_OTHER_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_DEMAND = Beta(f"B_QR_RED_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_DEMAND = Beta(f"B_QR_OTHER_LOG_DEMAND_{partition}", 0, None, None, 0)
+
+    B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_VEH = Beta(f"B_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+
+    B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+
+    B_BIP_T_ESPERA_TRASB = Beta(f"B_BIP_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_TRASB = Beta(f"B_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+
+    B_BIP_N_TRASB = Beta(f"B_BIP_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_N_TRASB = Beta(f"B_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_N_TRASB = Beta(f"B_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+
+    V_BIP = (
+        B_BIP_T_VEH * TVH_BIP
+        + B_BIP_T_ESPERA_INI * TEI_BIP
+        + B_BIP_T_ESPERA_TRASB * TET_BIP
+        + B_BIP_N_TRASB * NTR_BIP
+    )
+    V_QR_RED = (
+        ASC_QR_RED
+        + B_QR_RED_LAB_PM * LAB_PM
+        + B_QR_RED_LAB_PT * LAB_PT
+        + B_QR_RED_NO_LAB * NO_LAB
+        + B_QR_RED_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_RED_LOG_DEMAND * LOG_DEMAND
+        + B_QR_RED_T_VEH * TVH_QR_RED
+        + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+        + B_QR_RED_N_TRASB * NTR_QR_RED
+    )
+    V_QR_OTHER = (
+        ASC_QR_OTHER
+        + B_QR_OTHER_LAB_PM * LAB_PM
+        + B_QR_OTHER_LAB_PT * LAB_PT
+        + B_QR_OTHER_NO_LAB * NO_LAB
+        + B_QR_OTHER_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_OTHER_LOG_DEMAND * LOG_DEMAND
+        + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+        + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+    )
+
+    V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+    logprob = models.lognested(V, None, NESTS, CHOICE)
+
+    if clean_run_no_iter and project_root is not None:
+        remove_biogeme_iter_file(model_name, project_root)
+
+    biogeme = bio.BIOGEME(database, logprob)
+    biogeme.model_name = model_name
+    if quick:
+        results = biogeme.quick_estimate()
+    else:
+        results = biogeme.estimate()
+
+    stats = results.get_general_statistics()
+    params = br.get_pandas_estimated_parameters(results)
+    return stats, params
+
+
+MODEL_NUMERIC_COLUMNS = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_NO_LAB",
+    "DUMMY_ANIO_2025",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+]
+
+
+def to_biogeme_numeric_df(df: pl.DataFrame) -> pd.DataFrame:
+    missing = [c for c in MODEL_NUMERIC_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Faltan columnas requeridas para Biogeme: {missing}")
+    return (
+        df.select([pl.col(c).cast(pl.Float64) for c in MODEL_NUMERIC_COLUMNS])
+        .to_pandas()
+    )
+
+
+def display_param_subset(df_params: pd.DataFrame, preferred: list[str]) -> pd.DataFrame:
+    cols = [c for c in preferred if c in df_params.columns]
+    if not cols:
+        return df_params.head(12)
+    return df_params[cols].head(12)
+```
+
+## 4) Construcción pooled 2024 + 2025
+
+```{python}
+#| label: build-pooled-context
+print("label: build-pooled-context")
+od_frames = []
+trip_frames = []
+
+for partition in PARTITIONS:
+    df_od_alt, df_trips = build_partition_trip_context(partition)
+    od_frames.append(df_od_alt.with_columns(pl.lit(partition).alias("partition")))
+    trip_frames.append(df_trips)
+    gc.collect()
+
+df_od_pooled = pl.concat(od_frames, how="diagonal_relaxed")
+df_trips_pooled = pl.concat(trip_frames, how="diagonal_relaxed")
+df_trips_pooled, df_demand_pooled = add_origin_demand_controls(df_trips_pooled)
+
+df_od_pooled.write_parquet(OUT_OD_CONTEXT)
+df_trips_pooled.write_parquet(OUT_TRIPS_CONTEXT)
+
+print(f"\n✅ od_context pooled escrito en: {OUT_OD_CONTEXT}")
+print(f"✅ trips_context pooled escrito en: {OUT_TRIPS_CONTEXT}")
+print(f"   od rows   : {df_od_pooled.height:,}")
+print(f"   trip rows : {df_trips_pooled.height:,}")
+print(f"   demand cells : {df_demand_pooled.height:,}")
+```
+
+## 5) Checks rápidos del dataset pooled
+
+```{python}
+#| label: pooled-checks
+print("label: pooled-checks")
+display(
+    df_trips_pooled.select(
+        [
+            pl.len().alias("rows"),
+            pl.col("partition").n_unique().alias("n_partitions"),
+            pl.col("year").n_unique().alias("n_years"),
+            pl.col("choice_nested").value_counts(sort=True).alias("choice_dist"),
+        ]
+    )
+)
+
+display(
+    df_trips_pooled.group_by("partition").agg(
+        [
+            pl.len().alias("rows"),
+            pl.col("DUMMY_ANIO_2025").mean().alias("dummy_anio_2025_mean"),
+            pl.col("LOG_N_VIAJES_ZONA_INICIO_FRANJA").mean().alias("log_n_viajes_zona_inicio_franja_mean"),
+            pl.col("N_BIP").mean().alias("N_BIP_mean"),
+            pl.col("N_QR_RED").mean().alias("N_QR_RED_mean"),
+            pl.col("N_QR_OTHER").mean().alias("N_QR_OTHER_mean"),
+        ]
+    ).sort("partition")
+)
+
+display(
+    df_demand_pooled.group_by(["partition", "franja_v2"]).agg(
+        [
+            pl.len().alias("n_zona_franja_cells"),
+            pl.col("N_VIAJES_ZONA_INICIO_FRANJA").mean().alias("n_viajes_mean"),
+            pl.col("N_VIAJES_ZONA_INICIO_FRANJA").median().alias("n_viajes_median"),
+            pl.col("LOG_N_VIAJES_ZONA_INICIO_FRANJA").mean().alias("log_n_viajes_mean"),
+        ]
+    ).sort(["partition", "franja_v2"])
+)
+```
+
+## 6) Muestra de estimación Biogeme
+
+```{python}
+#| label: estimation-sample
+print("label: estimation-sample")
+print(f"SAMPLE_FRACTION_ESTIMATION = {SAMPLE_FRACTION_ESTIMATION}")
+
+df_trips_est = stratified_sample_partition_choice(
+    df_trips_pooled,
+    fraction=SAMPLE_FRACTION_ESTIMATION,
+    seed=42,
+)
+
+display(
+    df_trips_est.group_by(["partition", "choice_nested"]).agg(pl.len().alias("rows")).sort(["partition", "choice_nested"])
+)
+
+display(
+    df_trips_est.group_by("partition").agg(pl.len().alias("rows")).sort("partition")
+)
+```
+
+## 7) Estimación nested interanual
+
+```{python}
+#| label: nested-smoke
+print("label: nested-smoke")
+df_smoke = (
+    df_trips_est
+    .sample(fraction=0.02, seed=42)
+)
+df_smoke_pd = to_biogeme_numeric_df(df_smoke)
+
+smoke_stats, smoke_params = estimate_nested_option1_alt_specific_enriched(
+    df_smoke_pd,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_SMOKE,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+    quick=True,
+)
+
+display(display_param_subset(smoke_params, ["Name", "Value", "Rob. p-value", "Rob. p-value", "p-value", "Rob. t-test"]))
+```
+
+```{python}
+#| label: nested-full
+print("label: nested-full")
+df_model = to_biogeme_numeric_df(df_trips_est)
+
+stats_nested, params_nested = estimate_nested_option1_alt_specific_enriched(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_FULL,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+    quick=False,
+)
+
+display(display_param_subset(params_nested, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+```
+
+```{python}
+#| label: nested-summary
+print("label: nested-summary")
+summary_keys = [
+    "Final log likelihood",
+    "Rho-square for the init. model",
+    "Rho-square-bar for the init. model",
+    "Akaike Information Criterion",
+    "Bayesian Information Criterion",
+]
+summary_rows = []
+for key in summary_keys:
+    val = stats_nested.get(key)
+    if val is None:
+        continue
+    summary_rows.append({"metric": key, "value": val[0] if isinstance(val, tuple) else val})
+
+display(pl.DataFrame(summary_rows))
+display(
+    params_nested[
+        params_nested["Name"].isin([
+            "MU_QR_" + MODEL_PARTITION,
+            "ASC_QR_RED_" + MODEL_PARTITION,
+            "ASC_QR_OTHER_" + MODEL_PARTITION,
+            "B_QR_RED_ANIO_2025_" + MODEL_PARTITION,
+            "B_QR_OTHER_ANIO_2025_" + MODEL_PARTITION,
+            "B_QR_RED_LOG_DEMAND_" + MODEL_PARTITION,
+            "B_QR_OTHER_LOG_DEMAND_" + MODEL_PARTITION,
+        ])
+    ][[c for c in ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"] if c in params_nested.columns]]
+)
+```
+
+## 8) Próximo bloque: controles de demanda y oferta
+
+```{python}
+#| label: demand-supply-placeholder
+print("label: demand-supply-placeholder")
+print(
+    "Primer control de demanda ya incorporado y primera estimación nested interanual lista. "
+    "Pendiente siguiente bloque: construir el primer control de oferta y comparar contra esta corrida."
+)
+```

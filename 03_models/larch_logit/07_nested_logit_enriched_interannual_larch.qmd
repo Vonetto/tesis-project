@@ -1,0 +1,430 @@
+---
+title: "OD Buffers Enriched Interannual (Larch)"
+format: html
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  message: true
+---
+
+Este notebook replica en **Larch 6** la primera versión del modelo OD-buffers **enriquecido e interanual** definido en [07_nested_logit_enriched_interannual.qmd](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/07_nested_logit_enriched_interannual.qmd):
+
+- pooled `2024-W17 + 2025-W17`;
+- misma especificación alt-specific base de `05_nested_logit_od_buffers.qmd`;
+- mismos bloques `TVH`, `TEI`, `TET`, `NTR`;
+- nuevos controles:
+  - `DUMMY_ANIO_2025`
+  - `LOG_N_VIAJES_ZONA_INICIO_FRANJA`
+- ambos entrando diferencialmente en `QR_RED` y `QR_OTHER` respecto de `BIP`.
+
+::: {.callout-note}
+En **Larch**, el parámetro del nido se expresa como `Mu:QR` con rango `(0, 1]`.
+Para compararlo con Biogeme:
+
+`MU_biogeme ~= 1 / Mu:QR_larch`
+:::
+
+## 1) Setup
+
+```{python}
+#| label: setup
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import polars as pl
+from scipy.stats import norm
+
+import larch as lx
+from larch import P, X
+
+
+def resolve_project_root(start: Path | None = None) -> Path:
+    current = (start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / "config").exists() and (candidate / "lib").exists():
+            return candidate
+    raise RuntimeError("No se pudo resolver PROJECT_ROOT desde el notebook actual.")
+
+
+PROJECT_ROOT = resolve_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def format_sample_tag(sample_fraction: float | None) -> str:
+    if sample_fraction is None:
+        return "full"
+    pct = int(round(sample_fraction * 100))
+    return f"sample{pct}pct"
+
+
+print("✅ Setup listo")
+print("Larch version:", lx.__version__)
+```
+
+## 2) Configuración
+
+```{python}
+#| label: config
+
+POOLED_PATH = PROJECT_ROOT / "03_models" / "tmp" / "nested_enriched_interannual" / "trips_context_pooled_2024_2025.parquet"
+MODEL_PARTITION = "pooled_2024_2025"
+SAMPLE_FRACTION_ESTIMATION = 0.25
+SEED = 42
+LARCH_METHOD = "slsqp"
+LARCH_MAX_CAP = 20.0
+
+OUTPUT_DIR = (
+    PROJECT_ROOT
+    / "03_models"
+    / "larch_logit"
+    / "model_outputs_nl_larch"
+    / f"{MODEL_PARTITION}-nested-enriched-interannual-{format_sample_tag(SAMPLE_FRACTION_ESTIMATION)}"
+)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+print("Pooled path:", POOLED_PATH)
+print("Sample fraction:", SAMPLE_FRACTION_ESTIMATION)
+print("Larch method:", LARCH_METHOD)
+print("Larch max cap:", LARCH_MAX_CAP)
+print("Output dir:", OUTPUT_DIR)
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+
+def stratified_sample_partition_choice(
+    df: pl.DataFrame,
+    *,
+    fraction: float | None,
+    seed: int = 42,
+) -> pl.DataFrame:
+    if fraction is None:
+        return df
+    if not (0 < fraction <= 1):
+        raise ValueError(f"SAMPLE_FRACTION_ESTIMATION debe estar en (0,1], recibido: {fraction}")
+    return (
+        df.group_by("partition", "choice_nested", maintain_order=True)
+        .map_groups(lambda g: g.sample(fraction=fraction, shuffle=True, seed=seed))
+        .sort(["partition", "choice_nested"])
+    )
+
+
+LARCH_NUMERIC_COLUMNS = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_NO_LAB",
+    "DUMMY_ANIO_2025",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+]
+
+
+def prepare_larch_dataframe(df: pl.DataFrame) -> pd.DataFrame:
+    remap = {0: 1, 1: 2, 2: 3}
+    missing = [c for c in LARCH_NUMERIC_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Faltan columnas para Larch: {missing}")
+
+    out = (
+        df.select([pl.col(c) for c in LARCH_NUMERIC_COLUMNS] + [pl.col("partition")])
+        .with_columns(
+            pl.col("choice_nested").replace(remap).cast(pl.Int16).alias("choice_larch")
+        )
+        .drop("choice_nested")
+    )
+    pdf = out.to_pandas()
+    for col in pdf.columns:
+        if col in {"partition"}:
+            continue
+        if col == "choice_larch":
+            pdf[col] = pdf[col].astype("int32")
+        elif pd.api.types.is_integer_dtype(pdf[col]):
+            pdf[col] = pdf[col].astype("int32")
+        elif pd.api.types.is_float_dtype(pdf[col]):
+            pdf[col] = pdf[col].astype("float64")
+    return pdf
+
+
+def build_larch_stats_frame(model: lx.Model, n_obs: int) -> pd.DataFrame:
+    stats_raw = model.estimation_statistics_raw(compute_loglike_null=True)
+    stats = {
+        "Number of estimated parameters": len(model.pf),
+        "Number of free parameters": int((model.pf["holdfast"] == 0).sum()),
+        "Sample size": int(n_obs),
+    }
+    for key, value in stats_raw.items():
+        if isinstance(key, tuple):
+            label = " | ".join(str(k) for k in key)
+        else:
+            label = str(key)
+        stats[label] = value
+    return pd.DataFrame([stats])
+
+
+def build_larch_params_frame(model: lx.Model) -> pd.DataFrame:
+    pf = model.pf.copy().reset_index().rename(columns={"param_name": "Param", "value": "Value"})
+    robust_std_err = np.asarray(model.parameters["robust_std_err"].values, dtype=float)
+    robust_t = np.where(
+        np.isfinite(robust_std_err) & (robust_std_err > 0),
+        pf["Value"].to_numpy(dtype=float) / robust_std_err,
+        np.nan,
+    )
+    robust_p = np.where(np.isfinite(robust_t), 2 * norm.sf(np.abs(robust_t)), np.nan)
+    lower = pf["minimum"].to_numpy(dtype=float)
+    upper = pf["maximum"].to_numpy(dtype=float)
+    value = pf["Value"].to_numpy(dtype=float)
+    active_lower = np.isfinite(lower) & (np.abs(value - lower) <= 1e-6)
+    active_upper = np.isfinite(upper) & (np.abs(value - upper) <= 1e-6)
+    pf["Robust std err."] = robust_std_err
+    pf["Robust t-stat."] = robust_t
+    pf["Robust p-value"] = robust_p
+    pf["Active bound"] = active_lower | active_upper
+    pf["Biogeme-comparable MU"] = np.where(
+        pf["Param"] == "Mu:QR",
+        np.where(value != 0, 1.0 / value, np.nan),
+        np.nan,
+    )
+    return pf[
+        [
+            "Param",
+            "Value",
+            "Robust std err.",
+            "Robust t-stat.",
+            "Robust p-value",
+            "minimum",
+            "maximum",
+            "Active bound",
+            "Biogeme-comparable MU",
+        ]
+    ].rename(columns={"minimum": "Lower bound", "maximum": "Upper bound"})
+
+
+def build_larch_enriched_model(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    max_cap: float = 20.0,
+    nested: bool = True,
+) -> lx.Model:
+    alts = {1: "BIP", 2: "QR_RED", 3: "QR_OTHER"}
+    ds = lx.Dataset.construct.from_idco(pandas_df.drop(columns=["partition"], errors="ignore"), alts=alts)
+    m = lx.Model(ds)
+    model_kind = "Nested" if nested else "MNL"
+    m.title = f"{model_kind} OD Buffers enriched interannual ({partition})"
+    m.compute_engine = "numba"
+    m.choice_co_code = "choice_larch"
+    m.availability_co_vars = {1: 1, 2: 1, 3: 1}
+
+    m.utility_co[1] = (
+        P.B_BIP_T_VEH * X.TVH_BIP
+        + P.B_BIP_T_ESPERA_INI * X.TEI_BIP
+        + P.B_BIP_T_ESPERA_TRASB * X.TET_BIP
+        + P.B_BIP_N_TRASB * X.NTR_BIP
+    )
+
+    m.utility_co[2] = (
+        P.ASC_QR_RED
+        + P.B_QR_RED_LAB_PM * X.DUMMY_LAB_PM
+        + P.B_QR_RED_LAB_PT * X.DUMMY_LAB_PT
+        + P.B_QR_RED_NO_LAB * X.DUMMY_NO_LAB
+        + P.B_QR_RED_ANIO_2025 * X.DUMMY_ANIO_2025
+        + P.B_QR_RED_LOG_DEMAND * X.LOG_N_VIAJES_ZONA_INICIO_FRANJA
+        + P.B_QR_RED_T_VEH * X.TVH_QR_RED
+        + P.B_QR_RED_T_ESPERA_INI * X.TEI_QR_RED
+        + P.B_QR_RED_T_ESPERA_TRASB * X.TET_QR_RED
+        + P.B_QR_RED_N_TRASB * X.NTR_QR_RED
+    )
+
+    m.utility_co[3] = (
+        P.ASC_QR_OTHER
+        + P.B_QR_OTHER_LAB_PM * X.DUMMY_LAB_PM
+        + P.B_QR_OTHER_LAB_PT * X.DUMMY_LAB_PT
+        + P.B_QR_OTHER_NO_LAB * X.DUMMY_NO_LAB
+        + P.B_QR_OTHER_ANIO_2025 * X.DUMMY_ANIO_2025
+        + P.B_QR_OTHER_LOG_DEMAND * X.LOG_N_VIAJES_ZONA_INICIO_FRANJA
+        + P.B_QR_OTHER_T_VEH * X.TVH_QR_OTHER
+        + P.B_QR_OTHER_T_ESPERA_INI * X.TEI_QR_OTHER
+        + P.B_QR_OTHER_T_ESPERA_TRASB * X.TET_QR_OTHER
+        + P.B_QR_OTHER_N_TRASB * X.NTR_QR_OTHER
+    )
+
+    if nested:
+        m.graph.new_node(parameter="Mu:QR", children=[2, 3], name="QR")
+        m.ordering = [
+            ("ASCs", "ASC_.*"),
+            ("Time Dummies", "B_QR_.*_(LAB_PM|LAB_PT|NO_LAB)"),
+            ("Interannual", "B_QR_.*_ANIO_2025"),
+            ("Demand", "B_QR_.*_LOG_DEMAND"),
+            ("LOS", "B_.*_(T_VEH|T_ESPERA_INI|T_ESPERA_TRASB|N_TRASB)"),
+            ("LogSums", "Mu:.*"),
+        ]
+    else:
+        m.initialize_graph(alternative_codes=[1, 2, 3], alternative_names=["BIP", "QR_RED", "QR_OTHER"])
+        m.ordering = [
+            ("ASCs", "ASC_.*"),
+            ("Time Dummies", "B_QR_.*_(LAB_PM|LAB_PT|NO_LAB)"),
+            ("Interannual", "B_QR_.*_ANIO_2025"),
+            ("Demand", "B_QR_.*_LOG_DEMAND"),
+            ("LOS", "B_.*_(T_VEH|T_ESPERA_INI|T_ESPERA_TRASB|N_TRASB)"),
+        ]
+
+    m.set_cap(max_cap)
+    return m
+
+
+def estimate_larch_enriched(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    nested: bool,
+    max_cap: float = 20.0,
+    method: str = "slsqp",
+    quiet: bool = False,
+) -> tuple[lx.Model, pd.DataFrame, pd.DataFrame]:
+    m = build_larch_enriched_model(
+        pandas_df,
+        partition=partition,
+        max_cap=max_cap,
+        nested=nested,
+    )
+    m.maximize_loglike(method=method, quiet=quiet)
+    m.calculate_parameter_covariance(robust=True)
+    stats = build_larch_stats_frame(m, n_obs=len(pandas_df))
+    params = build_larch_params_frame(m)
+    return m, stats, params
+```
+
+## 4) Carga del pooled y muestra de estimación
+
+```{python}
+#| label: build-sample
+
+df_trips_pooled = pl.read_parquet(POOLED_PATH)
+print("rows pooled:", df_trips_pooled.height)
+
+df_trips_est = stratified_sample_partition_choice(
+    df_trips_pooled,
+    fraction=SAMPLE_FRACTION_ESTIMATION,
+    seed=SEED,
+)
+
+display(
+    df_trips_est.group_by(["partition", "choice_nested"]).agg(pl.len().alias("rows")).sort(["partition", "choice_nested"])
+)
+
+pdf_larch = prepare_larch_dataframe(df_trips_est)
+print("rows estimation:", len(pdf_larch))
+```
+
+## 5) Smoke test
+
+```{python}
+#| label: smoke-test-larch
+
+smoke_n = min(50_000, len(pdf_larch))
+pdf_smoke = pdf_larch.head(smoke_n).copy()
+
+model_smoke_nested, stats_smoke_nested, params_smoke_nested = estimate_larch_enriched(
+    pdf_smoke,
+    partition=f"{MODEL_PARTITION}-SMOKE",
+    nested=True,
+    method=LARCH_METHOD,
+    max_cap=LARCH_MAX_CAP,
+)
+
+model_smoke_mnl, stats_smoke_mnl, params_smoke_mnl = estimate_larch_enriched(
+    pdf_smoke,
+    partition=f"{MODEL_PARTITION}-SMOKE-MNL",
+    nested=False,
+    method=LARCH_METHOD,
+    max_cap=LARCH_MAX_CAP,
+)
+
+print("✅ Smoke nested OK")
+display(stats_smoke_nested)
+display(params_smoke_nested.head(12))
+
+print("✅ Smoke MNL OK")
+display(stats_smoke_mnl)
+display(params_smoke_mnl.head(12))
+```
+
+## 6) Estimación nested principal
+
+```{python}
+#| label: estimate-larch-nested
+
+model_larch_nested, stats_larch_nested, params_larch_nested = estimate_larch_enriched(
+    pdf_larch,
+    partition=MODEL_PARTITION,
+    nested=True,
+    method=LARCH_METHOD,
+    max_cap=LARCH_MAX_CAP,
+)
+
+stats_path_nested = OUTPUT_DIR / f"stats_nested_enriched_interannual_larch_{MODEL_PARTITION}.csv"
+params_path_nested = OUTPUT_DIR / f"params_nested_enriched_interannual_larch_{MODEL_PARTITION}.csv"
+stats_larch_nested.to_csv(stats_path_nested, index=False)
+params_larch_nested.to_csv(params_path_nested, index=False)
+
+print("✅ Nested guardado en:", OUTPUT_DIR)
+print("  -", stats_path_nested.name)
+print("  -", params_path_nested.name)
+display(stats_larch_nested)
+display(
+    params_larch_nested[
+        params_larch_nested["Param"].isin([
+            "Mu:QR",
+            "ASC_QR_RED",
+            "ASC_QR_OTHER",
+            "B_QR_RED_ANIO_2025",
+            "B_QR_OTHER_ANIO_2025",
+            "B_QR_RED_LOG_DEMAND",
+            "B_QR_OTHER_LOG_DEMAND",
+        ])
+    ]
+)
+```
+
+## 7) Estimación MNL de contraste
+
+```{python}
+#| label: estimate-larch-mnl
+#| eval: false
+
+model_larch_mnl, stats_larch_mnl, params_larch_mnl = estimate_larch_enriched(
+    pdf_larch,
+    partition=MODEL_PARTITION,
+    nested=False,
+    method=LARCH_METHOD,
+    max_cap=LARCH_MAX_CAP,
+)
+
+stats_path_mnl = OUTPUT_DIR / f"stats_mnl_enriched_interannual_larch_{MODEL_PARTITION}.csv"
+params_path_mnl = OUTPUT_DIR / f"params_mnl_enriched_interannual_larch_{MODEL_PARTITION}.csv"
+stats_larch_mnl.to_csv(stats_path_mnl, index=False)
+params_larch_mnl.to_csv(params_path_mnl, index=False)
+
+print("✅ MNL guardado en:", OUTPUT_DIR)
+display(stats_larch_mnl)
+display(params_larch_mnl.head(12))
+```

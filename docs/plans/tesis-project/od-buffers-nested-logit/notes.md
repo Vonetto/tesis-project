@@ -118,6 +118,44 @@
   - el modelo principal para interpretación pasa a ser el **MNL alt-specific**;
   - el nested se mantiene solo como contraste para documentar que el nido QR no agrega estructura empírica en esta base.
 
+## 2026-03-13 — Primer nested interanual enriquecido (decisión de especificación)
+- Para el notebook nuevo `03_models/07_nested_logit_enriched_interannual.qmd` se decidió **preservar la misma especificación nested base** del notebook `05`:
+  - mismas utilidades `V_BIP`, `V_QR_RED`, `V_QR_OTHER`;
+  - mismas dummies temporales V2 (`LAB_PM`, `LAB_PT`, `NO_LAB`, con `LAB_VALLE` como base);
+  - mismos bloques alt-specific `TVH`, `TEI`, `TET`, `NTR`;
+  - `n_trasbordos` sigue derivándose desde `n_etapas_recon - 1`.
+- En esta primera prueba interanual, sin socio-demo, se agregan solo dos controles:
+  - `DUMMY_ANIO_2025`
+  - `LOG_N_VIAJES_ZONA_INICIO_FRANJA`
+- Ambos controles entran **diferencialmente solo en `QR_RED` y `QR_OTHER` respecto de `BIP`**, no como términos comunes:
+  - `B_QR_RED_ANIO_2025 * DUMMY_ANIO_2025`
+  - `B_QR_OTHER_ANIO_2025 * DUMMY_ANIO_2025`
+  - `B_QR_RED_LOG_DEMAND * LOG_N_VIAJES_ZONA_INICIO_FRANJA`
+  - `B_QR_OTHER_LOG_DEMAND * LOG_N_VIAJES_ZONA_INICIO_FRANJA`
+- Justificación:
+  - `DUMMY_ANIO_2025` captura un shift interanual global relativo a la base `BIP`;
+  - `LOG_N_VIAJES_ZONA_INICIO_FRANJA` captura heterogeneidad contextual local de demanda por `zona_inicio_viaje × franja_V2 × año`;
+  - mantenerlos diferenciales respecto de `BIP` preserva la lógica identificacional del notebook base y evita reparametrizar la utilidad base en esta primera prueba.
+
+## 2026-03-13 — Muestreo de estimación interanual en Biogeme
+- El pooled `2024+2025` tiene `18.67M` filas alt-specific, demasiado grande para correrlo completo en Biogeme de forma estable en este entorno.
+- Se decidió usar una **submuestra estratificada por `partition × choice_nested`** con la **misma fracción en todos los estratos**, partiendo con `SAMPLE_FRACTION_ESTIMATION = 0.30`.
+- Justificación:
+  - preserva simultáneamente la composición por año (`2024-W17` vs `2025-W17`) y por alternativa (`BIP`, `QR_RED`, `QR_OTHER`);
+  - evita sobremuestrear alternativas escasas como `QR_RED`, lo que habría requerido corrección por `choice-based sampling`;
+  - mantiene una muestra `self-weighting`, por lo que no requiere ponderaciones adicionales en esta primera estimación.
+
+## 2026-03-13 — Réplica Larch del modelo enriquecido interanual
+- Se creó `03_models/larch_logit/07_nested_logit_enriched_interannual_larch.qmd`.
+- La réplica Larch usa:
+  - el mismo parquet pooled `03_models/tmp/nested_enriched_interannual/trips_context_pooled_2024_2025.parquet`;
+  - la misma submuestra estratificada por `partition × choice_nested` con `SAMPLE_FRACTION_ESTIMATION = 0.30`;
+  - la misma especificación alt-specific base del notebook `05`;
+  - los mismos controles nuevos `DUMMY_ANIO_2025` y `LOG_N_VIAJES_ZONA_INICIO_FRANJA`, entrando diferencialmente solo en `QR_RED` y `QR_OTHER`.
+- Alcance:
+  - `nested` principal en Larch para comparación con Biogeme;
+  - `MNL` de contraste en celda separada.
+
 ## 2026-03-03 — Diagnóstico de estabilidad y colinealidad del MNL alt-specific
 - Se compararon parámetros entre:
   - `Larch MNL full`;
@@ -1286,3 +1324,56 @@ Implication:
   - Los outputs intermedios de `04`/`05` se mantienen como artefactos tecnicos, no como fuente para modelacion.
 - Foco siguiente:
   - volver a la tarea principal del proyecto: enriquecimiento y reestimacion de los modelos OD-buffers usando estos parquets finales ya estabilizados.
+
+## 2026-03-12 - Arranque del modelo interanual enriquecido
+- Se confirmó que existe caracterización QR para ambos años en raw:
+  - `raw/caracterizacion/caracterización qr_202404.csv`
+  - `raw/caracterizacion/caracterización qr_202504.csv`
+- Hallazgo importante: la librería estaba hardcodeada a `caracterización qr_202504.csv`, por lo que cualquier corrida de `2024-W17` en modelos hubiera usado mal la caracterización 2025.
+- Fix aplicado:
+  - `lib/od_buffers_nested_logit.py`
+  - `lib/build_buffers_zona777_tipo_pago.py`
+  - `resolve_caracterizacion_path(..., partition_label)` y `_resolve_caracterizacion_path(..., partition_label)` ahora eligen `202404` o `202504` según la partición; si no se pasa partición, conservan el default `202504` para no romper notebooks viejos.
+- Se creó un notebook nuevo para no contaminar el flujo anterior:
+  - `03_models/07_nested_logit_enriched_interannual.qmd`
+- El notebook nuevo ya deja lista la base metodológica:
+  - carga `2024-W17` y `2025-W17`
+  - usa caracterización correcta por partición
+  - construye `od_context` y `trips_context` alt-specific pooled
+  - agrega `partition`, `year` y `DUMMY_ANIO_2025`
+  - mantiene la lógica base del OD-buffers anterior, incluyendo `n_trasbordos = n_etapas_recon - 1`
+- Decisión metodológica explícita de esta versión:
+  - partir con Nested Logit
+  - no incorporar aún socio-demo
+  - agregar primero `dummy_anio` y luego bloques de demanda/oferta
+
+## 2026-03-13 - Primera prueba de control de demanda para el modelo interanual
+- Se definió el primer bloque nuevo a probar como:
+  - `DUMMY_ANIO_2025`
+  - `LOG_N_VIAJES_ZONA_INICIO_FRANJA`
+- Decisiones metodológicas de esta primera prueba:
+  - usar `zona_inicio_viaje` solamente, no destino ni OD completo;
+  - construir la demanda por `zona_inicio_viaje × franja_V2 × año/partición`;
+  - usar las cuatro franjas V2 ya consistentes con el modelo base:
+    - `LAB_PM`
+    - `LAB_PT`
+    - `LAB_VALLE`
+    - `NO_LAB`
+  - ingresar la variable como `log1p(n_viajes)` y no en nivel crudo.
+- Rationale:
+  - `DUMMY_ANIO_2025` captura un shift interanual global;
+  - `LOG_N_VIAJES_ZONA_INICIO_FRANJA` captura heterogeneidad local/contextual de demanda;
+  - si el conteo no se construye por año, se mezclan intensidades de 2024 y 2025 y la dummy anual tendría que absorber también diferencias locales;
+  - partir solo con origen minimiza solapamiento con los atributos `OD × tipo_pago` ya presentes en el modelo base.
+- Se posterga para iteraciones siguientes:
+  - controles por destino;
+  - controles por OD completo;
+  - uso de hora exacta en vez de franja V2;
+  - socio-demo.
+- Implementación inicial realizada en `03_models/07_nested_logit_enriched_interannual.qmd`:
+  - se deriva `franja_v2` desde las dummies V2 del viaje;
+  - se cuenta demanda por `partition × zona_inicio_viaje × franja_v2`;
+  - se agrega `N_VIAJES_ZONA_INICIO_FRANJA` y `LOG_N_VIAJES_ZONA_INICIO_FRANJA` al `trips_context` pooled.
+- Smoke test sobre muestra limitada de ambas particiones:
+  - pooling exitoso con `share_nonnull_demand = 1.0`;
+  - celdas observadas por partición/franja consistentes en la muestra.

@@ -37,6 +37,8 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
 - [x] Investigar la implementación correcta en Larch 6 y dejar un notebook separado de réplica.
 - [ ] Inventariar y priorizar nuevas variables de control candidatas (demanda, oferta, accesibilidad, socio-demo).
 - [ ] Construir primer bloque de variables de demanda por zona/OD y franja horaria.
+  - Primera prueba acordada: `LOG_N_VIAJES_ZONA_INICIO_FRANJA` por `zona_inicio_viaje × franja_V2 × año`, junto con `DUMMY_ANIO_2025`.
+  - Entra en el nested con la misma especificación base del notebook `05`, agregando ambos controles solo diferencialmente para `QR_RED` y `QR_OTHER` respecto de `BIP`.
 - [ ] Construir primer bloque de variables de oferta de servicio por zona (paraderos, lineas, cercania a metro).
 - [ ] Retomar e integrar socio-demo en el modelo principal, comenzando por origen.
 - [x] Evaluar factibilidad de apilar `W17-2024` con `W17-2025` y definir una `dummy` de anio.
@@ -71,6 +73,7 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
   - agregar caches/indices para que `W17-2024` y `W17-2025` sean corribles en tiempos razonables.
 - [ ] Re-estimar el benchmark MNL enriquecido y revisar si mejora interpretabilidad/estabilidad.
 - [ ] Solo despues del enriquecimiento, decidir si vale la pena reintentar nested y/o retomar la comparacion `full` vs `generic` vs `mixed_tei_specific`.
+- [x] Crear una réplica en Larch del primer modelo enriquecido interanual, manteniendo la misma especificación de utilidades y controles nuevos que en Biogeme.
 
 ## Paused / Parked
 - Seleccion final entre `full`, `generic` y `mixed_tei_specific` queda pausada hasta probar especificaciones con controles adicionales.
@@ -78,4 +81,4 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
 - Reintento del nested sobre variantes parsimoniosas queda diferido hasta despues del enriquecimiento del modelo.
 
 ## Status
-- Current: `W17-2024` y `W17-2025` ya quedaron reprocesadas y validadas con el pipeline corregido. La rama de limpieza del pipeline queda cerrada a nivel de outputs finales de modelacion; el foco activo vuelve al enriquecimiento de la especificacion y la reestimacion de modelos con comparacion interanual.
+- Current: `W17-2024` y `W17-2025` ya quedaron reprocesadas y validadas con el pipeline corregido. El foco activo pasó a un notebook nuevo de modelo interanual enriquecido (`03_models/07_nested_logit_enriched_interannual.qmd`), ya con pooling base 2024+2025, `dummy_anio`, resolución correcta de caracterización por partición y primer control de demanda (`LOG_N_VIAJES_ZONA_INICIO_FRANJA`). La especificación nested ya quedó alineada metodológicamente con el notebook base `05`, manteniendo `TVH/TEI/TET/NTR` y haciendo entrar `DUMMY_ANIO_2025` y `LOG_N_VIAJES_ZONA_INICIO_FRANJA` solo de forma diferencial en `QR_RED` y `QR_OTHER`. También quedó creada la réplica Larch en `03_models/larch_logit/07_nested_logit_enriched_interannual_larch.qmd`, usando el mismo pooled y la misma muestra estratificada por `partition × choice_nested`. Lo siguiente es cerrar la primera corrida Biogeme/Larch de esta versión y luego agregar el primer control de oferta.

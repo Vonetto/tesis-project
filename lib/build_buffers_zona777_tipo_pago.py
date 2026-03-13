@@ -16,8 +16,9 @@ from config.constants import GCS_RAW_PATH, USE_LOCAL_PATHS, LOCAL_RAW_PATH  # no
 from lib.datalake import read_parquet_portable, read_csv_portable  # noqa: E402
 
 
-CARACTERIZACION_FILENAME = "caracterización qr_202504.csv"
-NOTEBOOK_LOCAL_ABSPATH = "/Volumes/KINGSTON/tesis-project/raw/caracterizacion/caracterización qr_202504.csv"
+DEFAULT_CARACTERIZACION_PERIOD = "202504"
+CARACTERIZACION_FILENAME = f"caracterización qr_{DEFAULT_CARACTERIZACION_PERIOD}.csv"
+NOTEBOOK_LOCAL_ABSPATH = f"/Volumes/KINGSTON/tesis-project/raw/caracterizacion/{CARACTERIZACION_FILENAME}"
 
 
 def _infer_partition_label_from_path(path: Path) -> str | None:
@@ -25,19 +26,38 @@ def _infer_partition_label_from_path(path: Path) -> str | None:
     return m.group(1) if m else None
 
 
-def _resolve_caracterizacion_path(explicit_path: str | None) -> str:
+def _period_from_partition_label(partition_label: str | None) -> str:
+    if not partition_label:
+        return DEFAULT_CARACTERIZACION_PERIOD
+    m = re.match(r"(\d{4})-W\d{2}", partition_label)
+    if not m:
+        return DEFAULT_CARACTERIZACION_PERIOD
+    year = m.group(1)
+    return f"{year}04"
+
+
+def _find_local_caracterizacion(raw_base: Path, period: str) -> str:
+    target_suffix = f"qr_{period}.csv"
+    base_dir = raw_base / "caracterizacion"
+    candidates = sorted(p for p in base_dir.glob(f"*{target_suffix}") if p.is_file())
+    if candidates:
+        return str(candidates[0])
+    return str(base_dir / f"caracterización qr_{period}.csv")
+
+
+def _resolve_caracterizacion_path(explicit_path: str | None, partition_label: str | None = None) -> str:
     if explicit_path:
         return explicit_path
 
-    if USE_LOCAL_PATHS:
-        # Replicate notebook logic as closely as possible (hard-coded external drive path).
-        if Path(NOTEBOOK_LOCAL_ABSPATH).exists():
-            return NOTEBOOK_LOCAL_ABSPATH
-        # Fallback: derive from config local raw path if available on this machine.
-        candidate = Path(LOCAL_RAW_PATH) / "caracterizacion" / CARACTERIZACION_FILENAME
-        return str(candidate)
+    period = _period_from_partition_label(partition_label)
 
-    return f"{GCS_RAW_PATH}/caracterizacion/{CARACTERIZACION_FILENAME}"
+    if USE_LOCAL_PATHS:
+        notebook_candidate = Path(NOTEBOOK_LOCAL_ABSPATH.replace(DEFAULT_CARACTERIZACION_PERIOD, period))
+        if notebook_candidate.exists():
+            return str(notebook_candidate)
+        return _find_local_caracterizacion(Path(LOCAL_RAW_PATH), period)
+
+    return f"{GCS_RAW_PATH}/caracterizacion/caracterización qr_{period}.csv"
 
 
 def load_caracterizacion(path: str) -> pl.DataFrame:
@@ -393,7 +413,7 @@ def _parse_args() -> BuffersConfig:
         sample_fraction=args.sample_fraction,
         sample_seed=args.sample_seed,
         drop_null_zones=not bool(args.keep_null_zones),
-        caracterizacion_path=_resolve_caracterizacion_path(args.caracterizacion_path),
+        caracterizacion_path=_resolve_caracterizacion_path(args.caracterizacion_path, partition),
         allow_missing_caracterizacion=bool(args.allow_missing_caracterizacion),
     )
 
