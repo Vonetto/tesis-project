@@ -1,5 +1,3 @@
-> Legacy path. Canonical location: [`docs/planning/workstreams/socio-demographics/notes.md`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/docs/planning/workstreams/socio-demographics/notes.md)
-
 # Notes — Socio-demographic Integration (Censo/CASEN ↔ Zonas777)
 
 ## 2026-04-09 (fork: análisis de microdatos comunales)

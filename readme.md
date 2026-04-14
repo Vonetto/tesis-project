@@ -168,6 +168,40 @@ Este proyecto usa una estrategia de ramas estructurada:
 
 📖 **Ver guía completa en:** [`GIT_WORKFLOW.md`](GIT_WORKFLOW.md)
 
+## Dónde leer avances y estado del proyecto
+
+La ubicación canónica para entender el estado del trabajo es:
+
+- [`docs/planning/`](docs/planning/)
+
+Ahí la documentación se divide en dos capas:
+
+- [`docs/planning/workstreams/`](docs/planning/workstreams/)
+  - bitácora operativa viva por línea de trabajo
+  - cada workstream mantiene:
+    - `notes.md`
+    - `task_plan.md`
+  - si quieres entender en qué se está trabajando **hoy**, parte aquí
+
+- [`docs/planning/stages/`](docs/planning/stages/)
+  - síntesis histórica por etapas del proyecto
+  - no replica el detalle diario; resume hitos, decisiones y outputs
+  - si quieres entender **cómo evolucionó** la tesis, parte aquí
+
+Archivos guía:
+
+- [`docs/planning/README.md`](docs/planning/README.md): convención de uso
+- [`docs/planning/project_timeline.md`](docs/planning/project_timeline.md): línea de tiempo corta
+- [`docs/planning/legacy_map.md`](docs/planning/legacy_map.md): mapeo entre rutas antiguas y nuevas
+
+### Importante
+
+- La carpeta histórica [`docs/plans/tesis-project/`](docs/plans/tesis-project/) queda como **legacy temporal**.
+- Los nuevos avances deben registrarse en [`docs/planning/workstreams/`](docs/planning/workstreams/).
+- Parte del backfill histórico también se apoya en:
+  - [`docs/avances/`](docs/avances/)
+  - notebooks en `02_eda/` y `03_models/`
+
 ## Contribuciones
 
 Este es un proyecto de tesis. Para dudas o colaboraciones, contactar a Juan Vicente Onetto Romero.
@@ -175,6 +209,5 @@ Este es un proyecto de tesis. Para dudas o colaboraciones, contactar a Juan Vice
 ## Licencia
 
 Por definir
-
 
 

@@ -1,5 +1,3 @@
-> Legacy path. Canonical location: [`docs/planning/workstreams/od-buffers-nested-logit/task_plan.md`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/docs/planning/workstreams/od-buffers-nested-logit/task_plan.md)
-
 # Task Plan — OD Buffers Model Enrichment
 
 ## Goal

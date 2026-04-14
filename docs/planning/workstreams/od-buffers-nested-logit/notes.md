@@ -1,5 +1,3 @@
-> Legacy path. Canonical location: [`docs/planning/workstreams/od-buffers-nested-logit/notes.md`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/docs/planning/workstreams/od-buffers-nested-logit/notes.md)
-
 # Notes — Nested Logit con Buffers OD (Option1 alt-specific)
 
 ## 2026-03-31 — Investigación preliminar de variable de ingresos

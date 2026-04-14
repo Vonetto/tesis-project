@@ -1,5 +1,3 @@
-> Legacy path. Canonical location: [`docs/planning/workstreams/time-dummies-v2-migration/task_plan.md`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/docs/planning/workstreams/time-dummies-v2-migration/task_plan.md)
-
 # Task Plan — Migración de Dummies Temporales a V2 (todos los modelos logit)
 
 ## Goal

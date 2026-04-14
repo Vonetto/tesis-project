@@ -1,5 +1,3 @@
-> Legacy path. Canonical location: [`docs/planning/workstreams/outputs-structure-cleanup/task_plan.md`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/docs/planning/workstreams/outputs-structure-cleanup/task_plan.md)
-
 # Task Plan
 
 ## Title

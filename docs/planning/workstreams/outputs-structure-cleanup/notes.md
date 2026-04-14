@@ -1,5 +1,3 @@
-> Legacy path. Canonical location: [`docs/planning/workstreams/outputs-structure-cleanup/notes.md`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/docs/planning/workstreams/outputs-structure-cleanup/notes.md)
-
 # Notes
 
 ## 2026-02-25
