@@ -1,0 +1,1128 @@
+---
+title: "EDA Clean — Censo 2024 ZONA777 + Join a Modelo 07"
+format: html
+---
+
+## Objetivo
+
+Este notebook no integra todavía variables al modelo. Su objetivo es auditar, desde cero y de forma limpia:
+
+- la naturaleza del agregado `Censo 2024 -> ZONA777`;
+- la unicidad y cobertura del parquet final;
+- la calidad de las variables candidatas;
+- y la validez del join hacia el pooled limpio usado en `03_models/07_nested_logit_enriched_interannual.qmd`.
+
+## Setup
+
+```{python}
+print("label: setup")
+#| label: setup
+from __future__ import annotations
+
+from pathlib import Path
+import json
+import sys
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import pandas as pd
+import polars as pl
+
+PROJECT_ROOT = Path.cwd()
+if not (PROJECT_ROOT / "lib").exists() and (PROJECT_ROOT.parent / "lib").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lib.interannual_offer_context import (
+    assert_left_join_preserves_rows,
+    ensure_unique_keys,
+    load_trip_zone_context,
+)
+from lib.censo2024_zona777 import COUNT_VARS, WEIGHTED_MEANS, SHARES, impute_missing_by_neighbor_median
+
+OUT_DIR = PROJECT_ROOT / "02_eda" / "tmp" / "censo2024_zona777"
+FINAL_PATH = OUT_DIR / "censo2024_zona777_agg_final.parquet"
+INTERSECTS_AREA_PATH = OUT_DIR / "censo2024_zona777_agg_intersects_area.parquet"
+ZONAS777_SHP = Path("/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp")
+TRIPS_CONTEXT_PATH = PROJECT_ROOT / "03_models" / "artifacts" / "interannual_enriched" / "trips_context_pooled_2024_2025.parquet"
+ESTIMATION_SAMPLE_PATH = PROJECT_ROOT / "03_models" / "artifacts" / "interannual_enriched" / "pooled_2024_2025-estimation-sample12pct.parquet"
+OFFICIAL_DICT_PATH = PROJECT_ROOT / "tmp" / "censo2024" / "diccionario_variables_glosas_censo2024.csv"
+SELECTED_DICT_DOC_PATH = PROJECT_ROOT / "docs" / "diccionario_censo2024_vars.md"
+
+JOIN_MODES = ["bbox", "region", "intersects", "intersects_area"]
+
+CANDIDATE_SOCIO_VARS = [
+    "prom_edad",
+    "prom_escolaridad18",
+    "share_inmigrantes",
+    "share_hacinamiento",
+]
+SECOND_ROUND_SOCIO_VARS = [
+    "share_internet",
+    "share_serv_compu",
+    "share_serv_tel_movil",
+    "share_discapacidad",
+    "share_analfabet",
+]
+DEFERRED_SOCIO_VARS = [
+    "share_ocupado",
+]
+
+print("OUT_DIR:", OUT_DIR)
+print("FINAL_PATH:", FINAL_PATH)
+print("ZONAS777_SHP:", ZONAS777_SHP)
+print("TRIPS_CONTEXT_PATH:", TRIPS_CONTEXT_PATH)
+print("ESTIMATION_SAMPLE_PATH:", ESTIMATION_SAMPLE_PATH)
+print("OFFICIAL_DICT_PATH:", OFFICIAL_DICT_PATH)
+print("SELECTED_DICT_DOC_PATH:", SELECTED_DICT_DOC_PATH)
+print("Variables candidatas activas (ronda 1):", CANDIDATE_SOCIO_VARS)
+print("Variables candidatas activas (ronda 2):", SECOND_ROUND_SOCIO_VARS)
+print("Variables postergadas:", DEFERRED_SOCIO_VARS)
+
+
+def socio_quality_summary(df: pl.DataFrame, socio_vars: list[str]) -> pl.DataFrame:
+    exprs = []
+    for c in socio_vars:
+        exprs.extend(
+            [
+                pl.col(c).min().alias(f"{c}_min"),
+                pl.col(c).max().alias(f"{c}_max"),
+                (pl.col(c) > 1).sum().alias(f"{c}_gt1"),
+                (pl.col(c) < 0).sum().alias(f"{c}_lt0"),
+                pl.col(c).is_null().sum().alias(f"{c}_nulls"),
+            ]
+        )
+    return df.select(exprs)
+
+
+def build_model_ready_subset(
+    *,
+    df_source: pl.DataFrame,
+    socio_vars: list[str],
+    zonas777_shp: Path,
+) -> tuple[gpd.GeoDataFrame, pl.DataFrame, pl.DataFrame]:
+    gdf_zonas_local = gpd.read_file(zonas777_shp)[["ZONA777", "geometry"]].copy()
+    gdf_zonas_local = gdf_zonas_local.set_crs("EPSG:4674", allow_override=True)
+
+    df_model_ready_pd, df_audit_pd = impute_missing_by_neighbor_median(
+        gdf_zonas=gdf_zonas_local,
+        df=df_source.select(["ZONA777"] + socio_vars).to_pandas(),
+        columns=socio_vars,
+    )
+
+    df_model_ready = pl.from_pandas(df_model_ready_pd)
+    df_audit = pl.from_pandas(df_audit_pd) if not df_audit_pd.empty else pl.DataFrame()
+    return gdf_zonas_local, df_model_ready, df_audit
+
+
+def render_spatial_maps(
+    *,
+    gdf_zonas_base: gpd.GeoDataFrame,
+    df_model_ready: pl.DataFrame,
+    socio_vars: list[str],
+    plot_cfg: dict[str, dict[str, str]],
+    title: str,
+    output_path: Path,
+) -> None:
+    gdf_zonas_map = gdf_zonas_base[["ZONA777", "geometry"]].copy()
+    if gdf_zonas_map["ZONA777"].duplicated().any():
+        gdf_zonas_map = gdf_zonas_map.dissolve(by="ZONA777", as_index=False)
+        gdf_zonas_map = gpd.GeoDataFrame(gdf_zonas_map, geometry="geometry", crs=gdf_zonas_base.crs)
+
+    gdf_plot = gdf_zonas_map.merge(df_model_ready.to_pandas(), on="ZONA777", how="left")
+    ncols = 2
+    nrows = int((len(socio_vars) + ncols - 1) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 6 * nrows))
+    axes = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+    for ax, var in zip(axes, socio_vars):
+        cfg = plot_cfg[var]
+        gdf_plot.plot(
+            column=var,
+            ax=ax,
+            cmap=cfg["cmap"],
+            linewidth=0.15,
+            edgecolor="white",
+            legend=True,
+            legend_kwds={"shrink": 0.75},
+            missing_kwds={"color": "#d9d9d9", "label": "Sin dato"},
+        )
+        q = (
+            df_model_ready
+            .select(
+                pl.col(var).min().alias("min"),
+                pl.col(var).median().alias("median"),
+                pl.col(var).max().alias("max"),
+            )
+            .row(0, named=True)
+        )
+        ax.set_title(
+            f"{cfg['title']}\nmin={q['min']:.3f} | mediana={q['median']:.3f} | max={q['max']:.3f}",
+            fontsize=11,
+        )
+        ax.set_axis_off()
+
+    for ax in axes[len(socio_vars):]:
+        ax.set_axis_off()
+
+    fig.suptitle(title, fontsize=15, y=0.98)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    print("Mapa guardado en:", output_path)
+    plt.show()
+
+
+def render_corr_matrix(
+    *,
+    df_model_ready: pl.DataFrame,
+    socio_vars: list[str],
+    title: str,
+    output_path: Path,
+) -> None:
+    df_corr_input = pd.DataFrame(df_model_ready.select(socio_vars).to_dicts())
+    df_corr = df_corr_input.corr(method="pearson", numeric_only=True)
+
+    display(df_corr.round(3))
+
+    pairs = []
+    vars_ = list(df_corr.columns)
+    for i, var_i in enumerate(vars_):
+        for j in range(i + 1, len(vars_)):
+            var_j = vars_[j]
+            corr_ij = float(df_corr.loc[var_i, var_j])
+            pairs.append(
+                {
+                    "var_1": var_i,
+                    "var_2": var_j,
+                    "corr": corr_ij,
+                    "abs_corr": abs(corr_ij),
+                }
+            )
+
+    display(pl.DataFrame(pairs).sort("abs_corr", descending=True))
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(df_corr.values, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(vars_)))
+    ax.set_yticks(range(len(vars_)))
+    ax.set_xticklabels(vars_, rotation=45, ha="right")
+    ax.set_yticklabels(vars_)
+
+    for i in range(len(vars_)):
+        for j in range(len(vars_)):
+            ax.text(j, i, f"{df_corr.iloc[i, j]:.2f}", ha="center", va="center", fontsize=10)
+
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    print("Matriz guardada en:", output_path)
+    plt.show()
+
+
+def ensure_trip_zone_context_loaded() -> tuple[pl.DataFrame, pl.DataFrame]:
+    global df_trips_keys, df_trip_zones
+
+    if "df_trips_keys" not in globals() or "df_trip_zones" not in globals():
+        df_trips_keys, df_trip_zones = load_trip_zone_context(TRIPS_CONTEXT_PATH)
+    return df_trips_keys, df_trip_zones
+```
+
+## 1) Inventario de outputs espaciales disponibles
+
+```{python}
+#| label: spatial-outputs-summary
+print("label: spatial-outputs-summary")
+rows = []
+for mode in JOIN_MODES:
+    parquet_path = OUT_DIR / f"censo2024_zona777_agg_{mode}.parquet"
+    diag_path = OUT_DIR / f"censo2024_zona777_diag_{mode}.json"
+    df = pl.read_parquet(parquet_path)
+    diag = json.loads(diag_path.read_text()) if diag_path.exists() else {}
+    rows.append(
+        {
+            "mode": mode,
+            "rows": df.height,
+            "dup_zona777": df.group_by("ZONA777").len().filter(pl.col("len") > 1).height,
+            "null_zona777": df.select(pl.col("ZONA777").is_null().sum()).item(),
+            "pct_centroid_outside_zonas777": diag.get("pct_centroid_outside_zonas777"),
+            "pct_entities_intersect_multiple_zonas777": diag.get("pct_entities_intersect_multiple_zonas777"),
+            "pct_base_keys_in_carto": diag.get("pct_base_keys_in_carto"),
+            "pct_carto_keys_in_base": diag.get("pct_carto_keys_in_base"),
+            "pct_rows_with_n_per": diag.get("pct_rows_with_n_per"),
+        }
+    )
+
+display(pl.DataFrame(rows).sort("mode"))
+```
+
+## 2) Confirmar qué representa el parquet final
+
+```{python}
+#| label: final-alias-check
+print("label: final-alias-check")
+df_final = pl.read_parquet(FINAL_PATH).sort("ZONA777")
+df_intersects_area = pl.read_parquet(INTERSECTS_AREA_PATH).sort("ZONA777")
+same_final_alias = df_final.equals(df_intersects_area)
+
+print("final rows:", df_final.height)
+print("intersects_area rows:", df_intersects_area.height)
+print("final == intersects_area:", same_final_alias)
+print("final columns:", len(df_final.columns))
+print("final first columns:", df_final.columns[:15])
+
+if not same_final_alias:
+    raise ValueError(
+        "censo2024_zona777_agg_final.parquet no coincide con "
+        "censo2024_zona777_agg_intersects_area.parquet; el alias final esta stale."
+    )
+```
+
+## 3) Unicidad y cobertura básica del parquet final
+
+```{python}
+#| label: final-key-checks
+print("label: final-key-checks")
+ensure_unique_keys(df_final, ["ZONA777"], "censo_final")
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1):
+    display(
+    df_final.select(
+        pl.len().alias("rows"),
+        pl.col("ZONA777").n_unique().alias("n_zonas"),
+        pl.col("ZONA777").is_null().sum().alias("null_zona777"),
+        pl.col("ZONA777").min().alias("min_zona777"),
+        pl.col("ZONA777").max().alias("max_zona777"),
+    )
+)
+```
+
+## 4) Inventario de variables del parquet final
+
+```{python}
+#| label: final-vars-inventory
+print("label: final-vars-inventory")
+count_cols = [c for c in df_final.columns if c.startswith("n_")]
+mean_cols = [c for c in df_final.columns if c.startswith("prom_")]
+share_cols = [c for c in df_final.columns if c.startswith("share_")]
+other_cols = [c for c in df_final.columns if c not in (["ZONA777"] + count_cols + mean_cols + share_cols)]
+
+inventory = pl.DataFrame(
+    {
+        "grupo": (
+            ["id"] * 1
+            + ["count"] * len(count_cols)
+            + ["mean"] * len(mean_cols)
+            + ["share"] * len(share_cols)
+            + ["other"] * len(other_cols)
+        ),
+        "variable": ["ZONA777"] + count_cols + mean_cols + share_cols + other_cols,
+    }
+)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1):
+    display(inventory)
+```
+
+## 5) Diccionario estructural del parquet final
+
+```{python}
+#| label: structural-variable-dictionary
+print("label: structural-variable-dictionary")
+rows = []
+for var in df_final.columns:
+    if var == "ZONA777":
+        rows.append(
+            {
+                "variable": var,
+                "grupo": "id",
+                "aggregation_type": "key",
+                "source_formula": "Identificador de zona 777",
+                "comment": "Llave final para joins al modelo",
+            }
+        )
+    elif var in COUNT_VARS:
+        rows.append(
+            {
+                "variable": var,
+                "grupo": "count",
+                "aggregation_type": "sum",
+                "source_formula": f"sum({var}) sobre unidades base asignadas a ZONA777",
+                "comment": "Conteo agregado a nivel zona",
+            }
+        )
+    elif var in WEIGHTED_MEANS:
+        w = WEIGHTED_MEANS[var]
+        rows.append(
+            {
+                "variable": var,
+                "grupo": "mean",
+                "aggregation_type": "weighted_mean",
+                "source_formula": f"sum({var} * {w}) / sum({w})",
+                "comment": f"Promedio ponderado usando {w} como peso",
+            }
+        )
+    elif var in SHARES:
+        num, den = SHARES[var]
+        rows.append(
+            {
+                "variable": var,
+                "grupo": "share",
+                "aggregation_type": "derived_share",
+                "source_formula": f"{num} / {den}",
+                "comment": "Share derivado después de agregar numerador y denominador",
+            }
+        )
+    else:
+        rows.append(
+            {
+                "variable": var,
+                "grupo": "other",
+                "aggregation_type": "unknown",
+                "source_formula": None,
+                "comment": "Revisar manualmente",
+            }
+        )
+
+df_structural_dict = pl.DataFrame(rows).sort(["grupo", "variable"])
+with pl.Config(tbl_rows=-1, tbl_cols=-1):
+    display(df_structural_dict)
+```
+
+## 6) Cruce con el diccionario oficial del Censo
+
+```{python}
+#| label: official-dictionary-join
+print("label: official-dictionary-join")
+if not OFFICIAL_DICT_PATH.exists():
+    raise FileNotFoundError(f"No existe diccionario oficial exportado en: {OFFICIAL_DICT_PATH}")
+
+df_official_dict = (
+    pl.read_csv(OFFICIAL_DICT_PATH)
+    .rename(
+        {
+            "Temática": "tematica",
+            "Variable": "variable",
+            "Tipo de variable": "tipo_variable",
+            "Descripción": "descripcion",
+            "Universo": "universo",
+        }
+    )
+)
+
+df_base_vars_dict = (
+    df_structural_dict
+    .filter(~pl.col("variable").is_in(list(SHARES.keys())))
+    .join(df_official_dict, on="variable", how="left")
+)
+
+share_rows = []
+for share_var, (num, den) in SHARES.items():
+    if share_var not in df_final.columns:
+        continue
+    num_desc = (
+        df_official_dict.filter(pl.col("variable") == num).select("descripcion").to_series().to_list()
+    )
+    den_desc = (
+        df_official_dict.filter(pl.col("variable") == den).select("descripcion").to_series().to_list()
+    )
+    den_univ = (
+        df_official_dict.filter(pl.col("variable") == den).select("universo").to_series().to_list()
+    )
+    share_rows.append(
+        {
+            "variable": share_var,
+            "grupo": "share",
+            "aggregation_type": "derived_share",
+            "source_formula": f"{num} / {den}",
+            "comment": "Variable derivada en el script de agregación",
+            "tematica": "Derivada",
+            "tipo_variable": "Proporción derivada",
+            "descripcion": f"Share derivado desde {num} sobre {den}",
+            "universo": den_univ[0] if den_univ else None,
+            "numerador_descripcion": num_desc[0] if num_desc else None,
+            "denominador_descripcion": den_desc[0] if den_desc else None,
+        }
+    )
+
+df_share_dict = pl.DataFrame(share_rows) if share_rows else pl.DataFrame()
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1):
+    display(df_base_vars_dict.sort(["grupo", "variable"]))
+with pl.Config(tbl_rows=-1, tbl_cols=-1):
+    display(df_share_dict.sort("variable"))
+```
+
+## 7) Variables candidatas: lectura conceptual antes de modelar
+
+```{python}
+#| label: candidate-dictionary
+print("label: candidate-dictionary")
+df_candidate_dict = (
+    pl.concat(
+        [
+            df_base_vars_dict.select(
+                ["variable", "grupo", "aggregation_type", "source_formula", "tematica", "tipo_variable", "descripcion", "universo", "comment"]
+            ),
+            df_share_dict.select(
+                ["variable", "grupo", "aggregation_type", "source_formula", "tematica", "tipo_variable", "descripcion", "universo", "comment"]
+            ),
+        ],
+        how="diagonal_relaxed",
+    )
+    .filter(pl.col("variable").is_in(CANDIDATE_SOCIO_VARS))
+    .with_columns(pl.col("variable").is_in(CANDIDATE_SOCIO_VARS).alias("es_candidata"))
+    .sort("variable")
+)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    display(df_candidate_dict)
+```
+
+## 8) Calidad de variables socio candidatas
+
+```{python}
+#| label: candidate-quality-summary
+print("label: candidate-quality-summary")
+exprs = []
+for c in CANDIDATE_SOCIO_VARS:
+    exprs.extend(
+        [
+            pl.col(c).min().alias(f"{c}_min"),
+            pl.col(c).max().alias(f"{c}_max"),
+            (pl.col(c) > 1).sum().alias(f"{c}_gt1"),
+            (pl.col(c) < 0).sum().alias(f"{c}_lt0"),
+            pl.col(c).is_null().sum().alias(f"{c}_nulls"),
+        ]
+    )
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    display(df_final.select(exprs))
+display(df_final.select(["ZONA777"] + CANDIDATE_SOCIO_VARS).head(10))
+```
+
+## 9) Zonas problemáticas puntuales en variables share
+
+```{python}
+#| label: problematic-share-zones
+print("label: problematic-share-zones")
+candidate_share_vars = [c for c in CANDIDATE_SOCIO_VARS if c.startswith("share_")]
+for c in candidate_share_vars:
+    bad = (
+        df_final
+        .filter((pl.col(c) > 1) | (pl.col(c) < 0) | pl.col(c).is_null())
+        .select(["ZONA777", c])
+        .sort(c, descending=True, nulls_last=True)
+    )
+    print(f"\nVariable: {c}")
+    print(f"n zonas problemáticas: {bad.height}")
+    
+    with pl.Config(tbl_rows=-1, tbl_cols=-1):
+        display(bad.head(15))
+```
+
+## 10) Cobertura del join contra el pooled limpio de `07`
+
+```{python}
+#| label: pooled-zone-coverage
+print("label: pooled-zone-coverage")
+df_trips_keys = (
+    pl.read_parquet(
+        TRIPS_CONTEXT_PATH,
+        columns=["partition", "franja_v2", "zona_inicio_viaje"],
+    )
+    .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False))
+)
+
+df_trip_zones = df_trips_keys.select("zona_inicio_viaje").drop_nulls().unique().sort("zona_inicio_viaje")
+df_censo_keys = df_final.select(pl.col("ZONA777").cast(pl.Int64, strict=False)).drop_nulls().unique().sort("ZONA777")
+
+trip_missing_in_censo = (
+    df_trip_zones.join(df_censo_keys, left_on="zona_inicio_viaje", right_on="ZONA777", how="anti")
+    .sort("zona_inicio_viaje")
+)
+censo_not_used = (
+    df_censo_keys.join(df_trip_zones, left_on="ZONA777", right_on="zona_inicio_viaje", how="anti")
+    .sort("ZONA777")
+)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1):
+    display(
+    pl.DataFrame(
+        {
+            "trip_unique_zonas": [df_trip_zones.height],
+            "censo_unique_zonas": [df_censo_keys.height],
+            "trip_zonas_missing_in_censo": [trip_missing_in_censo.height],
+            "censo_zonas_not_used_in_trips": [censo_not_used.height],
+        }
+    )
+)
+
+print("Trip zonas missing in censo:")
+with pl.Config(tbl_rows=-1, tbl_cols=-1):
+    display(trip_missing_in_censo)
+
+print("Censo zonas not used in trips:")
+with pl.Config(tbl_rows=-1, tbl_cols=-1):
+    display(censo_not_used.head(20))
+```
+
+## 11) Simulación explícita del join a trips_context
+
+```{python}
+#| label: explicit-join-check
+print("label: explicit-join-check")
+df_censo_join = (
+    df_final
+    .select(["ZONA777"] + CANDIDATE_SOCIO_VARS)
+    .with_columns(pl.col("ZONA777").cast(pl.Int64, strict=False))
+)
+ensure_unique_keys(df_censo_join, ["ZONA777"], "df_censo_join")
+
+before_rows = df_trips_keys.height
+df_trips_joined = (
+    df_trips_keys
+    .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+    .join(df_censo_join, on="ZONA777", how="left")
+    .drop("ZONA777")
+)
+assert_left_join_preserves_rows(before_rows, df_trips_joined.height, "join Censo sobre trips_context")
+
+display(
+    pl.DataFrame(
+        {
+            "rows_before": [before_rows],
+            "rows_after": [df_trips_joined.height],
+            "pct_rows_any_missing_socio": [
+                df_trips_joined.select(
+                    pl.any_horizontal([pl.col(c).is_null() for c in CANDIDATE_SOCIO_VARS]).mean()
+                ).item()
+            ],
+        }
+    )
+)
+
+display(
+    df_trips_joined.group_by(["partition", "franja_v2"]).agg(
+        pl.len().alias("rows"),
+        pl.col("zona_inicio_viaje").n_unique().alias("n_zonas"),
+        pl.any_horizontal([pl.col(c).is_null() for c in CANDIDATE_SOCIO_VARS]).mean().alias("pct_rows_any_missing_socio"),
+    ).sort(["partition", "franja_v2"])
+)
+```
+
+## 12) ¿Las filas faltantes / problemáticas realmente afectan al pooled usado?
+
+```{python}
+#| label: problematic-zones-used-in-trips
+for c in candidate_share_vars:
+    print(f"label: problematic-zones-used-in-trips for {c}")
+    bad = (
+        df_final
+        .filter(pl.col(c) > 1)
+        .join(df_trip_zones, left_on="ZONA777", right_on="zona_inicio_viaje", how="inner")
+        .select(["ZONA777", c])
+        .sort(c, descending=True)
+    )
+    print(f"\n{c}")
+    print(f"gt1 total en Censo: {df_final.filter(pl.col(c) > 1).height}")
+    print(f"gt1 que sí aparecen en trips_context: {bad.height}")
+    display(bad.head(15))
+
+null_any = (
+    df_final
+    .filter(pl.any_horizontal([pl.col(c).is_null() for c in CANDIDATE_SOCIO_VARS]))
+    .join(df_trip_zones, left_on="ZONA777", right_on="zona_inicio_viaje", how="inner")
+    .select(["ZONA777"] + CANDIDATE_SOCIO_VARS)
+)
+
+print("\nZonas con algún socio nulo que sí aparecen en trips_context:")
+display(null_any)
+```
+
+## 12b) Variables postergadas para segunda ronda
+
+```{python}
+#| label: deferred-vars-status
+print("label: deferred-vars-status")
+display(
+    df_final.select(
+        *[
+            pl.col(c).min().alias(f"{c}_min")
+            for c in DEFERRED_SOCIO_VARS
+        ],
+        *[
+            pl.col(c).max().alias(f"{c}_max")
+            for c in DEFERRED_SOCIO_VARS
+        ],
+        *[
+            (pl.col(c) > 1).sum().alias(f"{c}_gt1")
+            for c in DEFERRED_SOCIO_VARS
+        ],
+        *[
+            pl.col(c).is_null().sum().alias(f"{c}_nulls")
+            for c in DEFERRED_SOCIO_VARS
+        ],
+    )
+)
+```
+
+## 12c) Imputación espacial model-ready para zonas con socio faltante
+
+```{python}
+#| label: spatial-neighbor-imputation
+print("label: spatial-neighbor-imputation")
+gdf_zonas = gpd.read_file(ZONAS777_SHP)[["ZONA777", "geometry"]].copy()
+gdf_zonas = gdf_zonas.set_crs("EPSG:4674", allow_override=True)
+
+df_censo_model_ready_pd, df_censo_imputation_audit_pd = impute_missing_by_neighbor_median(
+    gdf_zonas=gdf_zonas,
+    df=df_final.select(["ZONA777"] + CANDIDATE_SOCIO_VARS).to_pandas(),
+    columns=CANDIDATE_SOCIO_VARS,
+)
+
+df_censo_model_ready = pl.from_pandas(df_censo_model_ready_pd)
+df_censo_imputation_audit = pl.from_pandas(df_censo_imputation_audit_pd)
+
+display(df_censo_imputation_audit)
+display(
+    df_censo_model_ready
+    .filter(pl.col("ZONA777") == 528)
+    .select(["ZONA777"] + CANDIDATE_SOCIO_VARS)
+)
+```
+
+## 12d) Mapas espaciales de variables candidatas model-ready
+
+```{python}
+#| label: spatial-maps-model-ready
+#
+import matplotlib.pyplot as plt
+print("label: spatial-maps-model-ready")
+MAP_OUTPUT_PATH = OUT_DIR / "censo_candidate_maps_model_ready.png"
+
+gdf_zonas_map = gdf_zonas[["ZONA777", "geometry"]].copy()
+if gdf_zonas_map["ZONA777"].duplicated().any():
+    gdf_zonas_map = gdf_zonas_map.dissolve(by="ZONA777", as_index=False)
+    gdf_zonas_map = gpd.GeoDataFrame(gdf_zonas_map, geometry="geometry", crs=gdf_zonas.crs)
+
+gdf_censo_model_ready = gdf_zonas_map.merge(
+    df_censo_model_ready.to_pandas(),
+    on="ZONA777",
+    how="left",
+)
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 14))
+axes = axes.flatten()
+
+plot_cfg = {
+    "prom_edad": {
+        "title": "Edad promedio",
+        "cmap": "YlOrBr",
+    },
+    "prom_escolaridad18": {
+        "title": "Escolaridad promedio 18+",
+        "cmap": "Greens",
+    },
+    "share_inmigrantes": {
+        "title": "Share inmigrantes",
+        "cmap": "Blues",
+    },
+    "share_hacinamiento": {
+        "title": "Share hacinamiento",
+        "cmap": "Reds",
+    },
+}
+
+for ax, var in zip(axes, CANDIDATE_SOCIO_VARS):
+    cfg = plot_cfg[var]
+    gdf_censo_model_ready.plot(
+        column=var,
+        ax=ax,
+        cmap=cfg["cmap"],
+        linewidth=0.15,
+        edgecolor="white",
+        legend=True,
+        legend_kwds={"shrink": 0.75},
+        missing_kwds={"color": "#d9d9d9", "label": "Sin dato"},
+    )
+    q = (
+        df_censo_model_ready
+        .select(
+            pl.col(var).min().alias("min"),
+            pl.col(var).median().alias("median"),
+            pl.col(var).max().alias("max"),
+        )
+        .row(0, named=True)
+    )
+    ax.set_title(
+        f"{cfg['title']}\nmin={q['min']:.3f} | mediana={q['median']:.3f} | max={q['max']:.3f}",
+        fontsize=11,
+    )
+    ax.set_axis_off()
+
+fig.suptitle("Censo 2024 -> ZONA777 | Variables candidatas model-ready", fontsize=15, y=0.98)
+fig.tight_layout()
+fig.savefig(MAP_OUTPUT_PATH, dpi=180, bbox_inches="tight")
+print("Mapa guardado en:", MAP_OUTPUT_PATH)
+plt.show()
+```
+
+## 12e) Correlación entre variables candidatas model-ready
+
+```{python}
+#| label: correlation-matrix-model-ready
+print("label: correlation-matrix-model-ready")
+CORR_OUTPUT_PATH = OUT_DIR / "censo_candidate_corr_matrix_model_ready.png"
+
+df_corr_input = pd.DataFrame(df_censo_model_ready.select(CANDIDATE_SOCIO_VARS).to_dicts())
+df_corr = df_corr_input.corr(method="pearson", numeric_only=True)
+
+display(df_corr.round(3))
+
+pairs = []
+vars_ = list(df_corr.columns)
+for i, var_i in enumerate(vars_):
+    for j in range(i + 1, len(vars_)):
+        var_j = vars_[j]
+        corr_ij = float(df_corr.loc[var_i, var_j])
+        pairs.append(
+            {
+                "var_1": var_i,
+                "var_2": var_j,
+                "corr": corr_ij,
+                "abs_corr": abs(corr_ij),
+            }
+        )
+
+df_corr_pairs = pl.DataFrame(pairs).sort("abs_corr", descending=True)
+display(df_corr_pairs)
+
+fig, ax = plt.subplots(figsize=(7, 6))
+im = ax.imshow(df_corr.values, cmap="RdBu_r", vmin=-1, vmax=1)
+ax.set_xticks(range(len(vars_)))
+ax.set_yticks(range(len(vars_)))
+ax.set_xticklabels(vars_, rotation=45, ha="right")
+ax.set_yticklabels(vars_)
+
+for i in range(len(vars_)):
+    for j in range(len(vars_)):
+        ax.text(j, i, f"{df_corr.iloc[i, j]:.2f}", ha="center", va="center", fontsize=10)
+
+ax.set_title("Matriz de correlación Pearson | Variables candidatas model-ready")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+fig.tight_layout()
+fig.savefig(CORR_OUTPUT_PATH, dpi=180, bbox_inches="tight")
+print("Matriz guardada en:", CORR_OUTPUT_PATH)
+plt.show()
+```
+
+## 12f) Join model-ready después de imputación espacial
+
+```{python}
+#| label: explicit-join-check-model-ready
+print("label: explicit-join-check-model-ready")
+ensure_unique_keys(df_censo_model_ready, ["ZONA777"], "df_censo_model_ready")
+
+before_rows_model = df_trips_keys.height
+df_trips_joined_model_ready = (
+    df_trips_keys
+    .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+    .join(df_censo_model_ready, on="ZONA777", how="left")
+    .drop("ZONA777")
+)
+assert_left_join_preserves_rows(before_rows_model, df_trips_joined_model_ready.height, "join Censo model-ready sobre trips_context")
+
+display(
+    pl.DataFrame(
+        {
+            "rows_before": [before_rows_model],
+            "rows_after": [df_trips_joined_model_ready.height],
+            "pct_rows_any_missing_socio": [
+                df_trips_joined_model_ready.select(
+                    pl.any_horizontal([pl.col(c).is_null() for c in CANDIDATE_SOCIO_VARS]).mean()
+                ).item()
+            ],
+        }
+    )
+)
+```
+
+## 13) Distribuciones trip-weighted después del join model-ready
+
+```{python}
+#| label: trip-weighted-summaries
+print("label: trip-weighted-summaries")
+display(
+    df_trips_joined_model_ready.select(
+        [
+            pl.len().alias("rows"),
+            *[pl.col(c).mean().alias(f"{c}_trip_weighted_mean") for c in CANDIDATE_SOCIO_VARS],
+            *[pl.col(c).median().alias(f"{c}_trip_weighted_median") for c in CANDIDATE_SOCIO_VARS],
+        ]
+    )
+)
+```
+
+## 14) Muestra de estimación actual y cobertura socio
+
+```{python}
+#| label: estimation-sample-coverage
+print("label: estimation-sample-coverage")
+df_est = (
+    pl.read_parquet(
+        ESTIMATION_SAMPLE_PATH,
+        columns=["partition", "franja_v2", "zona_inicio_viaje"],
+    )
+    .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+    .join(df_censo_model_ready, on="ZONA777", how="left")
+    .drop("ZONA777")
+)
+
+display(
+    df_est.group_by(["partition", "franja_v2"]).agg(
+        pl.len().alias("rows"),
+        pl.col("zona_inicio_viaje").n_unique().alias("n_zonas"),
+        pl.any_horizontal([pl.col(c).is_null() for c in CANDIDATE_SOCIO_VARS]).mean().alias("pct_rows_any_missing_socio"),
+    ).sort(["partition", "franja_v2"])
+)
+```
+
+## 15) Observaciones para la siguiente decisión
+
+- El parquet final debe ser único por `ZONA777` y preservar filas al joinear contra `trips_context`.
+- La comparación `trip_zonas_missing_in_censo == 0` es una precondición para meter Censo al modelo sin imputar por “falta de llave”.
+- Antes de elegir variables para el modelo, conviene leer primero el diccionario estructural:
+  - qué variables son conteos agregados;
+  - cuáles son promedios ponderados;
+  - y cuáles son shares derivados que pueden tener caveats de denominador/overlay.
+- En esta primera ronda, la exploración activa se restringe a:
+  - `prom_edad`
+  - `prom_escolaridad18`
+  - `share_inmigrantes`
+  - `share_hacinamiento`
+- `share_internet` y `share_ocupado` quedan explícitamente postergadas para una segunda ronda:
+  - no porque estén hoy fuera de rango, sino para no mezclar el análisis inicial con variables que requieren una discusión conceptual más fina de universo/interpretación.
+- Antes de integrar Censo a `07`, este notebook debiera dejar claro:
+  - qué variables son “seguras”;
+  - cuáles requieren transformación/clip/redefinición;
+  - y cuál será la política de imputación para zonas como `ZONA777 = 528`.
+
+## 16) Segunda ronda: lectura conceptual antes de modelar
+
+```{python}
+#| label: second-round-candidate-dictionary
+print("label: second-round-candidate-dictionary")
+df_second_round_dict = (
+    pl.concat(
+        [
+            df_base_vars_dict.select(
+                ["variable", "grupo", "aggregation_type", "source_formula", "tematica", "tipo_variable", "descripcion", "universo", "comment"]
+            ),
+            df_share_dict.select(
+                ["variable", "grupo", "aggregation_type", "source_formula", "tematica", "tipo_variable", "descripcion", "universo", "comment"]
+            ),
+        ],
+        how="diagonal_relaxed",
+    )
+    .filter(pl.col("variable").is_in(SECOND_ROUND_SOCIO_VARS))
+    .with_columns(pl.col("variable").is_in(SECOND_ROUND_SOCIO_VARS).alias("es_candidata"))
+    .sort("variable")
+)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    display(df_second_round_dict)
+```
+
+## 17) Segunda ronda: calidad de variables socio candidatas
+
+```{python}
+#| label: second-round-quality-summary
+print("label: second-round-quality-summary")
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    display(socio_quality_summary(df_final, SECOND_ROUND_SOCIO_VARS))
+display(df_final.select(["ZONA777"] + SECOND_ROUND_SOCIO_VARS).head(10))
+```
+
+## 18) Segunda ronda: zonas problemáticas puntuales
+
+```{python}
+#| label: second-round-problematic-share-zones
+print("label: second-round-problematic-share-zones")
+for c in SECOND_ROUND_SOCIO_VARS:
+    bad = (
+        df_final
+        .filter((pl.col(c) > 1) | (pl.col(c) < 0) | pl.col(c).is_null())
+        .select(["ZONA777", c])
+        .sort(c, descending=True, nulls_last=True)
+    )
+    print(f"\nVariable: {c}")
+    print(f"n zonas problemáticas: {bad.height}")
+
+    with pl.Config(tbl_rows=-1, tbl_cols=-1):
+        display(bad.head(15))
+```
+
+## 19) Segunda ronda: ¿las zonas problemáticas realmente afectan al pooled usado?
+
+```{python}
+#| label: second-round-problematic-zones-used-in-trips
+print("label: second-round-problematic-zones-used-in-trips")
+df_trips_keys, df_trip_zones = ensure_trip_zone_context_loaded()
+for c in SECOND_ROUND_SOCIO_VARS:
+    bad = (
+        df_final
+        .filter((pl.col(c) > 1) | (pl.col(c) < 0))
+        .join(df_trip_zones, left_on="ZONA777", right_on="zona_inicio_viaje", how="inner")
+        .select(["ZONA777", c])
+        .sort(c, descending=True)
+    )
+    print(f"\n{c}")
+    print(f"fuera de rango total en Censo: {df_final.filter((pl.col(c) > 1) | (pl.col(c) < 0)).height}")
+    print(f"fuera de rango que sí aparecen en trips_context: {bad.height}")
+    display(bad.head(15))
+
+null_any_round2 = (
+    df_final
+    .filter(pl.any_horizontal([pl.col(c).is_null() for c in SECOND_ROUND_SOCIO_VARS]))
+    .join(df_trip_zones, left_on="ZONA777", right_on="zona_inicio_viaje", how="inner")
+    .select(["ZONA777"] + SECOND_ROUND_SOCIO_VARS)
+)
+
+print("\nZonas con algún socio nulo de ronda 2 que sí aparecen en trips_context:")
+display(null_any_round2)
+```
+
+## 20) Segunda ronda: imputación espacial model-ready
+
+```{python}
+#| label: second-round-spatial-neighbor-imputation
+print("label: second-round-spatial-neighbor-imputation")
+gdf_zonas_round2, df_censo_model_ready_round2, df_censo_imputation_audit_round2 = build_model_ready_subset(
+    df_source=df_final,
+    socio_vars=SECOND_ROUND_SOCIO_VARS,
+    zonas777_shp=ZONAS777_SHP,
+)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1):
+    display(df_censo_imputation_audit_round2)
+
+display(
+    df_censo_model_ready_round2
+    .filter(pl.col("ZONA777") == 528)
+    .select(["ZONA777"] + SECOND_ROUND_SOCIO_VARS)
+)
+```
+
+## 21) Segunda ronda: mapas espaciales model-ready
+
+```{python}
+#| label: second-round-spatial-maps-model-ready
+print("label: second-round-spatial-maps-model-ready")
+MAP_OUTPUT_PATH_ROUND2 = OUT_DIR / "censo_second_round_maps_model_ready.png"
+
+plot_cfg_round2 = {
+    "share_internet": {"title": "Share internet", "cmap": "PuBuGn"},
+    "share_serv_compu": {"title": "Share computador", "cmap": "YlGnBu"},
+    "share_serv_tel_movil": {"title": "Share tel. movil", "cmap": "OrRd"},
+    "share_discapacidad": {"title": "Share discapacidad", "cmap": "Greys"},
+    "share_analfabet": {"title": "Share analfabetismo", "cmap": "RdPu"},
+}
+
+render_spatial_maps(
+    gdf_zonas_base=gdf_zonas_round2,
+    df_model_ready=df_censo_model_ready_round2,
+    socio_vars=SECOND_ROUND_SOCIO_VARS,
+    plot_cfg=plot_cfg_round2,
+    title="Censo 2024 -> ZONA777 | Variables candidatas model-ready (ronda 2)",
+    output_path=MAP_OUTPUT_PATH_ROUND2,
+)
+```
+
+## 22) Segunda ronda: correlación entre variables candidatas model-ready
+
+```{python}
+#| label: second-round-correlation-matrix-model-ready
+print("label: second-round-correlation-matrix-model-ready")
+CORR_OUTPUT_PATH_ROUND2 = OUT_DIR / "censo_second_round_corr_matrix_model_ready.png"
+
+render_corr_matrix(
+    df_model_ready=df_censo_model_ready_round2,
+    socio_vars=SECOND_ROUND_SOCIO_VARS,
+    title="Matriz de correlación Pearson | Variables candidatas model-ready (ronda 2)",
+    output_path=CORR_OUTPUT_PATH_ROUND2,
+)
+```
+
+## 23) Segunda ronda: join model-ready después de imputación espacial
+
+```{python}
+#| label: second-round-explicit-join-check-model-ready
+print("label: second-round-explicit-join-check-model-ready")
+ensure_unique_keys(df_censo_model_ready_round2, ["ZONA777"], "df_censo_model_ready_round2")
+df_trips_keys, df_trip_zones = ensure_trip_zone_context_loaded()
+
+before_rows_round2 = df_trips_keys.height
+df_trips_joined_model_ready_round2 = (
+    df_trips_keys
+    .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+    .join(df_censo_model_ready_round2, on="ZONA777", how="left")
+    .drop("ZONA777")
+)
+assert_left_join_preserves_rows(before_rows_round2, df_trips_joined_model_ready_round2.height, "join Censo model-ready ronda 2 sobre trips_context")
+
+display(
+    pl.DataFrame(
+        {
+            "rows_before": [before_rows_round2],
+            "rows_after": [df_trips_joined_model_ready_round2.height],
+            "pct_rows_any_missing_socio": [
+                df_trips_joined_model_ready_round2.select(
+                    pl.any_horizontal([pl.col(c).is_null() for c in SECOND_ROUND_SOCIO_VARS]).mean()
+                ).item()
+            ],
+        }
+    )
+)
+```
+
+## 24) Segunda ronda: distribuciones trip-weighted después del join model-ready
+
+```{python}
+#| label: second-round-trip-weighted-summaries
+print("label: second-round-trip-weighted-summaries")
+display(
+    df_trips_joined_model_ready_round2.select(
+        [
+            pl.len().alias("rows"),
+            *[pl.col(c).mean().alias(f"{c}_trip_weighted_mean") for c in SECOND_ROUND_SOCIO_VARS],
+            *[pl.col(c).median().alias(f"{c}_trip_weighted_median") for c in SECOND_ROUND_SOCIO_VARS],
+        ]
+    )
+)
+```
+
+## 25) Segunda ronda: muestra de estimación actual y cobertura socio
+
+```{python}
+#| label: second-round-estimation-sample-coverage
+print("label: second-round-estimation-sample-coverage")
+df_est_round2 = (
+    pl.read_parquet(
+        ESTIMATION_SAMPLE_PATH,
+        columns=["partition", "franja_v2", "zona_inicio_viaje"],
+    )
+    .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+    .join(df_censo_model_ready_round2, on="ZONA777", how="left")
+    .drop("ZONA777")
+)
+
+display(
+    df_est_round2.group_by(["partition", "franja_v2"]).agg(
+        pl.len().alias("rows"),
+        pl.col("zona_inicio_viaje").n_unique().alias("n_zonas"),
+        pl.any_horizontal([pl.col(c).is_null() for c in SECOND_ROUND_SOCIO_VARS]).mean().alias("pct_rows_any_missing_socio"),
+    ).sort(["partition", "franja_v2"])
+)
+```

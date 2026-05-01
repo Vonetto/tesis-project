@@ -87,9 +87,12 @@ else:
 ```{python}
 #| label: load-gtfs
 from datetime import date
+import os
 from lib.gtfs_manifest import build_manifest, pick_version_for_date
 
-manifest_gtfs = build_manifest(PROJECT_ROOT / "config" / "GTFS")
+GTFS_ROOT = Path(os.getenv("GTFS_ROOT_OVERRIDE", PROJECT_ROOT / "config" / "GTFS"))
+manifest_gtfs = build_manifest(GTFS_ROOT)
+print(f"GTFS root: {GTFS_ROOT}")
 week_service_dates = [date.fromisocalendar(YEAR_ANALISIS, WEEK_ANALISIS, d) for d in range(1, 8)]
 versions_in_week = {d: pick_version_for_date(d, manifest_gtfs) for d in week_service_dates}
 missing_versions = [d for d, v in versions_in_week.items() if v is None]
@@ -238,7 +241,7 @@ PARTITION_START_DATE = date.fromisocalendar(YEAR_ANALISIS, WEEK_ANALISIS, 1)
 import pickle
 import networkx as nx
 
-GRAPH_DIR = PROJECT_ROOT / "01_processing" / "metro_graphs"
+GRAPH_DIR = Path(os.getenv("METRO_GRAPH_DIR_OVERRIDE", PROJECT_ROOT / "01_processing" / "metro_graphs"))
 GRAPH_MANIFEST = GRAPH_DIR / "manifest_graphs.parquet"
 
 if not GRAPH_MANIFEST.exists():
@@ -250,6 +253,7 @@ def load_graph_by_folder(folder: str) -> nx.Graph:
         return pickle.load(f)
 
 print(f"GTFS en manifest: {[m.folder for m in manifest_gtfs]}")
+print(f"Metro graph dir: {GRAPH_DIR}")
 
 G_metro = load_graph_by_folder(version_for_date.folder)
 print(f"✅ Grafo cargado ({version_for_date.folder}) para {service_date}: {G_metro.number_of_nodes()} nodos, {G_metro.number_of_edges()} aristas.")

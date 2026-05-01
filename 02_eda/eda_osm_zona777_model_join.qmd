@@ -1,0 +1,203 @@
+---
+title: "EDA Clean — OSM ZONA777 candidate block"
+format: html
+---
+
+## Objetivo
+
+Este notebook toma el resultado de la auditoría OSM amplia y construye un primer bloque
+de variables candidatas `OSM -> ZONA777`.
+
+En esta etapa el objetivo es:
+
+- materializar un parquet de features OSM por `ZONA777`;
+- dejar explícita la shortlist activa de `key=value`;
+- auditar cobertura, rangos y densidades básicas;
+- y separar variables prioritarias de variables en observación.
+
+Todavía **no** se integran estas variables al modelo.
+
+## Setup
+
+```{python}
+#| label: setup
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+import geopandas as gpd
+import polars as pl
+
+PROJECT_ROOT = Path.cwd()
+if not (PROJECT_ROOT / "lib").exists() and (PROJECT_ROOT.parent / "lib").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lib.osm_zona777 import (
+    DEFAULT_OSM_ZONA777_SPECS,
+    OSM_MICROINFRA_ZONA777_SPECS,
+    OSMTagValueSpec,
+    build_osm_spec_table,
+    build_osm_zona777_outputs,
+)
+```
+
+## Configuración
+
+```{python}
+#| label: config
+print("label: config")
+ZONAS777_SHP = Path("/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp")
+RAW_OSM_PARQUET = PROJECT_ROOT / "02_eda" / "tmp" / "osm_zona777" / "osm_zona777_raw.parquet"
+OUT_DIR = PROJECT_ROOT / "02_eda" / "tmp" / "osm_zona777_model_join"
+OUT_FEATURES = OUT_DIR / "osm_zona777_features.parquet"
+OUT_SPECS = OUT_DIR / "osm_zona777_feature_specs.parquet"
+OUT_SUMMARY = OUT_DIR / "osm_zona777_summary.json"
+
+print("ZONAS777_SHP:", ZONAS777_SHP)
+print("RAW_OSM_PARQUET:", RAW_OSM_PARQUET)
+print("OUT_DIR:", OUT_DIR)
+print("n_specs:", len(DEFAULT_OSM_ZONA777_SPECS))
+print("priority_specs:", sum(s.status == "priority" for s in DEFAULT_OSM_ZONA777_SPECS))
+print("observation_specs:", sum(s.status == "observation" for s in DEFAULT_OSM_ZONA777_SPECS))
+```
+
+## Specs microinfraestructura candidata
+
+Estas specs no se activan automáticamente en el bloque principal hasta revisar el
+EDA en `02_eda/eda_osm_zona777.qmd`. Quedan acá para facilitar la siguiente ronda
+si se decide materializarlas como variables model-ready.
+
+```{python}
+#| label: microinfra-candidate-specs
+print("label: microinfra-candidate-specs")
+
+OSM_MICROINFRA_CANDIDATE_SPECS = OSM_MICROINFRA_ZONA777_SPECS + (
+    OSMTagValueSpec(
+        "highway",
+        "elevator",
+        "osm_highway_elevator",
+        "microinfra_sensitivity",
+        "accessibility sensitivity; low mass",
+    ),
+)
+
+df_microinfra_candidate_specs = build_osm_spec_table(OSM_MICROINFRA_CANDIDATE_SPECS)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_microinfra_candidate_specs)
+```
+
+## Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+
+def summarize_osm_feature_block(
+    df_features: pl.DataFrame,
+    df_specs: pl.DataFrame,
+) -> pl.DataFrame:
+    rows: list[dict[str, object]] = []
+    for spec in df_specs.to_dicts():
+        feature_name = spec["feature_name"]
+        count_col = f"{feature_name}_count"
+        presence_col = f"{feature_name}_presence"
+        density_col = f"{feature_name}_density_km2"
+        rows.append(
+            {
+                "status": spec["status"],
+                "key": spec["key"],
+                "value": spec["value"],
+                "feature_name": feature_name,
+                "notes": spec["notes"],
+                "nonzero_zonas_count": int(df_features.filter(pl.col(count_col) > 0).height),
+                "pct_zonas_nonzero_count": float(100 * df_features.filter(pl.col(count_col) > 0).height / df_features.height),
+                "total_count": int(df_features.select(pl.col(count_col).sum()).item()),
+                "max_count": int(df_features.select(pl.col(count_col).max()).item()),
+                "max_density_km2": float(df_features.select(pl.col(density_col).max()).item()),
+                "mean_density_km2": float(df_features.select(pl.col(density_col).mean()).item()),
+                "n_presence_ones": int(df_features.select(pl.col(presence_col).sum()).item()),
+            }
+        )
+    return pl.DataFrame(rows).sort(["status", "nonzero_zonas_count", "total_count"], descending=[False, True, True])
+```
+
+## Construir bloque OSM por ZONA777
+
+```{python}
+#| label: build-osm-zona777-features
+print("label: build-osm-zona777-features")
+df_osm_zona777 = build_osm_zona777_outputs(
+    osm_raw_path=RAW_OSM_PARQUET,
+    zonas_path=ZONAS777_SHP,
+    out_dir=OUT_DIR,
+    specs=DEFAULT_OSM_ZONA777_SPECS,
+)
+print("✅ OSM ZONA777 features escritos en:", OUT_FEATURES)
+print("✅ OSM ZONA777 specs escritos en:", OUT_SPECS)
+print("✅ OSM ZONA777 summary escrito en:", OUT_SUMMARY)
+print("shape:", df_osm_zona777.shape)
+display(df_osm_zona777.head(5))
+```
+
+## Shortlist activa
+
+```{python}
+#| label: osm-shortlist-active
+print("label: osm-shortlist-active")
+df_osm_specs = build_osm_spec_table(DEFAULT_OSM_ZONA777_SPECS)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_osm_specs)
+```
+
+## Resumen del bloque OSM
+
+```{python}
+#| label: osm-zona777-feature-summary
+print("label: osm-zona777-feature-summary")
+df_osm_feature_summary = summarize_osm_feature_block(
+    df_features=df_osm_zona777,
+    df_specs=df_osm_specs,
+)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_osm_feature_summary)
+```
+
+## Preview prioritarias
+
+```{python}
+#| label: osm-priority-preview
+print("label: osm-priority-preview")
+priority_feature_names = (
+    df_osm_specs
+    .filter(pl.col("status") == "priority")
+    .get_column("feature_name")
+    .to_list()
+)
+priority_cols = ["ZONA777", "AREA_KM2"]
+for feature_name in priority_feature_names[:8]:
+    priority_cols.extend(
+        [
+            f"{feature_name}_count",
+            f"{feature_name}_presence",
+            f"{feature_name}_density_km2",
+        ]
+    )
+display(df_osm_zona777.select(priority_cols).head(10))
+```
+
+## Notas
+
+```{python}
+#| label: osm-model-join-notes
+print("label: osm-model-join-notes")
+print(
+    """Notas de esta etapa:
+- este bloque usa punto representativo para el join `OSM -> ZONA777`;
+- para `amenity`, `shop`, `leisure` y `office`, esta versión ya es un candidato razonable;
+- `public_transport=*` queda en observación por posible redundancia con infraestructura ya modelada;
+- `landuse=*` queda como versión exploratoria y más adelante conviene reestimar por área intersectada."""
+)
+```

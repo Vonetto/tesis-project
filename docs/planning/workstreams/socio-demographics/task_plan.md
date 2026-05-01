@@ -56,4 +56,31 @@ Integrate socio-demographic data (Censo 2024; CASEN if needed) with Zonas777 geo
 - [x] Implementar pipeline operativo `softmax_tau003 -> MANZENT -> ZONA777` para producir proxies microdato sin pisar el parquet censal agregado existente.
 - [x] Crear EDA reproducible para las nuevas variables `ZONA777` derivadas de microdatos y persistir el piloto en `02_eda/tmp`.
 - [x] Refinar la desagregación educativa adulta desde `cine11` en `terciaria corta / universitaria / postgrado` y regenerar el piloto `softmax_tau003`.
-- [ ] Revisar resultados del nuevo EDA y decidir shortlist final para llevar al modelo.
+- [x] Revisar resultados preliminares del nuevo EDA y traducirlos a una shortlist inicial de variables para modelación.
+- [x] Preparar en `03_models/08_nested_logit_enriched_interannual_censo.qmd` la ruta Biogeme `Censo + microdatos spatialized`, incluyendo construcción del parquet full `ZONA777` si falta, estandarización sobre zonas usadas y outputs específicos de estimación.
+- [x] Ejecutar una primera ronda de modelos en `03_models/08_nested_logit_enriched_interannual_censo.qmd` con variables microdato educativas probadas **de a poco**:
+  - `share_cine18_universitaria_micro` ✓
+  - `share_cine18_terciaria_corta_micro` ✓
+  - `share_cine18_postgrado_micro` ✓
+- [x] Comparar resultados de la primera ronda microdato contra:
+  - `mnl_interannual_censo_prom_escolaridad18` ✓
+  - combinaciones controladas con `prom_escolaridad18` ✓ (no convergieron)
+  - combo `universitaria + terciaria_corta` ✓ (no convergió)
+- [ ] Revisar los resultados del resto de variables censo ya corridas (`prom_edad`, `share_inmigrantes`, `share_hacinamiento`, `share_internet`, `share_serv_compu`, `share_serv_tel_movil`, `share_discapacidad`, `share_analfabet`) y sus combos con `prom_escolaridad18`.
+- [ ] Analizar `mnl_interannual_censo_full` (todas las variables censo juntas) y observar su comportamiento respecto a las especificaciones individuales.
+- [x] Decidir cierre final de etapa para proxy educativa principal:
+  - `share_cine18_universitaria_o_mas_micro` queda como candidata principal por coherencia metodológica e interpretabilidad;
+  - `prom_escolaridad18` queda como benchmark agregado explícito;
+  - `share_cine18_postgrado_micro` queda como sensibilidad;
+  - no seguir abriendo más proxies educativas en esta rama.
+- [x] Reabrir la decisión metodológica por definición del proxy educativo:
+  - si la pregunta es “nivel académico como proxy de ingreso”, conviene construir una variable de **al menos universitaria**;
+  - se define `share_cine18_universitaria_o_mas_micro = cine11 in [9, 10, 11]` para 18+;
+  - queda implementada de punta a punta en `lib`, `02_eda` y `03_models/08`.
+- [ ] Evaluar si vale la pena incorporar `share_independiente_micro` como variable laboral secundaria en una segunda ronda.
+- [x] Cerrar shortlist final de proxies educativas para llevar al modelo principal y documentar qué variables se descartan por redundancia.
+- [x] Correr EDA + primera estimación de `share_cine18_universitaria_o_mas_micro` y compararla contra:
+  - `share_cine18_universitaria_micro`;
+  - `prom_escolaridad18`;
+  - `share_cine18_postgrado_micro`.
+- [ ] Integrar al frente principal del modelo `share_cine18_universitaria_o_mas_micro`, manteniendo `prom_escolaridad18` como benchmark explícito y `share_cine18_postgrado_micro` como sensibilidad.

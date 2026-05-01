@@ -49,6 +49,13 @@ DEFAULT_VARS = [
     "n_viv_hacinadas",
 ]
 
+AGE_18_PLUS_BUCKETS = [
+    "n_edad_18_24",
+    "n_edad_25_44",
+    "n_edad_45_59",
+    "n_edad_60_mas",
+]
+
 # Counts: sum
 COUNT_VARS = [
     "n_per",
@@ -79,8 +86,7 @@ COUNT_VARS = [
 # Weighted means: (var * weight) / sum(weight)
 WEIGHTED_MEANS = {
     "prom_edad": "n_per",
-    # prom_escolaridad18 ideally weighted by pop 18+, but not provided here; use n_per as proxy
-    "prom_escolaridad18": "n_per",
+    "prom_escolaridad18": "n_18_mas",
     "prom_per_hog": "n_hog",
 }
 
@@ -207,6 +213,21 @@ def _read_base_csv(cfg: JoinConfig, variables: List[str]) -> pd.DataFrame:
             if pd.api.types.is_string_dtype(col) or col.dtype == object:
                 col = col.astype("string").str.replace(",", ".", regex=False)
             df[v] = pd.to_numeric(col, errors="coerce")
+    return df
+
+
+def _expand_required_variables(variables: List[str]) -> List[str]:
+    expanded = list(variables)
+    if "prom_escolaridad18" in expanded:
+        expanded = list(dict.fromkeys(expanded + AGE_18_PLUS_BUCKETS))
+    return expanded
+
+
+def _add_derived_weight_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if set(AGE_18_PLUS_BUCKETS).issubset(df.columns):
+        # Use a strict rule: if any 18+ bucket is missing, the derived weight is NA.
+        df["n_18_mas"] = df[AGE_18_PLUS_BUCKETS].sum(axis=1, min_count=len(AGE_18_PLUS_BUCKETS))
     return df
 
 
@@ -343,6 +364,15 @@ def _overlay_area_weighted(
     return inter[keep]
 
 
+def _apply_area_share_scaling(df_join: pd.DataFrame) -> pd.DataFrame:
+    df_join = df_join.copy()
+    scale_cols = set(COUNT_VARS) | {w for w in WEIGHTED_MEANS.values() if w not in COUNT_VARS}
+    for v in scale_cols:
+        if v in df_join.columns:
+            df_join[v] = df_join[v] * df_join["area_share"]
+    return df_join
+
+
 def _aggregate_by_zona(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     # sum counts
@@ -374,12 +404,78 @@ def _aggregate_by_zona(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+def sync_final_output_alias(out_dir: Path, preferred_mode: str = "intersects_area") -> Path:
+    source = out_dir / f"censo2024_zona777_agg_{preferred_mode}.parquet"
+    target = out_dir / "censo2024_zona777_agg_final.parquet"
+    if not source.exists():
+        raise FileNotFoundError(f"Preferred aggregated parquet not found: {source}")
+    target.write_bytes(source.read_bytes())
+    return target
+
+
+def impute_missing_by_neighbor_median(
+    gdf_zonas: gpd.GeoDataFrame,
+    df: pd.DataFrame,
+    columns: List[str],
+    zone_col: str = "ZONA777",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if zone_col not in gdf_zonas.columns or zone_col not in df.columns:
+        raise ValueError(f"Missing zone key '{zone_col}' in geometry or data frame")
+    if "geometry" not in gdf_zonas.columns:
+        raise ValueError("gdf_zonas must include a geometry column")
+    if df[zone_col].duplicated().any():
+        raise ValueError(f"df has duplicate keys in {zone_col}")
+
+    gdf_geom = gdf_zonas[[zone_col, "geometry"]].copy()
+    if gdf_geom[zone_col].duplicated().any():
+        # Some ZONA777 polygons are multipart in the source shapefile.
+        # Dissolve them to one geometry per zone before deriving contiguity.
+        gdf_geom = gdf_geom.dissolve(by=zone_col, as_index=False)
+        gdf_geom = gpd.GeoDataFrame(gdf_geom, geometry="geometry", crs=gdf_zonas.crs)
+
+    gdf = gdf_geom.merge(df[[zone_col] + columns], on=zone_col, how="left")
+    out = df.copy()
+    audit_rows = []
+
+    missing_rows = gdf[gdf[columns].isna().any(axis=1)]
+    for _, row in missing_rows.iterrows():
+        zone_id = row[zone_col]
+        geom = row.geometry
+        neighbors = gdf[(gdf[zone_col] != zone_id) & (gdf.geometry.touches(geom))].copy()
+        neighbor_ids = sorted(neighbors[zone_col].dropna().astype(int).tolist())
+
+        for col in columns:
+            if not pd.isna(row[col]):
+                continue
+            valid = neighbors[col].dropna()
+            if valid.empty:
+                raise ValueError(
+                    f"No valid first-order neighbors available to impute {col} for {zone_col}={zone_id}"
+                )
+            imputed = float(valid.median())
+            out.loc[out[zone_col] == zone_id, col] = imputed
+            audit_rows.append(
+                {
+                    zone_col: int(zone_id),
+                    "variable": col,
+                    "imputed_value": imputed,
+                    "n_valid_neighbors": int(valid.shape[0]),
+                    "neighbor_ids": neighbor_ids,
+                    "method": "first_order_neighbor_median",
+                }
+            )
+
+    audit = pd.DataFrame(audit_rows)
+    return out, audit
+
+
 def run(cfg: JoinConfig, variables: List[str] | None = None) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    variables = variables or DEFAULT_VARS
+    variables = _expand_required_variables(variables or DEFAULT_VARS)
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     # read base + cartography + zonas
     df_base = _read_base_csv(cfg, variables)
+    df_base = _add_derived_weight_columns(df_base)
     gdf_ent = _read_carto(cfg.carto_parquet)
     gdf_zonas = _read_zonas777(cfg.zonas777_shp)
 
@@ -419,15 +515,9 @@ def run(cfg: JoinConfig, variables: List[str] | None = None) -> Tuple[pd.DataFra
         df_join = pd.DataFrame(gdf_inter.drop(columns="geometry")).merge(
             df_base, on=cfg.join_key, how="left"
         )
-        # apply area share to count vars and weights
-        for v in COUNT_VARS:
-            if v in df_join.columns:
-                df_join[v] = df_join[v] * df_join["area_share"]
-        # also scale weight variables used in weighted means / shares
-        for w in set(WEIGHTED_MEANS.values()):
-            if w in df_join.columns:
-                df_join[w] = df_join[w] * df_join["area_share"]
-        # keep area_share for diagnostics if needed
+        # Count variables include the denominators used as weighted-mean weights,
+        # so scaling them once by area_share is sufficient.
+        df_join = _apply_area_share_scaling(df_join)
     else:
         gdf_join = _spatial_assign_zona777(gdf, gdf_zonas, use_centroid=cfg.use_centroid)
         df_join = pd.DataFrame(gdf_join.drop(columns="geometry"))

@@ -1,0 +1,418 @@
+---
+title: "EDA — Microdatos Censo 2024 Spatialized to ZONA777"
+format: html
+---
+
+## Objetivo
+
+Este notebook audita las nuevas variables `ZONA777` derivadas desde microdatos comunales del Censo 2024 mediante la ruta:
+
+- `microdatos comunales -> softmax_tau003 -> MANZENT -> ZONA777`
+
+El foco es:
+
+- validar la forma y cobertura del output nuevo;
+- revisar sanidad básica de las variables derivadas;
+- comparar la señal educativa nueva contra el Censo agregado tradicional;
+- y dejar una shortlist razonable para llevar al modelo.
+
+## Setup
+
+```{python}
+#| label: setup
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import pandas as pd
+import polars as pl
+
+PROJECT_ROOT = Path.cwd()
+if not (PROJECT_ROOT / "lib").exists() and (PROJECT_ROOT.parent / "lib").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lib.censo2024_microdata_base import MicrodataPaths
+from lib.censo2024_microdata_zona777 import build_spatialized_microdata_outputs
+
+PERSONAS_ZIP = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/personas_censo2024.zip")
+HOGARES_ZIP = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/hogares_censo2024.zip")
+VIVIENDAS_ZIP = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/viviendas_censo2024.zip")
+BASE_ZIP = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/Base_manzana_entidad_CPV24.zip")
+CARTO_MZ = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/cartografia_parquet/Cartografia_censo2024_Pais_Manzanas.parquet")
+ZONAS777_SHP = Path("/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp")
+
+OUT_DIR = PROJECT_ROOT / "02_eda" / "tmp" / "censo2024_microdata_zona777"
+PILOT_DIR = OUT_DIR / "pilot_softmax_tau003"
+OFFICIAL_CENSO_ZONA777 = PROJECT_ROOT / "02_eda" / "tmp" / "censo2024_zona777" / "censo2024_zona777_agg_final.parquet"
+PILOT_COMUNAS = ["13132", "13112", "13101"]  # Vitacura, La Pintana, Santiago
+TAU = 0.03
+SEED = 42
+
+EDUCATION_VARS = [
+    "prom_escolaridad18_micro",
+    "share_cine18_primaria_micro",
+    "share_cine18_secundaria_micro",
+    "share_cine18_terciaria_corta_micro",
+    "share_cine18_universitaria_micro",
+    "share_cine18_universitaria_o_mas_micro",
+    "share_cine18_postgrado_micro",
+]
+LABOR_VARS = [
+    "share_ocupado_15mas_micro",
+    "share_fuera_fuerza_trabajo_15mas_micro",
+    "share_dependiente_micro",
+    "share_independiente_micro",
+]
+VULNERABILITY_VARS = [
+    "share_discapacidad_5mas_micro",
+    "share_analfabet_15mas_micro",
+]
+ALL_MICRO_VARS = EDUCATION_VARS + LABOR_VARS + VULNERABILITY_VARS
+
+print("OUT_DIR:", OUT_DIR)
+print("PILOT_DIR:", PILOT_DIR)
+print("OFFICIAL_CENSO_ZONA777:", OFFICIAL_CENSO_ZONA777)
+print("PILOT_COMUNAS:", PILOT_COMUNAS)
+print("TAU:", TAU)
+print("SEED:", SEED)
+```
+
+## Materializar piloto si falta
+
+```{python}
+#| label: build-pilot-if-missing
+PILOT_DIR.mkdir(parents=True, exist_ok=True)
+pilot_zona777_path = PILOT_DIR / "censo2024_microdata_zona777_features.parquet"
+pilot_manzent_path = PILOT_DIR / "censo2024_microdata_manzent_features.parquet"
+pilot_summary_path = PILOT_DIR / "censo2024_microdata_zona777_summary.json"
+
+if not pilot_zona777_path.exists():
+    should_rebuild_pilot = True
+else:
+    existing_cols = set(pl.scan_parquet(pilot_zona777_path).collect_schema().names())
+    should_rebuild_pilot = "share_cine18_universitaria_o_mas_micro" not in existing_cols
+
+if should_rebuild_pilot:
+    if pilot_zona777_path.exists():
+        print("ℹ️ Piloto existente no tiene `share_cine18_universitaria_o_mas_micro`; regenerando...")
+    artifacts = build_spatialized_microdata_outputs(
+        micro_paths=MicrodataPaths(
+            personas_zip=PERSONAS_ZIP,
+            hogares_zip=HOGARES_ZIP,
+            viviendas_zip=VIVIENDAS_ZIP,
+        ),
+        base_zip=BASE_ZIP,
+        carto_parquet=CARTO_MZ,
+        zonas777_shp=ZONAS777_SHP,
+        tau=TAU,
+        seed=SEED,
+        comuna_codes=PILOT_COMUNAS,
+    )
+    artifacts.manzent_features.to_parquet(pilot_manzent_path, index=False)
+    artifacts.zona777_features.to_parquet(pilot_zona777_path, index=False)
+    summary = {
+        "n_households": int(len(artifacts.household_base)),
+        "n_assigned_households": int(len(artifacts.household_assignment)),
+        "n_manzent_features": int(len(artifacts.manzent_features)),
+        "n_zona777_features": int(len(artifacts.zona777_features)),
+        "tau": float(TAU),
+        "seed": int(SEED),
+        "comunas": [str(c) for c in PILOT_COMUNAS],
+    }
+    pilot_summary_path.write_text(pd.Series(summary).to_json(indent=2), encoding="utf-8")
+else:
+    print("ℹ️ Reusando piloto existente con `universitaria_o_mas` ya materializada.")
+
+print("pilot_zona777_path:", pilot_zona777_path)
+print("pilot_manzent_path:", pilot_manzent_path)
+print("pilot_summary_path:", pilot_summary_path)
+```
+
+## Cargar datos
+
+```{python}
+#| label: load-data
+df_micro = pl.read_parquet(pilot_zona777_path).sort("ZONA777")
+df_micro_manz = pl.read_parquet(pilot_manzent_path)
+df_official = pl.read_parquet(OFFICIAL_CENSO_ZONA777).sort("ZONA777")
+
+gdf_zonas = gpd.read_file(ZONAS777_SHP)[["ZONA777", "geometry"]].copy()
+gdf_zonas = gdf_zonas.set_crs("EPSG:4674", allow_override=True)
+if gdf_zonas["ZONA777"].duplicated().any():
+    gdf_zonas = gdf_zonas.dissolve(by="ZONA777", as_index=False)
+    gdf_zonas = gpd.GeoDataFrame(gdf_zonas, geometry="geometry", crs="EPSG:4674")
+
+print("df_micro shape:", df_micro.shape)
+print("df_micro_manz shape:", df_micro_manz.shape)
+print("df_official shape:", df_official.shape)
+```
+
+## Inventario de outputs
+
+```{python}
+#| label: microdata-zona777-summary
+print("label: microdata-zona777-summary")
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_micro.head())
+display(pl.DataFrame({"column": df_micro.columns}))
+```
+
+## Sanidad básica
+
+```{python}
+#| label: microdata-zona777-quality-summary
+print("label: microdata-zona777-quality-summary")
+
+def socio_quality_summary(df: pl.DataFrame, socio_vars: list[str]) -> pl.DataFrame:
+    exprs = []
+    for c in socio_vars:
+        exprs.extend([pl.col(c).min().alias(f"{c}_min"), pl.col(c).max().alias(f"{c}_max")])
+        if c != "prom_escolaridad18_micro":
+            exprs.extend(
+                [
+                    (pl.col(c) > 1).sum().alias(f"{c}_gt1"),
+                    (pl.col(c) < 0).sum().alias(f"{c}_lt0"),
+                ]
+            )
+        exprs.append(pl.col(c).is_null().sum().alias(f"{c}_nulls"))
+    return df.select(exprs)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(socio_quality_summary(df_micro, ALL_MICRO_VARS))
+
+```
+
+## Zonas problemáticas
+
+```{python}
+#| label: microdata-zona777-problematic-zones
+print("label: microdata-zona777-problematic-zones")
+for c in ALL_MICRO_VARS:
+    if c == "prom_escolaridad18_micro":
+        bad = (
+            df_micro
+            .filter(pl.col(c).is_null())
+            .select(["ZONA777", c])
+            .sort("ZONA777")
+        )
+    else:
+        bad = (
+            df_micro
+            .filter((pl.col(c) > 1) | (pl.col(c) < 0) | pl.col(c).is_null())
+            .select(["ZONA777", c])
+            .sort("ZONA777")
+        )
+    print(f"\nVariable: {c}")
+    print(f"n zonas problemáticas: {bad.height}")
+    display(bad)
+```
+
+## Comparación con Censo agregado tradicional
+
+```{python}
+#| label: microdata-vs-official-education
+print("label: microdata-vs-official-education")
+df_compare = (
+    df_micro
+    .join(
+        df_official.select(["ZONA777", "prom_escolaridad18", "share_discapacidad", "share_analfabet"]),
+        on="ZONA777",
+        how="left",
+    )
+)
+
+comparison_corr = pd.DataFrame(
+    df_compare.select(
+        [
+            "prom_escolaridad18_micro",
+            "prom_escolaridad18",
+            "share_cine18_primaria_micro",
+            "share_cine18_secundaria_micro",
+            "share_cine18_terciaria_corta_micro",
+            "share_cine18_universitaria_micro",
+            "share_cine18_universitaria_o_mas_micro",
+            "share_cine18_postgrado_micro",
+            "share_cine18_terciaria_micro",
+            "share_discapacidad_5mas_micro",
+            "share_discapacidad",
+            "share_analfabet_15mas_micro",
+            "share_analfabet",
+        ]
+    ).to_dicts()
+).corr(numeric_only=True)
+
+display(comparison_corr.round(3))
+```
+
+## Mapas educación
+
+```{python}
+#| label: microdata-zona777-maps-education
+print("label: microdata-zona777-maps-education")
+
+def render_spatial_maps(
+    *,
+    gdf_zonas_base: gpd.GeoDataFrame,
+    df_model_ready: pl.DataFrame,
+    socio_vars: list[str],
+    plot_cfg: dict[str, dict[str, str]],
+    title: str,
+    output_path: Path,
+) -> None:
+    gdf_plot = gdf_zonas_base.merge(df_model_ready.to_pandas(), on="ZONA777", how="left")
+    ncols = 2
+    nrows = int((len(socio_vars) + ncols - 1) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 6 * nrows))
+    axes = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+    for ax, var in zip(axes, socio_vars):
+        cfg = plot_cfg[var]
+        gdf_plot.plot(
+            column=var,
+            ax=ax,
+            cmap=cfg["cmap"],
+            linewidth=0.15,
+            edgecolor="white",
+            legend=True,
+            legend_kwds={"shrink": 0.75},
+            missing_kwds={"color": "#d9d9d9", "label": "Sin dato"},
+        )
+        q = (
+            df_model_ready
+            .select(
+                pl.col(var).min().alias("min"),
+                pl.col(var).median().alias("median"),
+                pl.col(var).max().alias("max"),
+            )
+            .row(0, named=True)
+        )
+        ax.set_title(
+            f"{cfg['title']}\nmin={q['min']:.3f} | mediana={q['median']:.3f} | max={q['max']:.3f}",
+            fontsize=11,
+        )
+        ax.set_axis_off()
+
+    for ax in axes[len(socio_vars):]:
+        ax.set_axis_off()
+
+    fig.suptitle(title, fontsize=15, y=0.98)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    print("Mapa guardado en:", output_path)
+    plt.show()
+
+education_cfg = {
+    "prom_escolaridad18_micro": {"title": "Promedio escolaridad 18+ (micro)", "cmap": "viridis"},
+    "share_cine18_primaria_micro": {"title": "Share CINE 18+ primaria", "cmap": "Reds"},
+    "share_cine18_secundaria_micro": {"title": "Share CINE 18+ secundaria", "cmap": "Blues"},
+    "share_cine18_terciaria_corta_micro": {"title": "Share CINE 18+ terciaria corta", "cmap": "YlGnBu"},
+    "share_cine18_universitaria_micro": {"title": "Share CINE 18+ universitaria", "cmap": "PuBuGn"},
+    "share_cine18_universitaria_o_mas_micro": {"title": "Share CINE 18+ universitaria o más", "cmap": "GnBu"},
+    "share_cine18_postgrado_micro": {"title": "Share CINE 18+ postgrado", "cmap": "BuPu"},
+}
+
+render_spatial_maps(
+    gdf_zonas_base=gdf_zonas,
+    df_model_ready=df_micro,
+    socio_vars=EDUCATION_VARS,
+    plot_cfg=education_cfg,
+    title="Microdatos spatialized -> ZONA777 | Bloque educación",
+    output_path=PILOT_DIR / "microdata_zona777_education_maps.png",
+)
+```
+
+## Mapas laboral / estatus
+
+```{python}
+#| label: microdata-zona777-maps-labor
+print("label: microdata-zona777-maps-labor")
+labor_cfg = {
+    "share_ocupado_15mas_micro": {"title": "Share ocupado 15+", "cmap": "Greens"},
+    "share_fuera_fuerza_trabajo_15mas_micro": {"title": "Share fuera fuerza 15+", "cmap": "Purples"},
+    "share_dependiente_micro": {"title": "Share dependiente", "cmap": "Oranges"},
+    "share_independiente_micro": {"title": "Share independiente", "cmap": "cividis"},
+}
+
+render_spatial_maps(
+    gdf_zonas_base=gdf_zonas,
+    df_model_ready=df_micro,
+    socio_vars=LABOR_VARS,
+    plot_cfg=labor_cfg,
+    title="Microdatos spatialized -> ZONA777 | Bloque laboral / estatus",
+    output_path=PILOT_DIR / "microdata_zona777_labor_maps.png",
+)
+```
+
+## Matriz de correlación nueva
+
+```{python}
+#| label: microdata-zona777-correlation-matrix
+print("label: microdata-zona777-correlation-matrix")
+
+def render_corr_matrix(
+    *,
+    df_model_ready: pl.DataFrame,
+    socio_vars: list[str],
+    title: str,
+    output_path: Path,
+) -> None:
+    df_corr_input = pd.DataFrame(df_model_ready.select(socio_vars).to_dicts())
+    df_corr = df_corr_input.corr(method="pearson", numeric_only=True)
+    display(df_corr.round(3))
+
+    pairs = []
+    vars_ = list(df_corr.columns)
+    for i, var_i in enumerate(vars_):
+        for j in range(i + 1, len(vars_)):
+            var_j = vars_[j]
+            corr_ij = float(df_corr.loc[var_i, var_j])
+            pairs.append({"var_1": var_i, "var_2": var_j, "corr": corr_ij, "abs_corr": abs(corr_ij)})
+
+    display(
+        pl.DataFrame(pairs).sort("abs_corr", descending=True))
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    im = ax.imshow(df_corr.values, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(vars_)))
+    ax.set_yticks(range(len(vars_)))
+    ax.set_xticklabels(vars_, rotation=45, ha="right")
+    ax.set_yticklabels(vars_)
+    for i in range(len(vars_)):
+        for j in range(len(vars_)):
+            ax.text(j, i, f"{df_corr.iloc[i, j]:.2f}", ha="center", va="center", fontsize=9)
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    print("Matriz guardada en:", output_path)
+    plt.show()
+
+render_corr_matrix(
+    df_model_ready=df_compare,
+    socio_vars=[
+        "prom_escolaridad18_micro",
+        "share_cine18_primaria_micro",
+        "share_cine18_secundaria_micro",
+        "share_cine18_terciaria_corta_micro",
+        "share_cine18_universitaria_micro",
+        "share_cine18_universitaria_o_mas_micro",
+        "share_cine18_postgrado_micro",
+        "share_ocupado_15mas_micro",
+        "share_fuera_fuerza_trabajo_15mas_micro",
+        "share_dependiente_micro",
+        "share_independiente_micro",
+        "share_discapacidad_5mas_micro",
+        "share_analfabet_15mas_micro",
+        "prom_escolaridad18",
+    ],
+    title="Matriz de correlación | microdatos spatialized + benchmark Censo agregado",
+    output_path=PILOT_DIR / "microdata_zona777_corr_matrix.png",
+)
+```
+
+## Shortlist preliminar

@@ -33,7 +33,7 @@ print("OUT_DIR:", OUT_DIR)
 
 ```{python}
 #| label: run-join-aggregation
-from lib.censo2024_zona777 import JoinConfig, run
+from lib.censo2024_zona777 import JoinConfig, run, sync_final_output_alias
 
 for mode in ["bbox", "region", "intersects"]:
     print(f"\n--- filter_mode={mode} ---")
@@ -67,6 +67,9 @@ cfg_area = JoinConfig(
 df_agg_area, diag_area = run(cfg_area)
 print("Diagnostics:", diag_area)
 print(df_agg_area.head())
+
+FINAL_PATH = sync_final_output_alias(OUT_DIR, preferred_mode="intersects_area")
+print("\nFinal alias synced from intersects_area:", FINAL_PATH)
 ```
 
 ## Outputs

@@ -102,6 +102,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=200_000)
     parser.add_argument("--limit", type=int, default=None, help="Optional row limit for smoke tests")
     parser.add_argument(
+        "--gtfs-root",
+        type=Path,
+        default=None,
+        help="Optional GTFS root override. Default: config/GTFS",
+    )
+    parser.add_argument(
+        "--graph-dir",
+        type=Path,
+        default=None,
+        help="Optional Metro graph directory override. Default: 01_processing/metro_graphs",
+    )
+    parser.add_argument(
         "--input-path",
         type=Path,
         default=None,
@@ -413,16 +425,20 @@ class WaitTimeEngine:
         partition_start: date,
         input_path: Path,
         freq_path: Path,
+        gtfs_root: Path | None = None,
+        graph_dir: Path | None = None,
     ) -> None:
         self.project_root = project_root
         self.partition_label = partition_label
         self.partition_start = partition_start
         self.input_path = input_path
         self.freq_path = freq_path
+        self.gtfs_root = gtfs_root or (project_root / "config" / "GTFS")
+        self.graph_dir = graph_dir or (project_root / "01_processing" / "metro_graphs")
 
-        self.manifest = build_manifest(project_root / "config" / "GTFS")
+        self.manifest = build_manifest(self.gtfs_root)
         if not self.manifest:
-            raise FileNotFoundError("No GTFS versions found in config/GTFS")
+            raise FileNotFoundError(f"No GTFS versions found in {self.gtfs_root}")
         week_service_dates = [partition_start + timedelta(days=offset) for offset in range(7)]
         versions_in_week = {d: pick_version_for_date(d, self.manifest) for d in week_service_dates}
         missing_versions = [d for d, version in versions_in_week.items() if version is None]
@@ -440,7 +456,7 @@ class WaitTimeEngine:
         if self.version is None:
             raise ValueError(f"No GTFS version found for partition {partition_label}")
 
-        self.graph = load_graph(project_root / "01_processing" / "metro_graphs", self.version.folder)
+        self.graph = load_graph(self.graph_dir, self.version.folder)
         self._build_gtfs_indexes()
         self._build_bus_indexes()
         self._build_graph_indexes()
@@ -928,6 +944,8 @@ def main() -> None:
 
     partition = args.partition
     partition_start = partition_start_date(partition)
+    gtfs_root = args.gtfs_root or (PROJECT_ROOT / "config" / "GTFS")
+    graph_dir = args.graph_dir or (PROJECT_ROOT / "01_processing" / "metro_graphs")
     input_path = args.input_path or (PROJECT_ROOT / "01_processing" / "tmp" / f"etapas_reconstruidas_{partition}.parquet")
     freq_path = args.freq_path or (PROJECT_ROOT / "tmp" / f"frecuencias_buses_{partition}.parquet")
     output_path = args.output_path or (PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{partition}.parquet")
@@ -944,6 +962,8 @@ def main() -> None:
     print(f"Partición: {partition}")
     print(f"Input reconstruido: {input_path}")
     print(f"Frecuencias bus: {freq_path}")
+    print(f"GTFS root: {gtfs_root}")
+    print(f"Metro graph dir: {graph_dir}")
     start_t = time.time()
     engine = WaitTimeEngine(
         project_root=PROJECT_ROOT,
@@ -951,6 +971,8 @@ def main() -> None:
         partition_start=partition_start,
         input_path=input_path,
         freq_path=freq_path,
+        gtfs_root=gtfs_root,
+        graph_dir=graph_dir,
     )
     print(
         f"GTFS seleccionado: {engine.version.folder} "

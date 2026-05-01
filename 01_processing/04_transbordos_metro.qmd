@@ -48,7 +48,7 @@ from config import (
     HORAS_BAJO,
 )
 from lib.datalake import read_parquet_portable
-from lib.transbordos_metro import shortest_path_with_line
+from lib.transbordos_metro import shortest_path_with_line, sync_trip_level_terminals_from_legs
 ```
 
 ```{python}
@@ -188,10 +188,12 @@ def _get_t_veh_lookup(gtfs_dir: Path) -> dict:
 ```{python}
 #| label: load-weighted-graphs
 import pandas as pd
+import os
 from lib.gtfs_manifest import build_manifest, pick_version_for_date
 from lib.transbordos_metro import normalize_station_name
 
-GRAPH_DIR = PROJECT_ROOT / "01_processing" / "metro_graphs"
+GTFS_ROOT = Path(os.getenv("GTFS_ROOT_OVERRIDE", PROJECT_ROOT / "config" / "GTFS"))
+GRAPH_DIR = Path(os.getenv("METRO_GRAPH_DIR_OVERRIDE", PROJECT_ROOT / "01_processing" / "metro_graphs"))
 GRAPH_MANIFEST = GRAPH_DIR / "manifest_graphs.parquet"
 
 if not GRAPH_MANIFEST.exists():
@@ -205,7 +207,9 @@ def load_graph_by_folder(folder: str) -> nx.Graph:
     with open(path, "rb") as f:
         return pickle.load(f)
 
-manifest_gtfs = build_manifest(PROJECT_ROOT / "config" / "GTFS")
+manifest_gtfs = build_manifest(GTFS_ROOT)
+print(f"GTFS root: {GTFS_ROOT}")
+print(f"Graph dir: {GRAPH_DIR}")
 print(f"GTFS en manifest: {[m.folder for m in manifest_gtfs]}")
 
 # Seleccionar y cargar el grafo según la fecha de la partición.
@@ -234,7 +238,7 @@ print(f"✅ Grafo cargado ({version_for_date.folder}) para {service_date}: {G_me
 ## Función de Validación del Grafo
 ```{python}
 #|label: graph-validation-function
-
+print("label: graph-validation-function")
 
 
 print("Construyendo el grafo de la red de Metro (con nombres ESTANDARIZADOS ROBUSTOS)...")
@@ -283,6 +287,8 @@ print("✅ Función de validación `is_direct_path_valid` (ESTANDARIZADA) defini
 
 ```{python}
 #| label: validate-coverage-viajes
+print("label: validate-coverage-viajes")
+
 if lf_data is None:
     print("❌ No hay datos de viajes cargados; omitiendo validación.")
 else:
@@ -322,7 +328,7 @@ else:
     print(sorted(graph_stations))
 
     # Validación cruzada vs GTFS (solo estaciones de Metro: rutas route_type=1 presentes en stop_times)
-    gtfs_path = PROJECT_ROOT / "config" / "GTFS" / version_for_date.folder
+    gtfs_path = GTFS_ROOT / version_for_date.folder
     routes_metro = pl.read_csv(gtfs_path / "routes.txt", schema_overrides={"route_id": pl.Utf8, "route_short_name": pl.Utf8, "route_type": pl.Int8}, truncate_ragged_lines=True).filter(pl.col("route_type") == 1)["route_id"].to_list()
     trips_metro = pl.read_csv(gtfs_path / "trips.txt", schema_overrides={"route_id": pl.Utf8, "trip_id": pl.Utf8}).filter(pl.col("route_id").is_in(routes_metro))["trip_id"].to_list()
     stop_times = pl.read_csv(gtfs_path / "stop_times.txt", schema_overrides={"trip_id": pl.Utf8, "stop_id": pl.Utf8})
@@ -355,6 +361,8 @@ else:
 ## Viajes con al menos una etapa Metro (tipo_transporte == 2)
 ```{python}
 #| label: pct-viajes-metro
+
+print("label: pct-viajes-metro")
 metro_flags = [(pl.col(f'tipo_transporte_{i}').cast(pl.Utf8) == '2') for i in range(1,5)]
 
 lf_flagged = lf_data.with_columns(
@@ -376,6 +384,7 @@ print(f"Viajes con >=1 etapa Metro: {metro:,} ({metro/total*100:.2f}% del total)
 ## Distribución de número de etapas en viajes con Metro
 ```{python}
 #| label: etapas-por-viaje-metro
+print("label: etapas-por-viaje-metro")
 # Optimizado: calcular todo en una sola pasada
 lf_metro = lf_data.with_columns(
     metro_any = pl.any_horizontal([
@@ -405,6 +414,7 @@ print(df_result)
 ## Desglose por combinación de modos (bus=1/3, metro=2, metrotren=4)
 ```{python}
 #| label: desglose-modos
+print("label: desglose-modos")
 bus_flags   = [(pl.col(f'tipo_transporte_{i}').cast(pl.Utf8).is_in(['1','3']).fill_null(False)) for i in range(1,5)]
 metro_flags = [(pl.col(f'tipo_transporte_{i}').cast(pl.Utf8) == '2').fill_null(False) for i in range(1,5)]
 tren_flags  = [(pl.col(f'tipo_transporte_{i}').cast(pl.Utf8) == '4').fill_null(False) for i in range(1,5)]
@@ -444,6 +454,8 @@ show("Metro + Bus + Metrotren", df_modes['metro_bus_tren'])
 ## Número de etapas por combinación de modos
 ```{python}
 #| label: etapas-por-modo
+
+print("label: etapas-por-modo")
 bus_flags   = [(pl.col(f'tipo_transporte_{i}').cast(pl.Utf8).is_in(['1','3']).fill_null(False)) for i in range(1,5)]
 metro_flags = [(pl.col(f'tipo_transporte_{i}').cast(pl.Utf8) == '2').fill_null(False) for i in range(1,5)]
 tren_flags  = [(pl.col(f'tipo_transporte_{i}').cast(pl.Utf8) == '4').fill_null(False) for i in range(1,5)]
@@ -503,6 +515,7 @@ print(df_etapas_modo)
 ## Consulta puntual de camino y tiempo con la función shortest_path_with_line
 ```{python}
 #| label: shortest-path-example
+print("label: shortest-path-example")
 from lib.transbordos_metro.metro_graph_builder import shortest_path_with_line
 
 orig = "UNIVERSIDAD DE CHILE"
@@ -567,6 +580,7 @@ else:
 ## Marcado de viajes con transbordo interno no identificado (etapa imposible sin transfers)
 ```{python}
 #| label: flag-internal-transfer
+print("label: flag-internal-transfer")
 import networkx as nx
 
 # Subgrafos travel-only por línea (nodos tuple: (estación, línea))
@@ -673,6 +687,7 @@ with pl.Config(
 ## Reconstrucción de rutas mínimas para ejemplos True (etapas corregidas y tiempo)
 ```{python}
 #| label: reconstruccion-ejemplos
+print("label: reconstruccion-ejemplos")
 from lib.transbordos_metro.metro_graph_builder import shortest_path_with_line
 
 # Tomamos las mismas muestras True ya mostradas
@@ -766,6 +781,7 @@ with pl.Config(tbl_cols=-1, tbl_width_chars=1000, tbl_hide_column_data_types=Tru
 ## Reconstrucción completa (muestra) de viajes marcados y detección de torniquete tras reconstrucción
 ```{python}
 #| label: reconstruccion-completa-muestra
+print("label: reconstruccion-completa-muestra")
 from lib.transbordos_metro.metro_graph_builder import shortest_path_with_line
 
 SAMPLE_LIMIT = 2000  # ajustar si se requiere más/menos
@@ -1183,6 +1199,7 @@ for row in df_bad.iter_rows(named=True):
             out[f"zona_subida_{j}"] = None
             out[f"zona_bajada_{j}"] = None
 
+    out = sync_trip_level_terminals_from_legs(out, legs_out)
     recon_rows.append(out)
 
 df_bad_recon = pl.DataFrame(recon_rows, schema=schema_dict, strict=False, orient="row")

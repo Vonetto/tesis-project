@@ -830,3 +830,391 @@
   - dejar de tratar `prom_escolaridad18_micro` como share;
   - comparar la nueva desagregación `terciaria corta / universitaria / postgrado`;
   - actualizar mapas, matriz de correlación y shortlist preliminar.
+
+## 2026-04-14 (EDA preliminar de variables `ZONA777` derivadas desde microdatos spatialized)
+- Se consolidó el piloto operativo:
+  - `microdatos comunales -> softmax_tau003 -> MANZENT -> ZONA777`
+- Artefactos principales del piloto:
+  - `02_eda/tmp/censo2024_microdata_zona777/pilot_softmax_tau003/censo2024_microdata_zona777_features.parquet`
+  - `02_eda/tmp/censo2024_microdata_zona777/pilot_softmax_tau003/censo2024_microdata_manzent_features.parquet`
+  - `02_eda/tmp/censo2024_microdata_zona777/pilot_softmax_tau003/censo2024_microdata_zona777_summary.json`
+- Notebook de auditoría/EDA:
+  - [`02_eda/eda_censo2024_microdata_zona777.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/02_eda/eda_censo2024_microdata_zona777.qmd)
+
+### Sanidad básica del output `ZONA777`
+- El piloto quedó con:
+  - `111` zonas `ZONA777`
+  - `36` columnas en el agregado final
+  - `3202` filas `MANZENT`
+- Hallazgo de calidad:
+  - todas las shares auditadas quedaron en rango `[0,1]`, sin `nulls`;
+  - `prom_escolaridad18_micro` quedó con rango plausible:
+    - `min ~= 7.76`
+    - `max ~= 16.17`
+
+### Hallazgos preliminares del bloque educación
+- `share_cine18_universitaria_micro` quedó casi pegada a la dimensión educativa principal ya conocida:
+  - `corr(prom_escolaridad18_micro, share_cine18_universitaria_micro) ~= 0.981`
+  - `corr(prom_escolaridad18, share_cine18_universitaria_micro) ~= 0.909`
+- Lectura:
+  - esta variable funciona como la mejor proxy interpretable de **capital humano alto general**;
+  - puede reemplazar interpretativamente a `prom_escolaridad18`, pero no conviene meterlas juntas de entrada.
+- `share_cine18_postgrado_micro` mostró una señal más específica:
+  - `corr(prom_escolaridad18_micro, share_cine18_postgrado_micro) ~= 0.806`
+  - `corr(prom_escolaridad18, share_cine18_postgrado_micro) ~= 0.790`
+  - baja asociación con el bloque laboral:
+    - `corr(share_ocupado_15mas_micro, share_cine18_postgrado_micro) ~= 0.114`
+    - `corr(share_fuera_fuerza_trabajo_15mas_micro, share_cine18_postgrado_micro) ~= 0.011`
+    - `corr(share_dependiente_micro, share_cine18_postgrado_micro) ~= -0.067`
+    - `corr(share_independiente_micro, share_cine18_postgrado_micro) ~= 0.038`
+- Lectura:
+  - `postgrado` parece capturar una dimensión más selectiva de **élite educativa / estatus alto**, no solo escolaridad promedio.
+- `share_cine18_terciaria_corta_micro` quedó más separada del gradiente educativo tradicional:
+  - `corr(prom_escolaridad18_micro, share_cine18_terciaria_corta_micro) ~= 0.417`
+  - `corr(prom_escolaridad18, share_cine18_terciaria_corta_micro) ~= 0.301`
+  - y muy alineada al bloque laboral:
+    - `corr(share_ocupado_15mas_micro, share_cine18_terciaria_corta_micro) ~= 0.862`
+    - `corr(share_dependiente_micro, share_cine18_terciaria_corta_micro) ~= 0.835`
+    - `corr(share_fuera_fuerza_trabajo_15mas_micro, share_cine18_terciaria_corta_micro) ~= -0.888`
+    - `corr(share_independiente_micro, share_cine18_terciaria_corta_micro) ~= -0.828`
+- Lectura:
+  - `terciaria_corta` no parece solo “más educación”, sino una dimensión más cercana a **formación técnica / inserción laboral formal**.
+
+### Hallazgos preliminares del bloque laboral
+- `share_ocupado_15mas_micro` y `share_fuera_fuerza_trabajo_15mas_micro` son casi espejo:
+  - `corr ~= -0.980`
+- `share_dependiente_micro` y `share_independiente_micro` son casi espejo:
+  - `corr ~= -0.997`
+- Juicio preliminar:
+  - para primeras pruebas de modelo no conviene cargar todo el bloque laboral;
+  - si se quiere una sola candidata laboral, `share_independiente_micro` parece más informativa que `share_dependiente_micro` o `share_ocupado_15mas_micro`.
+
+### Lectura sustantiva provisional
+- El split educativo de `CINE-11` permitió separar tres cosas que antes estaban mezcladas:
+  - `share_cine18_universitaria_micro`:
+    - proxy de **capital humano alto general**
+  - `share_cine18_postgrado_micro`:
+    - proxy de **élite educativa / estatus alto**
+  - `share_cine18_terciaria_corta_micro`:
+    - proxy de una dimensión distinta, más cercana a **formación técnica / inserción laboral**
+- Esto es más informativo que seguir usando solo `prom_escolaridad18`, porque permite diferenciar entre educación alta general, educación muy alta y educación técnica.
+
+### Fiabilidad y límites de estas variables
+- Estas variables **no** son observaciones directas a nivel `ZONA777`;
+  - son proxies derivadas desde una población sintética spatialized:
+    - `comuna -> MANZENT -> ZONA777`
+- La confianza metodológica actual se apoya en:
+  - mejor desempeño frente a la baseline aleatoria;
+  - validación contra targets finos observados;
+  - rangos plausibles y patrones espaciales coherentes;
+  - correlaciones que cuentan historias sustantivamente razonables.
+- Límite explícito:
+  - deben presentarse como **proxies spatialized validadas**, no como mediciones observadas directamente en `ZONA777`.
+
+### Implicancia para modelación
+- No conviene meter juntas desde el inicio variables que representan la misma dimensión:
+  - `prom_escolaridad18`
+  - `prom_escolaridad18_micro`
+  - `share_cine18_universitaria_micro`
+  - `share_cine18_terciaria_micro`
+- Prioridad preliminar para próximas corridas del modelo:
+  1. `share_cine18_universitaria_micro`
+  2. `share_cine18_terciaria_corta_micro`
+  3. `share_cine18_postgrado_micro`
+  4. `share_independiente_micro` como laboral secundaria
+- Estrategia acordada:
+  - probarlas **de a poco**, no todas juntas;
+  - primero como reemplazo o competidoras de `prom_escolaridad18`;
+  - luego, si la interpretación se mantiene estable, evaluar combinaciones controladas.
+
+### Integración en notebook de modelos `08`
+- Se decidió implementar la primera ronda en Biogeme, no en Larch, dentro de:
+  - `03_models/08_nested_logit_enriched_interannual_censo.qmd`
+- El notebook `08` quedó extendido con una ruta paralela `Censo + microdatos spatialized`:
+  - construcción del parquet full `ZONA777` si no existe:
+    - `02_eda/tmp/censo2024_microdata_zona777/full_softmax_tau003/censo2024_microdata_zona777_features.parquet`
+  - construcción de un `model-ready` específico para microdatos;
+  - estandarización de variables microdato sobre las zonas efectivamente usadas en la muestra;
+  - construcción de una muestra de estimación combinada:
+    - `pooled_2024_2025-estimation-sample5pct-censo4-micro.parquet`
+- Variables microdato incluidas en esta primera ronda:
+  - `share_cine18_universitaria_micro`
+  - `share_cine18_terciaria_corta_micro`
+  - `share_cine18_postgrado_micro`
+  - `share_independiente_micro`
+- Especificaciones añadidas al notebook:
+  - `mnl_interannual_micro_share_cine18_universitaria`
+  - `mnl_interannual_micro_share_cine18_terciaria_corta`
+  - `mnl_interannual_micro_share_cine18_postgrado`
+  - `mnl_interannual_censo_escolaridad_micro_terciaria_corta`
+  - `mnl_interannual_censo_escolaridad_micro_postgrado`
+- Criterio mantenido:
+  - no empezar combinando `prom_escolaridad18` con `share_cine18_universitaria_micro`, por su alta redundancia;
+  - sí probar primero cada proxy nueva por separado y luego combinaciones controladas con `prom_escolaridad18`.
+- Validación de edición:
+  - los bloques Python del `qmd` fueron chequeados sintácticamente y compilan sin errores antes de ejecutar la corrida completa.
+
+## 2026-04-15 — Primera ronda de modelación: resultados y observaciones
+
+### Modelos estimados y fit comparado
+
+| Modelo | Params | LL | AIC | LRT vs baseline | Gradiente |
+|---|---|---|---|---|---|
+| `mnl_interannual_censo_baseline` | 30 | -467,338.7 | 934,737 | — | 9.4 |
+| `mnl_interannual_micro_share_cine18_universitaria` | 32 | -464,686.6 | 929,437 | 5,304 | 8.8 |
+| `mnl_interannual_micro_share_cine18_postgrado` | 32 | -465,082.2 | 930,228 | 4,513 | 7.8 |
+| `mnl_interannual_censo_prom_escolaridad18` | 32 | -464,865.3 | 929,795 | 4,947 | 13.5 |
+| `mnl_interannual_micro_share_cine18_terciaria_corta` | 32 | -466,720.3 | 933,505 | 1,237 | 6.9 |
+| `mnl_interannual_censo_escolaridad_micro_terciaria_corta` | 34 | -464,718.2 | 929,504 | 5,241 | ⚠️ 241 |
+| `mnl_interannual_censo_escolaridad_micro_postgrado` | 34 | -464,705.6 | 929,479 | 5,266 | ⚠️ 564 |
+| `mnl_interannual_micro_universitaria_terciaria_corta` | 34 | -464,668.8 | 929,406 | 5,340 | ⚠️ 1,926 |
+
+Baseline = modelo enriquecido de notebook 07 con controles de transporte, oferta, demanda y `DUMMY_ANIO_2025`. N=933,276.
+
+### Observaciones sobre las variables micro de educación
+
+**`share_cine18_universitaria_micro`:**
+- Coeficiente QR_RED: +0.474, t=67.98; QR_OTHER: +0.087, t=26.43
+- Significativa en ambas alternativas. Efecto asimétrico: QR_RED captura ~5.5x más que QR_OTHER
+- Mejor fit individual entre todas las variables probadas (AIC 929,437 vs baseline 934,737)
+- Supera a `prom_escolaridad18` en AIC por 358 puntos con igual número de parámetros
+
+**`share_cine18_postgrado_micro`:**
+- Coeficiente QR_RED: +0.342, t=66.73; QR_OTHER: +0.064, t=24.03
+- Misma dirección que universitaria. Fit menor (ΔAIC=791 respecto a universitaria)
+- Patrón de movimiento de coeficientes de transporte similar al de universitaria
+
+**`share_cine18_terciaria_corta_micro`:**
+- Coeficiente QR_RED: -0.226, t=-33.84; QR_OTHER: -0.042, t=-13.15
+- Signo opuesto a universitaria y postgrado
+- Fit individual mucho más débil (LRT=1,237 vs 5,304 de universitaria)
+
+**`prom_escolaridad18` (agregado oficial):**
+- Coeficiente QR_RED: +0.552, t=62.86; QR_OTHER: +0.082, t=21.59
+- Misma dirección que universitaria. Coeficiente mayor en valor absoluto, pero fit peor
+- Gradiente 13.5 — aceptable pero levemente más alto que los modelos micro
+
+### Observaciones sobre modelos combinados
+
+**`prom_escolaridad18` + terciaria corta / postgrado:**
+- Ambos muestran problemas serios de convergencia numérica (gradient norm 241 y 564 respectivamente)
+- Las variables microdato y el agregado oficial comparten la misma población subyacente → superficie de likelihood plana
+- Los coeficientes reportados en estos modelos deben interpretarse con mucha cautela y no usarse como evidencia principal
+
+**`share_cine18_universitaria_micro` + `share_cine18_terciaria_corta_micro`:**
+- Gradient norm = 1,926 — el más alto de todos
+- A pesar de que ambas tienen signos opuestos (esperado como indicador de baja colinealidad), el combo muestra convergencia numérica muy débil
+- En el combo, terciaria corta pierde ~87% de su efecto: QR_RED pasa de -0.226 (sola) a -0.030 (en combo)
+- El ΔAIC sobre universitaria sola es solo 31 puntos con 2 parámetros extra y no-convergencia
+
+### Observaciones sobre movimiento de otros coeficientes al incorporar educación
+
+Nota: los patrones a continuación son más pronunciados en los modelos con variables de fuerte corrección (universitaria, postgrado, escolaridad18). Terciaria corta sola, por ser el corrector más débil, produce movimientos menores o no produce el patrón.
+
+- `LOG_DEMAND` QR_RED: +0.128 en baseline → flipa a negativo en modelos con universitaria (-0.073), postgrado (-0.088), escolaridad18 (-0.047) y todos los combos. Con terciaria corta sola se atenúa a +0.046 pero **no flipa** (permanece positivo)
+  - Interpretación: en baseline, LOG_DEMAND absorbía parte del efecto de composición socioeducativa zonal; la corrección depende de la fuerza de la variable educativa
+- `METRO_LINE_COUNT` QR_RED: -0.053 baseline → varía ampliamente (+0.008 a +0.221) según especificación educativa; con terciaria corta sola sube a +0.167
+  - El parámetro es inestable entre especificaciones y no se observa dirección consistente
+- `NO_LAB` QR_RED: 0.302 baseline → con universitaria/postgrado/combos cae a 0.025-0.090 e incluso pierde significancia; con terciaria corta sola permanece en 0.191 (significativo)
+  - Sugiere que el efecto de franja no-laboral para QR_RED estaba parcialmente capturando heterogeneidad socioeducativa zonal, más visible cuando la variable educativa tiene fuerza suficiente
+- `LAB_PT` QR_RED: se atenúa al agregar educación; con universitaria/postgrado/escolaridad18/combos cae a 0.191-0.283; con terciaria corta sola permanece en 0.380 (atenuación menor)
+- `ASC_QR_RED`: se vuelve menos negativo al agregar educación; con universitaria/postgrado/escolaridad18/combos oscila entre -3.5 y -3.9; con terciaria corta sola permanece en -4.233 (cerca del baseline de -4.490)
+
+### Observación sobre asimetría QR_RED vs QR_OTHER
+
+En todos los modelos con variables de educación, el efecto sobre QR_RED es aproximadamente 5–7x mayor que sobre QR_OTHER (rango observado: 5.3x para postgrado, 5.4x para universitaria y terciaria corta, 6.7x para escolaridad18). Esta asimetría es consistente independientemente de la variable educativa usada.
+
+---
+
+## 2026-04-16 — Segunda ronda: variables censo agregadas (share_hacinamiento, share_internet)
+
+### Modelos estimados y fit comparado
+
+| Modelo | Params | LL | AIC | LRT vs baseline | Gradiente |
+|---|---|---|---|---|---|
+| `mnl_interannual_censo_baseline` | 30 | -467,338.7 | 934,737 | — | 9.4 |
+| `mnl_interannual_micro_share_cine18_universitaria` | 32 | -464,686.6 | 929,437 | 5,304 | 8.8 |
+| `mnl_interannual_censo_prom_escolaridad18` | 32 | -464,865.3 | 929,795 | 4,947 | 13.5 |
+| `mnl_interannual_micro_share_cine18_postgrado` | 32 | -465,082.2 | 930,228 | 4,513 | 7.8 |
+| `mnl_interannual_censo_share_internet` | 32 | -465,843.5 | 931,751 | 2,990 | 7.8 |
+| `mnl_interannual_censo_share_hacinamiento` | 32 | -466,449.9 | 932,964 | 1,778 | 4.5 |
+| `mnl_interannual_micro_share_cine18_terciaria_corta` | 32 | -466,720.3 | 933,505 | 1,237 | 6.9 |
+
+Todos los LRT con 2 df son altamente significativos (χ² crítico al 0.001 = 13.8). Gradientes todos aceptables (< 20).
+
+### Observaciones: `share_hacinamiento`
+
+- Coeficiente QR_RED: **-0.324**, t=-36.5, p≈0; QR_OTHER: **-0.009**, t=-2.76, p=0.006
+- Signo negativo en ambas alternativas: más hacinamiento → menor adopción QR. Coherente con su interpretación como proxy inverso de ingreso.
+- **Asimetría extrema**: efecto QR_RED es ~36x el efecto QR_OTHER (0.324 / 0.009). Hacinamiento predice fuertemente la adopción de pago RED, pero su efecto en QR_OTHER es prácticamente nulo.
+- Quinto mejor fit individual entre variables convergentes (AIC=932,964 vs baseline 934,737; ΔAIC=-1,773).
+- Mejor que terciaria corta (AIC=933,505) pero notablemente peor que postgrado (AIC=930,228).
+
+**Movimiento de otros coeficientes:**
+- `ASC_QR_RED`: -4.535 — más negativo que baseline (-4.490) y que todos los modelos con variables de educación (−3.5 a −4.233). Comportamiento opuesto al patrón educativo: las variables positivas (educación) volvían el ASC menos negativo; hacinamiento (predictor negativo) lo vuelve más negativo.
+- `LOG_DEMAND` QR_RED: +0.051, t=5.14 — atenuado respecto al baseline (+0.128) pero no flipa. Comportamiento similar al de terciaria corta sola (+0.046); hacinamiento es un corrector débil del confounding demanda-composición.
+- `METRO_LINE_COUNT` QR_RED: +0.026, t=0.95, p=0.34 — no significativo. Patrón de inestabilidad consistente con lo observado en los modelos educativos.
+- `NO_LAB` QR_RED: +0.216 — entre el baseline (0.302) y el rango universitaria/postgrado (0.025–0.090); más cercano al patrón de corrector débil (cf. terciaria corta: 0.191).
+- `LAB_PT` QR_RED: +0.406 — similar a terciaria corta sola (0.380), lejos del rango de los correctores fuertes (0.191–0.283). Confirma comportamiento de corrector débil.
+
+### Observaciones: `share_internet`
+
+- Coeficiente QR_RED: **+0.633**, t=+43.5, p≈0; QR_OTHER: **+0.088**, t=+17.2, p≈0
+- Signo positivo en ambas alternativas: más acceso a internet → mayor adopción QR.
+- **Asimetría**: ~7.2x (0.633 / 0.088). Magnitud consistente con el rango educativo (5.3x–6.7x).
+- Cuarto mejor fit individual entre variables convergentes (AIC=931,751; ΔAIC=-2,986), tras universitaria, escolaridad18 y postgrado. Queda 1,523 puntos de AIC por encima de postgrado (AIC=930,228).
+- Coeficiente QR_RED (+0.633) es el más alto de todos los modelos individuales, superando a universitaria (+0.474) y escolaridad18 (+0.552).
+
+**Movimiento de otros coeficientes:**
+- `ASC_QR_RED`: -4.334 — menos negativo que baseline (-4.490) y que hacinamiento (-4.535); más negativo que terciaria corta (-4.233) y los modelos educativos fuertes (−3.5 a −3.9). Posición intermedia coherente con fit de rango similar.
+- `LOG_DEMAND` QR_RED: +0.021, t=2.11, p=0.035 — al borde de la significancia, casi neutro. Más atenuado que hacinamiento (+0.051) y terciaria corta (+0.046); más cercano al flip observado en postgrado y superiores. Internet es corrector más fuerte del confounding de demanda que hacinamiento, aunque no llega a flipa a negativo como universitaria/postgrado/escolaridad18.
+- `METRO_LINE_COUNT` QR_RED: **-0.069**, t=-2.53, p=0.011 — significativo negativo. Notable: en todos los modelos anteriores este parámetro fue inestable y mayoritariamente positivo o no significativo. Con share_internet se vuelve significativamente negativo. Posible correlación espacial entre cobertura de internet y densidad de líneas de metro (zonas con más metro pueden tener más o menos internet de formas no lineales).
+- `METRO_LINE_COUNT` QR_OTHER: +0.069, t=5.04 — significativo positivo, casi simétrico en magnitud al QR_RED pero con signo opuesto. Patrón inusual que no aparece en los otros modelos.
+- `NO_LAB` QR_RED: +0.174 — más atenuado que hacinamiento (0.216) y terciaria corta (0.191), pero aún lejos del rango universitaria/postgrado (0.025–0.090). Corrector intermedio.
+- `LAB_PT` QR_RED: +0.383 — similar a terciaria corta (0.380) y hacinamiento (0.406). Atenuación moderada respecto al baseline.
+
+### Observaciones comparadas sobre proxies de ingreso
+
+**`share_hacinamiento`:**
+- Proxy inverso de ingreso (más hacinamiento → menor renta esperada). Señal real pero débil en términos de fit.
+- La asimetría extrema QR_RED/QR_OTHER (~36x) es llamativa: hacinamiento captura adopción RED pero no QR_OTHER. Una posible lectura es que los pagos QR_OTHER (canales más informales) no son sensibles a la composición socioeconómica de la zona tanto como el pago formal RED.
+- No resuelve el confounding de LOG_DEMAND de forma sustancial (queda +0.051).
+
+**`share_internet`:**
+- Proxy compuesto: captura simultáneamente acceso a infraestructura digital y nivel socioeconómico. No es un proxy limpio de ingreso.
+- Cuarto mejor modelo individual convergente. Queda 1,523 puntos de AIC por encima de postgrado (AIC=930,228).
+- La anomalía de `METRO_LINE_COUNT` QR_RED (−0.069, significativo) sugiere que internet tiene correlaciones espaciales con la distribución de infraestructura de transporte que ninguna de las variables educativas captaba.
+- El efecto QR_RED (+0.633) es el mayor de todos los modelos individuales, lo que puede reflejar que digital literacy + infraestructura de conectividad son más directamente relevantes para el pago QR (que es un acto digital) que el nivel educativo per se.
+
+**Posición relativa respecto a variables educativas:**
+- Ninguna de las dos variables de esta ronda supera a universitaria o escolaridad18 en fit.
+- Internet queda entre postgrado (AIC=930,228) y hacinamiento (AIC=932,964); hacinamiento queda entre internet y terciaria corta (AIC=933,505).
+- Para el objetivo de identificar un proxy de ingreso/socioeconómico: hacinamiento es más interpretable causalmente como proxy de ingreso, pero estadísticamente más débil; internet tiene mejor fit pero mezcla canales de efecto.
+
+---
+
+## 2026-04-16 — Cierre de etapa: comparación final `universitaria_micro` vs `prom_escolaridad18`
+
+### Comparación final de variables candidatas principales
+
+| Variable | Interpretación | LL | AIC | Gradiente | QR_RED | QR_OTHER |
+|---|---|---|---|---|---|---|
+| `prom_escolaridad18` | promedio agregado de escolaridad adulta | -464,865.3 | 929,794.6 | 13.5 | +0.552 | +0.081 |
+| `share_cine18_universitaria_micro` | proporción de adultos con educación universitaria | -464,686.6 | 929,437.2 | 8.8 | +0.474 | +0.087 |
+
+### Decisión metodológica
+- Se cierra la etapa tomando `share_cine18_universitaria_micro` como **proxy principal candidata** de capital humano alto general.
+- `prom_escolaridad18` se mantiene como **benchmark agregado tradicional** para comparar especificaciones.
+- `share_cine18_postgrado_micro` queda como **especificación de sensibilidad**:
+  - útil para testear una lectura más selectiva de élite educativa / estatus alto;
+  - no reemplaza a `universitaria_micro` como variable principal.
+- `share_cine18_terciaria_corta_micro` queda fuera del rol de proxy principal de ingreso/capital humano alto:
+  - su interpretación es distinta, más cercana a formación técnica / estructura laboral.
+
+### Justificación de la decisión
+- La prioridad no es solo el fit, sino la combinación de:
+  - interpretabilidad;
+  - coherencia con la idea de “nivel educacional” sugerida como proxy;
+  - estabilidad/convergencia razonable;
+  - y, recién después, desempeño empírico.
+- Bajo ese criterio, `share_cine18_universitaria_micro` domina a `prom_escolaridad18`:
+  - es más interpretable;
+  - está más cerca de la noción de “nivel educacional” por tramos;
+  - muestra mejor `LL`, mejor `AIC` y mejor gradiente;
+  - y mantiene signos limpios y significativos en ambas alternativas QR.
+
+### Implicancia para la línea principal
+- La siguiente integración al frente principal del modelo debería hacerse con:
+  - `share_cine18_universitaria_micro` como candidata principal;
+  - `prom_escolaridad18` como benchmark;
+  - `share_cine18_postgrado_micro` solo como sensibilidad.
+
+---
+
+## 2026-04-16 — Reapertura metodológica: construir `universitaria o más`
+
+### Motivo
+- Se reabrió la definición de la proxy educativa principal por una objeción conceptual válida:
+  - si el objetivo es usar **nivel académico como proxy de ingreso**, dejar `postgrado` fuera de la categoría principal puede ser metodológicamente incoherente;
+  - `share_cine18_universitaria_micro` mide solo `cine11 == 9`, no “al menos universitaria”.
+
+### Nueva definición operativa
+- Se define una nueva variable adulta:
+  - `n_cine18_universitaria_o_mas = cine11 in [9, 10, 11]` para personas de 18+.
+- A partir de eso se deriva:
+  - `share_cine18_universitaria_o_mas_micro = n_cine18_universitaria_o_mas / n_cine18_total_obs`.
+- Interpretación:
+  - proporción de adultos de la zona con **educación universitaria o postgrado**;
+  - esto corresponde mejor a “al menos universitaria” como proxy de capital humano alto / ingreso potencial.
+
+### Implementación realizada
+- `lib/censo2024_microdata_base.py`
+  - se agregó `n_cine18_universitaria_o_mas` a la agregación hogar-personas.
+- `lib/censo2024_microdata_zona777.py`
+  - se agregó el conteo a `MANZENT_COUNT_COLS`;
+  - se derivó `share_cine18_universitaria_o_mas_micro` tanto en `MANZENT` como en `ZONA777`.
+- `lib/test_censo2024_microdata_base.py`
+  - se extendieron asserts para el nuevo conteo adulto.
+- `lib/test_censo2024_microdata_zona777.py`
+  - se extendieron asserts para la nueva share en `MANZENT` y `ZONA777`.
+- `02_eda/eda_censo2024_microdata_zona777.qmd`
+  - se incorporó la nueva variable al bloque de educación, correlaciones y mapas.
+- `03_models/08_nested_logit_enriched_interannual_censo.qmd`
+  - se incorporó al `model-ready` micro;
+  - se agregó parámetro/tag `SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z`;
+  - se añadió una especificación MNL:
+    - `mnl_interannual_micro_share_cine18_universitaria_o_mas`;
+  - y su bloque de carga de resultados correspondiente.
+
+### Validación hecha
+- Tests unitarios:
+  - `~/.local/share/mamba/envs/larch-env/bin/python -m unittest lib.test_censo2024_microdata_base lib.test_censo2024_microdata_zona777`
+  - resultado: `5 tests OK`
+- Sintaxis notebooks:
+  - `02_eda/eda_censo2024_microdata_zona777.qmd` → `10` bloques Python OK
+  - `03_models/08_nested_logit_enriched_interannual_censo.qmd` → `60` bloques Python OK
+
+### Estado
+- La decisión previa que favorecía `share_cine18_universitaria_micro` queda **provisional**.
+- Antes de integrar una proxy educativa final al frente principal, ahora corresponde correr y evaluar:
+  - `share_cine18_universitaria_o_mas_micro`
+  - contra `share_cine18_universitaria_micro`
+  - y contra `prom_escolaridad18`.
+
+---
+
+## 2026-04-16 — Cierre final: `universitaria_o_mas` reemplaza a `universitaria` exacta
+
+### Resultado de la comparación final
+
+| Variable | Interpretación | LL | AIC | Gradiente | QR_RED | QR_OTHER |
+|---|---|---|---|---|---|---|
+| `prom_escolaridad18` | promedio agregado de escolaridad adulta | -464,865.3 | 929,794.6 | 13.5 | +0.552 | +0.081 |
+| `share_cine18_universitaria_micro` | proporción de adultos con educación universitaria exacta | -464,686.6 | 929,437.2 | 8.8 | +0.474 | +0.087 |
+| `share_cine18_universitaria_o_mas_micro` | proporción de adultos con al menos educación universitaria | -464,717.0 | 929,498.0 | 9.9 | +0.436 | +0.081 |
+
+### Lectura
+- `share_cine18_universitaria_o_mas_micro` queda muy cerca de `share_cine18_universitaria_micro` en desempeño empírico:
+  - pierde muy poco en `LL`/`AIC`;
+  - mantiene signos positivos y muy significativos en `QR_RED` y `QR_OTHER`;
+  - sigue superando claramente a `prom_escolaridad18`.
+- La ganancia principal no es de fit, sino de **coherencia metodológica**:
+  - evita dejar `postgrado` fuera del grupo de educación alta;
+  - representa mejor la idea de “al menos universitaria” como proxy de ingreso/capital humano alto.
+
+### Decisión metodológica final
+- Se reemplaza la decisión provisional anterior.
+- La proxy educativa principal pasa a ser:
+  - `share_cine18_universitaria_o_mas_micro`
+- Se mantiene:
+  - `prom_escolaridad18` como benchmark explícito;
+  - `share_cine18_postgrado_micro` como sensibilidad;
+  - `share_cine18_universitaria_micro` como referencia desagregada útil, pero no como proxy principal final.
+- Se cierra la rama educativa en este punto:
+  - no seguir abriendo nuevas proxies educativas por ahora.
+
+### Implicancia para la línea principal
+- La próxima integración al frente principal del modelo debe hacerse con:
+  - `share_cine18_universitaria_o_mas_micro` como variable educativa candidata;
+  - `prom_escolaridad18` como benchmark explícito;
+  - `share_cine18_postgrado_micro` solo como sensibilidad.

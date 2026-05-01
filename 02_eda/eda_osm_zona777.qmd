@@ -1,0 +1,850 @@
+---
+title: "EDA — OpenStreetMap audit for ZONA777"
+format: html
+---
+
+## Objetivo
+
+Abrir una rama de auditoría amplia de `OpenStreetMap` para `ZONA777`, antes de definir variables candidatas para modelación.
+
+El objetivo de esta etapa **no** es construir todavía un bloque final de variables, sino responder:
+
+- qué familias de tags existen realmente en el área de estudio;
+- cuánta masa y cobertura espacial tienen;
+- qué tags parecen suficientemente interpretables y agregables por zona;
+- y qué shortlist preliminar vale la pena llevar a una segunda etapa.
+
+## Enfoque
+
+El notebook sigue una lógica de dos etapas:
+
+1. **Inventario amplio**
+   - consultar o cargar features OSM dentro del área de estudio;
+   - resumir por `key` y `key=value`.
+
+2. **Screening**
+   - medir cobertura por `ZONA777`;
+   - medir masa total;
+   - y dejar una shortlist preliminar de familias/tag-values plausibles.
+
+## Setup
+
+```{python}
+#| label: setup
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+import warnings
+
+PROJECT_ROOT = Path.cwd()
+if not (PROJECT_ROOT / "lib").exists() and (PROJECT_ROOT.parent / "lib").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    import geopandas as gpd
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import polars as pl
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "Este notebook requiere geopandas, matplotlib, pandas y polars."
+    ) from exc
+
+try:
+    import osmnx as ox
+except ModuleNotFoundError:
+    ox = None
+    warnings.warn(
+        "osmnx no está instalado en este entorno. Se podrá reusar un export local, "
+        "pero no consultar OSM directamente desde este notebook hasta instalarlo.",
+        stacklevel=1,
+    )
+else:
+    ox.settings.log_console = True
+    ox.settings.use_cache = True
+```
+
+## Configuración
+
+```{python}
+#| label: config
+print("label: config")
+ZONAS777_SHP = Path("/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp")
+
+OUT_DIR = PROJECT_ROOT / "02_eda" / "tmp" / "osm_zona777"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+RAW_OSM_PARQUET = OUT_DIR / "osm_zona777_raw.parquet"
+RAW_OSM_POINTS_PARQUET = OUT_DIR / "osm_zona777_points_for_join.parquet"
+RAW_OSM_BY_KEY_DIR = OUT_DIR / "raw_by_key"
+RAW_OSM_BY_KEY_DIR.mkdir(parents=True, exist_ok=True)
+KEY_INVENTORY_PATH = OUT_DIR / "osm_key_inventory.parquet"
+TAGVALUE_INVENTORY_PATH = OUT_DIR / "osm_tagvalue_inventory.parquet"
+ZONA_KEY_COVERAGE_PATH = OUT_DIR / "osm_zona_key_coverage.parquet"
+SHORTLIST_TAGVALUE_INVENTORY_PATH = OUT_DIR / "osm_shortlist_tagvalue_inventory.parquet"
+SHORTLIST_TAGVALUE_COVERAGE_PATH = OUT_DIR / "osm_shortlist_tagvalue_coverage.parquet"
+SHORTLIST_TAGVALUE_SCREENING_PATH = OUT_DIR / "osm_shortlist_tagvalue_screening.parquet"
+MICROINFRA_TAGVALUE_AUDIT_PATH = OUT_DIR / "osm_microinfra_tagvalue_audit.parquet"
+
+USE_EXISTING_EXPORT_IF_AVAILABLE = True
+SAVE_RAW_QUERY = True
+QUERY_MODE = "per_key"  # "per_key" | "all_at_once"
+
+OSM_PRIMARY_KEYS = [
+    "amenity",
+    "shop",
+    "office",
+    "leisure",
+    "tourism",
+    "historic",
+    "landuse",
+    "building",
+    "place",
+    "highway",
+    "railway",
+    "public_transport",
+    "aeroway",
+    "natural",
+    "man_made",
+]
+
+MIN_TOTAL_OBJECTS_FOR_SCREEN = 25
+MIN_ZONA_COVERAGE_FOR_SCREEN = 10
+TOP_VALUES_PER_KEY = 30
+
+OSM_SHORTLIST_KEYS = [
+    "amenity",
+    "shop",
+    "leisure",
+    "public_transport",
+    "office",
+    "landuse",
+]
+
+MIN_TAGVALUE_OBJECTS_FOR_SCREEN = 50
+MIN_TAGVALUE_ZONA_COVERAGE_FOR_SCREEN = 15
+
+OSM_GENERIC_VALUES = {"yes"}
+OSM_SEMANTIC_EXCLUDE = {
+    "amenity": {
+        "bench",
+        "waste_basket",
+        "parking_space",
+        "parking_entrance",
+        "bicycle_parking",
+        "toilets",
+        "fountain",
+        "recycling",
+    },
+    "shop": {"yes"},
+    "office": {"yes"},
+}
+
+print("OUT_DIR:", OUT_DIR)
+print("RAW_OSM_PARQUET:", RAW_OSM_PARQUET)
+print("RAW_OSM_BY_KEY_DIR:", RAW_OSM_BY_KEY_DIR)
+print("QUERY_MODE:", QUERY_MODE)
+print("OSM_PRIMARY_KEYS:", OSM_PRIMARY_KEYS)
+print("OSM_SHORTLIST_KEYS:", OSM_SHORTLIST_KEYS)
+```
+
+## Cargar ZONA777
+
+```{python}
+#| label: load-zonas
+print("label: load-zonas")
+gdf_zonas = gpd.read_file(ZONAS777_SHP)[["ZONA777", "geometry"]].copy()
+gdf_zonas = gdf_zonas.set_crs("EPSG:4674", allow_override=True)
+if gdf_zonas["ZONA777"].duplicated().any():
+    gdf_zonas = gdf_zonas.dissolve(by="ZONA777", as_index=False)
+    gdf_zonas = gpd.GeoDataFrame(gdf_zonas, geometry="geometry", crs="EPSG:4674")
+
+aoi_union = gdf_zonas.to_crs(4326).union_all()
+print("n_zonas:", len(gdf_zonas))
+print("bbox:", tuple(round(v, 6) for v in aoi_union.bounds))
+```
+
+## Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+
+def load_or_query_osm_features(
+    *,
+    polygon,
+    primary_keys: list[str],
+    raw_path: Path,
+    raw_by_key_dir: Path,
+    use_existing: bool = True,
+    save_raw: bool = True,
+    query_mode: str = "per_key",
+) -> gpd.GeoDataFrame:
+    if use_existing and raw_path.exists():
+        print(f"ℹ️ Reusando export OSM existente: {raw_path}")
+        return gpd.read_parquet(raw_path)
+
+    if ox is None:
+        raise RuntimeError(
+            "No existe export local y osmnx no está disponible para consultar OSM."
+        )
+
+    from osmnx import _overpass
+
+    if query_mode not in {"per_key", "all_at_once"}:
+        raise ValueError("query_mode debe ser 'per_key' o 'all_at_once'")
+
+    n_requests = len(_overpass._make_overpass_polygon_coord_strs(polygon))
+    print(f"ℹ️ Keys solicitadas: {len(primary_keys)}")
+    print(f"ℹ️ La geometría se dividirá en {n_requests} request(s) Overpass por consulta.")
+    print("ℹ️ Esto puede tardar varios minutos. `per_key` permite ver progreso y reusar checkpoints.")
+
+    if query_mode == "all_at_once":
+        tags = {k: True for k in primary_keys}
+        print("ℹ️ Consultando OSM con tags:", tags)
+        gdf = ox.features_from_polygon(polygon, tags=tags).reset_index()
+        print(f"✅ Consulta OSM terminada. Filas descargadas: {len(gdf):,}")
+    else:
+        parts: list[gpd.GeoDataFrame] = []
+        for i, key in enumerate(primary_keys, start=1):
+            key_path = raw_by_key_dir / f"osm_{key}.parquet"
+            if use_existing and key_path.exists():
+                print(f"[{i}/{len(primary_keys)}] ℹ️ Reusando export por key `{key}`: {key_path}")
+                gdf_key = gpd.read_parquet(key_path)
+            else:
+                print(f"[{i}/{len(primary_keys)}] ℹ️ Consultando key `{key}`...")
+                gdf_key = ox.features_from_polygon(polygon, tags={key: True}).reset_index()
+                gdf_key = gpd.GeoDataFrame(gdf_key, geometry="geometry", crs="EPSG:4326")
+                print(f"[{i}/{len(primary_keys)}] ✅ `{key}` descargada: {len(gdf_key):,} filas")
+                if save_raw:
+                    gdf_key.to_parquet(key_path)
+                    print(f"[{i}/{len(primary_keys)}] ✅ Checkpoint guardado: {key_path}")
+            parts.append(gdf_key)
+
+        if not parts:
+            raise RuntimeError("No se descargó ninguna parte OSM.")
+
+        gdf = pd.concat(parts, ignore_index=True)
+        if {"element", "id"}.issubset(gdf.columns):
+            before = len(gdf)
+            gdf = gdf.drop_duplicates(subset=["element", "id"], keep="first")
+            print(f"ℹ️ Dedupe por element/id: {before:,} -> {len(gdf):,}")
+        else:
+            before = len(gdf)
+            gdf = gdf.drop_duplicates()
+            print(f"ℹ️ Dedupe completo: {before:,} -> {len(gdf):,}")
+
+    gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs="EPSG:4326")
+    if save_raw:
+        gdf.to_parquet(raw_path)
+        print(f"✅ Export OSM raw guardado en: {raw_path}")
+    return gdf
+
+
+def prepare_osm_points_for_join(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    gdf = gdf.copy()
+    gdf = gdf[gdf.geometry.notnull()].copy()
+    gdf = gdf.to_crs(4326)
+    # Para una primera auditoría usamos centroides representativos.
+    gdf["geometry"] = gdf.geometry.representative_point()
+    return gdf
+
+
+def key_inventory(gdf: gpd.GeoDataFrame, primary_keys: list[str]) -> pl.DataFrame:
+    rows = []
+    for key in primary_keys:
+        if key not in gdf.columns:
+            rows.append(
+                {
+                    "key": key,
+                    "n_objects_with_key": 0,
+                    "n_distinct_values": 0,
+                    "top_values_preview": None,
+                }
+            )
+            continue
+        s = gdf[key].dropna().astype("string")
+        value_counts = s.value_counts(dropna=True)
+        rows.append(
+            {
+                "key": key,
+                "n_objects_with_key": int(s.shape[0]),
+                "n_distinct_values": int(s.nunique(dropna=True)),
+                "top_values_preview": ", ".join(value_counts.head(10).index.astype(str).tolist()),
+            }
+        )
+    return pl.DataFrame(rows).sort("n_objects_with_key", descending=True)
+
+
+def tagvalue_inventory(
+    gdf: gpd.GeoDataFrame,
+    primary_keys: list[str],
+    top_values_per_key: int,
+) -> pl.DataFrame:
+    rows = []
+    for key in primary_keys:
+        if key not in gdf.columns:
+            continue
+        s = gdf[key].dropna().astype("string")
+        if s.empty:
+            continue
+        vc = s.value_counts(dropna=True).head(top_values_per_key)
+        for value, count in vc.items():
+            rows.append(
+                {
+                    "key": key,
+                    "value": str(value),
+                    "n_objects": int(count),
+                }
+            )
+    return pl.DataFrame(rows).sort(["key", "n_objects"], descending=[False, True])
+
+
+def zona_key_coverage(
+    gdf_points: gpd.GeoDataFrame,
+    gdf_zonas_base: gpd.GeoDataFrame,
+    primary_keys: list[str],
+) -> pl.DataFrame:
+    joined = gpd.sjoin(
+        gdf_points[["geometry"] + [c for c in primary_keys if c in gdf_points.columns]],
+        gdf_zonas_base[["ZONA777", "geometry"]],
+        how="inner",
+        predicate="within",
+    )
+    rows = []
+    n_zonas = int(gdf_zonas_base["ZONA777"].nunique())
+    for key in primary_keys:
+        if key not in joined.columns:
+            rows.append(
+                {
+                    "key": key,
+                    "n_objects": 0,
+                    "n_zonas_with_presence": 0,
+                    "pct_zonas_with_presence": 0.0,
+                }
+            )
+            continue
+        sub = joined.loc[joined[key].notna(), ["ZONA777", key]]
+        n_objects = int(len(sub))
+        n_zonas_with_presence = int(sub["ZONA777"].nunique())
+        rows.append(
+            {
+                "key": key,
+                "n_objects": n_objects,
+                "n_zonas_with_presence": n_zonas_with_presence,
+                "pct_zonas_with_presence": float(100 * n_zonas_with_presence / n_zonas),
+            }
+        )
+    return pl.DataFrame(rows).sort("n_objects", descending=True)
+
+
+def shortlist_tagvalue_inventory(
+    df_tagvalue_inventory: pl.DataFrame,
+    shortlist_keys: list[str],
+) -> pl.DataFrame:
+    return (
+        df_tagvalue_inventory
+        .filter(pl.col("key").is_in(shortlist_keys))
+        .sort(["key", "n_objects"], descending=[False, True])
+    )
+
+
+def zona_tagvalue_coverage(
+    gdf_points: gpd.GeoDataFrame,
+    gdf_zonas_base: gpd.GeoDataFrame,
+    shortlist_keys: list[str],
+    df_tagvalue_shortlist: pl.DataFrame,
+) -> pl.DataFrame:
+    joined = gpd.sjoin(
+        gdf_points[["geometry"] + [c for c in shortlist_keys if c in gdf_points.columns]],
+        gdf_zonas_base[["ZONA777", "geometry"]],
+        how="inner",
+        predicate="within",
+    )
+    n_zonas = int(gdf_zonas_base["ZONA777"].nunique())
+    allowed_values = {
+        key: set(
+            df_tagvalue_shortlist
+            .filter(pl.col("key") == key)
+            .get_column("value")
+            .to_list()
+        )
+        for key in shortlist_keys
+    }
+
+    rows = []
+    for key in shortlist_keys:
+        if key not in joined.columns:
+            continue
+        sub = joined.loc[joined[key].notna(), ["ZONA777", key]].copy()
+        if sub.empty:
+            continue
+        sub[key] = sub[key].astype("string")
+        if allowed_values.get(key):
+            sub = sub.loc[sub[key].isin(allowed_values[key])].copy()
+        if sub.empty:
+            continue
+        grouped = (
+            sub.groupby(key, dropna=True)
+            .agg(
+                n_objects=("ZONA777", "size"),
+                n_zonas_with_presence=("ZONA777", "nunique"),
+            )
+            .reset_index()
+            .rename(columns={key: "value"})
+        )
+        grouped["key"] = key
+        grouped["pct_zonas_with_presence"] = (
+            100 * grouped["n_zonas_with_presence"] / n_zonas
+        )
+        rows.append(grouped[["key", "value", "n_objects", "n_zonas_with_presence", "pct_zonas_with_presence"]])
+
+    if not rows:
+        return pl.DataFrame(
+            schema={
+                "key": pl.String,
+                "value": pl.String,
+                "n_objects": pl.Int64,
+                "n_zonas_with_presence": pl.Int64,
+                "pct_zonas_with_presence": pl.Float64,
+            }
+        )
+
+    return (
+        pl.from_pandas(pd.concat(rows, ignore_index=True))
+        .sort(["key", "n_objects"], descending=[False, True])
+    )
+
+
+def shortlist_tagvalue_screening(
+    df_tagvalue_shortlist: pl.DataFrame,
+    df_tagvalue_coverage: pl.DataFrame,
+    *,
+    min_objects: int,
+    min_zona_coverage: int,
+    generic_values: set[str],
+    semantic_exclude: dict[str, set[str]],
+) -> pl.DataFrame:
+    return (
+        df_tagvalue_shortlist
+        .join(df_tagvalue_coverage, on=["key", "value"], how="left")
+        .with_columns(
+            pl.col("n_zonas_with_presence").fill_null(0),
+            pl.col("pct_zonas_with_presence").fill_null(0.0),
+            pl.col("n_objects_right").fill_null(pl.col("n_objects")).alias("n_objects_zonal"),
+            pl.col("value").is_in(sorted(generic_values)).alias("is_generic_value"),
+            pl.struct(["key", "value"]).map_elements(
+                lambda row: row["value"] in semantic_exclude.get(row["key"], set()),
+                return_dtype=pl.Boolean,
+            ).alias("is_semantically_excluded"),
+        )
+        .drop("n_objects_right")
+        .rename({"n_objects": "n_objects_inventory"})
+        .with_columns(
+            (
+                (pl.col("n_objects_inventory") >= min_objects)
+                & (pl.col("n_zonas_with_presence") >= min_zona_coverage)
+                & ~pl.col("is_generic_value")
+                & ~pl.col("is_semantically_excluded")
+            ).alias("passes_shortlist_screen")
+        )
+        .with_columns(
+            pl.when(pl.col("passes_shortlist_screen"))
+            .then(pl.lit("keep_candidate"))
+            .when(pl.col("is_generic_value"))
+            .then(pl.lit("drop_generic"))
+            .when(pl.col("is_semantically_excluded"))
+            .then(pl.lit("drop_semantic"))
+            .when(
+                (pl.col("n_objects_inventory") < min_objects)
+                | (pl.col("n_zonas_with_presence") < min_zona_coverage)
+            )
+            .then(pl.lit("drop_low_mass_or_coverage"))
+            .otherwise(pl.lit("review"))
+            .alias("screening_decision")
+        )
+        .select(
+            [
+                "key",
+                "value",
+                "n_objects_inventory",
+                "n_zonas_with_presence",
+                "pct_zonas_with_presence",
+                "is_generic_value",
+                "is_semantically_excluded",
+                "passes_shortlist_screen",
+                "screening_decision",
+            ]
+        )
+        .sort(
+            ["passes_shortlist_screen", "key", "n_objects_inventory"],
+            descending=[True, False, True],
+        )
+    )
+
+
+def microinfra_tagvalue_audit(
+    gdf: gpd.GeoDataFrame,
+    gdf_points: gpd.GeoDataFrame,
+    gdf_zonas_base: gpd.GeoDataFrame,
+    tag_specs: list[dict[str, str]],
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    needed_keys = sorted({spec["key"] for spec in tag_specs if spec["key"] in gdf.columns})
+    transport_like = pd.Series(False, index=gdf.index)
+    if "highway" in gdf.columns:
+        transport_like |= gdf["highway"].astype("string").isin(["bus_stop", "platform"])
+    if "public_transport" in gdf.columns:
+        transport_like |= gdf["public_transport"].astype("string").isin(["platform", "station", "stop_position"])
+    if "bus" in gdf.columns:
+        transport_like |= gdf["bus"].astype("string").isin(["yes", "designated"])
+    if "railway" in gdf.columns:
+        transport_like |= gdf["railway"].astype("string").isin(["subway_entrance", "station", "stop", "platform", "halt"])
+
+    joined = gpd.sjoin(
+        gdf_points[["geometry"] + needed_keys],
+        gdf_zonas_base[["ZONA777", "geometry"]],
+        how="inner",
+        predicate="within",
+    )
+    n_zonas = int(gdf_zonas_base["ZONA777"].nunique())
+    rows = []
+    sample_rows = []
+    for spec in tag_specs:
+        key = spec["key"]
+        value = spec["value"]
+        feature_name = spec["feature_name"]
+        if key not in gdf.columns:
+            rows.append(
+                {
+                    **spec,
+                    "n_objects": 0,
+                    "n_zonas_with_presence": 0,
+                    "pct_zonas_with_presence": 0.0,
+                    "share_transport_like": None,
+                    "screening_note": "missing_key",
+                }
+            )
+            continue
+
+        mask = gdf[key].astype("string").eq(value)
+        sub_joined = joined.loc[joined[key].astype("string").eq(value), ["ZONA777", key]].copy()
+        n_objects = int(mask.sum())
+        n_zonas_with_presence = int(sub_joined["ZONA777"].nunique()) if not sub_joined.empty else 0
+        rows.append(
+            {
+                **spec,
+                "n_objects": n_objects,
+                "n_zonas_with_presence": n_zonas_with_presence,
+                "pct_zonas_with_presence": float(100 * n_zonas_with_presence / n_zonas),
+                "share_transport_like": float(transport_like.loc[mask].mean()) if n_objects else None,
+                "screening_note": spec.get("screening_note", ""),
+            }
+        )
+
+        sample_cols = [
+            c
+            for c in [
+                "element",
+                "id",
+                "name",
+                "highway",
+                "public_transport",
+                "amenity",
+                "railway",
+                "bus",
+                "shelter",
+                "bench",
+                "wheelchair",
+                "covered",
+                "crossing",
+                "operator",
+                "network",
+                "ref",
+            ]
+            if c in gdf.columns
+        ]
+        for record in gdf.loc[mask, sample_cols].head(10).to_dict("records"):
+            sample_rows.append({"feature_name": feature_name, **record})
+
+    return (
+        pl.from_pandas(pd.DataFrame(rows)).sort("n_objects", descending=True),
+        pl.from_pandas(pd.DataFrame(sample_rows)) if sample_rows else pl.DataFrame(),
+    )
+```
+
+## Cargar o consultar OSM
+
+```{python}
+#| label: load-or-query-osm
+print("label: load-or-query-osm")
+gdf_osm_raw = load_or_query_osm_features(
+    polygon=aoi_union,
+    primary_keys=OSM_PRIMARY_KEYS,
+    raw_path=RAW_OSM_PARQUET,
+    raw_by_key_dir=RAW_OSM_BY_KEY_DIR,
+    use_existing=USE_EXISTING_EXPORT_IF_AVAILABLE,
+    save_raw=SAVE_RAW_QUERY,
+    query_mode=QUERY_MODE,
+)
+print("raw shape:", gdf_osm_raw.shape)
+display(gdf_osm_raw.head(5))
+```
+
+## Preparar puntos representativos para join zonal
+
+```{python}
+#| label: prepare-osm-points
+print("label: prepare-osm-points")
+gdf_osm_points = prepare_osm_points_for_join(gdf_osm_raw)
+if SAVE_RAW_QUERY:
+    gdf_osm_points.to_parquet(RAW_OSM_POINTS_PARQUET)
+    print(f"✅ OSM representative points guardados en: {RAW_OSM_POINTS_PARQUET}")
+print("points shape:", gdf_osm_points.shape)
+display(gdf_osm_points.head(5))
+```
+
+## Inventario por key
+
+```{python}
+#| label: osm-key-inventory
+print("label: osm-key-inventory")
+df_key_inventory = key_inventory(gdf_osm_raw, OSM_PRIMARY_KEYS)
+df_key_inventory.write_parquet(KEY_INVENTORY_PATH)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_key_inventory)
+```
+
+## Inventario por key=value
+
+```{python}
+#| label: osm-tagvalue-inventory
+print("label: osm-tagvalue-inventory")
+df_tagvalue_inventory = tagvalue_inventory(
+    gdf_osm_raw,
+    primary_keys=OSM_PRIMARY_KEYS,
+    top_values_per_key=TOP_VALUES_PER_KEY,
+)
+df_tagvalue_inventory.write_parquet(TAGVALUE_INVENTORY_PATH)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_tagvalue_inventory)
+```
+
+## Cobertura por ZONA777
+
+```{python}
+#| label: osm-zona-key-coverage
+print("label: osm-zona-key-coverage")
+df_zona_key_coverage = zona_key_coverage(
+    gdf_points=gdf_osm_points,
+    gdf_zonas_base=gdf_zonas.to_crs(4326),
+    primary_keys=OSM_PRIMARY_KEYS,
+)
+df_zona_key_coverage.write_parquet(ZONA_KEY_COVERAGE_PATH)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_zona_key_coverage)
+```
+
+## Screening preliminar
+
+```{python}
+#| label: osm-screening
+print("label: osm-screening")
+df_screen = (
+    df_key_inventory
+    .join(df_zona_key_coverage, on="key", how="left")
+    .with_columns(
+        (
+            (pl.col("n_objects_with_key") >= MIN_TOTAL_OBJECTS_FOR_SCREEN)
+            & (pl.col("n_zonas_with_presence") >= MIN_ZONA_COVERAGE_FOR_SCREEN)
+        ).alias("passes_first_screen")
+    )
+    .sort(["passes_first_screen", "n_objects_with_key"], descending=[True, True])
+)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_screen)
+```
+
+## Comentarios de shortlist
+
+## Screening profundo dentro del shortlist
+
+```{python}
+#| label: osm-shortlist-tagvalue-inventory
+print("label: osm-shortlist-tagvalue-inventory")
+df_tagvalue_shortlist = shortlist_tagvalue_inventory(
+    df_tagvalue_inventory=df_tagvalue_inventory,
+    shortlist_keys=OSM_SHORTLIST_KEYS,
+)
+df_tagvalue_shortlist.write_parquet(SHORTLIST_TAGVALUE_INVENTORY_PATH)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_tagvalue_shortlist)
+```
+
+```{python}
+#| label: osm-shortlist-tagvalue-coverage
+print("label: osm-shortlist-tagvalue-coverage")
+df_tagvalue_shortlist_coverage = zona_tagvalue_coverage(
+    gdf_points=gdf_osm_points,
+    gdf_zonas_base=gdf_zonas.to_crs(4326),
+    shortlist_keys=OSM_SHORTLIST_KEYS,
+    df_tagvalue_shortlist=df_tagvalue_shortlist,
+)
+df_tagvalue_shortlist_coverage.write_parquet(SHORTLIST_TAGVALUE_COVERAGE_PATH)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_tagvalue_shortlist_coverage)
+```
+
+```{python}
+#| label: osm-shortlist-tagvalue-screening
+print("label: osm-shortlist-tagvalue-screening")
+df_tagvalue_shortlist_screening = shortlist_tagvalue_screening(
+    df_tagvalue_shortlist=df_tagvalue_shortlist,
+    df_tagvalue_coverage=df_tagvalue_shortlist_coverage,
+    min_objects=MIN_TAGVALUE_OBJECTS_FOR_SCREEN,
+    min_zona_coverage=MIN_TAGVALUE_ZONA_COVERAGE_FOR_SCREEN,
+    generic_values=OSM_GENERIC_VALUES,
+    semantic_exclude=OSM_SEMANTIC_EXCLUDE,
+)
+df_tagvalue_shortlist_screening.write_parquet(SHORTLIST_TAGVALUE_SCREENING_PATH)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_tagvalue_shortlist_screening)
+```
+
+```{python}
+#| label: osm-shortlist-notes
+print("label: osm-shortlist-notes")
+print(
+    """Usar esta etapa para anotar, después de revisar el screening profundo:
+- familias del shortlist que sobreviven a segunda auditoría;
+- key=value candidatas con masa, cobertura e interpretabilidad;
+- valores a descartar por genericidad ('yes') o poca utilidad semántica;
+- nota metodológica especial: `landuse` parece prometedora, pero más adelante
+  conviene tratarla por área intersectada y no solo por punto representativo."""
+)
+```
+
+## Auditoría microinfraestructura de acceso y espera
+
+Esta sección revisa tags OSM más cercanos a infraestructura física de paraderos,
+estaciones y acceso peatonal. No los incorpora todavía al bloque model-ready; solo
+audita masa, cobertura territorial e interpretabilidad.
+
+```{python}
+#| label: osm-microinfra-tagvalue-audit
+print("label: osm-microinfra-tagvalue-audit")
+
+OSM_MICROINFRA_TAG_SPECS = [
+    {
+        "feature_name": "osm_shelter_yes",
+        "key": "shelter",
+        "value": "yes",
+        "theme": "stop_quality",
+        "screening_note": "candidate_main",
+    },
+    {
+        "feature_name": "osm_bench_yes",
+        "key": "bench",
+        "value": "yes",
+        "theme": "stop_quality",
+        "screening_note": "candidate_main",
+    },
+    {
+        "feature_name": "osm_railway_subway_entrance",
+        "key": "railway",
+        "value": "subway_entrance",
+        "theme": "metro_access",
+        "screening_note": "candidate_main_with_redundancy_check",
+    },
+    {
+        "feature_name": "osm_highway_elevator",
+        "key": "highway",
+        "value": "elevator",
+        "theme": "accessibility",
+        "screening_note": "sensitivity_low_mass",
+    },
+    {
+        "feature_name": "osm_wheelchair_yes",
+        "key": "wheelchair",
+        "value": "yes",
+        "theme": "accessibility",
+        "screening_note": "do_not_use_raw_filter_transport_first",
+    },
+    {
+        "feature_name": "osm_tactile_paving_yes",
+        "key": "tactile_paving",
+        "value": "yes",
+        "theme": "accessibility",
+        "screening_note": "sensitivity_low_coverage",
+    },
+    {
+        "feature_name": "osm_highway_crossing",
+        "key": "highway",
+        "value": "crossing",
+        "theme": "pedestrian_access",
+        "screening_note": "too_transversal_for_main",
+    },
+    {
+        "feature_name": "osm_crossing_traffic_signals",
+        "key": "crossing",
+        "value": "traffic_signals",
+        "theme": "pedestrian_access",
+        "screening_note": "too_transversal_for_main",
+    },
+    {
+        "feature_name": "osm_highway_traffic_signals",
+        "key": "highway",
+        "value": "traffic_signals",
+        "theme": "pedestrian_access",
+        "screening_note": "too_transversal_for_main",
+    },
+    {
+        "feature_name": "osm_amenity_bus_station",
+        "key": "amenity",
+        "value": "bus_station",
+        "theme": "transport_node",
+        "screening_note": "likely_too_sparse",
+    },
+    {
+        "feature_name": "osm_shop_ticket",
+        "key": "shop",
+        "value": "ticket",
+        "theme": "payment_access",
+        "screening_note": "likely_too_sparse",
+    },
+]
+
+df_microinfra_audit, df_microinfra_samples = microinfra_tagvalue_audit(
+    gdf=gdf_osm_raw,
+    gdf_points=gdf_osm_points,
+    gdf_zonas_base=gdf_zonas.to_crs(4326),
+    tag_specs=OSM_MICROINFRA_TAG_SPECS,
+)
+df_microinfra_audit.write_parquet(MICROINFRA_TAGVALUE_AUDIT_PATH)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_microinfra_audit)
+```
+
+```{python}
+#| label: osm-microinfra-samples
+print("label: osm-microinfra-samples")
+with pl.Config(tbl_rows=80, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_microinfra_samples)
+```
+
+```{python}
+#| label: osm-microinfra-notes
+print("label: osm-microinfra-notes")
+print(
+    """Lectura esperada:
+- `shelter=yes` y `bench=yes` son candidatos fuertes solo si aparecen pegados a `bus_stop`/`public_transport=platform`;
+- `railway=subway_entrance` puede aportar acceso físico a Metro, pero debe revisarse contra `LOG_METRO_LINE_COUNT`;
+- `wheelchair=yes` no debe usarse crudo si mezcla estaciones/paraderos con comercios y equipamientos;
+- cruces y semáforos (`highway=crossing`, `crossing=traffic_signals`, `highway=traffic_signals`) son útiles descriptivamente,
+  pero demasiado transversales para entrar al bloque principal sin una hipótesis separada."""
+)
+```
