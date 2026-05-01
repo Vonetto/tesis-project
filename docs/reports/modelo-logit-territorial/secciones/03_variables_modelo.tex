@@ -1,0 +1,174 @@
+\section{Variables del modelo}
+
+\subsection{Estructura general de las variables}
+
+El modelo se estima a nivel de viaje individual. Cada observación corresponde a un viaje realizado en el sistema de transporte público y contiene, además de la alternativa de pago observada, un conjunto de atributos asociados al viaje, al contexto temporal y al entorno territorial de la zona de origen.
+
+Las variables utilizadas en la especificación se pueden agrupar en tres grandes bloques. El primer bloque corresponde a atributos directamente asociados al viaje y a las alternativas disponibles, tales como tiempos de viaje, tiempos de espera y número de transbordos. Estas variables pueden tomar valores distintos para \texttt{BIP}, \texttt{QR\_RED} y \texttt{QR\_OTHER}, por lo que entran como variables alternativas-específicas.
+
+El segundo bloque corresponde a variables temporales, de demanda y de oferta operacional. Estas variables describen el contexto en que ocurre el viaje, por ejemplo el año de observación, la franja horaria, el nivel de demanda local y la disponibilidad de infraestructura u oferta de transporte en la zona de origen. En general, estas variables son comunes a las tres alternativas dentro de una misma observación.
+
+El tercer bloque corresponde a variables territoriales construidas a partir de fuentes externas, principalmente Censo 2024 y OpenStreetMap. Estas variables caracterizan el entorno socioeconómico, urbano y de infraestructura de la zona de origen del viaje. Para integrarlas al modelo, cada viaje se asocia a una zona territorial \texttt{ZONA777}, y las variables zonales se incorporan según la zona de inicio del viaje.
+
+En términos de escala, las variables con prefijo \texttt{LOG\_} corresponden a transformaciones logarítmicas del tipo \(\log(1+x)\). Esta transformación se utiliza para reducir la asimetría de variables de conteo o densidad operacional y para permitir una interpretación asociada a cambios proporcionales. Por otra parte, las variables con sufijo \texttt{\_z} corresponden a variables estandarizadas, es decir, transformadas restando su media y dividiendo por su desviación estándar. En estos casos, el coeficiente se interpreta como el cambio en utilidad asociado a un aumento de una desviación estándar en la variable.
+
+Finalmente, es importante distinguir entre variables alternativas-específicas y variables comunes. Las primeras pueden tener valores distintos para cada alternativa de pago dentro de un mismo viaje, mientras que las segundas tienen el mismo valor para \texttt{BIP}, \texttt{QR\_RED} y \texttt{QR\_OTHER}. Esta distinción es relevante para la interpretación de los coeficientes y para la decisión metodológica discutida en la sección anterior.
+
+\subsection{Variables de viaje, tiempo y transbordos}
+
+El primer grupo de variables corresponde a atributos directamente asociados al viaje y a las alternativas de pago. Estas variables buscan capturar diferencias en el costo temporal y operacional asociado a cada alternativa disponible. En la base de estimación aparecen con sufijos por alternativa, por ejemplo \texttt{TVH\_BIP}, \texttt{TVH\_QR\_RED} y \texttt{TVH\_QR\_OTHER}.
+
+Estas variables se construyen a partir de los viajes observados, agregando información por par origen--destino y tipo de pago. Para cada alternativa, se calcula el promedio observado de los atributos de viaje entre viajes comparables. Para la alternativa efectivamente elegida, se utiliza una corrección tipo \textit{leave-one-out}, de modo que el viaje observado no contribuya a construir su propio atributo alternativo. Esto evita que la variable de contexto de la alternativa elegida incorpore mecánicamente el mismo viaje que se está modelando.
+
+Las variables de tiempo utilizadas son:
+
+\begin{itemize}
+    \item \texttt{T\_VEH}: tiempo en vehículo de la alternativa, construido a partir de la suma de los tiempos en vehículo de las etapas del viaje. En la base aparece como \texttt{TVH\_*} y se mide en segundos.
+    \item \texttt{T\_ESPERA\_INI}: tiempo de espera inicial de la alternativa. En la base aparece como \texttt{TEI\_*} y se mide en segundos.
+    \item \texttt{T\_ESPERA\_TRASB}: tiempo de espera asociado a transbordos. En la base aparece como \texttt{TET\_*} y se mide en segundos.
+    \item \texttt{N\_TRASB}: número de transbordos de la alternativa. En la base aparece como \texttt{NTR\_*} y corresponde a una variable de conteo.
+\end{itemize}
+
+A diferencia de las variables territoriales o de contexto, estas variables pueden tomar valores distintos para \texttt{BIP}, \texttt{QR\_RED} y \texttt{QR\_OTHER} dentro de una misma observación. Por esta razón, sus coeficientes son directamente identificables para las tres alternativas, incluyendo \texttt{BIP}. En términos de interpretación, coeficientes negativos para tiempos de espera o transbordos indican una menor utilidad de la alternativa a medida que aumenta el costo temporal u operacional asociado a ella.
+
+\subsection{Variables temporales, demanda y oferta operacional}
+
+El segundo grupo de variables describe el contexto temporal, la intensidad de demanda local y la oferta operacional disponible en la zona de origen del viaje. A diferencia de las variables de tiempo y transbordos descritas en la subsección anterior, estas variables son comunes a las tres alternativas dentro de una misma observación. Es decir, para un viaje dado, el valor de estas variables es el mismo al evaluar \texttt{BIP}, \texttt{QR\_RED} y \texttt{QR\_OTHER}.
+
+Las variables temporales permiten controlar por diferencias sistemáticas entre años y franjas horarias. La variable \texttt{ANIO\_2025} identifica los viajes realizados durante el año 2025 dentro de la muestra conjunta 2024--2025. Las variables \texttt{LAB\_PM}, \texttt{LAB\_PT} y \texttt{NO\_LAB} describen el tipo de franja temporal del viaje. En particular, \texttt{LAB\_PM} toma valor uno para viajes en día laboral durante la punta mañana, definida por las horas 6, 7 y 8; \texttt{LAB\_PT} toma valor uno para viajes en día laboral durante la punta tarde, definida por las horas 18 y 19; y \texttt{NO\_LAB} identifica viajes en días no laborales. La categoría omitida corresponde a \texttt{LAB\_VALLE}, es decir, viajes en día laboral fuera de las horas punta definidas.
+
+La variable de demanda local corresponde a \texttt{LOG\_DEMAND}. Esta variable busca capturar la intensidad de viajes observada en el entorno temporal y espacial del viaje. Para construirla, los viajes se agrupan por año de observación, zona de inicio y franja horaria. Luego se cuenta el número de viajes observados en cada celda año--zona--franja. Para evitar que el viaje observado contribuya mecánicamente a su propio contexto de demanda, se utiliza una corrección tipo \textit{leave-one-out}, restando una unidad al conteo de la celda y truncando el resultado en cero. Finalmente, la variable incluida en el modelo corresponde a:
+
+\begin{equation}
+    \texttt{LOG\_DEMAND}
+    =
+    \log(1 + \texttt{N\_VIAJES\_ZONA\_INICIO\_FRANJA}).
+\end{equation}
+
+Por lo tanto, esta variable no representa la demanda total del sistema, sino una proxy de intensidad local de demanda en la zona de origen y franja temporal del viaje, calculada separadamente para cada año de observación.
+
+Las variables de oferta operacional describen la disponibilidad de infraestructura o servicios de transporte en la zona de origen. La variable \texttt{LOG\_BUS\_STOP\_DENSITY} se construye a partir del número de paraderos de bus únicos asociados a cada zona. Estos paraderos se asignan a zonas mediante un cruce paradero--zona, y luego se calcula la densidad dividiendo el número de paraderos por el área de la zona en kilómetros cuadrados. La variable final corresponde a \(\log(1+\texttt{BUS\_STOP\_DENSITY})\).
+
+La variable \texttt{LOG\_BUS\_LINE\_COUNT} busca capturar la variedad de servicios de bus disponibles en la zona y franja horaria. Para construirla se utilizan perfiles de oferta de bus con información de \texttt{ServicioUsuario}, \texttt{Paradero} y \texttt{timestamp}. La variable \texttt{ServicioUsuario} se usa como proxy de servicio o línea de bus. Primero, los registros se agregan a nivel horario y se asocian los paraderos a zonas mediante el cruce paradero--zona. Luego, para cada combinación de zona, franja y hora, se cuenta el número de servicios únicos observados. Finalmente, se promedia este conteo horario dentro de cada franja, obteniendo \texttt{BUS\_LINE\_COUNT}. La variable incluida en el modelo corresponde a \(\log(1+\texttt{BUS\_LINE\_COUNT})\).
+
+La variable \texttt{LOG\_METRO\_LINE\_COUNT} representa la disponibilidad de líneas de Metro en la zona y franja horaria. Se construye a partir de información GTFS de Metro/Red, incluyendo calendario, frecuencias, servicios activos y estaciones. Para cada fecha y hora se identifican los servicios activos; luego se cruza la cobertura estación--línea con la asignación estación--zona. Para cada combinación de zona, franja y hora se cuenta el número de líneas de Metro activas asociadas a estaciones de la zona, y posteriormente se promedia este conteo dentro de la franja. La variable final corresponde a \(\log(1+\texttt{METRO\_LINE\_COUNT})\).
+
+En conjunto, estas variables permiten controlar por diferencias de contexto temporal, intensidad de demanda y disponibilidad de oferta de transporte que podrían estar asociadas a la elección del medio de pago. Dado que son variables comunes a las alternativas dentro de una misma observación, su interpretación depende de la parametrización adoptada para variables comunes, discutida en la sección anterior.
+
+\subsection{Variables sociodemográficas del Censo 2024}
+
+Las variables sociodemográficas provienen del Censo 2024 y se incorporan al modelo a nivel de zona de origen del viaje. Para ello se utilizaron dos rutas complementarias de procesamiento. La primera corresponde a variables derivadas desde la base agregada de manzana-entidad del Censo 2024, la cual sí contiene una referencia espacial fina. Estas unidades censales se cruzan espacialmente con la zonificación \texttt{ZONA777}. Cuando los límites de las unidades censales no coinciden exactamente con los límites de \texttt{ZONA777}, la asignación se realiza mediante una agregación/interpolación areal, usando la intersección espacial entre ambas geometrías. Luego, los conteos censales se agregan a nivel de \texttt{ZONA777} y las proporciones se calculan después de sumar numeradores y denominadores, evitando promediar directamente porcentajes de unidades de distinto tamaño.
+
+La segunda ruta corresponde a variables construidas desde los microdatos comunales del Censo 2024.
+Estos microdatos contienen información individual y de hogares más detallada, pero no incluyen una
+localización fina a nivel de manzana o entidad, sino identificadores comunales. Por lo tanto, no
+pueden ser unidos directamente a \texttt{ZONA777}. Para utilizarlos, se implementó una estrategia
+operacional de espacialización intra-comunal inspirada en la discusión metodológica de
+E. Graells-Garrido sobre asignación espacial de viviendas censales sin ubicación fina.\footnote{
+E. Graells-Garrido, ``Cuando los datos no tienen ubicación: un método para asignar viviendas
+censales'', Datagramas, 2026. Disponible en:
+\path{https://datagramas.cl/2026/01/cuando-los-datos-no-tienen-ubicacion-un-metodo-para-asignar-viviendas-censales/}.
+}
+La idea general es combinar microdatos comunales con información agregada a unidades espaciales más
+pequeñas, de modo que la distribución espacial resultante sea consistente con los agregados
+observados.
+
+En este trabajo se utiliza una versión simplificada y operacional de esa idea: se construyen perfiles
+a partir de los microdatos, se asignan probabilísticamente a unidades manzana-entidad
+(\texttt{MANZENT}) usando restricciones de capacidad y luego se agregan a \texttt{ZONA777} mediante
+el mismo cruce espacial del pipeline censal. A diferencia del ejemplo metodológico original, aquí no
+se implementa el procedimiento completo de refinamiento espacial, por lo que las variables
+microespacializadas deben interpretarse como aproximaciones territoriales consistentes con los
+agregados disponibles, no como ubicaciones observadas de los hogares.
+
+El bloque censal finalmente incorporado al modelo principal contiene cuatro variables. La primera es \path{share_cine18_universitaria_o_mas_micro_z}, que mide la proporción espacializada de población de 18 años o más con educación universitaria o superior. Esta variable proviene de los microdatos espacializados y actúa como proxy de capital educativo o nivel socioeconómico del entorno de origen. La segunda es \path{share_hacinamiento_z}, definida como la proporción de viviendas particulares ocupadas clasificadas como hacinadas. La tercera es \path{share_discapacidad_z}, que corresponde a la proporción de personas con discapacidad. La cuarta es \path{share_inmigrantes_z}, definida como la proporción de población inmigrante. Todas estas variables se estandarizan, por lo que sus coeficientes se interpretan como cambios en utilidad asociados a un aumento de una desviación estándar en la característica territorial.
+
+Durante el proceso de especificación también se evaluaron otras variables censales que no fueron incluidas en el bloque principal. Entre ellas se encuentran:
+
+\begin{itemize}
+    \item \path{prom_edad_z}, \path{prom_escolaridad18_z}, \path{share_internet_z}, \path{share_serv_compu_z}, \path{share_serv_tel_movil_z} y \path{share_analfabet_z}.
+    \item \path{share_cine18_universitaria_micro_z}, \path{share_cine18_terciaria_corta_micro_z}, \path{share_cine18_postgrado_micro_z} y \path{share_independiente_micro_z}.
+\end{itemize}
+
+Estas variables se dejaron fuera por una combinación de menor aporte incremental, señales menos robustas o significativas, redundancia con variables ya seleccionadas, o una interpretación sustantiva menos directa para el objetivo del modelo. En particular, el bloque final privilegia una especificación más parsimoniosa y defendible: educación superior como proxy socioeconómica, hacinamiento como vulnerabilidad habitacional, discapacidad como dimensión de accesibilidad social, e inmigración como composición territorial.
+
+Estas variables deben interpretarse como atributos del entorno de origen del viaje, no como características individuales necesariamente observadas para cada persona que viaja. Por ejemplo, un coeficiente asociado a \texttt{share\_inmigrantes\_z} no indica que una persona inmigrante tenga mayor o menor propensión a usar cierta alternativa de pago, sino que los viajes iniciados en zonas con mayor presencia relativa de población inmigrante presentan diferencias sistemáticas en la utilidad relativa de las alternativas.
+
+\subsection{Variables de OpenStreetMap}
+
+El tercer grupo de variables territoriales proviene de OpenStreetMap (OSM). A diferencia de las variables censales, que describen composición sociodemográfica de la zona, las variables OSM buscan capturar atributos del entorno construido, disponibilidad de servicios urbanos y elementos de infraestructura próximos al origen del viaje. En este reporte se tratan todas estas variables como parte de un mismo bloque OSM, incluyendo tanto equipamientos urbanos como variables de microinfraestructura de transporte.
+
+El procesamiento comienza con una extracción de objetos OSM dentro del área de estudio. Para cada objeto se utiliza su geometría representativa y se realiza un cruce espacial con la zonificación \texttt{ZONA777}. Luego, para cada zona se cuentan los objetos que cumplen con una combinación específica de llave y valor OSM, por ejemplo \texttt{amenity=school} o \texttt{railway=subway\_entrance}. Estos conteos se dividen por el área de la zona en kilómetros cuadrados, obteniendo densidades del tipo:
+
+\begin{equation}
+    \texttt{OSM\_FEATURE\_DENSITY\_KM2}
+    =
+    \frac{\texttt{N\_OBJETOS\_OSM\_FEATURE}}{\texttt{AREA\_ZONA\_KM2}}.
+\end{equation}
+
+Finalmente, las densidades se estandarizan, por lo que las variables incluidas en el modelo tienen sufijo \texttt{\_z}. En consecuencia, sus coeficientes se interpretan como el cambio en utilidad asociado a un aumento de una desviación estándar en la densidad del atributo OSM correspondiente.
+
+El bloque OSM principal incluye cinco variables de equipamiento urbano. La variable \path{osm_amenity_school_density_km2_z} mide la densidad de objetos etiquetados como \texttt{amenity=school}; \path{osm_amenity_university_density_km2_z} mide la densidad de objetos \texttt{amenity=university}; \path{osm_leisure_playground_density_km2_z} mide la densidad de áreas o puntos asociados a juegos infantiles; \path{osm_leisure_sports_centre_density_km2_z} mide la densidad de centros deportivos; y \path{osm_shop_convenience_density_km2_z} mide la densidad de comercio de conveniencia. En conjunto, estas variables aproximan centralidad barrial, intensidad de servicios locales, usos del suelo y composición funcional del entorno urbano.
+
+Además del bloque principal, el modelo seleccionado incorpora dos variables OSM de infraestructura de acceso al transporte. La primera es \path{osm_transport_shelter_yes_density_km2_z}. Esta variable no corresponde a todos los objetos OSM con \texttt{shelter=yes}, sino a objetos filtrados como relevantes para transporte, por ejemplo paraderos, plataformas, estaciones o elementos con etiquetas asociadas a transporte público. Por lo tanto, se interpreta como una proxy de presencia de refugio o techo en puntos de espera de transporte, no como un inventario oficial completo de paraderos con refugio. La segunda es \path{osm_railway_subway_entrance_density_km2_z}, construida a partir de objetos \texttt{railway=subway\_entrance}. Esta variable aproxima la presencia física de accesos a Metro en la zona, y no simplemente la existencia de una estación o línea de Metro.
+
+Durante el proceso de exploración también se evaluaron otras variables OSM que no fueron incorporadas en la especificación principal. Entre ellas se encuentran \path{osm_leisure_park_density_km2_z}, \path{osm_shop_supermarket_density_km2_z}, \path{osm_amenity_restaurant_density_km2_z}, \path{osm_shop_mall_density_km2_z}, \path{osm_amenity_pharmacy_density_km2_z}, \path{osm_office_company_density_km2_z}, \path{osm_office_government_density_km2_z} y \path{osm_transport_bench_yes_density_km2_z}. También se revisaron variables de conectividad peatonal o vial, como cruces y semáforos, pero se consideraron demasiado transversales para el objetivo principal del modelo. Estas variables se dejaron fuera por una combinación de menor aporte incremental, posible redundancia con variables de oferta ya incluidas, menor estabilidad estadística o interpretación menos directa respecto de la elección del medio de pago.
+
+La interpretación de las variables OSM requiere una cautela adicional. OpenStreetMap es una fuente colaborativa y su cobertura puede variar espacialmente según el nivel de mapeo de cada zona. Por ello, estas variables no deben entenderse como mediciones administrativas exhaustivas, sino como proxies observables del entorno construido y de la infraestructura mapeada. Aun así, su valor para este modelo está en capturar diferencias territoriales que no aparecen en las variables operacionales tradicionales, especialmente en dimensiones de equipamiento urbano y experiencia de acceso al transporte.
+
+\subsection{Resumen de variables utilizadas}
+
+La Tabla~\ref{tab:variables_resumen} resume las variables incluidas en la especificación principal del modelo. La columna de tratamiento indica si la variable es alternativa-específica o común al viaje, y resume la transformación aplicada antes de la estimación.
+
+\begingroup
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{longtable}{p{0.17\textwidth} p{0.12\textwidth} p{0.33\textwidth} p{0.18\textwidth} p{0.16\textwidth}}
+\caption{Resumen de variables utilizadas en el modelo}
+\label{tab:variables_resumen}\\
+\toprule
+Variable & Bloque & Definición & Fuente & Tratamiento \\
+\midrule
+\endfirsthead
+
+\toprule
+Variable & Bloque & Definición & Fuente & Tratamiento \\
+\midrule
+\endhead
+
+\bottomrule
+\endfoot
+
+\texttt{T\_VEH} & Viaje & Tiempo en vehículo de la alternativa. & Viajes observados & Alt.-específica; segundos \\
+\texttt{T\_ESPERA\_INI} & Viaje & Tiempo de espera inicial de la alternativa. & Viajes observados & Alt.-específica; segundos \\
+\texttt{T\_ESPERA\_TRASB} & Viaje & Tiempo de espera asociado a transbordos. & Viajes observados & Alt.-específica; segundos \\
+\texttt{N\_TRASB} & Viaje & Número de transbordos de la alternativa. & Viajes observados & Alt.-específica; conteo \\
+
+\texttt{ANIO\_2025} & Temporal & Indicador de viaje observado en 2025. & Base de viajes & Común; dummy \\
+\texttt{LAB\_PM} & Temporal & Día laboral en punta mañana. & Base de viajes & Común; dummy \\
+\texttt{LAB\_PT} & Temporal & Día laboral en punta tarde. & Base de viajes & Común; dummy \\
+\texttt{NO\_LAB} & Temporal & Día no laboral. & Base de viajes & Común; dummy \\
+
+\texttt{LOG\_DEMAND} & Contexto & Intensidad local de viajes por año, zona de origen y franja. & Viajes observados & Común; log, leave-one-out \\
+\texttt{BUS stops} & Contexto & Densidad de paraderos de bus en la zona de origen. & Paraderos y \texttt{ZONA777} & Común; log \\
+\texttt{Bus lines} & Contexto & Número promedio de servicios de bus disponibles por zona y franja. & Oferta bus & Común; log \\
+\texttt{Metro lines} & Contexto & Número promedio de líneas de Metro activas por zona y franja. & GTFS Metro/Red & Común; log \\
+
+Educación univ. 18+ & Censo & Proporción espacializada de población 18+ con educación universitaria o superior. & Microdatos Censo 2024 espacializados & Común; estandarizada \\
+Hacinamiento & Censo & Proporción de viviendas particulares ocupadas con hacinamiento. & Censo 2024 manzana-entidad & Común; estandarizada \\
+Discapacidad & Censo & Proporción de personas con discapacidad. & Censo 2024 manzana-entidad & Común; estandarizada \\
+Inmigrantes & Censo & Proporción de población inmigrante. & Censo 2024 manzana-entidad & Común; estandarizada \\
+
+Escuelas OSM & OSM & Densidad de objetos \texttt{amenity=school}. & OpenStreetMap & Común; densidad/km\(^2\), est. \\
+Universidades OSM & OSM & Densidad de objetos \texttt{amenity=university}. & OpenStreetMap & Común; densidad/km\(^2\), est. \\
+Playgrounds OSM & OSM & Densidad de juegos infantiles. & OpenStreetMap & Común; densidad/km\(^2\), est. \\
+Centros deportivos OSM & OSM & Densidad de centros deportivos. & OpenStreetMap & Común; densidad/km\(^2\), est. \\
+Convenience OSM & OSM & Densidad de comercio de conveniencia. & OpenStreetMap & Común; densidad/km\(^2\), est. \\
+Refugios transporte OSM & OSM & Densidad de objetos de transporte con \texttt{shelter=yes}. & OpenStreetMap & Común; densidad/km\(^2\), est. \\
+Accesos Metro OSM & OSM & Densidad de accesos físicos a Metro. & OpenStreetMap & Común; densidad/km\(^2\), est. \\
+
+\end{longtable}
+\endgroup
+
+\noindent
+La categoría temporal omitida es \texttt{LAB\_VALLE}. Para las variables comunes al viaje, la forma de reportar coeficientes por alternativa depende de la parametrización adoptada: en la opción A se normaliza \texttt{BIP} a cero para variables comunes, mientras que en la opción B se reporta un coeficiente para \texttt{BIP} mediante la restricción de suma cero.

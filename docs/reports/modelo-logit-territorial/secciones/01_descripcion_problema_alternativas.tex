@@ -1,0 +1,14 @@
+\section{Descripción del problema y alternativas}
+
+Este reporte documenta un modelo logit multinomial orientado a estudiar la elección del medio de pago en viajes de transporte público en Santiago. En particular, el modelo distingue entre viajes pagados con tarjeta BIP y viajes pagados mediante códigos QR, separando estos últimos según el canal de pago utilizado. El objetivo es analizar cómo atributos del viaje, condiciones operacionales del sistema y características territoriales del entorno de origen se asocian con la utilidad relativa de cada alternativa de pago.
+
+La unidad de observación corresponde a un viaje individual observado en la muestra de estimación. Cada viaje se vincula a una zona de inicio \texttt{ZONA777}, definida a partir del paradero o estación donde comienza el viaje. Las \texttt{ZONA777} corresponden a la zonificación espacial utilizada para agregar viajes, oferta y atributos territoriales del sistema de transporte de Santiago. En este reporte se usan como unidad espacial de referencia para incorporar al modelo información contextual de la zona donde se inicia el viaje, incluyendo variables de demanda, oferta, características sociodemográficas y entorno construido.
+
+El conjunto de alternativas del modelo está compuesto por tres categorías mutuamente excluyentes:
+\begin{itemize}
+    \item \texttt{BIP}: viaje pagado con tarjeta BIP.
+    \item \texttt{QR\_RED}: viaje pagado mediante QR asociado a la aplicación o canal oficial de Red Metropolitana de Movilidad.
+    \item \texttt{QR\_OTHER}: viaje pagado mediante otros canales o aplicaciones QR distintos de \texttt{QR\_RED}.
+\end{itemize}
+
+La separación entre \texttt{QR\_RED} y \texttt{QR\_OTHER} responde a que el pago QR no constituye necesariamente una alternativa homogénea. Distintos canales QR pueden estar asociados a mecanismos de adopción, disponibilidad tecnológica, patrones de uso y contextos territoriales diferentes. Por esta razón, el modelo no se limita a comparar tarjeta BIP versus QR agregado, sino que permite estimar diferencias en la utilidad relativa de cada tipo de pago digital frente al uso de BIP.

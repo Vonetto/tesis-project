@@ -1,0 +1,61 @@
+\section{Decisión de modelo principal y sensibilidades}
+
+A partir de los resultados anteriores, el modelo principal propuesto corresponde al modelo territorial
+que incorpora variables de viaje, variables temporales, demanda y oferta operacional, variables
+sociodemográficas del Censo 2024 y variables OSM, incluyendo infraestructura de acceso al sistema.
+En particular, se mantiene la especificación con refugios de transporte y accesos a Metro, ya que
+ambas variables aportan una lectura sustantiva relevante sobre condiciones del entorno de acceso y
+presentan señales estadísticamente informativas.
+
+La decisión de mantener esta especificación no se basa únicamente en la mejora de ajuste global, sino
+también en su interpretabilidad. La inclusión de
+\path{osm_transport_shelter_yes_density_km2_z} permite incorporar una dimensión de infraestructura
+de parada que no estaba representada por las variables operacionales tradicionales. Por su parte,
+\path{osm_railway_subway_entrance_density_km2_z} agrega información sobre accesibilidad física a la
+red de Metro, complementando la variable de número de líneas de Metro disponibles en la zona.
+
+En términos de ajuste, el modelo presenta una mejora respecto de especificaciones más simples y
+mantiene convergencia satisfactoria. Sin embargo, la evaluación no debe reducirse exclusivamente a
+AIC, BIC o log-verosimilitud. En modelos con variables territoriales altamente correlacionadas, una
+variable puede aportar valor sustantivo aun cuando la mejora incremental en ajuste sea moderada. Por
+esto, la decisión final combina tres criterios: desempeño estadístico, estabilidad de signos y valor
+interpretativo para política pública.
+
+Respecto de la parametrización, se reportan dos rutas en paralelo. La Opción A trata a \texttt{BIP}
+como referencia para variables comunes, lo que corresponde a una especificación más convencional y
+directa de leer en términos de contrastes contra \texttt{BIP}. La Opción B impone una restricción de
+suma cero para variables comunes, permitiendo reportar coeficientes para las tres alternativas. Esta
+segunda ruta facilita una lectura más simétrica entre \texttt{BIP}, \texttt{QR\_OTHER} y
+\texttt{QR\_RED}, pero requiere recordar que los coeficientes de variables comunes se interpretan
+como desviaciones relativas respecto del promedio de alternativas.
+
+Dado que ambas rutas producen el mismo ajuste global, la diferencia entre ellas no corresponde a una
+diferencia de capacidad predictiva, sino a una decisión de identificación y presentación. Por ello,
+la elección entre Opción A y Opción B se deja explícitamente como una decisión metodológica a discutir.
+Para efectos de interpretación, la Opción B resulta útil porque permite observar la dirección relativa
+asociada a \texttt{BIP}; para efectos de estimación convencional, la Opción A sigue siendo una
+referencia válida y transparente.
+
+Como sensibilidad computacional y de robustez, también se estimaron modelos equivalentes en Larch con
+muestras mayores. En particular, se probaron muestras de 5\% y 10\%, aprovechando que Larch permitió
+trabajar con mayor volumen de datos sin los problemas de memoria observados previamente. Los resultados
+mantuvieron métricas de ajuste y patrones generales consistentes con la estimación en Biogeme al 2\%.
+Esto entrega una confirmación adicional de que las señales principales no dependen únicamente del
+submuestreo inicial.
+
+En síntesis, se propone mantener como especificación principal el modelo territorial con Censo, OSM,
+refugios de transporte y accesos a Metro. Esta especificación conserva buen desempeño estadístico,
+agrega variables interpretables desde una perspectiva de autoridad de transporte y permite discutir
+cómo el entorno territorial de origen se asocia con la elección entre \texttt{BIP}, \texttt{QR\_OTHER}
+y \texttt{QR\_RED}. Sin embargo, esta especificación no debe entenderse necesariamente como el modelo
+definitivo de la investigación, sino como el modelo principal desarrollado hasta esta etapa del
+análisis.
+
+Aún queda pendiente evaluar nuevas familias de variables que podrían complementar la lectura
+territorial, especialmente aquellas vinculadas con calidad de infraestructura de paraderos y
+estaciones, accesibilidad peatonal, seguridad del entorno, disponibilidad de puntos de carga o pago,
+y medidas operacionales de confiabilidad, regularidad y ocupación. Estas variables podrían mejorar la
+capacidad explicativa del modelo y, sobre todo, aumentar su valor interpretativo para una autoridad
+de transporte. La decisión metodológica pendiente es si reportar como especificación principal la
+Opción A, con \texttt{BIP} como referencia para variables comunes, o la Opción B, con coeficientes
+reportables para las tres alternativas mediante suma cero.

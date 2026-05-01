@@ -1,0 +1,69 @@
+\section{Ajuste y convergencia del modelo}
+
+\subsection{Resultados globales de estimación}
+
+La Tabla~\ref{tab:ajuste_convergencia} resume las métricas globales del modelo principal
+territorial bajo las dos formas de parametrizar las variables comunes. La Opción A mantiene a
+\texttt{BIP} como alternativa de referencia para las variables comunes, mientras que la Opción B
+usa una restricción de suma cero para reportar coeficientes para las tres alternativas. Ambas
+especificaciones representan el mismo contenido conductual y, por lo tanto, entregan el mismo
+ajuste global.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Ajuste y convergencia del modelo principal territorial}
+\label{tab:ajuste_convergencia}
+\begin{tabular}{lrr}
+\toprule
+Métrica & Opción A & Opción B \\
+\midrule
+Parámetros estimados & 52 & 52 \\
+Observaciones & 466{,}639 & 466{,}639 \\
+Observaciones excluidas & 0 & 0 \\
+Log-verosimilitud inicial & -512{,}655.3 & -512{,}655.3 \\
+Log-verosimilitud final & -232{,}257.1 & -232{,}257.1 \\
+Test de razón de verosimilitud & 560{,}796.5 & 560{,}796.5 \\
+Rho-cuadrado & 0.5470 & 0.5470 \\
+Rho-cuadrado ajustado & 0.5470 & 0.5470 \\
+AIC & 464{,}618.2 & 464{,}618.2 \\
+BIC & 465{,}193.0 & 465{,}193.0 \\
+Norma final del gradiente & 4.7659 & 4.8173 \\
+Convergencia & Sí & Sí \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+En ambos casos, el modelo converge correctamente y no excluye observaciones de la muestra de
+estimación. La igualdad en log-verosimilitud, AIC y BIC confirma que las dos opciones no
+corresponden a modelos sustantivamente distintos, sino a dos normalizaciones alternativas para
+presentar los coeficientes de variables comunes. La diferencia principal está en la interpretación
+de los parámetros: en la Opción A los coeficientes de variables comunes se leen respecto de
+\texttt{BIP}, mientras que en la Opción B los coeficientes se leen como desviaciones respecto del
+promedio de alternativas.
+
+\subsection{Lectura de las métricas de ajuste}
+
+La log-verosimilitud final mejora sustancialmente respecto de la log-verosimilitud inicial, pasando
+de $-512{,}655.3$ a $-232{,}257.1$. Esto indica que las variables incluidas en la especificación
+aportan capacidad explicativa relevante respecto de un modelo sin parámetros informativos. En la
+misma línea, el test de razón de verosimilitud alcanza un valor de $560{,}796.5$, lo que refleja una
+mejora global importante frente al modelo inicial.
+
+El valor de rho-cuadrado es $0.5470$, lo que sugiere un ajuste alto para un modelo de elección
+discreta aplicado a viajes individuales. Esta métrica no debe interpretarse como un $R^2$ de
+regresión lineal, pero sí permite evaluar cuánto mejora el modelo respecto de una especificación
+base. En este caso, el resultado indica que el modelo logra capturar una parte sustantiva de la
+estructura observada de elección entre \texttt{BIP}, \texttt{QR\_RED} y \texttt{QR\_OTHER}.
+
+Los criterios AIC y BIC son iguales entre ambas opciones, porque ambas tienen la misma
+log-verosimilitud y el mismo número de parámetros estimados. Por lo tanto, no sirven para escoger
+entre la Opción A y la Opción B. La elección entre ambas debe entenderse como una decisión
+metodológica de interpretación y presentación de resultados, no como una comparación de ajuste
+predictivo o estadístico.
+
+Finalmente, ambas especificaciones reportan convergencia numérica. La Opción B requiere más
+iteraciones que la Opción A debido a la parametrización con restricción de suma cero, pero alcanza
+el mismo óptimo de log-verosimilitud. Por esta razón, la decisión entre ambas rutas se deja
+planteada como una decisión de reporte: mantener una lectura tradicional respecto de \texttt{BIP} o
+presentar coeficientes comparables para las tres alternativas.

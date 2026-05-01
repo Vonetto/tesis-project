@@ -1,0 +1,140 @@
+\section{Especificación MNL y función de utilidad}
+
+\subsection{Marco general de utilidad aleatoria}
+
+La especificación del modelo sigue el marco de utilidad aleatoria, ampliamente utilizado en modelos de elección discreta en transporte. Bajo este enfoque, se asume que cada viaje \(n\) tiene asociada una utilidad latente para cada alternativa de medio de pago \(i\). La alternativa observada corresponde a aquella que entrega la mayor utilidad dentro del conjunto de alternativas disponibles.
+
+En este caso, el conjunto de elección es fijo y está compuesto por tres medios de pago:
+
+\begin{equation}
+    C_n = \{\texttt{BIP}, \texttt{QR\_RED}, \texttt{QR\_OTHER}\}.
+\end{equation}
+
+Para cada viaje \(n\) y alternativa \(i \in C_n\), la utilidad total se define como:
+
+\begin{equation}
+    U_{ni} = V_{ni} + \varepsilon_{ni},
+\end{equation}
+
+donde \(U_{ni}\) corresponde a la utilidad total de la alternativa \(i\) para el viaje \(n\), \(V_{ni}\) es la utilidad sistemática u observable, y \(\varepsilon_{ni}\) es un componente no observado por el analista. Este último término captura factores no incluidos explícitamente en el modelo, como preferencias individuales no observadas, condiciones específicas del viaje o errores de medición.
+
+La utilidad sistemática \(V_{ni}\) se especifica como una combinación lineal de dos tipos de
+variables: atributos que pueden variar entre alternativas dentro de un mismo viaje y variables
+comunes al viaje o a la zona de origen. En forma general:
+
+\begin{equation}
+    V_{ni}
+    =
+    ASC_i
+    +
+    \sum_{k \in K^{AS}} \beta^{AS}_{ki} X_{kni}
+    +
+    \sum_{m \in K^{C}} \beta^{C}_{mi} Z_{mn}.
+\end{equation}
+
+En esta expresión, \(ASC_i\) corresponde a la constante específica de la alternativa \(i\).
+El término \(X_{kni}\) representa variables alternativa-específicas, cuyo valor puede cambiar entre
+alternativas para un mismo viaje \(n\), como tiempos de viaje, esperas y transbordos. Por su parte,
+\(Z_{mn}\) representa variables comunes al viaje o a la zona de origen, como año, franja horaria,
+demanda, oferta, variables censales y variables OSM. Aunque estas últimas tienen el mismo valor para
+las tres alternativas de una observación, sus coeficientes pueden diferir por alternativa,
+permitiendo capturar cómo el contexto temporal o territorial modifica la utilidad relativa de cada
+medio de pago.
+
+La constante específica de alternativa captura la utilidad media de una alternativa que no es explicada por las variables observadas. En el modelo, \texttt{BIP} se utiliza como alternativa base de normalización para las constantes:
+
+\begin{equation}
+    ASC_{\texttt{BIP}} = 0.
+\end{equation}
+
+En consecuencia, las constantes estimadas para \texttt{QR\_RED} y \texttt{QR\_OTHER} se interpretan respecto de \texttt{BIP}. Por ejemplo, si \(ASC_{\texttt{QR\_RED}}\) es negativo, esto indica que, manteniendo constantes las demás variables, \texttt{QR\_RED} presenta una menor utilidad media relativa que \texttt{BIP}.
+
+Bajo el supuesto de que los términos no observados \(\varepsilon_{ni}\) son independientes e idénticamente distribuidos Gumbel tipo I, la probabilidad de que el viaje \(n\) utilice la alternativa \(i\) toma la forma logit multinomial:
+
+\begin{equation}
+    P_{ni}
+    =
+    \frac{\exp(V_{ni})}
+    {\sum_{j \in C_n} \exp(V_{nj})}.
+\end{equation}
+
+Así, el modelo transforma las utilidades sistemáticas de \texttt{BIP}, \texttt{QR\_RED} y \texttt{QR\_OTHER} en probabilidades de elección. Por esta razón, los coeficientes deben interpretarse siempre en términos relativos entre alternativas: un coeficiente positivo aumenta la utilidad sistemática de una alternativa respecto de las demás, mientras que un coeficiente negativo la reduce, manteniendo constantes el resto de las variables del modelo.
+
+\subsection{Duda metodológica pendiente: Variables alternativas-específicas y variables comunes}
+
+La especificación combina dos tipos de variables. El primer grupo corresponde a variables que pueden variar entre alternativas dentro de una misma observación, como el tiempo en vehículo, los tiempos de espera y el número de transbordos asociados a cada alternativa. Para estas variables, el coeficiente de \texttt{BIP} es directamente identificable, ya que el valor de la variable puede diferir entre \texttt{BIP}, \texttt{QR\_RED} y \texttt{QR\_OTHER}.
+
+El segundo grupo corresponde a variables comunes a las alternativas dentro de una misma observación. En este grupo se incluyen variables temporales y de contexto, como el año, la franja horaria, la demanda y oferta del entorno, además de variables territoriales provenientes del Censo y de OpenStreetMap. Estas variables tienen el mismo valor para las tres alternativas de una observación. Por esta razón, no se identifican tres efectos absolutos independientes, sino diferencias relativas entre alternativas.
+
+Esto puede verse directamente en la probabilidad logit. Si una misma variable \(X_{kn}\) entra con el mismo valor en todas las alternativas, sumar un término común \(c X_{kn}\) a todas las utilidades no modifica las probabilidades:
+
+\begin{equation}
+    \frac{\exp(V_{ni} + c X_{kn})}
+    {\sum_{j \in C_n} \exp(V_{nj} + c X_{kn})}
+    =
+    \frac{\exp(V_{ni})}
+    {\sum_{j \in C_n} \exp(V_{nj})}.
+\end{equation}
+
+Este punto abre una decisión metodológica que todavía no se encuentra cerrada. En particular, queda por definir cuál es la forma más clara y correcta de reportar los coeficientes asociados a variables comunes: tratarlas directamente como efectos relativos respecto de una alternativa base, o imponer una restricción que permita presentar coeficientes reportables para las tres alternativas. Por esta razón, en este reporte se presentan dos rutas posibles de especificación y reporte.
+
+\subsection{Ruta A: \texttt{BIP} como alternativa base}
+
+La primera ruta utiliza \texttt{BIP} como alternativa base para las variables comunes al viaje o a la zona. Bajo esta parametrización, para una variable común \(X_{kn}\), se fija:
+
+\begin{equation}
+    \beta_{k,\texttt{BIP}} = 0,
+\end{equation}
+
+y se estiman los coeficientes asociados a \texttt{QR\_RED} y \texttt{QR\_OTHER}. De forma simplificada, la contribución de una variable común a las utilidades queda expresada como:
+
+\begin{align}
+    V_{n,\texttt{BIP}}
+    &=
+    \cdots, \\
+    V_{n,\texttt{QR\_RED}}
+    &=
+    \cdots
+    +
+    \beta_{k,\texttt{QR\_RED}} X_{kn}, \\
+    V_{n,\texttt{QR\_OTHER}}
+    &=
+    \cdots
+    +
+    \beta_{k,\texttt{QR\_OTHER}} X_{kn}.
+\end{align}
+
+En esta ruta, los coeficientes de \texttt{QR\_RED} y \texttt{QR\_OTHER} se interpretan directamente como cambios en la utilidad relativa de cada alternativa QR respecto de \texttt{BIP}. Para las variables que sí varían entre alternativas, como tiempos y transbordos, se mantienen coeficientes específicos para \texttt{BIP}, \texttt{QR\_RED} y \texttt{QR\_OTHER}, ya que en ese caso el coeficiente de \texttt{BIP} es directamente identificable.
+
+La ventaja de esta ruta es que corresponde a una normalización estándar y directa. Su limitación es que, para las variables comunes, \texttt{BIP} queda implícito como categoría de referencia, lo que puede dificultar una presentación simétrica de resultados en formato wide.
+
+\subsection{Ruta B: coeficientes reportables para las tres alternativas}
+
+La segunda ruta mantiene la misma información empírica, pero reparametriza las variables comunes para poder reportar coeficientes asociados a \texttt{BIP}, \texttt{QR\_RED} y \texttt{QR\_OTHER}. Para cada variable común \(X_{kn}\), se impone una restricción de suma cero:
+
+\begin{equation}
+    \beta_{k,\texttt{BIP}}
+    +
+    \beta_{k,\texttt{QR\_RED}}
+    +
+    \beta_{k,\texttt{QR\_OTHER}}
+    =
+    0.
+\end{equation}
+
+Bajo esta restricción, el coeficiente de \texttt{BIP} para una variable común no se estima libremente, sino que se deriva a partir de los otros dos coeficientes:
+
+\begin{equation}
+    \beta_{k,\texttt{BIP}}
+    =
+    -\beta_{k,\texttt{QR\_RED}}
+    -\beta_{k,\texttt{QR\_OTHER}}.
+\end{equation}
+
+Esta parametrización permite presentar los resultados en formato wide, con columnas para \texttt{BIP}, \texttt{QR\_RED} y \texttt{QR\_OTHER}, manteniendo la identificación del modelo. Sin embargo, debe aclararse que, para las variables comunes, el coeficiente de \texttt{BIP} es un coeficiente derivado bajo la restricción de suma cero, no un parámetro libre adicional.
+
+\subsection{Relación entre ambas rutas}
+
+Las dos rutas anteriores son formas equivalentes de representar el mismo contenido empírico del modelo. En ambos casos se identifican diferencias relativas entre alternativas, y no efectos absolutos independientes para variables que son comunes dentro de una observación.
+
+En la estimación realizada, ambas parametrizaciones entregan la misma verosimilitud final, el mismo AIC, el mismo BIC y el mismo número de parámetros estimados. Por lo tanto, la elección entre ambas no corresponde a una diferencia sustantiva en ajuste estadístico, sino a una decisión de interpretación y presentación. La Ruta A es más directa como normalización econométrica, mientras que la Ruta B facilita la presentación de resultados en formato wide con una columna para cada alternativa.

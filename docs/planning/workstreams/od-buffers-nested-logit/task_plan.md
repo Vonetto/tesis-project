@@ -11,6 +11,42 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
 - Mantener la estructura **alt-specific** y `leave_one_out` en la alternativa elegida.
 - No perder la evidencia ya obtenida de `nested vs MNL`; esa rama queda documentada pero en pausa.
 - Incorporar nuevos controles primero sobre el benchmark MNL y reevaluar nested solo despues.
+- Si una decisión nace en el worktree `tesis-project-ml`, su detalle canónico queda allá; este repo solo registra la síntesis puente y su impacto sobre la línea principal.
+
+## Current Focus — Reporte informal del modelo logit territorial
+- [ ] Crear un reporte LaTeX independiente, informal y separado del manuscrito principal de tesis:
+  - ubicación acordada: `docs/reports/modelo-logit-territorial/reporte_modelo_logit.tex`;
+  - no usar la carpeta externa de Seminario Tesis;
+  - no incluir portada ni índice.
+- [ ] Escribir sección 1: descripción del problema y alternativas:
+  - `BIP`;
+  - `QR_RED`;
+  - `QR_OTHER`.
+- [ ] Escribir sección 2: especificación MNL y función de utilidad:
+  - normalización de alternativa base;
+  - variables comunes/base;
+  - variables territoriales con coeficientes alternativo-específicos.
+- [ ] Escribir sección 3: variables base, Censo, OSM y microinfraestructura:
+  - definición operacional;
+  - fuente;
+  - transformación/estandarización cuando corresponda.
+- [ ] Escribir sección 4: estrategia de estimación y muestra:
+  - `pooled_2024_2025`;
+  - `sample2pct`;
+  - muestra conjunta `censo4-micro-osm`;
+  - estimación en Biogeme y criterio YAML de convergencia.
+- [ ] Generar sección 5: tabla de ajuste/convergencia del modelo elegido:
+  - modelo principal `mnl_joint_censo_main_4_plus_osm_main_plus_subway_entrance`;
+  - sensibilidad `mnl_joint_censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance`.
+- [ ] Generar sección 6: tabla wide de parámetros:
+  - columnas por alternativa (`BIP`, `QR_RED`, `QR_OTHER`);
+  - incluir `beta`, `t` robusto y `p_error` robusto.
+- [ ] Escribir sección 7: interpretación de signos/significancia por alternativa.
+- [ ] Escribir sección 8: decisión de modelo principal y sensibilidades:
+  - modelo principal: `main + subway_entrance`;
+  - sensibilidad de política pública: `main + shelter + subway_entrance`;
+  - `transport_bench` excluido del modelo principal.
+- [ ] Compilar el PDF del reporte y revisar formato de tablas largas.
 
 ## Plan
 - [x] Definir dataset/particiones a usar (OD, choice, columnas finales).
@@ -25,6 +61,26 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
 - [x] Re-estimar corrida limpia del modelo principal y dejar output final.
 - [x] Revisar minuciosamente la implementación/estimación del modelo principal y documentar riesgos metodológicos/código.
 - [ ] Analizar e interpretar resultados del modelo principal.
+- [x] Cerrar provisionalmente el bloque Censo territorial del notebook `14`:
+  - candidato principal: `mnl_censo_stepwise_main_4`;
+  - sensibilidad: `mnl_censo_connectivity_main_4_plus_compu`;
+  - descartar `share_internet_z` como extensión principal por baja señal marginal.
+- [x] Cerrar provisionalmente el bloque OSM territorial del notebook `14`:
+  - candidato principal: `sports_centre + convenience + playground + school + university`;
+  - sensibilidad parsimoniosa: `sports_centre + convenience + school + university`;
+  - `office_company` queda como sensibilidad conceptual, no como bloque principal.
+- [ ] Preparar y correr modelos conjuntos `Censo + OSM` en `sample5pct` desde el notebook `14`:
+  - primeros 3 modelos de ruta A ya estimados;
+  - el cuarto modelo volvió a botar el kernel incluso sin cache de muestras;
+  - ruta actual: rehacer la ruta A completa en `sample2pct` para mantener comparabilidad interna;
+  - `run-screening` fue ajustado para liberar cada muestra pandas y evitar acumulación de RAM.
+- [ ] Auditar la ruta conjunta `Censo + OSM` en Larch:
+  - notebook preparado: `03_models/larch_logit/14_territorial_stepwise_mnl_larch.qmd`;
+  - correr sobre `sample2pct-censo4-micro-osm`;
+  - configuración por defecto reducida a `main_4`, `main_4 + osm_main` y `main_4 + compu + osm_main`;
+  - comparar ranking de LL/AIC/BIC, signos y significancia contra Biogeme, sin asumir equivalencia perfecta de framework.
+- [x] Dejar una nota puente reconstruible para decisiones del worktree `tesis-project-ml` que impactan esta línea:
+  - `docs/planning/workstreams/od-buffers-nested-logit/ml_worktree_sync.md`
 - [x] Implementar la misma especificación como **MNL benchmark principal** en **Larch**.
 - [x] Implementar la misma especificación como **MNL benchmark principal** en **Biogeme**.
 - [x] Comparar `nested vs MNL` en ambos frameworks para documentar que el nido no agrega valor frente a `MU_QR = 1`.
@@ -48,6 +104,10 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
   - `OFERTA_METRO_ZONA_INICIO_FRANJA`
 - [ ] Evaluar el bloque conjunto `demanda + oferta` sobre el modelo interanual enriquecido antes de cerrar discusión de modelo final.
 - [ ] Retomar e integrar socio-demo en el modelo principal, comenzando por origen.
+- [x] Abrir una rama específica de auditoría `OpenStreetMap` / built environment:
+  - primero inventario amplio de keys/tags disponibles en el área `ZONA777`;
+  - luego screening por masa/cobertura/interpretabilidad;
+  - recién después definir shortlist de variables OSM candidatas para modelación.
 - [ ] Investigar una variable de ingresos/recursos monetarios para origen:
   - verificar si el Censo 2024 contiene ingresos (respuesta preliminar: no);
   - evaluar si ESI 2024 sirve como fuente directa o solo como insumo para small-area estimation/proxy;
@@ -170,11 +230,188 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
   - impedir que una falla de cobertura de oferta bus quede silenciosamente imputada con `0`.
 - [ ] Solo despues del enriquecimiento, decidir si vale la pena reintentar nested y/o retomar la comparacion `full` vs `generic` vs `mixed_tei_specific`.
 - [x] Crear una réplica en Larch del primer modelo enriquecido interanual, manteniendo la misma especificación de utilidades y controles nuevos que en Biogeme.
+- [x] Abrir una rama OSM / built environment con auditoría amplia antes de definir variables:
+  - notebook base:
+    - `02_eda/eda_osm_zona777.qmd`
+  - consulta OSM por `key` con checkpoints reutilizables;
+  - inventario por `key`, por `key=value` y cobertura por `ZONA777`.
+- [x] Cerrar una shortlist inicial de familias OSM para segunda etapa:
+  - `amenity`
+  - `shop`
+  - `leisure`
+  - `public_transport`
+  - `office`
+  - `landuse`
+- [x] Cerrar una shortlist inicial de `key=value` prioritarias dentro del bloque OSM:
+  - `amenity=school`
+  - `amenity=restaurant`
+  - `amenity=pharmacy`
+  - `amenity=kindergarten`
+  - `amenity=clinic`
+  - `amenity=university`
+  - `shop=convenience`
+  - `shop=supermarket`
+  - `shop=bakery`
+  - `shop=hardware`
+  - `shop=mall`
+  - `leisure=park`
+  - `leisure=playground`
+  - `leisure=sports_centre`
+  - `office=company`
+  - `office=government`
+  - `office=educational_institution`
+  - `landuse=residential`
+  - `landuse=industrial`
+  - `landuse=retail`
+  - `landuse=commercial`
+- [x] Construir un primer bloque `OSM -> ZONA777` model-ready para la shortlist inicial:
+  - para `amenity`, `shop`, `leisure`, `office`:
+    - conteos por zona;
+    - densidades por km²;
+    - y presencia/ausencia cuando tenga más sentido.
+  - para `public_transport`:
+    - construirlo solo como bloque en observación, no como candidato principal todavía.
+  - para `landuse`:
+    - aceptar una primera versión exploratoria por punto representativo si es necesario;
+    - pero dejar abierto el paso posterior a área intersectada.
+  - implementado en:
+    - `lib/osm_zona777.py`
+    - `02_eda/eda_osm_zona777_model_join.qmd`
+- [x] Definir una primera ronda corta de variables OSM para modelación:
+  - `osm_leisure_park`
+  - `osm_amenity_school`
+  - `osm_shop_supermarket`
+  - `osm_amenity_restaurant`
+  - `osm_shop_mall`
+  - `osm_amenity_university`
+  - `osm_amenity_pharmacy`
+- [x] Integrar la primera ronda OSM al frente de modelación, probándolas de forma disciplinada:
+  - primero como corridas separadas / screening corto;
+  - se probó también una ruta corta de combinaciones de a dos;
+  - conclusión: no vale la pena empujar por ahora un bloque OSM conjunto parsimonioso.
+- [x] Definir una segunda ronda OSM cerrada para screening univariado adicional:
+  - `osm_shop_convenience`
+  - `osm_leisure_playground`
+  - `osm_office_company`
+  - `osm_leisure_sports_centre`
+  - `osm_office_government`
+- [x] Adaptar `03_models/10_nested_logit_enriched_interannual_osm.qmd` para incluir la segunda ronda OSM:
+  - construir también esas variables en el artifact model-ready;
+  - correrlas como univariados;
+  - extender la tabla resumen para compararlas con la primera ronda.
+- [x] Cerrar la rama OSM con decisión metodológica explícita:
+  - OSM queda documentado como rama exploratoria útil, con varias variables prometedoras;
+  - no queda, por ahora, un bloque multivariado OSM firme para integrar al frente principal;
+  - las variables con mejor evidencia empírica retenida hasta ahora son:
+    - `osm_amenity_school`
+    - `osm_shop_supermarket`
+    - `osm_leisure_sports_centre`
+    - `osm_leisure_playground`
+- [ ] Auditar redundancia entre variables OSM candidatas y controles de infraestructura ya existentes:
+  - especialmente para:
+    - `public_transport=*`
+    - centralidades comerciales;
+    - y equipamientos educativos.
+- [x] Solo después de construir el bloque OSM model-ready, decidir qué variables pasan a una primera ronda de modelación MNL:
+  - se definió una primera ronda;
+  - luego se extendió a una segunda ronda univariada;
+  - y finalmente se cerró la rama OSM como screening exploratorio, sin consolidar por ahora un bloque multivariado OSM principal.
+
+## Nueva fase post-reunión con profesora (2026-04-23)
+- [x] Documentar explícitamente que `03_models/11_screening_territorial_summary.qmd` no sirve como artefacto de reporte final:
+  - queda como memo técnico interno;
+  - no debe usarse como salida principal para presentación o escritura.
+- [x] Abrir una tarea prioritaria y separada de diagnóstico de convergencia MNL:
+  - auditar `NaN` / `null` en artifacts y estimation samples;
+  - revisar preservación de filas después de joins;
+  - auditar columnas constantes o casi constantes;
+  - revisar estandarización y rangos extremos;
+  - revisar si hay bugs de especificación que estén contaminando `Censo` y `OSM`;
+  - explicitar si la no convergencia era real o si había un error metodológico/técnico.
+- [x] Cerrar mini experimento separado de optimización en `Biogeme`:
+  - `03_models/13_biogeme_optimizer_mini_experiment.qmd`
+  - comparar univariados y multivariados bajo:
+    - `current_bfgs_never`
+    - `simple_bounds_no_hessian`
+    - `simple_bounds_analytical`
+    - `automatic_default`
+  - y revisar:
+    - `yaml_convergence`
+    - `yaml_cause_of_termination`
+    - `yaml_relative_gradient`
+    - `Final gradient norm`
+- [x] Reemplazar el criterio heurístico `Final gradient norm <= 50` como sello de convergencia:
+  - ya no debe usarse como criterio principal;
+  - pasa a quedar solo como métrica auxiliar.
+- [x] Fijar nueva convención de convergencia para corridas `Biogeme`:
+  - criterio principal:
+    - `yaml_convergence`
+    - `yaml_cause_of_termination`
+    - `yaml_relative_gradient`
+  - `Final gradient norm` queda solo como referencia secundaria.
+- [x] Fijar nueva configuración default de optimización para reruns territoriales en `Biogeme`:
+  - usar `automatic_default` como primera opción;
+  - dejar `simple_bounds_analytical` como sensibilidad cercana;
+  - dejar de usar `simple_bounds_BFGS + calculating_second_derivatives = never` como default para bloques multivariados territoriales.
+- [ ] Redefinir el protocolo de screening `Censo` para incluir coeficientes estimados en:
+  - `BIP`
+  - `QR_RED`
+  - `QR_OTHER`
+  y dejar de reportar solo alternativas QR.
+- [ ] Redefinir el protocolo de screening `OSM` para incluir coeficientes estimados en:
+  - `BIP`
+  - `QR_RED`
+  - `QR_OTHER`
+  y dejar de reportar solo alternativas QR.
+- [x] Crear un notebook operativo nuevo que reemplace al `11` como protocolo de screening territorial:
+  - archivo:
+    - `03_models/14_territorial_stepwise_mnl_nested.qmd`
+  - incorpora:
+    - convergencia leída desde `YAML`;
+    - coeficientes para `BIP`, `QR_RED` y `QR_OTHER`;
+    - estimación tanto `MNL` como `Nested`;
+    - screening univariado por bloque;
+    - bloque `Censo full`;
+    - bloque `OSM full`;
+    - bloque conjunto `Censo + OSM`.
+- [ ] Rehacer el screening `Censo` con estrategia stepwise variable por variable:
+  - agregar una variable a la vez sobre el baseline de transporte;
+  - revisar principalmente `t-value` / `p-value` por alternativa;
+  - correrlo bajo la nueva convención de convergencia y optimización `Biogeme`;
+  - y solo después construir integraciones acumulativas del bloque.
+- [ ] Rehacer el screening `OSM` con estrategia stepwise variable por variable:
+  - agregar una variable a la vez sobre el baseline de transporte;
+  - revisar principalmente `t-value` / `p-value` por alternativa;
+  - correrlo bajo la nueva convención de convergencia y optimización `Biogeme`;
+  - y solo después construir integraciones acumulativas del bloque.
+- [ ] Correr integración acumulativa por bloque territorial una vez resuelto el diagnóstico de convergencia:
+  - `Censo` completo;
+  - `OSM` completo;
+  - y luego `Censo + OSM`.
+- [ ] Preparar un reporte formal estilo paper, separado de los notebooks de trabajo:
+  - incluir metodología;
+  - función de utilidad;
+  - definición de variables;
+  - y tablas de resultados por fila de variable con:
+    - `beta_bip`, `t-value`, `p-value`
+    - `beta_qr_red`, `t-value`, `p-value`
+    - `beta_qr_other`, `t-value`, `p-value`
+- [ ] Revisar si la estructura de notebooks actual debe reordenarse en nuevas piezas separadas:
+  - diagnóstico de convergencia;
+  - screening `Censo`;
+  - screening `OSM`;
+  - integración conjunta;
+  - reporte final.
 
 ## Paused / Parked
 - Seleccion final entre `full`, `generic` y `mixed_tei_specific` queda pausada hasta probar especificaciones con controles adicionales.
 - Interpretacion final cerrada de los parametros actuales queda pausada; los resultados actuales se conservan como baseline metodologico.
 - Reintento del nested sobre variantes parsimoniosas queda diferido hasta despues del enriquecimiento del modelo.
+- Integración de `public_transport=*` como variables OSM principales queda en observación hasta revisar solapamiento con:
+  - `BUS_STOP_DENSITY`
+  - `BUS_LINE_COUNT`
+  - `METRO_LINE_COUNT`
+  - y otros controles estructurales ya incorporados.
 
 ## Status
 - Current: tras detectar y corregir el bug de terminales stale en `04_transbordos_metro.qmd`, se abrió una nueva ronda de reprocesamiento/reeestimación para artefactos espaciales. Como resguardo histórico, se archivó el snapshot pre-fix `03_models/archives/pre_fix_buffers_2026-03-25/`, que preserva la última foto formalmente reportada para OD-buffers (`Biogeme sample60pct`, `Larch full`). `2025-W15` y `2025-W14` siguen habilitadas y procesadas end-to-end usando proxies temporales basados en `GTFS_20250412`, con salidas finales en:
@@ -264,3 +501,41 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
     - mapas;
     - correlaciones;
     - join y cobertura sobre la muestra de estimación.
+  Tras la reunión con profesora del `2026-04-23`, la estrategia cambia de forma material:
+  - el foco inmediato ya no es presentar ni pulir `11`;
+  - el foco inmediato pasa a ser:
+    - diagnosticar por qué tantos `MNL` no convergen;
+    - reespecificar el screening para incluir también coeficientes `BIP`;
+    - rehacer la integración territorial en modo stepwise variable por variable;
+    - y cerrar después un reporte formal estilo paper.
+  Por lo tanto:
+  - las conclusiones previas sobre `Censo` y `OSM` deben leerse como cierre provisional de una fase exploratoria;
+  - no como cierre definitivo del protocolo que se usará en el reporte final.
+
+### Current Focus — Reporte informal del modelo logit territorial
+
+- [x] Crear reporte LaTeX separado en `docs/reports/modelo-logit-territorial/reporte_modelo_logit.tex`.
+- [x] Redactar sección 1: descripción del problema y alternativas.
+- [x] Redactar sección 2 con marco RUM/MNL y dejar explícita la duda metodológica de identificación.
+- [x] Agregar placeholders para comparar:
+  - Opción A: `BIP` como base para variables comunes.
+  - Opción B: efectos reportables para tres alternativas con restricción de suma cero.
+- [x] Crear `03_models/15_mnl_common_variable_parametrization_options.qmd` para re-estimar modelos metodológicos bajo Opción A y Opción B, sin mezclar esta rama con el notebook operativo `14`.
+- [x] Correr preset `joint_mnl_censo_osm_method_options` en notebook `15` para los dos modelos `main + shelter + subway_entrance`:
+  - Opción A: `bip_only_alt_specific`;
+  - Opción B: `bip_reportable_sum_zero`.
+- [x] Comparar métricas y tablas wide entre Opción A y Opción B.
+- [x] Completar secciones 3-8 del reporte con resultados finales.
+- [x] Agregar índice, nota inicial y anexos con tablas extendidas.
+- [x] Revisar el reporte y corregir los principales problemas detectados:
+  - función de utilidad separando variables alternativa-específicas y comunes;
+  - referencia a E. Graells-Garrido como inspiración metodológica, con nota al pie;
+  - compilación final del PDF.
+
+### Current Focus — Cerrado
+
+- [x] Reporte informal del modelo logit territorial finalizado para envío a profesores.
+- [ ] Follow-up posterior al envío:
+  - recoger comentarios de profesoras/profesores;
+  - decidir si el reporte usa Opción A u Opción B como especificación principal;
+  - evaluar nuevas familias de variables de infraestructura/acceso para una siguiente iteración del modelo.

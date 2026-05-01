@@ -1,5 +1,354 @@
 # Notes — Nested Logit con Buffers OD (Option1 alt-specific)
 
+## 2026-04-29 — Decisión editorial para reporte informal del modelo logit territorial
+- Se decidió preparar un reporte LaTeX independiente e informal, separado del manuscrito principal de tesis.
+- Ubicación acordada dentro de este repo:
+  - `docs/reports/modelo-logit-territorial/reporte_modelo_logit.tex`
+- Decisión de organización:
+  - crear un reporte autónomo dentro de `docs/reports/`;
+  - no usar la carpeta externa de Seminario Tesis para este entregable;
+  - no agregar portada ni índice.
+- Estructura acordada del reporte:
+  - descripción del problema y alternativas (`BIP`, `QR_RED`, `QR_OTHER`);
+  - especificación MNL y función de utilidad;
+  - variables base, Censo, OSM y microinfraestructura, con definiciones;
+  - estrategia de estimación y muestra;
+  - tabla de ajuste/convergencia del modelo elegido;
+  - tabla wide de parámetros;
+  - interpretación de signos/significancia por alternativa;
+  - decisión de modelo principal y sensibilidades.
+- Modelo principal a reportar:
+  - `mnl_joint_censo_main_4_plus_osm_main_plus_subway_entrance`
+- Sensibilidad a reportar:
+  - `mnl_joint_censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance`
+
+## 2026-04-29 — Decisión sobre microinfraestructura OSM en modelos conjuntos `Censo + OSM`
+- Notebook operativo:
+  - [`03_models/14_territorial_stepwise_mnl_nested.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/14_territorial_stepwise_mnl_nested.qmd)
+- Contexto:
+  - tras cerrar el bloque conjunto `Censo main_4 + OSM main`, se exploró si OSM podía aportar variables más accionables para política pública relacionadas con infraestructura/acceso a paraderos y estaciones;
+  - se auditó `OSM Map Features` y el export local OSM de `ZONA777` antes de incluir variables nuevas.
+- Variables auditadas:
+  - `shelter=yes`
+  - `bench=yes`
+  - `wheelchair=yes`
+  - `railway=subway_entrance`
+  - `highway=crossing`
+  - `crossing=traffic_signals`
+  - `highway=traffic_signals`
+  - `highway=elevator`
+  - `shop=ticket`
+  - `amenity=bus_station`
+- Decisión de construcción:
+  - no usar `wheelchair=yes` cruda porque solo una parte menor de los objetos era claramente transport-like;
+  - no usar cruces/semaforos en el modelo principal porque son demasiado transversales y no específicos de experiencia de pago/acceso al transporte;
+  - no usar `shop=ticket` ni `amenity=bus_station` por baja cobertura y mezcla conceptual;
+  - construir versiones filtradas para infraestructura de espera:
+    - `osm_transport_shelter_yes_density_km2_z`
+    - `osm_transport_bench_yes_density_km2_z`
+  - usar directamente:
+    - `osm_railway_subway_entrance_density_km2_z`
+- Definición práctica de `shelter`:
+  - en OSM, `shelter=yes` indica que el objeto tiene una estructura física de resguardo/cubierta asociada a otro elemento, comúnmente `highway=bus_stop` o `public_transport=platform`;
+  - en este proyecto se usa filtrado a objetos transport-like, por lo que `osm_transport_shelter_yes_density_km2_z` debe interpretarse como densidad zonal estandarizada de paraderos/plataformas con refugio/cubierta reportada en OSM;
+  - es proxy de calidad básica de espera, no de calidad completa del paradero: no garantiza banca, iluminación, información al usuario ni estado físico.
+- Ronda incremental inicial sobre `Censo main_4 + OSM main` (`sample2pct`, Biogeme):
+  - `+ transport_shelter`: `LL = -232278.4`, `AIC = 464676.7`, `BIC = 465339.9`.
+  - `+ transport_shelter + transport_bench`: `LL = -232272.2`, `AIC = 464670.5`, `BIC = 465366.9`.
+  - `+ transport_shelter + transport_bench + subway_entrance`: `LL = -232252.1`, `AIC = 464636.3`, `BIC = 465365.8`.
+  - benchmark `Censo main_4 + OSM main`: `LL = -232294.6`, `AIC = 464703.1`, `BIC = 465333.2`.
+- Lectura de la ronda incremental:
+  - las tres variantes mejoran `LL` y `AIC`;
+  - `BIC` no mejora en las variantes incrementales que incluyen `shelter`/`bench` bajo esa ruta;
+  - `bench` queda relegada por menor parsimonia y señal menos necesaria;
+  - `subway_entrance` aparece como la candidata más fuerte, por lo que se corrieron checks directos sin `bench`.
+- Checks directos agregados:
+  - `mnl_joint_censo_main_4_plus_osm_main_plus_subway_entrance`
+  - `mnl_joint_censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance`
+- Resultados de checks directos (`sample2pct`, Biogeme):
+  - `main + subway_entrance`: `LL = -232268.5`, `AIC = 464657.0`, `BIC = 465320.2`, convergencia YAML verdadera.
+  - `main + shelter + subway_entrance`: `LL = -232257.1`, `AIC = 464640.2`, `BIC = 465336.6`, convergencia YAML verdadera.
+- Comparación contra benchmark `main`:
+  - `main + subway_entrance` mejora simultáneamente `LL`, `AIC` y `BIC`:
+    - `Delta LL ≈ +26.1`
+    - `Delta AIC ≈ -46.1`
+    - `Delta BIC ≈ -13.0`
+  - `main + shelter + subway_entrance` mejora más `LL` y `AIC`, pero queda levemente peor que el benchmark en `BIC`:
+    - `Delta LL ≈ +37.5`
+    - `Delta AIC ≈ -62.9`
+    - `Delta BIC ≈ +3.4`
+- Parámetros clave:
+  - En `main + subway_entrance`, `osm_railway_subway_entrance_density_km2_z`:
+    - `BIP`: positivo y significativo (`beta ≈ 0.0167`, `t ≈ 6.76`);
+    - `QR_OTHER`: prácticamente cero y no significativo;
+    - `QR_RED`: negativo y significativo (`beta ≈ -0.0166`, `t ≈ -3.78`).
+  - En `main + shelter + subway_entrance`, `osm_railway_subway_entrance_density_km2_z` mantiene el patrón:
+    - `BIP`: positivo y significativo;
+    - `QR_OTHER`: no significativo;
+    - `QR_RED`: negativo y significativo.
+  - En `main + shelter + subway_entrance`, `osm_transport_shelter_yes_density_km2_z`:
+    - `BIP`: no significativo;
+    - `QR_OTHER`: negativo y significativo;
+    - `QR_RED`: positivo y significativo.
+- Lectura sustantiva:
+  - `subway_entrance` capta acceso físico/centralidad de Metro y desplaza utilidad hacia `BIP` más que hacia `QR_RED`;
+  - `shelter` capta infraestructura de espera de superficie y tiene una lectura de política pública más accionable, favoreciendo `QR_RED` frente a `QR_OTHER`;
+  - agregar `shelter` no desordena fuertemente parámetros base ni parámetros territoriales principales: tiempos, transbordos, demanda, educación, discapacidad, hacinamiento e inmigrantes mantienen signos y magnitudes razonables.
+- Decisión:
+  - actualizar el candidato principal conjunto a:
+    - `mnl_joint_censo_main_4_plus_osm_main_plus_subway_entrance`
+  - mantener como sensibilidad/política pública:
+    - `mnl_joint_censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance`
+  - no incluir `transport_bench` en el modelo principal;
+  - reportar `shelter` con cautela: es conceptualmente valiosa y accionable, pero no gana la comparación de parsimonia por `BIC` frente al modelo con solo `subway_entrance`.
+
+## 2026-04-28 — Decisión sobre auditoría Larch para modelos conjuntos `Censo + OSM`
+- Notebook de auditoría:
+  - [`03_models/larch_logit/14_territorial_stepwise_mnl_larch.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/larch_logit/14_territorial_stepwise_mnl_larch.qmd)
+- Modelos auditados:
+  - `mnl_larch_joint_censo_main_4`
+  - `mnl_larch_joint_censo_main_4_plus_osm_main`
+  - `mnl_larch_joint_censo_main_4_compu_plus_osm_main`
+- Evidencia de ajuste en Larch:
+  - `sample2pct` (`n = 466639`): `LL/caso = -0.498009`, `-0.497804`, `-0.497760`, respectivamente.
+  - `sample5pct` (`n = 933276`): `LL/caso = -0.497631`, `-0.497421`, `-0.497389`, respectivamente.
+  - `sample10pct` (`n = 1866552`): `LL/caso = -0.497666`, `-0.497471`, `-0.497448`, respectivamente.
+- Lectura:
+  - el ranking de ajuste es estable en los tres tamaños muestrales: `compu + osm_main` mejora más, `osm_main` queda segundo y `censo_main_4` funciona como benchmark conservador;
+  - los niveles de `LL/caso` son prácticamente invariantes entre `2pct`, `5pct` y `10pct`, por lo que no hay señal de que el resultado dependa críticamente del sampleo;
+  - Larch permitió escalar hasta `sample10pct` sin el crash de RAM observado en Biogeme, por lo que sirve como chequeo fuerte de factibilidad computacional y estabilidad de ranking;
+  - los betas son razonablemente comparables en signo y magnitud con Biogeme, especialmente para la estructura principal del modelo, pero la inferencia de Larch no es suficientemente confiable para reportar.
+- Problema de inferencia en Larch:
+  - varias variables territoriales tuvieron errores estándar robustos nulos o faltantes, y la inferencia clásica tampoco resolvió limpiamente el problema;
+  - esto es consistente con una debilidad de identificación/covarianza para variables territoriales comunes a todas las alternativas dentro de una observación, estimadas con coeficientes alternativo-específicos;
+  - por lo tanto, Larch no se usará para decidir significancia estadística ni para reemplazar las tablas principales de Biogeme.
+- Decisión:
+  - usar Biogeme como fuente canónica para parámetros, errores robustos, `t` y `p`;
+  - usar Larch como confirmación externa de ranking, estabilidad muestral y factibilidad de memoria;
+  - no seguir insistiendo en corregir la inferencia de Larch para esta etapa, porque no cambia la decisión sustantiva y puede consumir tiempo sin aportar una tabla reportable;
+  - mantener como modelo conjunto principal `mnl_joint_censo_main_4_plus_osm_main`;
+  - mantener `mnl_joint_censo_main_4_compu_plus_osm_main` como sensibilidad ampliada y `mnl_joint_censo_main_4` como benchmark conservador.
+- Nota posterior:
+  - esta decisión fue actualizada el `2026-04-29` tras la ronda de microinfraestructura OSM;
+  - el nuevo candidato principal conjunto pasa a ser `mnl_joint_censo_main_4_plus_osm_main_plus_subway_entrance`.
+
+## 2026-04-27 — Primeros modelos conjuntos `Censo + OSM` y ajuste de memoria en notebook `14`
+- Corrida conjunta `joint_mnl_censo_to_osm_route_a` en `sample5pct` cayó por RAM en:
+  - `mnl_joint_censo_main_4_plus_sports_convenience_playground`
+- Modelos alcanzados antes del crash:
+  - `mnl_joint_censo_main_4`: `LL = -464427.2`, `AIC = 928938.4`, `BIC = 929431.8`.
+  - `mnl_joint_censo_main_4_plus_sports`: `LL = -464396.4`, `AIC = 928882.7`, `BIC = 929411.3`.
+  - `mnl_joint_censo_main_4_plus_sports_convenience`: `LL = -464386.7`, `AIC = 928869.4`, `BIC = 929433.2`.
+- Lectura:
+  - el primer modelo conjunto replica exactamente el `Censo main_4`, por lo que la muestra conjunta no cambió la base efectiva;
+  - agregar `sports_centre` sobre Censo mejora claramente el ajuste (`Delta LL = +30.8`, `Delta AIC = -55.7`, `Delta BIC = -20.5`);
+  - agregar `convenience` sobre `Censo + sports` mejora poco en LL/AIC (`Delta LL = +9.7`, `Delta AIC = -13.3`) pero empeora BIC (`Delta BIC = +21.9`), por lo que su retención queda pendiente de los modelos con `playground`, `school` y `university`.
+- Diagnóstico técnico:
+  - el crash probablemente fue amplificado por `run-screening`, que cacheaba una muestra pandas distinta por cada conjunto de variables;
+  - en rutas stepwise, cada especificación tiene `extra_cols` distinto, por lo que el notebook podía mantener varias copias grandes en memoria.
+- Cambio aplicado:
+  - `run-screening` ya no usa `sample_cache`;
+  - cada modelo carga su muestra pandas, estima, escribe artefactos y libera objetos antes del siguiente modelo;
+  - se agregó `ACTIVE_PRESET = "joint_mnl_censo_to_osm_route_a_missing"` para correr solo los 5 modelos pendientes.
+- Decisión operativa:
+  - no bajar todavía el sampleo;
+  - primero reintentar `sample5pct` con el preset de faltantes y el uso de memoria corregido;
+  - si vuelve a caer, pasar a correr los pendientes de a uno o bajar muestra como último recurso.
+- Actualización tras reintento:
+  - el kernel volvió a caer en el mismo modelo (`mnl_joint_censo_main_4_plus_sports_convenience_playground`);
+  - no quedaron artefactos parciales para ese modelo;
+  - por lo tanto, el problema ya no parece ser acumulación por cache entre modelos, sino memoria pico dentro de la estimación de Biogeme para especificaciones conjuntas más anchas en `sample5pct`.
+- Decisión operativa actualizada:
+  - rehacer la ruta conjunta completa en `sample2pct` con el mismo optimizador (`automatic` + derivadas analíticas), para mantener comparabilidad interna entre los 8 modelos conjuntos;
+  - no mezclar los 3 resultados `sample5pct` con los 5 resultados pendientes en `sample2pct`;
+  - si `sample2pct` converge y ordena claramente los candidatos, usarlo como screening conjunto y dejar `sample5pct` como evidencia de que los primeros modelos son estables;
+  - si hace falta una estimación final de un candidato grande en `sample5pct`, considerar correr solo ese modelo en una máquina con más RAM o como sensibilidad con optimizador sin Hessiana, dejando explícito el cambio metodológico.
+- Auditoría Larch:
+  - se agregó `03_models/larch_logit/14_territorial_stepwise_mnl_larch.qmd` como réplica MNL específica para la ruta conjunta A;
+  - usa la misma muestra `sample2pct-censo4-micro-osm`, las mismas variables y coeficientes territoriales para `BIP`, `QR_RED` y `QR_OTHER`;
+  - quedó configurado por defecto para correr solo los tres modelos de auditoría final: `main_4`, `main_4 + osm_main` y `main_4 + compu + osm_main`;
+  - su propósito es auditar robustez/ranking y factibilidad de memoria, no reemplazar automáticamente a Biogeme, porque auditorías previas ya mostraron diferencias framework/optimización en modelos más simples.
+
+## 2026-04-27 — Cierre provisional bloque OSM en notebook territorial `14`
+- Notebook operativo:
+  - [`03_models/14_territorial_stepwise_mnl_nested.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/14_territorial_stepwise_mnl_nested.qmd)
+- Decisión:
+  - usar como candidato OSM principal el bloque:
+    - `osm_leisure_sports_centre_density_km2_z`
+    - `osm_shop_convenience_density_km2_z`
+    - `osm_leisure_playground_density_km2_z`
+    - `osm_amenity_school_density_km2_z`
+    - `osm_amenity_university_density_km2_z`
+  - mantener como sensibilidad parsimoniosa:
+    - `osm_leisure_sports_centre_density_km2_z`
+    - `osm_shop_convenience_density_km2_z`
+    - `osm_amenity_school_density_km2_z`
+    - `osm_amenity_university_density_km2_z`
+  - no incluir `osm_office_company_density_km2_z` en el candidato principal OSM, aunque queda como sensibilidad conceptual por su aparición en el frente ML.
+- Evidencia `sample5pct`:
+  - antiguo mejor OSM de primera ronda (`sports + convenience + office + playground + school`): `LL = -466590.0`, `AIC = 933270.0`, `BIC = 933798.6`.
+  - nuevo candidato principal (`sports + convenience + playground + school + university`): `LL = -466387.0`, `AIC = 932864.0`, `BIC = 933392.6`.
+  - sensibilidad parsimoniosa (`sports + convenience + school + university`): `LL = -466477.2`, `AIC = 933038.3`, `BIC = 933531.7`.
+- Lectura:
+  - `university` no reemplaza a `convenience`, pero sí aporta fuertemente sobre la ruta OSM ya fuerte;
+  - `office_company` queda débil/inestable cuando compite con `university`, especialmente frente a QR_RED;
+  - `school` aporta una señal territorial distinta, con signo opuesto al bloque de centralidad/actividad;
+  - las variables base del modelo (`T_ESPERA_*`, `N_TRASB`, `LOG_BUS_STOP_DENSITY`, `LOG_DEMAND`) se mantienen razonablemente estables, por lo que el bloque OSM no parece romper la especificación.
+- Variables OSM descartadas o relegadas:
+  - `restaurant`: muy competitivo en univariados, pero la ruta `convenience` domina al pasar a stepwise;
+  - `office_company`: sensibilidad, no principal;
+  - `mall`, `supermarket`, `pharmacy`, `government`, `park`: no prioritarias para la primera especificación conjunta.
+- Siguiente paso operativo:
+  - preparar modelos conjuntos `Censo + OSM` usando:
+    - Censo principal: `mnl_censo_stepwise_main_4`;
+    - Censo sensibilidad: `mnl_censo_connectivity_main_4_plus_compu`;
+    - OSM principal: `sports + convenience + playground + school + university`;
+    - OSM sensibilidad: `sports + convenience + school + university`.
+
+## 2026-04-26 — Cierre provisional bloque Censo en notebook territorial `14`
+- Notebook operativo:
+  - [`03_models/14_territorial_stepwise_mnl_nested.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/14_territorial_stepwise_mnl_nested.qmd)
+- Decisión:
+  - usar `mnl_censo_stepwise_main_4` como candidato Censo principal;
+  - mantener `mnl_censo_connectivity_main_4_plus_compu` como sensibilidad Censo;
+  - descartar `share_internet_z` como extensión principal del bloque Censo por baja señal marginal.
+- Especificación Censo principal (`main_4`):
+  - `share_cine18_universitaria_o_mas_micro_z`
+  - `share_hacinamiento_z`
+  - `share_discapacidad_z`
+  - `share_inmigrantes_z`
+- Resultado principal `sample5pct`:
+  - `main_4`: `LL = -464427.2`, `AIC = 928938.4`, `BIC = 929431.8`, convergencia Biogeme YAML verdadera.
+  - `main_4 + compu`: `LL = -464395.4`, `AIC = 928880.9`, `BIC = 929409.5`, convergencia Biogeme YAML verdadera.
+- Lectura:
+  - `main_4 + compu` mejora AIC/BIC y `share_serv_compu_z` tiene señal robusta para `QR_RED` y `QR_OTHER`;
+  - pero también mueve la interpretación de `hacinamiento`/`discapacidad`, probablemente por solapamiento socioeconómico;
+  - por eso queda como sensibilidad, no como reemplazo automático del candidato principal.
+- Modelos alternativos sin educación estimados como chequeo:
+  - `compu + hacinamiento + discapacidad + inmigrantes`: `LL = -464906.5`, `AIC = 929897.0`, `BIC = 930390.3`.
+  - `internet + hacinamiento + discapacidad + inmigrantes`: `LL = -465087.0`, `AIC = 930257.9`, `BIC = 930751.3`.
+  - ambos quedan claramente por debajo de `main_4`, lo que refuerza que la señal de educación debe mantenerse en el bloque Censo.
+- Siguiente paso operativo:
+  - pasar a OSM univariado MNL en `sample5pct`, con coeficientes para `BIP`, `QR_RED` y `QR_OTHER`, antes de construir un bloque OSM stepwise.
+
+## 2026-04-23 — Síntesis puente actualizada desde `tesis-project-ml` para variables Censo + OSM
+- Se revisó el estado del worktree paralelo `tesis-project-ml` y se actualizó la síntesis puente de sus hallazgos más recientes en:
+  - [`docs/planning/workstreams/od-buffers-nested-logit/ml_worktree_sync.md`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/docs/planning/workstreams/od-buffers-nested-logit/ml_worktree_sync.md)
+- Confirmación importante:
+  - las variables de Censo y OSM ya estaban documentadas por separado en este repo;
+  - lo que faltaba dejar explícito era la lectura integrada desde el frente ML sobre cuáles sobreviven cuando compiten juntas y frente a `x/y`.
+- Hallazgo puente principal desde `tesis-project-ml`:
+  - el bloque amplio `O/P` sirvió para screening;
+  - pero la especificación compacta preferida quedó en `R_SPATIAL_SHORTLIST_SOCIO_OSM`.
+- Shortlist final retenida por el frente ML:
+  - `share_cine18_postgrado_micro`
+  - `share_cine18_universitaria_o_mas_micro`
+  - `osm_amenity_university`
+  - `share_discapacidad`
+  - `share_inmigrantes`
+  - `prom_edad`
+  - `osm_office_company`
+- SHAP exacto relevante en la ronda final del frente ML:
+  - bloque `Q_SHORTLIST_SOCIO_OSM` (`mean_abs_shap`):
+    - `share_cine18_postgrado_micro = 0.087395`
+    - `osm_amenity_university = 0.037523`
+    - `share_discapacidad = 0.033763`
+    - `share_cine18_universitaria_o_mas_micro = 0.030238`
+    - `share_inmigrantes = 0.023758`
+    - `prom_edad = 0.018722`
+    - `osm_office_company = 0.014293`
+  - bloque `R_SPATIAL_SHORTLIST_SOCIO_OSM` (`mean_abs_shap`):
+    - `share_cine18_postgrado_micro = 0.074255`
+    - `Y_ORIGIN_M = 0.046112`
+    - `X_ORIGIN_M = 0.036493`
+    - `osm_amenity_university = 0.029954`
+    - `share_discapacidad = 0.022553`
+    - `share_cine18_universitaria_o_mas_micro = 0.020094`
+    - `share_inmigrantes = 0.014540`
+    - `prom_edad = 0.013512`
+    - `osm_office_company = 0.013216`
+- SHAP del bloque full también dejó una referencia útil:
+  - en `O_SOCIO_OSM_FULL`, las variables nuevas más altas fueron:
+    - `share_cine18_postgrado_micro = 0.083165`
+    - `osm_amenity_university = 0.023519`
+    - `share_discapacidad = 0.022670`
+    - `share_inmigrantes = 0.020604`
+    - `share_cine18_universitaria_o_mas_micro = 0.018527`
+    - `osm_office_company = 0.017213`
+    - `osm_amenity_pharmacy = 0.015367`
+  - en `P_SPATIAL_SOCIO_OSM_FULL`, las variables nuevas que mejor sobrevivieron frente a `x/y` fueron:
+    - `share_cine18_postgrado_micro = 0.080821`
+    - `osm_amenity_university = 0.019936`
+    - `share_discapacidad = 0.012169`
+    - `share_inmigrantes = 0.011890`
+    - `prom_edad = 0.010929`
+    - `osm_office_company = 0.010760`
+    - `share_cine18_universitaria_o_mas_micro = 0.010445`
+- Lectura útil para este repo:
+  - `share_cine18_postgrado_micro` emerge como la señal nueva más fuerte;
+  - `osm_amenity_university` también sobrevive de manera consistente;
+  - varias variables que parecían prometedoras en screening aislado pierden fuerza en el bloque full, especialmente:
+    - `share_hacinamiento`
+    - `share_analfabet`
+    - `share_internet`
+    - `share_serv_compu`
+    - `share_serv_tel_movil`
+    - varias OSM comerciales/recreativas secundarias
+- Implicancia metodológica:
+  - si la línea principal quiere una ruta parsimoniosa de integración territorial, hoy la mejor base puente no es el bloque socio/OSM completo sino esta shortlist priorizada;
+  - aun así, el frente ML sigue mostrando residuo espacial después de controlar por esa shortlist, así que no conviene sobreleerla como explicación exhaustiva de la geografía.
+- Resultado adicional del tuning en ML:
+  - el tuning espacial de `R` mejoró `spatial CV`, pero empeoró el holdout temporal `W17`;
+  - por tanto, en el frente ML quedó solo como sensibilidad anti-overfit espacial, no como especificación principal.
+- Resultado adicional más reciente del frente ML:
+  - se probó explícitamente la combinación conjunta:
+    - `S_DEMAND_OFFER_SHORTLIST_SOCIO_OSM = baseline + demand/offer + shortlist`
+    - `T_SPATIAL_DEMAND_OFFER_SHORTLIST_SOCIO_OSM = baseline + x/y + demand/offer + shortlist`
+  - SHAP exacto relevante en `S`:
+    - `share_cine18_postgrado_micro = 0.101788`
+    - `share_discapacidad = 0.038907`
+    - `LOG_DEMAND = 0.038193`
+    - `osm_amenity_university = 0.025429`
+    - `share_inmigrantes = 0.021535`
+    - `share_cine18_universitaria_o_mas_micro = 0.017853`
+    - `LOG_BUS_LINE_COUNT = 0.014470`
+    - `LOG_BUS_STOP_DENSITY = 0.012767`
+    - `osm_office_company = 0.011699`
+    - `prom_edad = 0.011039`
+    - `LOG_METRO_LINE_COUNT = 0.009598`
+  - SHAP exacto relevante en `T`:
+    - `share_cine18_postgrado_micro = 0.075058`
+    - `Y_ORIGIN_M = 0.043995`
+    - `LOG_DEMAND = 0.035600`
+    - `X_ORIGIN_M = 0.034868`
+    - `share_discapacidad = 0.024265`
+    - `share_cine18_universitaria_o_mas_micro = 0.021920`
+    - `osm_amenity_university = 0.017180`
+    - `share_inmigrantes = 0.015499`
+    - `LOG_BUS_LINE_COUNT = 0.012719`
+    - `LOG_BUS_STOP_DENSITY = 0.008995`
+    - `prom_edad = 0.008208`
+    - `osm_office_company = 0.008158`
+    - `LOG_METRO_LINE_COUNT = 0.002610`
+  - lectura puente:
+    - `LOG_DEMAND` sí sobrevive al competir con la shortlist, incluso con `x/y`;
+    - la oferta bus también sobrevive, especialmente vía `LOG_BUS_LINE_COUNT`;
+    - `LOG_METRO_LINE_COUNT` queda mucho más débil en la combinación conjunta;
+    - por tanto, ya no corresponde decir simplemente que “queda pendiente ver si demanda/oferta deben mantenerse”: el frente ML ahora sugiere complementariedad parcial entre shortlist y bloque `demanda + oferta`, sobre todo por el lado de demanda y bus.
+
+## 2026-04-14 — Sincronización explícita con worktree `tesis-project-ml`
+- Se formalizó el puente documental con el worktree paralelo de ML:
+  - [`docs/planning/workstreams/od-buffers-nested-logit/ml_worktree_sync.md`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/docs/planning/workstreams/od-buffers-nested-logit/ml_worktree_sync.md)
+- Propósito:
+  - dejar reconstruible, desde este repo, qué decisiones nacieron en `tesis-project-ml` y cómo impactan la línea principal;
+  - evitar duplicar toda la bitácora ML dentro de `tesis-project`;
+  - mantener una separación clara entre:
+    - fuente canónica del frente ML (`tesis-project-ml/docs/planning/workstreams/ml-baselines-shap/`);
+    - síntesis puente de implicancias para `od-buffers` y la tesis principal.
+- Regla acordada:
+  - las decisiones detalladas de ML viven en el otro worktree;
+  - este repo solo registra la síntesis de impacto metodológico cuando afecte la línea principal.
+
 ## 2026-03-31 — Investigación preliminar de variable de ingresos
 - Se revisó el diccionario local del Censo 2024 ya integrado al proyecto:
   - `tmp/censo2024/diccionario_variables_glosas_censo2024.csv`
@@ -1995,6 +2344,40 @@ Implication:
   - en cambio, cada `ServicioUsuario` agrupa varios `ServicioSentido` (mediana ≈ `4`, máximo `15`);
   - el conjunto de `ServicioUsuario` es estable entre semanas y su formato está limpio;
   - por lo tanto, `ServicioUsuario` se considera la mejor aproximación disponible a línea percibida por el usuario.
+
+## 2026-04-17 - Apertura de rama OSM / built environment
+- Se retoma explícitamente la idea de incorporar variables de `OpenStreetMap`, pero **no** partiendo por variables ya definidas.
+- Decisión metodológica:
+  - antes de diseñar proxies, primero auditar qué keys/tags existen realmente en el área de estudio;
+  - no descartar tempranamente familias como `landuse`, `historic`, `highway`, `place`, `office`, `shop`, etc.;
+  - hacer primero un inventario amplio y solo después un screening por cobertura, masa e interpretabilidad.
+- Se creó un notebook nuevo para esta etapa:
+  - `02_eda/eda_osm_zona777.qmd`
+- Alcance del notebook:
+  - cargar `ZONA777`;
+  - consultar o reusar un export `OSM` raw;
+  - inventariar keys principales;
+  - inventariar `key=value`;
+  - medir cobertura por `ZONA777`;
+  - y dejar una shortlist preliminar posterior.
+- Families incluidas inicialmente en la auditoría:
+  - `amenity`
+  - `shop`
+  - `office`
+  - `leisure`
+  - `tourism`
+  - `historic`
+  - `landuse`
+  - `building`
+  - `place`
+  - `highway`
+  - `railway`
+  - `public_transport`
+  - `aeroway`
+  - `natural`
+  - `man_made`
+- Estado actual:
+  - rama abierta en modo **EDA/inventario**, todavía no en modo modelación.
 - Decisión sobre granularidad temporal:
   - `BUS_STOP_DENSITY` y `METRO_STATION_DENSITY` quedan **estáticas por zona**;
   - `BUS_LINE_COUNT` y `METRO_LINE_COUNT` se construirán por `partition × zona_inicio_viaje × franja_v2`, como **promedio de líneas únicas por hora** dentro de cada franja.
@@ -2609,3 +2992,502 @@ Implication:
   - `prom_escolaridad18 + share_discapacidad`
   - `prom_escolaridad18 + share_analfabet`
 - El `full` viejo y el bloque `nested` no se redefinieron; siguen usando la primera ronda.
+
+## 2026-04-17 - Auditoría OSM amplia y cierre de shortlist inicial por familia/tag
+- Se abrió la rama `OpenStreetMap / built environment` en:
+  - `02_eda/eda_osm_zona777.qmd`
+- La lógica acordada fue:
+  - no definir variables OSM ex ante;
+  - primero inventariar qué `keys` y `key=value` existen realmente en el soporte `ZONA777`;
+  - luego filtrar por:
+    - masa;
+    - cobertura territorial;
+    - interpretabilidad;
+    - y no redundancia obvia con bloques ya existentes.
+- Para evitar una consulta única demasiado pesada a Overpass, el notebook quedó configurado en modo `per_key`, con:
+  - logging por familia;
+  - checkpoints reutilizables en `02_eda/tmp/osm_zona777/raw_by_key/`;
+  - y export raw consolidado en parquet:
+    - `02_eda/tmp/osm_zona777/osm_zona777_raw.parquet`
+- Resultado de la auditoría amplia:
+  - objetos raw concatenados antes de dedupe: `652,460`
+  - objetos tras dedupe por `element/id`: `629,152`
+  - columnas raw observadas: `1,421`
+- Familias con mayor masa observada:
+  - `highway`
+  - `building`
+  - `natural`
+  - `amenity`
+  - `leisure`
+  - `landuse`
+  - `shop`
+  - `public_transport`
+- Conclusión metodológica de esa primera pasada:
+  - `highway`, `building` y `natural` no se descartan, pero se dejan para una segunda fase por requerir tratamiento geométrico más fino;
+  - para una primera ronda de construcción por zona se priorizan familias más interpretables y agregables por conteo/presencia.
+
+## 2026-04-17 - Shortlist OSM inicial cerrada para segunda etapa
+- Tras revisar:
+  - `osm-key-inventory`
+  - `osm-tagvalue-inventory`
+  - `osm-zona-key-coverage`
+  - `osm-shortlist-tagvalue-coverage`
+  - `osm-shortlist-tagvalue-screening`
+  se cerró una shortlist inicial de familias OSM para pasar a construcción de variables candidatas.
+- Familias retenidas:
+  - `amenity`
+  - `shop`
+  - `leisure`
+  - `public_transport`
+  - `office`
+  - `landuse`
+- Decisión importante:
+  - `public_transport=*` queda en observación por posible solapamiento con variables de infraestructura de transporte ya presentes en el modelo;
+  - aun así se mantiene auditada, no descartada.
+- Dentro de esa shortlist, las candidatas prioritarias quedan así:
+  - `amenity=school`
+  - `amenity=restaurant`
+  - `amenity=pharmacy`
+  - `amenity=kindergarten`
+  - `amenity=clinic`
+  - `amenity=university`
+  - `shop=convenience`
+  - `shop=supermarket`
+  - `shop=bakery`
+  - `shop=hardware`
+  - `shop=mall`
+  - `leisure=park`
+  - `leisure=playground`
+  - `leisure=sports_centre`
+  - `office=company`
+  - `office=government`
+  - `office=educational_institution`
+  - `landuse=residential`
+  - `landuse=industrial`
+  - `landuse=retail`
+  - `landuse=commercial`
+- Se deja explícitamente documentado que:
+  - `amenity=university` debe entrar sí o sí como candidata, aunque no sea de las más masivas;
+  - `shop=mall` también debe entrar sí o sí, por su interpretación de centralidad comercial mayor.
+- Variables `public_transport` que quedan en observación:
+  - `public_transport=platform`
+  - `public_transport=station`
+  - `public_transport=stop_position`
+  Motivo:
+  - pueden pisarse con:
+    - `BUS_STOP_DENSITY`
+    - `BUS_LINE_COUNT`
+    - `METRO_LINE_COUNT`
+    - y otras proxies de infraestructura ya integradas.
+- Descartes claros en esta etapa:
+  - valores genéricos `*=yes`
+  - y tags semánticamente poco útiles para modelación zonal inicial, por ejemplo:
+    - `amenity=bench`
+    - `amenity=parking_space`
+    - `amenity=waste_basket`
+    - `amenity=parking_entrance`
+    - `amenity=bicycle_parking`
+    - `amenity=toilets`
+    - `amenity=fountain`
+    - `amenity=recycling`
+- Nota metodológica especial:
+  - `landuse` parece prometedora, pero la versión actual vía punto representativo es solo exploratoria;
+  - si sobrevive a la siguiente ronda, convendrá reconstruirla por área intersectada con `ZONA777` en vez de conteo por punto.
+- Conclusión:
+  - la etapa de auditoría OSM amplia queda cerrada;
+  - el siguiente paso ya no es más screening general, sino construir un bloque `OSM -> ZONA777 model-ready` para esta shortlist inicial.
+
+## 2026-04-17 - Primera ronda OSM fijada para modelación
+- Tras construir el primer bloque `OSM -> ZONA777` en:
+  - `lib/osm_zona777.py`
+  - `02_eda/eda_osm_zona777_model_join.qmd`
+  se definió una **primera ronda corta de modelación** con variables OSM prioritarias.
+- Variables OSM elegidas para esa primera ronda:
+  - `osm_leisure_park`
+  - `osm_amenity_school`
+  - `osm_shop_supermarket`
+  - `osm_amenity_restaurant`
+  - `osm_shop_mall`
+  - `osm_amenity_university`
+  - `osm_amenity_pharmacy`
+- Criterio de selección:
+  - mantener una primera ronda corta y altamente interpretable;
+  - combinar:
+    - espacio público / recreación (`park`);
+    - equipamiento educativo (`school`, `university`);
+    - equipamiento/comercio cotidiano (`supermarket`, `restaurant`, `pharmacy`);
+    - centralidad comercial mayor (`mall`);
+  - evitar en esta primera ronda variables OSM que puedan pisarse más directamente con el bloque ya existente de infraestructura de transporte.
+- Decisión explícita:
+  - `osm_amenity_university` y `osm_shop_mall` quedan retenidas sí o sí en esta primera ronda, no solo en rondas posteriores.
+- Variables OSM que quedan para rondas siguientes:
+  - `osm_amenity_kindergarten`
+  - `osm_amenity_clinic`
+  - `osm_shop_convenience`
+  - `osm_shop_bakery`
+  - `osm_shop_hardware`
+  - `osm_leisure_playground`
+  - `osm_leisure_sports_centre`
+  - `osm_office_company`
+  - `osm_office_government`
+  - `osm_office_educational_institution`
+  - y `landuse=*` como rama más exploratoria.
+- `public_transport=*` se mantiene fuera de la primera ronda de modelación por ahora, en observación, debido a posible redundancia con:
+  - `BUS_STOP_DENSITY`
+  - `BUS_LINE_COUNT`
+  - `METRO_LINE_COUNT`
+  - y otros controles estructurales ya presentes en el modelo.
+
+## 2026-04-19 - Segunda ronda OSM fijada para screening univariado
+- Tras revisar la primera ronda OSM, se cerró una **segunda ronda corta** enfocada en dimensiones complementarias de actividad económica y equipamiento barrial.
+- Variables elegidas para esta segunda ronda:
+  - `osm_shop_convenience`
+  - `osm_leisure_playground`
+  - `osm_office_company`
+  - `osm_leisure_sports_centre`
+  - `osm_office_government`
+- Orden operativo sugerido:
+  - `shop_convenience`
+  - `leisure_playground`
+  - `office_company`
+  - `leisure_sports_centre`
+  - `office_government`
+- Criterio:
+  - complementar la primera ronda con medidas de:
+    - comercio cotidiano barrial (`shop_convenience`);
+    - equipamiento recreativo fino (`playground`, `sports_centre`);
+    - actividad económica / institucional (`office_company`, `office_government`);
+  - evitar por ahora nuevas variables `public_transport=*` y `landuse=*`, por mayor riesgo de redundancia o de tratamiento geométrico insuficiente.
+- Decisión operativa:
+  - esta segunda ronda entra a `03_models/10_nested_logit_enriched_interannual_osm.qmd` como **screening univariado adicional**;
+  - no se define todavía una nueva ruta multivariada con estas variables hasta ver sus univariados.
+
+## 2026-04-19 - Cierre metodológico de la rama OSM tras screening MNL
+- La rama OSM queda cerrada, por ahora, como **exploración estructurada de built environment**, ya con:
+  - auditoría amplia;
+  - shortlist por `key=value`;
+  - bloque `OSM -> ZONA777 model-ready`;
+  - y screening MNL en `03_models/10_nested_logit_enriched_interannual_osm.qmd`.
+- Resultado general:
+  - varias variables OSM muestran señal interpretable en corridas univariadas;
+  - pero los bloques OSM multivariados se vuelven numéricamente inestables muy rápido, incluso en combinaciones de a dos.
+- Balance de la primera ronda OSM:
+  - fuertes y limpios:
+    - `osm_amenity_school`
+    - `osm_shop_supermarket`
+  - útiles / defendibles:
+    - `osm_shop_mall`
+    - `osm_amenity_university`
+    - `osm_amenity_pharmacy`
+  - débil:
+    - `osm_leisure_park`
+  - prometedora pero inestable:
+    - `osm_amenity_restaurant`
+- Balance de la segunda ronda OSM:
+  - fuertes y estables:
+    - `osm_leisure_sports_centre`
+    - `osm_leisure_playground`
+  - fuertes pero inestables:
+    - `osm_shop_convenience`
+    - `osm_office_company`
+    - `osm_office_government`
+- Combinaciones OSM probadas:
+  - `school + supermarket` fue el mejor par, pero con gradiente todavía alto;
+  - `school + mall` y `supermarket + mall` no quedaron utilizables;
+  - no se justifica seguir forzando bloques OSM multivariados grandes en esta etapa.
+- Decisión metodológica:
+  - OSM sí aporta variables candidatas útiles e interpretables;
+  - pero, por ahora, debe quedar como:
+    - screening exploratorio;
+    - comparación sustantiva de proxies de built environment;
+    - y reserva de candidatas puntuales para etapas posteriores;
+  - no como un bloque multivariado OSM consolidado dentro del frente principal del modelo.
+- Variables OSM que merecen quedar retenidas con mejor evidencia empírica hasta ahora:
+  - `osm_amenity_school`
+  - `osm_shop_supermarket`
+  - `osm_leisure_sports_centre`
+  - `osm_leisure_playground`
+- Variables OSM que conviene mantener en observación, pero con cautela numérica:
+  - `osm_shop_mall`
+  - `osm_amenity_university`
+  - `osm_amenity_pharmacy`
+  - `osm_shop_convenience`
+  - `osm_office_company`
+  - `osm_office_government`
+
+## 2026-04-23 - Reunión con profesora y rediseño del flujo territorial
+- Se revisó el notebook-resumen `03_models/11_screening_territorial_summary.qmd` con la profesora y se concluyó que **no sirve como artefacto de reporte**.
+- Críticas principales al `11`:
+  - mezcla demasiados bloques en una sola narrativa;
+  - presenta resultados de forma incompleta o inconsistente entre secciones;
+  - no deja ver con suficiente claridad el rol de `BIP`;
+  - y no organiza las tablas como reporte formal de resultados econométricos.
+- Decisión:
+  - `11` no se usará como documento final de presentación;
+  - puede quedar como memo técnico interno, pero no como output a mostrar ni como base de escritura.
+
+### Cambio de criterio de lectura para selección de variables
+- La profesora sugirió una lógica más simple y operativa para el screening:
+  - agregar variables **una a una**;
+  - revisar sobre todo si la variable estimada tiene `t-value` defendible (`|t| >= 1.96` como regla práctica);
+  - no sobrerreaccionar, en esta etapa, a pequeñas variaciones de `rho²`, `LL`, `AIC` o gradiente si la variable nueva está entrando con señal clara.
+- Precisión metodológica interna:
+  - este consejo no elimina la importancia de la convergencia;
+  - pero sí obliga a no usar como criterio principal de descarte comparaciones demasiado globales entre bloques antes de revisar parámetro por parámetro.
+
+### Nueva exigencia de especificación y reporte
+- La profesora indicó que **deben estimarse también los coeficientes para `BIP`** cuando sea posible.
+- Implicancia:
+  - el protocolo anterior, centrado en mostrar principalmente `QR_RED` y `QR_OTHER`, queda incompleto;
+  - las nuevas corridas y tablas deben reportar, por variable:
+    - `beta_bip`, `t-value`, `p-value`
+    - `beta_qr_red`, `t-value`, `p-value`
+    - `beta_qr_other`, `t-value`, `p-value`
+- Esto aplica tanto para variables de `Censo` como de `OSM`.
+
+### Sospecha metodológica crítica: la no convergencia es anómala
+- La profesora consideró **sumamente extraño** que tantos `MNL` no estén convergiendo, especialmente bajo configuraciones básicas y con muchas iteraciones disponibles.
+- Hipótesis a revisar:
+  - presencia de `NaN` o `null` en artifacts/model-ready/samples;
+  - joins defectuosos o pérdida silenciosa de filas;
+  - variables constantes o casi constantes;
+  - estandarización con problemas;
+  - especificación incorrecta de utilidades al integrar bloques nuevos;
+  - o algún bug metodológico que hoy esté contaminando varios resultados.
+- Decisión:
+  - abrir una tarea separada y prioritaria de **diagnóstico de convergencia**;
+  - no seguir tomando la no convergencia como un mero hecho empírico sin auditarla.
+
+### Nueva secuencia de trabajo acordada
+- No corregir `11`.
+- Rediseñar el flujo en etapas separadas:
+  1. diagnóstico de convergencia;
+  2. rerun de screening `Censo` variable por variable, ahora incluyendo `BIP`;
+  3. rerun de screening `OSM` variable por variable, ahora incluyendo `BIP`;
+  4. integración acumulativa por bloque:
+     - `Censo`
+     - `OSM`
+  5. corrida conjunta final:
+     - `Censo + OSM`
+- La lógica cambia desde “cerrar rápidamente shortlist por comparaciones globales” a “integrar disciplinadamente y revisar parámetro a parámetro”.
+
+### Entregable final esperado
+- La profesora pidió un **informe/reporte estilo paper**, siguiendo como referencia:
+  - `/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/papers/1-s2.0-S0968090X2100454X-main.pdf`
+- Ese reporte debe incluir:
+  - metodología;
+  - función de utilidad;
+  - definición de todas las variables;
+  - y tablas de resultados con formato horizontal por alternativa:
+    - `beta_bip`, `t-value`, `p-error`
+    - `beta_qr_red`, `t-value`, `p-error`
+    - `beta_qr_other`, `t-value`, `p-error`
+- Decisión documental:
+  - **no se abre un workstream nuevo**;
+  - esto sigue perteneciendo a `od-buffers-nested-logit`, pero entra a una nueva fase metodológica post-reunión.
+
+## 2026-04-23 - Diagnóstico de convergencia MNL y mini experimento de optimización Biogeme
+- Se creó `03_models/12_mnl_convergence_diagnostics.qmd` para auditar por separado:
+  - integridad de muestras;
+  - `nulls`;
+  - columnas degeneradas;
+  - extremos luego de estandarización;
+  - correlaciones simples;
+  - y la especificación efectiva que se estaba estimando.
+- Hallazgos del diagnóstico de datos:
+  - no aparecieron `nulls` silenciosos en las muestras `Censo` ni `OSM`;
+  - no hubo evidencia de joins defectuosos o pérdida rara de filas;
+  - no aparecieron columnas constantes;
+  - en `Censo`, el problema principal parece ser redundancia/colinealidad entre proxies socioeducativas;
+  - en `OSM`, además de redundancia interna, hay colas/extremos mucho más pesados y fuerte concentración espacial en variables como:
+    - `osm_shop_mall_density_km2_z`
+    - `osm_amenity_university_density_km2_z`
+    - `osm_amenity_pharmacy_density_km2_z`
+    - `osm_office_government_density_km2_z`
+    - `osm_amenity_restaurant_density_km2_z`
+- Hallazgo metodológico clave del diagnóstico:
+  - las variables territoriales nuevas en `08` y `10` hoy entran solo en `QR_RED` y `QR_OTHER`;
+  - no entran en `BIP`;
+  - esto confirma el gap de especificación que la profesora marcó en la reunión.
+
+### Mini experimento de optimización Biogeme
+- Se creó `03_models/13_biogeme_optimizer_mini_experiment.qmd` para aislar una duda puntual:
+  - mantener fija la utilidad `MNL`;
+  - variar solo la configuración del optimizador en `Biogeme`;
+  - comparar modelos `Censo` y `OSM`, tanto univariados como multivariados.
+- Configuraciones comparadas:
+  - `current_bfgs_never`
+    - `simple_bounds_BFGS`
+    - `calculating_second_derivatives = never`
+  - `simple_bounds_no_hessian`
+    - `simple_bounds`
+    - `calculating_second_derivatives = never`
+  - `simple_bounds_analytical`
+    - `simple_bounds`
+    - `calculating_second_derivatives = analytical`
+  - `automatic_default`
+    - `optimization_algorithm = automatic`
+    - `calculating_second_derivatives = analytical`
+- Modelos usados en el barrido:
+  - `Censo` univariado:
+    - `share_cine18_universitaria_o_mas_micro_z`
+  - `Censo` multivariado parsimonioso:
+    - `share_cine18_universitaria_o_mas_micro_z`
+    - `share_hacinamiento_z`
+    - `share_discapacidad_z`
+    - `share_inmigrantes_z`
+  - `OSM` univariado:
+    - `osm_amenity_school_density_km2_z`
+  - `OSM` multivariado corto:
+    - `school + supermarket`
+  - `OSM` multivariado `full` primera ronda.
+
+### Resultado principal del experimento
+- Quedó refutada la regla práctica que veníamos usando:
+  - `Final gradient norm <= 50 => converge`
+- Esa regla era una heurística nuestra, no el criterio de `Biogeme`.
+- `Biogeme` reporta convergencia usando:
+  - `convergence`
+  - `Cause of termination`
+  - `Relative gradient`
+  - y el detalle de iteraciones/evaluaciones
+  en el `YAML` del resultado.
+- Resultado empírico:
+  - `automatic_default` y `simple_bounds_analytical` dieron resultados idénticos en los 5 modelos probados;
+  - `current_bfgs_never` y `simple_bounds_no_hessian` dieron resultados idénticos entre sí.
+- Lectura:
+  - en estos modelos, `automatic_default` cae efectivamente en la familia Newton/trust-region con Hessiana;
+  - y las variantes sin Hessiana quedan en la familia `BFGS` con trust region.
+
+### Qué cambió en la lectura de convergencia
+- Para modelos univariados simples:
+  - `BFGS + no Hessian` sí puede converger;
+  - por ejemplo:
+    - `censo_uni_universitaria_o_mas`
+    - `osm_uni_school`
+- Para modelos multivariados territoriales:
+  - `BFGS + no Hessian` falla con frecuencia vía:
+    - `Maximum number of iterations reached`
+  - mientras que `automatic_default` / `simple_bounds_analytical` sí convergen limpiamente.
+- Casos más importantes:
+  - `censo_multi_parsimonioso`
+    - con `current_bfgs_never`: `convergence = false`, `Maximum number of iterations reached`
+    - con `automatic_default`: `convergence = true`
+  - `osm_multi_school_supermarket`
+    - con `current_bfgs_never`: `convergence = false`
+    - con `automatic_default`: `convergence = true`
+  - `osm_multi_full_r1`
+    - con `current_bfgs_never`: `convergence = false`, `LL = -233248.7`, `AIC = 466585.3`
+    - con `automatic_default`: `convergence = true`, `LL = -233236.4`, `AIC = 466560.9`
+- Este último caso es especialmente importante:
+  - no es solo un problema de criterio de parada;
+  - la configuración antigua estaba llegando a una solución peor.
+
+### Decisión metodológica nueva
+- A partir de ahora, no corresponde seguir usando `Final gradient norm <= 50` como sello de convergencia en `Censo` u `OSM`.
+- El criterio correcto a reportar para `Biogeme` pasa a ser:
+  - `yaml_convergence`
+  - `yaml_cause_of_termination`
+  - `yaml_relative_gradient`
+  - y solo de apoyo `Final gradient norm`
+- Configuración por defecto recomendada para el rerun stepwise:
+  - `automatic_default`
+- `simple_bounds_analytical` queda como configuración equivalente/consistente para chequeos de sensibilidad.
+- La configuración antigua:
+  - `simple_bounds_BFGS`
+  - `calculating_second_derivatives = never`
+  deja de ser el default para modelos multivariados territoriales.
+
+## 2026-04-23 - Nuevo notebook operativo para screening territorial con MNL y Nested
+- Se creó `03_models/14_territorial_stepwise_mnl_nested.qmd` como reemplazo operativo del notebook `11`.
+- Alcance del nuevo notebook:
+  - estimación `MNL` y `Nested` dentro del mismo flujo;
+  - convergencia reportada desde `YAML`, no desde umbrales ad hoc sobre `Final gradient norm`;
+  - variables territoriales nuevas entrando en:
+    - `BIP`
+    - `QR_RED`
+    - `QR_OTHER`
+  - screening univariado por bloque;
+  - bloque `Censo full`;
+  - bloque `OSM full`;
+  - bloque conjunto `Censo + OSM`.
+- Decisión de diseño:
+  - no se modifica `11`;
+  - `11` queda como memo exploratorio viejo;
+  - `14` pasa a ser el artefacto operativo para la fase post-reunión con la profesora.
+- Decisión operativa:
+  - el notebook nuevo queda con `RUN_ESTIMATION = False` por defecto;
+  - permite correr subconjuntos vía `ACTIVE_MODEL_LABELS`;
+  - usa `automatic_default` como configuración base de `Biogeme`;
+  - y deja una tabla horizontal por variable con:
+    - `beta_bip`, `t_bip`, `p_bip`
+    - `beta_qr_red`, `t_qr_red`, `p_qr_red`
+    - `beta_qr_other`, `t_qr_other`, `p_qr_other`
+  - además de una tabla separada para `MU_QR` en los modelos `Nested`.
+
+## 2026-04-29 - Duda metodológica sobre variables comunes y reestimación para reporte
+
+- En el reporte informal del modelo logit territorial se dejó explícito el problema de identificación para variables comunes al viaje/zona:
+  - año, franja, demanda, oferta agregada, Censo y OSM tienen el mismo valor para todas las alternativas de un viaje;
+  - en MNL solo se identifican diferencias de utilidad, no niveles absolutos de coeficientes comunes.
+- Se documentaron dos opciones para discutir con la profesora:
+  - Opción A: `BIP` como base para variables comunes, con coeficientes solo para `QR_RED` y `QR_OTHER`.
+  - Opción B: efectos reportables para `BIP`, `QR_RED` y `QR_OTHER` usando una restricción de identificación, inicialmente suma cero.
+- Se creó `03_models/15_mnl_common_variable_parametrization_options.qmd` como notebook separado para no mezclar esta duda metodológica con el notebook operativo `14`:
+  - nuevo preset `joint_mnl_censo_osm_method_options`;
+  - nuevo campo de especificación `common_variable_parametrization`;
+  - modos disponibles:
+    - `current`: comportamiento previo, controles comunes base normalizados contra `BIP` y `extra_cols` con tres betas libres;
+    - `bip_base`: Opción A, variables comunes y `extra_cols` normalizadas contra `BIP`;
+    - `sum_zero`: Opción B, variables comunes y `extra_cols` con coeficiente `BIP` derivado como `-(QR_RED + QR_OTHER)`.
+- El notebook `14` se mantuvo como frente operativo principal de screening territorial, sin los cambios específicos de Opción A/B.
+- Modelos preparados para reestimación metodológica:
+  - `mnl_joint_censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance_option_a_bip_only_alt_specific`;
+  - `mnl_joint_censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance_option_b_bip_reportable_sum_zero`.
+- Se decidió no correr la variante `main + subway_entrance` en este notebook metodológico; la comparación se concentra solo en `main + shelter + subway_entrance`.
+
+## 2026-04-30 - Cierre del reporte informal del modelo logit territorial
+
+- Estado final: **tarea cerrada**.
+- Reporte LaTeX finalizado en:
+  - `docs/reports/modelo-logit-territorial/reporte_modelo_logit.tex`
+  - `docs/reports/modelo-logit-territorial/reporte_modelo_logit.pdf`
+- Estructura final del reporte:
+  - nota inicial e índice;
+  - sección 1: descripción del problema y alternativas (`BIP`, `QR_RED`, `QR_OTHER`);
+  - sección 2: especificación MNL/RUM, función de utilidad y duda metodológica sobre variables comunes;
+  - sección 3: variables del modelo, incluyendo viaje, temporalidad, demanda/oferta, Censo y OSM;
+  - sección 4: estrategia de estimación y muestra;
+  - sección 5: ajuste y convergencia;
+  - sección 6: parámetros en formato wide para Opción A y Opción B;
+  - sección 7: interpretación de signos y significancia;
+  - sección 8: decisión de modelo principal y sensibilidades;
+  - anexos: tablas extendidas con errores estándar robustos.
+- Se incorporaron los resultados finales de `03_models/15_mnl_common_variable_parametrization_options.qmd` para el modelo `main + shelter + subway_entrance`:
+  - Opción A: `bip_only_alt_specific`;
+  - Opción B: `bip_reportable_sum_zero`;
+  - ambas con 52 parámetros, 466,639 observaciones, `LL final = -232257.1`, `AIC = 464618.2`, `BIC = 465193.0`.
+- Decisión metodológica documentada:
+  - Opción A mantiene `BIP` como referencia para variables comunes;
+  - Opción B reporta coeficientes para tres alternativas mediante restricción de suma cero;
+  - ambas representan el mismo contenido empírico y tienen el mismo ajuste global;
+  - queda como decisión abierta cuál usar como reporte principal tras feedback docente.
+- Correcciones finales aplicadas antes del cierre:
+  - la función de utilidad se corrigió para distinguir variables alternativa-específicas `X_{kni}` y variables comunes `Z_{mn}`;
+  - la referencia a E. Graells-Garrido se reformuló como inspiración metodológica, con nota al pie y aclaración de que se implementó una versión simplificada/operacional;
+  - se agregó una nota inicial indicando que el reporte es un documento de trabajo y no la versión definitiva del modelo de tesis.
+- Verificación:
+  - comando usado:
+    - `latexmk -g -pdf -interaction=nonstopmode -halt-on-error reporte_modelo_logit.tex`
+  - directorio:
+    - `docs/reports/modelo-logit-territorial/`
+  - resultado:
+    - PDF compila correctamente.
+- Riesgo residual conocido:
+  - persisten warnings menores de `Overfull \hbox` en la tabla resumen de variables de la sección 3;
+  - no bloquean la compilación ni afectan las tablas principales/anexos;
+  - se pueden corregir si se quiere pulir visualmente antes de una entrega más formal.
+- Follow-ups después del envío:
+  - recibir feedback de profesoras/profesores;
+  - decidir entre Opción A y Opción B para la especificación principal;
+  - evaluar nuevas variables de infraestructura/acceso, seguridad, puntos de carga/pago y confiabilidad operacional para futuras iteraciones.
