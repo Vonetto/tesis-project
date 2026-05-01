@@ -83,8 +83,10 @@ from lib.od_buffers_nested_logit import (
 
 # Directorios
 MODELS_DIR = PROJECT_ROOT / "03_models"
-NOTEBOOK_TMP_DIR = MODELS_DIR / "tmp" / "od_buffers_nested_logit"
-NOTEBOOK_TMP_DIR.mkdir(parents=True, exist_ok=True)
+OD_ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "od_buffers"
+OD_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+BIOGEME_RESULTS_ROOT = MODELS_DIR / "biogeme-logit" / "results" / "05_od_buffers"
+BIOGEME_RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
 
 def remove_biogeme_iter_file(model_name: str, project_root: Path):
     """Borra archivos .iter del modelo para forzar corrida limpia sin warm-start."""
@@ -517,9 +519,9 @@ lf = read_parquet_portable(str(PARQUET_PATH))
 if RUN_BUILD_CONTEXT:
     _banner("Construcción OD x tipo_pago context")
     df_od_context = _build_context(lf)
-    df_od_context.write_parquet(NOTEBOOK_TMP_DIR / f"od_context_{PARTITION}.parquet")
+    df_od_context.write_parquet(OD_ARTIFACTS_DIR / f"od_context_{PARTITION}.parquet")
 else:
-    od_path = NOTEBOOK_TMP_DIR / f"od_context_{PARTITION}.parquet"
+    od_path = OD_ARTIFACTS_DIR / f"od_context_{PARTITION}.parquet"
     if od_path.exists():
         df_od_context = pl.read_parquet(od_path)
         print(f"ℹ️ Usando OD context existente: {od_path}")
@@ -538,7 +540,7 @@ if RUN_ESTIMATE_OPTION1_V2:
         drop_chosen_singletons=DROP_CHOSEN_SINGLETONS,
     )
     df_trips_v2 = _maybe_sample(df_trips_v2)
-    df_trips_v2.write_parquet(NOTEBOOK_TMP_DIR / f"trips_context_v2_{PARTITION}.parquet")
+    df_trips_v2.write_parquet(OD_ARTIFACTS_DIR / f"trips_context_v2_{PARTITION}.parquet")
     if RUN_CHECK_BASE_V2:
         _banner("Option1 | V2 | check base")
         cols = ["DUMMY_LAB_PM", "DUMMY_LAB_PT", "DUMMY_NO_LAB"]
@@ -554,7 +556,7 @@ if RUN_ESTIMATE_OPTION1_V2:
             print(df_flags)
     _banner("Option1 | V2 | estimate")
     stats, params = _estimate_option1_v2(df_trips_v2)
-    OUTPUT_DIR_OPT1_V2 = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-{sample_tag}"
+    OUTPUT_DIR_OPT1_V2 = BIOGEME_RESULTS_ROOT / f"{PARTITION}-option1-v2-{sample_tag}"
     OUTPUT_DIR_OPT1_V2.mkdir(parents=True, exist_ok=True)
     params.to_csv(OUTPUT_DIR_OPT1_V2 / f"params_nested_logit_od_context_{PARTITION}.csv", index=False)
     pd.DataFrame([stats]).to_csv(OUTPUT_DIR_OPT1_V2 / f"stats_nested_logit_od_context_{PARTITION}.csv", index=False)
@@ -566,14 +568,14 @@ if RUN_ESTIMATE_OPTION1_V2:
 # 3) MNL con misma utilidad
 if RUN_ESTIMATE_OPTION1_V2_MNL:
     _banner("Option1 | V2 | MNL benchmark")
-    trips_path = NOTEBOOK_TMP_DIR / f"trips_context_v2_{PARTITION}.parquet"
+    trips_path = OD_ARTIFACTS_DIR / f"trips_context_v2_{PARTITION}.parquet"
     if "df_trips_v2" not in locals():
         if trips_path.exists():
             df_trips_v2 = pl.read_parquet(trips_path)
         else:
             raise FileNotFoundError(f"No existe dataset trips_context_v2 en {trips_path}")
     stats_mnl, params_mnl = _estimate_option1_v2_mnl(df_trips_v2)
-    OUTPUT_DIR_OPT1_V2_MNL = NOTEBOOK_TMP_DIR / f"{PARTITION}-mnl-option1-v2-{sample_tag}"
+    OUTPUT_DIR_OPT1_V2_MNL = BIOGEME_RESULTS_ROOT / f"{PARTITION}-mnl-option1-v2-{sample_tag}"
     OUTPUT_DIR_OPT1_V2_MNL.mkdir(parents=True, exist_ok=True)
     params_mnl.to_csv(OUTPUT_DIR_OPT1_V2_MNL / f"params_mnl_od_context_{PARTITION}.csv", index=False)
     pd.DataFrame([stats_mnl]).to_csv(OUTPUT_DIR_OPT1_V2_MNL / f"stats_mnl_od_context_{PARTITION}.csv", index=False)
@@ -613,7 +615,7 @@ if "df_caract" not in locals() or df_caract is None:
 
 df_od_context = build_od_alt_specific_context_table(lf, df_caract, config=cfg)
 
-PATH_OD_CONTEXT = NOTEBOOK_TMP_DIR / f"od_context_{PARTITION}.parquet"
+PATH_OD_CONTEXT = OD_ARTIFACTS_DIR / f"od_context_{PARTITION}.parquet"
 df_od_context.write_parquet(PATH_OD_CONTEXT)
 
 print("✅ OD context guardado en:", PATH_OD_CONTEXT)
@@ -654,7 +656,7 @@ df_trips_v2 = build_trip_dataset_with_alt_specific_context(
 if SAMPLE_FRACTION is not None:
     df_trips_v2 = df_trips_v2.sample(fraction=SAMPLE_FRACTION, seed=SEED)
 
-PATH_TRIPS_CONTEXT_V2 = NOTEBOOK_TMP_DIR / f"trips_context_v2_{PARTITION}.parquet"
+PATH_TRIPS_CONTEXT_V2 = OD_ARTIFACTS_DIR / f"trips_context_v2_{PARTITION}.parquet"
 df_trips_v2.write_parquet(PATH_TRIPS_CONTEXT_V2)
 
 print("✅ Dataset Option1 V2 guardado en:", PATH_TRIPS_CONTEXT_V2)
@@ -856,7 +858,7 @@ stats, params = estimate_nested_option1_alt_specific(
     project_root=PROJECT_ROOT,
 )
 
-OUTPUT_DIR_OPT1_V2 = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-{sample_tag}"
+OUTPUT_DIR_OPT1_V2 = BIOGEME_RESULTS_ROOT / f"{PARTITION}-option1-v2-{sample_tag}"
 OUTPUT_DIR_OPT1_V2.mkdir(parents=True, exist_ok=True)
 
 params_path_opt1_v2 = OUTPUT_DIR_OPT1_V2 / f"params_nested_logit_od_context_{PARTITION}.csv"
@@ -892,7 +894,7 @@ stats_mnl, params_mnl = estimate_mnl_option1_alt_specific(
     project_root=PROJECT_ROOT,
 )
 
-OUTPUT_DIR_OPT1_V2_MNL = NOTEBOOK_TMP_DIR / f"{PARTITION}-mnl-option1-v2-{sample_tag}"
+OUTPUT_DIR_OPT1_V2_MNL = BIOGEME_RESULTS_ROOT / f"{PARTITION}-mnl-option1-v2-{sample_tag}"
 OUTPUT_DIR_OPT1_V2_MNL.mkdir(parents=True, exist_ok=True)
 
 params_path_opt1_v2_mnl = OUTPUT_DIR_OPT1_V2_MNL / f"params_mnl_od_context_{PARTITION}.csv"
@@ -931,8 +933,8 @@ def _load_results(folder, params_file, stats_file, param_clean_fn=None):
     return {"params": df_params, "stats": df_stats}
 
 sample_tag = "full" if SAMPLE_FRACTION is None else f"sample{int(SAMPLE_FRACTION*100)}pct"
-OPTION1_V2_DIR = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-{sample_tag}"
-OPTION1_V2_MNL_DIR = NOTEBOOK_TMP_DIR / f"{PARTITION}-mnl-option1-v2-{sample_tag}"
+OPTION1_V2_DIR = BIOGEME_RESULTS_ROOT / f"{PARTITION}-option1-v2-{sample_tag}"
+OPTION1_V2_MNL_DIR = BIOGEME_RESULTS_ROOT / f"{PARTITION}-mnl-option1-v2-{sample_tag}"
 result_opt1_v2 = _load_results(
     str(OPTION1_V2_DIR),
     f"params_nested_logit_od_context_{PARTITION}.csv",
@@ -1155,7 +1157,7 @@ if not CENSO_ZONA777_PATH.exists():
     raise FileNotFoundError(f"No existe Censo final en: {CENSO_ZONA777_PATH}")
 
 # 1) Cargar (o reconstruir) trips_context_v2 con zona_inicio_viaje disponible
-PATH_TRIPS_CONTEXT_V2 = NOTEBOOK_TMP_DIR / f"trips_context_v2_{PARTITION}.parquet"
+PATH_TRIPS_CONTEXT_V2 = OD_ARTIFACTS_DIR / f"trips_context_v2_{PARTITION}.parquet"
 
 if PATH_TRIPS_CONTEXT_V2.exists():
     df_trips_v2 = pl.read_parquet(PATH_TRIPS_CONTEXT_V2)
@@ -1171,7 +1173,7 @@ else:
             df_caract = None
 
     if "df_od_context" not in locals():
-        od_path = NOTEBOOK_TMP_DIR / f"od_context_{PARTITION}.parquet"
+        od_path = OD_ARTIFACTS_DIR / f"od_context_{PARTITION}.parquet"
         if od_path.exists():
             df_od_context = pl.read_parquet(od_path)
             print(f"ℹ️ Usando OD context existente: {od_path}")
@@ -1259,7 +1261,7 @@ if SOCIO_STANDARDIZE:
         socio_z_cols.append(zc)
     SOCIO_FEATURES_MODEL = socio_z_cols
 
-PATH_TRIPS_CONTEXT_V2_SOCIO = NOTEBOOK_TMP_DIR / f"trips_context_v2_socio_origen_{PARTITION}.parquet"
+PATH_TRIPS_CONTEXT_V2_SOCIO = OD_ARTIFACTS_DIR / f"trips_context_v2_socio_origen_{PARTITION}.parquet"
 df_trips_v2_socio.write_parquet(PATH_TRIPS_CONTEXT_V2_SOCIO)
 
 print("✅ Dataset Option1 V2 + socio origen guardado en:", PATH_TRIPS_CONTEXT_V2_SOCIO)
@@ -1324,7 +1326,7 @@ stats_socio, params_socio = estimate_nested_option1_alt_specific(
 )
 
 sample_tag = "full" if SAMPLE_FRACTION is None else f"sample{int(SAMPLE_FRACTION*100)}pct"
-OUTPUT_DIR_OPT1_V2_SOCIO = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-socio-origen-{sample_tag}"
+OUTPUT_DIR_OPT1_V2_SOCIO = BIOGEME_RESULTS_ROOT / f"{PARTITION}-option1-v2-socio-origen-{sample_tag}"
 OUTPUT_DIR_OPT1_V2_SOCIO.mkdir(parents=True, exist_ok=True)
 
 params_path = OUTPUT_DIR_OPT1_V2_SOCIO / f"params_nested_logit_od_context_v2_socio_origen_{PARTITION}.csv"
@@ -1348,8 +1350,8 @@ print("label: compare-option1-v2-vs-socio-origen")
 
 sample_tag = "full" if SAMPLE_FRACTION is None else f"sample{int(SAMPLE_FRACTION*100)}pct"
 
-base_dir = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-{sample_tag}"
-socio_dir = NOTEBOOK_TMP_DIR / f"{PARTITION}-option1-v2-socio-origen-{sample_tag}"
+base_dir = BIOGEME_RESULTS_ROOT / f"{PARTITION}-option1-v2-{sample_tag}"
+socio_dir = BIOGEME_RESULTS_ROOT / f"{PARTITION}-option1-v2-socio-origen-{sample_tag}"
 socio_dir.mkdir(parents=True, exist_ok=True)
 
 base_stats_path = base_dir / f"stats_nested_logit_od_context_{PARTITION}.csv"

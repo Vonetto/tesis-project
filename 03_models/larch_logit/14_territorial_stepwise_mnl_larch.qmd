@@ -1,0 +1,761 @@
+---
+title: "Territorial Stepwise MNL Joint Censo + OSM (Larch)"
+format: html
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  message: true
+---
+
+Replica en **Larch** la ruta conjunta MNL del notebook operativo
+[`03_models/14_territorial_stepwise_mnl_nested.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/14_territorial_stepwise_mnl_nested.qmd).
+
+Alcance:
+
+- solo `MNL`;
+- misma muestra conjunta `Censo + OSM`;
+- subconjunto final de la ruta A de modelos conjuntos;
+- coeficientes territoriales para `BIP`, `QR_RED` y `QR_OTHER`;
+- pensado como auditoría de robustez/memoria, no como reemplazo automático de Biogeme.
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+
+import gc
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp/xdg-cache")
+
+import numpy as np
+import pandas as pd
+import polars as pl
+from scipy.stats import norm
+
+if os.environ.get("LARCH_DISABLE_NUMBA_CACHE", "1") == "1":
+    import numba as nb
+
+    _original_njit = nb.njit
+    _original_guvectorize = nb.guvectorize
+
+    def _njit_without_cache(*args, **kwargs):
+        kwargs["cache"] = False
+        return _original_njit(*args, **kwargs)
+
+    def _guvectorize_without_cache(*args, **kwargs):
+        kwargs["cache"] = False
+        return _original_guvectorize(*args, **kwargs)
+
+    nb.njit = _njit_without_cache
+    nb.guvectorize = _guvectorize_without_cache
+
+import larch as lx
+if not all(hasattr(lx, attr) for attr in ["P", "X", "Model", "Dataset"]):
+    raise ImportError(
+        "Este kernel no tiene una instalación completa de Larch. "
+        f"Se importó {lx!r}, pero no expone P, X, Model ni Dataset. "
+        "Selecciona un kernel/entorno con Larch instalado o instala Larch en este entorno "
+        "antes de ejecutar este notebook."
+    )
+
+from larch import P, X
+
+
+def resolve_project_root(start: Path | None = None) -> Path:
+    current = (start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / "config").exists() and (candidate / "lib").exists():
+            return candidate
+    raise RuntimeError("No se pudo resolver PROJECT_ROOT desde el notebook actual.")
+
+
+PROJECT_ROOT = resolve_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lib.od_buffers_nested_logit import read_parquet_portable
+
+print("PROJECT_ROOT:", PROJECT_ROOT)
+print("Larch:", lx)
+```
+
+```{python}
+import os
+os.environ["LARCH_TERRITORIAL_SAMPLE_TAG"] = "sample2pct"
+```
+## 2) Config
+
+```{python}
+#| label: config
+print("label: config")
+
+MODEL_PARTITION = "pooled_2024_2025"
+ESTIMATION_SAMPLE_TAG = os.environ.get("LARCH_TERRITORIAL_SAMPLE_TAG", "sample2pct")
+LARCH_METHOD = os.environ.get("LARCH_METHOD", "slsqp").lower()
+LARCH_MAXITER = int(os.environ.get("LARCH_MAXITER", "500"))
+LARCH_FTOL = float(os.environ.get("LARCH_FTOL", "1e-12"))
+LARCH_OPTIONS = {"maxiter": LARCH_MAXITER, "ftol": LARCH_FTOL}
+LARCH_MAX_CAP = float(os.environ.get("LARCH_MAX_CAP", "20"))
+
+MODELS_DIR = PROJECT_ROOT / "03_models"
+ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "interannual_enriched"
+RESULTS_ROOT = MODELS_DIR / "larch_logit" / "results" / "14_territorial_stepwise_mnl_larch"
+RESULTS_DIR = RESULTS_ROOT / f"{MODEL_PARTITION}-larch-{ESTIMATION_SAMPLE_TAG}"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+JOINT_SAMPLE_PATH = (
+    ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-censo4-micro-osm.parquet"
+)
+
+BASE_COLUMNS = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_NO_LAB",
+    "DUMMY_ANIO_2025",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+]
+
+CENSO_MAIN_COLS = [
+    "share_cine18_universitaria_o_mas_micro_z",
+    "share_hacinamiento_z",
+    "share_discapacidad_z",
+    "share_inmigrantes_z",
+]
+CENSO_MAIN_PLUS_COMPU_COLS = CENSO_MAIN_COLS + ["share_serv_compu_z"]
+
+OSM_COLS = {
+    "sports_centre": "osm_leisure_sports_centre_density_km2_z",
+    "convenience": "osm_shop_convenience_density_km2_z",
+    "playground": "osm_leisure_playground_density_km2_z",
+    "school": "osm_amenity_school_density_km2_z",
+    "university": "osm_amenity_university_density_km2_z",
+}
+
+OSM_MAIN_COLS = [
+    OSM_COLS["sports_centre"],
+    OSM_COLS["convenience"],
+    OSM_COLS["playground"],
+    OSM_COLS["school"],
+    OSM_COLS["university"],
+]
+OSM_PARSIMONIOUS_COLS = [
+    OSM_COLS["sports_centre"],
+    OSM_COLS["convenience"],
+    OSM_COLS["school"],
+    OSM_COLS["university"],
+]
+
+JOINT_ROUTE_A_SPECS = [
+    ("censo_main_4", CENSO_MAIN_COLS),
+    ("censo_main_4_plus_sports", CENSO_MAIN_COLS + [OSM_COLS["sports_centre"]]),
+    ("censo_main_4_plus_sports_convenience", CENSO_MAIN_COLS + [OSM_COLS["sports_centre"], OSM_COLS["convenience"]]),
+    (
+        "censo_main_4_plus_sports_convenience_playground",
+        CENSO_MAIN_COLS + [OSM_COLS["sports_centre"], OSM_COLS["convenience"], OSM_COLS["playground"]],
+    ),
+    (
+        "censo_main_4_plus_sports_convenience_playground_school",
+        CENSO_MAIN_COLS
+        + [OSM_COLS["sports_centre"], OSM_COLS["convenience"], OSM_COLS["playground"], OSM_COLS["school"]],
+    ),
+    ("censo_main_4_plus_osm_main", CENSO_MAIN_COLS + OSM_MAIN_COLS),
+    ("censo_main_4_plus_osm_parsimonious", CENSO_MAIN_COLS + OSM_PARSIMONIOUS_COLS),
+    ("censo_main_4_compu_plus_osm_main", CENSO_MAIN_PLUS_COMPU_COLS + OSM_MAIN_COLS),
+]
+
+FINAL_AUDIT_LABELS = [
+    "censo_main_4",
+    "censo_main_4_plus_osm_main",
+    "censo_main_4_compu_plus_osm_main",
+]
+
+ACTIVE_LABELS = [
+    label.strip()
+    for label in os.environ.get("LARCH_TERRITORIAL_ACTIVE_LABELS", ",".join(FINAL_AUDIT_LABELS)).split(",")
+    if label.strip()
+]
+KNOWN_ROUTE_A_LABELS = {label for label, _ in JOINT_ROUTE_A_SPECS}
+UNKNOWN_ACTIVE_LABELS = sorted(set(ACTIVE_LABELS) - KNOWN_ROUTE_A_LABELS)
+if UNKNOWN_ACTIVE_LABELS:
+    raise ValueError(f"Labels Larch desconocidos: {UNKNOWN_ACTIVE_LABELS}")
+
+PARAM_TAGS = {
+    "share_cine18_universitaria_o_mas_micro_z": "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z",
+    "share_hacinamiento_z": "SHARE_HACINAMIENTO_Z",
+    "share_discapacidad_z": "SHARE_DISCAPACIDAD_Z",
+    "share_inmigrantes_z": "SHARE_INMIGRANTES_Z",
+    "share_serv_compu_z": "SHARE_SERV_COMPU_Z",
+    "osm_leisure_sports_centre_density_km2_z": "OSM_LEISURE_SPORTS_CENTRE_DENSITY_KM2_Z",
+    "osm_shop_convenience_density_km2_z": "OSM_SHOP_CONVENIENCE_DENSITY_KM2_Z",
+    "osm_leisure_playground_density_km2_z": "OSM_LEISURE_PLAYGROUND_DENSITY_KM2_Z",
+    "osm_amenity_school_density_km2_z": "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z",
+    "osm_amenity_university_density_km2_z": "OSM_AMENITY_UNIVERSITY_DENSITY_KM2_Z",
+}
+
+MODEL_SPECS = [
+    {
+        "model": f"mnl_larch_joint_{label}",
+        "label": label,
+        "extra_cols": cols,
+        "sample_path": JOINT_SAMPLE_PATH,
+    }
+    for label, cols in JOINT_ROUTE_A_SPECS
+    if label in ACTIVE_LABELS
+]
+
+print("JOINT_SAMPLE_PATH:", JOINT_SAMPLE_PATH)
+print("RESULTS_DIR:", RESULTS_DIR)
+print("LARCH_METHOD:", LARCH_METHOD, LARCH_OPTIONS)
+print("ACTIVE_LABELS:", ACTIVE_LABELS)
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+
+def result_paths(model_name: str) -> tuple[Path, Path]:
+    out_dir = RESULTS_DIR / model_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / f"params_{model_name}.csv", out_dir / f"stats_{model_name}.csv"
+
+
+def load_larch_numeric_df_from_parquet(path: Path, extra_cols: list[str]) -> pd.DataFrame:
+    selected = BASE_COLUMNS + list(extra_cols)
+    missing = [c for c in selected if c not in pl.scan_parquet(str(path)).collect_schema().names()]
+    if missing:
+        raise ValueError(f"Faltan columnas en {path.name}: {missing}")
+    return (
+        read_parquet_portable(str(path))
+        .select([pl.col(c).cast(pl.Float64) for c in selected])
+        .collect()
+        .to_pandas()
+    )
+
+
+def prepare_larch_dataframe(pandas_df: pd.DataFrame, extra_cols: list[str]) -> pd.DataFrame:
+    remap = {0: 1, 1: 2, 2: 3}
+    cols = BASE_COLUMNS + list(extra_cols)
+    pdf = pandas_df[cols].copy()
+    pdf["choice_larch"] = pdf["choice_nested"].replace(remap).astype("int32")
+    pdf = pdf.drop(columns=["choice_nested"])
+    for col in pdf.columns:
+        if col == "choice_larch":
+            pdf[col] = pdf[col].astype("int32")
+        else:
+            pdf[col] = pdf[col].astype("float64")
+    return pdf
+
+
+def build_larch_stats_frame(model: lx.Model, n_obs: int) -> pd.DataFrame:
+    stats_raw = model.estimation_statistics_raw(compute_loglike_null=True)
+    stats = {
+        "Number of estimated parameters": len(model.pf),
+        "Number of free parameters": int((model.pf["holdfast"] == 0).sum()),
+        "Sample size": int(n_obs),
+    }
+    for key, value in stats_raw.items():
+        label = " | ".join(str(k) for k in key) if isinstance(key, tuple) else str(key)
+        stats[label] = value
+    return pd.DataFrame([stats])
+
+
+def build_larch_params_frame(model: lx.Model) -> pd.DataFrame:
+    pf = model.pf.copy().reset_index().rename(columns={"param_name": "Name", "value": "Value"})
+    std_err = np.asarray(model.parameters["std_err"].values, dtype=float)
+    classic_t = np.where(
+        np.isfinite(std_err) & (std_err > 0),
+        pf["Value"].to_numpy(dtype=float) / std_err,
+        np.nan,
+    )
+    classic_p = np.where(np.isfinite(classic_t), 2 * norm.sf(np.abs(classic_t)), np.nan)
+    robust_std_err = np.asarray(model.parameters["robust_std_err"].values, dtype=float)
+    robust_t = np.where(
+        np.isfinite(robust_std_err) & (robust_std_err > 0),
+        pf["Value"].to_numpy(dtype=float) / robust_std_err,
+        np.nan,
+    )
+    robust_p = np.where(np.isfinite(robust_t), 2 * norm.sf(np.abs(robust_t)), np.nan)
+    pf["Std err."] = std_err
+    pf["t-stat."] = classic_t
+    pf["p-value"] = classic_p
+    pf["Robust std err."] = robust_std_err
+    pf["Robust t-stat."] = robust_t
+    pf["Robust p-value"] = robust_p
+    return pf[
+        [
+            "Name",
+            "Value",
+            "Std err.",
+            "t-stat.",
+            "p-value",
+            "Robust std err.",
+            "Robust t-stat.",
+            "Robust p-value",
+        ]
+    ]
+
+
+def beta(name: str):
+    return getattr(P, name)
+
+
+def x(name: str):
+    return getattr(X, name)
+
+
+def build_larch_joint_model(
+    pandas_df: pd.DataFrame,
+    *,
+    model_name: str,
+    extra_cols: list[str],
+) -> lx.Model:
+    pdf = prepare_larch_dataframe(pandas_df, extra_cols=extra_cols)
+    ds = lx.Dataset.construct.from_idco(pdf, alts={1: "BIP", 2: "QR_RED", 3: "QR_OTHER"})
+    m = lx.Model(ds)
+    m.title = model_name
+    m.compute_engine = "numba"
+    m.choice_co_code = "choice_larch"
+    m.availability_co_vars = {1: 1, 2: 1, 3: 1}
+
+    part = MODEL_PARTITION
+    v_bip = (
+        beta(f"B_BIP_T_VEH_{part}") * X.TVH_BIP
+        + beta(f"B_BIP_T_ESPERA_INI_{part}") * X.TEI_BIP
+        + beta(f"B_BIP_T_ESPERA_TRASB_{part}") * X.TET_BIP
+        + beta(f"B_BIP_N_TRASB_{part}") * X.NTR_BIP
+    )
+
+    v_red = (
+        beta(f"ASC_QR_RED_{part}")
+        + beta(f"B_QR_RED_LAB_PM_{part}") * X.DUMMY_LAB_PM
+        + beta(f"B_QR_RED_LAB_PT_{part}") * X.DUMMY_LAB_PT
+        + beta(f"B_QR_RED_NO_LAB_{part}") * X.DUMMY_NO_LAB
+        + beta(f"B_QR_RED_ANIO_2025_{part}") * X.DUMMY_ANIO_2025
+        + beta(f"B_QR_RED_LOG_DEMAND_{part}") * X.LOG_N_VIAJES_ZONA_INICIO_FRANJA
+        + beta(f"B_QR_RED_LOG_BUS_STOP_DENSITY_{part}") * X.LOG_BUS_STOP_DENSITY
+        + beta(f"B_QR_RED_LOG_BUS_LINE_COUNT_{part}") * X.LOG_BUS_LINE_COUNT
+        + beta(f"B_QR_RED_LOG_METRO_LINE_COUNT_{part}") * X.LOG_METRO_LINE_COUNT
+        + beta(f"B_QR_RED_T_VEH_{part}") * X.TVH_QR_RED
+        + beta(f"B_QR_RED_T_ESPERA_INI_{part}") * X.TEI_QR_RED
+        + beta(f"B_QR_RED_T_ESPERA_TRASB_{part}") * X.TET_QR_RED
+        + beta(f"B_QR_RED_N_TRASB_{part}") * X.NTR_QR_RED
+    )
+
+    v_other = (
+        beta(f"ASC_QR_OTHER_{part}")
+        + beta(f"B_QR_OTHER_LAB_PM_{part}") * X.DUMMY_LAB_PM
+        + beta(f"B_QR_OTHER_LAB_PT_{part}") * X.DUMMY_LAB_PT
+        + beta(f"B_QR_OTHER_NO_LAB_{part}") * X.DUMMY_NO_LAB
+        + beta(f"B_QR_OTHER_ANIO_2025_{part}") * X.DUMMY_ANIO_2025
+        + beta(f"B_QR_OTHER_LOG_DEMAND_{part}") * X.LOG_N_VIAJES_ZONA_INICIO_FRANJA
+        + beta(f"B_QR_OTHER_LOG_BUS_STOP_DENSITY_{part}") * X.LOG_BUS_STOP_DENSITY
+        + beta(f"B_QR_OTHER_LOG_BUS_LINE_COUNT_{part}") * X.LOG_BUS_LINE_COUNT
+        + beta(f"B_QR_OTHER_LOG_METRO_LINE_COUNT_{part}") * X.LOG_METRO_LINE_COUNT
+        + beta(f"B_QR_OTHER_T_VEH_{part}") * X.TVH_QR_OTHER
+        + beta(f"B_QR_OTHER_T_ESPERA_INI_{part}") * X.TEI_QR_OTHER
+        + beta(f"B_QR_OTHER_T_ESPERA_TRASB_{part}") * X.TET_QR_OTHER
+        + beta(f"B_QR_OTHER_N_TRASB_{part}") * X.NTR_QR_OTHER
+    )
+
+    for col in extra_cols:
+        tag = PARAM_TAGS[col]
+        v_bip = v_bip + beta(f"B_BIP_{tag}_{part}") * x(col)
+        v_red = v_red + beta(f"B_QR_RED_{tag}_{part}") * x(col)
+        v_other = v_other + beta(f"B_QR_OTHER_{tag}_{part}") * x(col)
+
+    m.utility_co[1] = v_bip
+    m.utility_co[2] = v_red
+    m.utility_co[3] = v_other
+    m.initialize_graph(alternative_codes=[1, 2, 3], alternative_names=["BIP", "QR_RED", "QR_OTHER"])
+    m.set_cap(LARCH_MAX_CAP)
+    return m
+
+
+def estimate_larch_joint_model(spec: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    df_model = load_larch_numeric_df_from_parquet(spec["sample_path"], spec["extra_cols"])
+    model = build_larch_joint_model(
+        df_model,
+        model_name=spec["model"],
+        extra_cols=spec["extra_cols"],
+    )
+    model.maximize_loglike(method=LARCH_METHOD, quiet=False, options=LARCH_OPTIONS)
+    model.calculate_parameter_covariance(robust=True)
+    stats = build_larch_stats_frame(model, n_obs=len(df_model))
+    params = build_larch_params_frame(model)
+    del df_model, model
+    gc.collect()
+    return stats, params
+```
+
+## 4) Diseño de estimación
+
+```{python}
+#| label: estimation-design
+print("label: estimation-design")
+df_design = pl.DataFrame(
+    [
+        {
+            "model": spec["model"],
+            "sample_path": spec["sample_path"].name,
+            "n_extra_vars": len(spec["extra_cols"]),
+            "extra_vars": ", ".join(spec["extra_cols"]),
+        }
+        for spec in MODEL_SPECS
+    ]
+)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    display(df_design)
+```
+
+## 5) Ejecutar modelos
+
+```{python}
+#| label: run-larch-joint-route-a
+print("label: run-larch-joint-route-a")
+
+summary_rows = []
+
+for spec in MODEL_SPECS:
+    params_path, stats_path = result_paths(spec["model"])
+    print(f"Estimando Larch: {spec['model']}")
+    try:
+        stats_df, params_df = estimate_larch_joint_model(spec)
+        stats_df.to_csv(stats_path, index=False)
+        params_df.to_csv(params_path, index=False)
+        row = stats_df.iloc[0].to_dict()
+        summary_rows.append(
+            {
+                "model": spec["model"],
+                "sample_path": spec["sample_path"].name,
+                "n_extra_vars": len(spec["extra_cols"]),
+                "status": "ok",
+                "error_type": None,
+                "error_message": None,
+                **row,
+            }
+        )
+    except Exception as exc:
+        print(f"ERROR en {spec['model']}: {type(exc).__name__}: {exc}")
+        summary_rows.append(
+            {
+                "model": spec["model"],
+                "sample_path": spec["sample_path"].name,
+                "n_extra_vars": len(spec["extra_cols"]),
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }
+        )
+    gc.collect()
+
+df_summary = pd.DataFrame(summary_rows)
+df_summary.to_csv(RESULTS_DIR / "convergence_summary.csv", index=False)
+display(df_summary)
+```
+
+## 6) Cargar resultados
+
+```{python}
+#| label: load-results
+print("label: load-results")
+
+rows = []
+missing = []
+for spec in MODEL_SPECS:
+    params_path, stats_path = result_paths(spec["model"])
+    if stats_path.exists() and params_path.exists():
+        stats = pd.read_csv(stats_path).iloc[0].to_dict()
+        rows.append({"model": spec["model"], "n_extra_vars": len(spec["extra_cols"]), **stats})
+    else:
+        missing.append(spec["model"])
+
+if rows:
+    display(pd.DataFrame(rows))
+if missing:
+    display(pl.DataFrame({"missing_model": missing}))
+```
+
+## 7) Parámetros por modelo
+
+```{python}
+#| label: new-variable-parameters-wide-selected
+print("label: new-variable-parameters-wide")
+
+# Acepta label corto, por ejemplo:
+#   "censo_main_4_plus_osm_main"
+# o nombre completo:
+#   "mnl_larch_joint_censo_main_4_plus_osm_main"
+PARAMETER_MODEL = "mnl_larch_joint_censo_main_4_plus_osm_main"
+
+
+def resolve_parameter_model(model_or_label: str) -> dict:
+    label = model_or_label.removeprefix("mnl_larch_joint_")
+    known_specs = dict(JOINT_ROUTE_A_SPECS)
+    if label not in known_specs:
+        raise ValueError(
+            f"Modelo/label desconocido: {model_or_label}. "
+            f"Opciones válidas: {sorted(known_specs)}"
+        )
+    return {
+        "model": f"mnl_larch_joint_{label}",
+        "label": label,
+        "extra_cols": known_specs[label],
+        "sample_path": JOINT_SAMPLE_PATH,
+    }
+
+
+def load_parameter_frame(model_or_label: str) -> tuple[dict, pd.DataFrame]:
+    spec = resolve_parameter_model(model_or_label)
+    params_path, _ = result_paths(spec["model"])
+    if not params_path.exists():
+        raise FileNotFoundError(
+            f"No existe archivo de parámetros para {spec['model']}: {params_path}"
+        )
+    return spec, pd.read_csv(params_path)
+
+
+def parse_larch_parameter_name(name: str) -> tuple[str | None, str | None]:
+    suffix = f"_{MODEL_PARTITION}"
+    stem = name.removesuffix(suffix)
+    if stem == "ASC_QR_RED":
+        return "QR_RED", "ASC"
+    if stem == "ASC_QR_OTHER":
+        return "QR_OTHER", "ASC"
+    for alt, prefix in [
+        ("QR_OTHER", "B_QR_OTHER_"),
+        ("QR_RED", "B_QR_RED_"),
+        ("BIP", "B_BIP_"),
+    ]:
+        if stem.startswith(prefix):
+            return alt, stem.removeprefix(prefix)
+    return None, None
+
+
+def parameter_wide_for_variables(
+    params_df: pd.DataFrame,
+    *,
+    model_name: str,
+    variable_order: list[str],
+    tag_to_variable: dict[str, str],
+) -> pl.DataFrame:
+    rows = []
+    variable_set = set(variable_order)
+    for _, row in params_df.iterrows():
+        alt, tag = parse_larch_parameter_name(row["Name"])
+        variable = tag_to_variable.get(tag)
+        if alt is None or variable not in variable_set:
+            continue
+        rows.append(
+            {
+                "block": "joint",
+                "family": "mnl",
+                "model": model_name,
+                "variable": variable,
+                "alternative": alt,
+                "beta": row["Value"],
+                "t": row["Robust t-stat."],
+                "p_error": row["Robust p-value"],
+            }
+        )
+
+    long_df = pd.DataFrame(rows)
+    output_rows = []
+    alt_keys = {"BIP": "bip", "QR_OTHER": "qr_other", "QR_RED": "qr_red"}
+    for variable in variable_order:
+        subset = long_df[long_df["variable"] == variable].set_index("alternative") if not long_df.empty else pd.DataFrame()
+        out = {"block": "joint", "family": "mnl", "model": model_name, "variable": variable}
+        for alt, key in alt_keys.items():
+            out[f"beta_{key}"] = subset.loc[alt, "beta"] if alt in subset.index else None
+        for alt, key in alt_keys.items():
+            out[f"p_error_{key}"] = subset.loc[alt, "p_error"] if alt in subset.index else None
+        for alt, key in alt_keys.items():
+            out[f"t_{key}"] = subset.loc[alt, "t"] if alt in subset.index else None
+        output_rows.append(out)
+
+    columns = [
+        "block", "family", "model", "variable",
+        "beta_bip", "beta_qr_other", "beta_qr_red",
+        "p_error_bip", "p_error_qr_other", "p_error_qr_red",
+        "t_bip", "t_qr_other", "t_qr_red",
+    ]
+    return pl.from_pandas(pd.DataFrame(output_rows, columns=columns))
+
+
+def warn_missing_inference(df_wide: pl.DataFrame, *, inference_label: str) -> None:
+    pdf = df_wide.to_pandas()
+    missing = []
+    for key, alt in [("bip", "BIP"), ("qr_other", "QR_OTHER"), ("qr_red", "QR_RED")]:
+        has_beta = pdf[f"beta_{key}"].notna()
+        missing_inference = pdf[f"t_{key}"].isna() | pdf[f"p_error_{key}"].isna()
+        for variable in pdf.loc[has_beta & missing_inference, "variable"].tolist():
+            missing.append(f"{variable}:{alt}")
+    if missing:
+        print(
+            f"Advertencia: Larch no entregó inferencia {inference_label} para: "
+            + ", ".join(missing)
+        )
+
+
+selected_spec, selected_params = load_parameter_frame(PARAMETER_MODEL)
+tag_to_new_variable = {tag: variable for variable, tag in PARAM_TAGS.items()}
+df_new_variable_parameters_wide = parameter_wide_for_variables(
+    selected_params,
+    model_name=selected_spec["model"],
+    variable_order=selected_spec["extra_cols"],
+    tag_to_variable=tag_to_new_variable,
+)
+warn_missing_inference(df_new_variable_parameters_wide, inference_label="robusta")
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    display(df_new_variable_parameters_wide)
+```
+
+```{python}
+#| label: base-parameters-wide-selected
+print("label: base-parameters-wide")
+
+BASE_PARAM_TAGS = {
+    "ASC": "ASC",
+    "ANIO_2025": "ANIO_2025",
+    "LAB_PM": "LAB_PM",
+    "LAB_PT": "LAB_PT",
+    "LOG_BUS_LINE_COUNT": "LOG_BUS_LINE_COUNT",
+    "LOG_BUS_STOP_DENSITY": "LOG_BUS_STOP_DENSITY",
+    "LOG_DEMAND": "LOG_DEMAND",
+    "LOG_METRO_LINE_COUNT": "LOG_METRO_LINE_COUNT",
+    "NO_LAB": "NO_LAB",
+    "N_TRASB": "N_TRASB",
+    "T_ESPERA_INI": "T_ESPERA_INI",
+    "T_ESPERA_TRASB": "T_ESPERA_TRASB",
+    "T_VEH": "T_VEH",
+}
+BASE_PARAM_ORDER = [
+    "ANIO_2025",
+    "ASC",
+    "LAB_PM",
+    "LAB_PT",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_DEMAND",
+    "LOG_METRO_LINE_COUNT",
+    "NO_LAB",
+    "N_TRASB",
+    "T_ESPERA_INI",
+    "T_ESPERA_TRASB",
+    "T_VEH",
+]
+
+selected_spec, selected_params = load_parameter_frame(PARAMETER_MODEL)
+df_base_parameters_wide = parameter_wide_for_variables(
+    selected_params,
+    model_name=selected_spec["model"],
+    variable_order=BASE_PARAM_ORDER,
+    tag_to_variable=BASE_PARAM_TAGS,
+)
+warn_missing_inference(df_base_parameters_wide, inference_label="robusta")
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    display(df_base_parameters_wide)
+```
+
+```{python}
+#| label: new-variable-parameters-wide-classic-selected
+print("label: new-variable-parameters-wide-classic")
+
+
+def parameter_wide_for_variables_with_inference_columns(
+    params_df: pd.DataFrame,
+    *,
+    model_name: str,
+    variable_order: list[str],
+    tag_to_variable: dict[str, str],
+    t_col: str,
+    p_col: str,
+) -> pl.DataFrame:
+    required_cols = {"Name", "Value", t_col, p_col}
+    missing_cols = sorted(required_cols - set(params_df.columns))
+    if missing_cols:
+        raise ValueError(
+            f"El archivo de parámetros no tiene columnas {missing_cols}. "
+            "Reestima el modelo con la versión actual del notebook para guardar "
+            "errores clásicos además de robustos."
+        )
+
+    rows = []
+    variable_set = set(variable_order)
+    for _, row in params_df.iterrows():
+        alt, tag = parse_larch_parameter_name(row["Name"])
+        variable = tag_to_variable.get(tag)
+        if alt is None or variable not in variable_set:
+            continue
+        rows.append(
+            {
+                "block": "joint",
+                "family": "mnl",
+                "model": model_name,
+                "variable": variable,
+                "alternative": alt,
+                "beta": row["Value"],
+                "t": row[t_col],
+                "p_error": row[p_col],
+            }
+        )
+
+    long_df = pd.DataFrame(rows)
+    output_rows = []
+    alt_keys = {"BIP": "bip", "QR_OTHER": "qr_other", "QR_RED": "qr_red"}
+    for variable in variable_order:
+        subset = long_df[long_df["variable"] == variable].set_index("alternative") if not long_df.empty else pd.DataFrame()
+        out = {"block": "joint", "family": "mnl", "model": model_name, "variable": variable}
+        for alt, key in alt_keys.items():
+            out[f"beta_{key}"] = subset.loc[alt, "beta"] if alt in subset.index else None
+        for alt, key in alt_keys.items():
+            out[f"p_error_{key}"] = subset.loc[alt, "p_error"] if alt in subset.index else None
+        for alt, key in alt_keys.items():
+            out[f"t_{key}"] = subset.loc[alt, "t"] if alt in subset.index else None
+        output_rows.append(out)
+
+    columns = [
+        "block", "family", "model", "variable",
+        "beta_bip", "beta_qr_other", "beta_qr_red",
+        "p_error_bip", "p_error_qr_other", "p_error_qr_red",
+        "t_bip", "t_qr_other", "t_qr_red",
+    ]
+    return pl.from_pandas(pd.DataFrame(output_rows, columns=columns))
+
+
+selected_spec, selected_params = load_parameter_frame(PARAMETER_MODEL)
+df_new_variable_parameters_wide_classic = parameter_wide_for_variables_with_inference_columns(
+    selected_params,
+    model_name=selected_spec["model"],
+    variable_order=selected_spec["extra_cols"],
+    tag_to_variable=tag_to_new_variable,
+    t_col="t-stat.",
+    p_col="p-value",
+)
+warn_missing_inference(df_new_variable_parameters_wide_classic, inference_label="clásica")
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    display(df_new_variable_parameters_wide_classic)
+```

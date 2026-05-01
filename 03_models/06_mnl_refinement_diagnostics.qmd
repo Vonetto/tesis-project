@@ -580,11 +580,13 @@ VARIANTS = {
     "mixed_tei_nested": {"mode": "mixed_tei_specific", "use_tet": True, "use_ntr": True, "structure": "nested"},
 }
 
-NOTEBOOK_TMP_DIR = PROJECT_ROOT / "03_models" / "tmp" / "od_buffers_nested_logit"
-NOTEBOOK_TMP_DIR.mkdir(parents=True, exist_ok=True)
+OD_ARTIFACTS_DIR = PROJECT_ROOT / "03_models" / "artifacts" / "od_buffers"
+OD_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-REFINE_OUT_DIR = PROJECT_ROOT / "03_models" / "tmp" / "mnl_refinement"
-REFINE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+BIOGEME_REFINE_OUT_DIR = PROJECT_ROOT / "03_models" / "biogeme-logit" / "results" / "06_mnl_refinement"
+BIOGEME_REFINE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+LARCH_REFINE_OUT_DIR = PROJECT_ROOT / "03_models" / "larch_logit" / "results" / "06_mnl_refinement"
+LARCH_REFINE_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 sample_tag = format_sample_tag(SAMPLE_FRACTION)
 
@@ -701,7 +703,7 @@ for variant_name, spec in VARIANTS.items():
 
     if RUN_BIOGEME:
         model_name = f"mnl_refine_{PARTITION}_{variant_name}_{sample_tag}"
-        out_dir = REFINE_OUT_DIR / "biogeme" / f"{PARTITION}-{variant_name}-{sample_tag}"
+        out_dir = BIOGEME_REFINE_OUT_DIR / f"{PARTITION}-{variant_name}-{sample_tag}"
         out_dir.mkdir(parents=True, exist_ok=True)
         stats_b, params_b = build_biogeme_mnl(
             df_pandas_biogeme,
@@ -727,7 +729,7 @@ for variant_name, spec in VARIANTS.items():
         print("✅ Biogeme guardado en:", out_dir)
 
     if RUN_LARCH:
-        out_dir = REFINE_OUT_DIR / "larch" / f"{PARTITION}-{variant_name}-{sample_tag}"
+        out_dir = LARCH_REFINE_OUT_DIR / f"{PARTITION}-{variant_name}-{sample_tag}"
         out_dir.mkdir(parents=True, exist_ok=True)
         stats_l, params_l = build_larch_mnl(
             df_pandas_larch,
@@ -768,7 +770,7 @@ print("label: load-and-compare")
 records = []
 for fw in ["biogeme", "larch"]:
     for variant_name in VARIANTS.keys():
-        out_dir = REFINE_OUT_DIR / fw / f"{PARTITION}-{variant_name}-{sample_tag}"
+        out_dir = (BIOGEME_REFINE_OUT_DIR if fw == "biogeme" else LARCH_REFINE_OUT_DIR) / f"{PARTITION}-{variant_name}-{sample_tag}"
         stats_path = out_dir / f"stats_{PARTITION}.csv"
         params_path = out_dir / f"params_{PARTITION}.csv"
         if not (stats_path.exists() and params_path.exists()):

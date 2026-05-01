@@ -1,0 +1,1071 @@
+---
+TITLE: "Tesis — 11 | Resumen Screening Territorial"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Consolidar, en un solo notebook de lectura, el screening territorial ya realizado en esta rama:
+
+- baseline contextual de transporte;
+- screening `Censo` / microdata;
+- screening `OSM`;
+- y una nota breve de contraste con el frente `ML/SHAP`.
+
+Este notebook **no re-estima** modelos. Solo lee artefactos ya generados en:
+
+- [`07_nested_logit_enriched_interannual.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/07_nested_logit_enriched_interannual.qmd)
+- [`08_nested_logit_enriched_interannual_censo.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/08_nested_logit_enriched_interannual_censo.qmd)
+- [`10_nested_logit_enriched_interannual_osm.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/10_nested_logit_enriched_interannual_osm.qmd)
+
+::: {.callout-note}
+## Uso sugerido
+Este notebook está pensado como memo técnico para reunión. La lógica es:
+
+1. fijar el baseline contextual de transporte;
+2. mostrar qué variables se probaron en `Censo` y `OSM`;
+3. mostrar qué pasó en univariados y en especificaciones múltiples acotadas;
+4. cerrar con una síntesis integrada y un puente corto con `ML/SHAP`.
+:::
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró la raíz del proyecto.")
+```
+
+## 2) Configuración y helpers
+
+```{python}
+#| label: config-and-helpers
+print("label: config-and-helpers")
+CONVERGENCE_GRADIENT_THRESHOLD = 50.0
+
+RESULTS_07 = (
+    PROJECT_ROOT
+    / "03_models"
+    / "biogeme-logit"
+    / "results"
+    / "07_interannual_enriched"
+    / "pooled_2024_2025-biogeme-sample12pct"
+)
+RESULTS_08_UNIV = (
+    PROJECT_ROOT
+    / "03_models"
+    / "biogeme-logit"
+    / "results"
+    / "08_interannual_censo"
+    / "pooled_2024_2025-biogeme-sample5pct"
+)
+RESULTS_08_MULTI = (
+    PROJECT_ROOT
+    / "03_models"
+    / "biogeme-logit"
+    / "results"
+    / "08_interannual_censo"
+    / "pooled_2024_2025-biogeme-sample2pct"
+)
+RESULTS_10 = (
+    PROJECT_ROOT
+    / "03_models"
+    / "biogeme-logit"
+    / "results"
+    / "10_interannual_osm"
+    / "pooled_2024_2025-biogeme-sample2pct"
+)
+
+
+def load_result(results_dir: Path, model_name: str) -> dict:
+    params_path = results_dir / f"params_{model_name}.csv"
+    stats_path = results_dir / f"stats_{model_name}.csv"
+    params_df = pd.read_csv(params_path) if params_path.exists() else None
+    stats_df = pd.read_csv(stats_path) if stats_path.exists() else None
+    return {
+        "model_name": model_name,
+        "params": params_df,
+        "stats": stats_df,
+        "params_path": params_path,
+        "stats_path": stats_path,
+    }
+
+
+def stat_value(stats_df: pd.DataFrame | None, metric: str) -> float | None:
+    if stats_df is None or stats_df.empty:
+        return None
+    match = stats_df.loc[stats_df["metric"] == metric, "value"]
+    if match.empty:
+        return None
+    value = match.iloc[0]
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def converged_flag(stats_df: pd.DataFrame | None) -> str:
+    grad = stat_value(stats_df, "Final gradient norm")
+    if grad is None:
+        return "?"
+    return "sí" if grad <= CONVERGENCE_GRADIENT_THRESHOLD else "no"
+
+
+def pick_param_row(params_df: pd.DataFrame | None, token: str, alt_prefix: str) -> pd.Series | None:
+    if params_df is None:
+        return None
+    mask = params_df["Name"].str.contains(f"{alt_prefix}_{token}_pooled_2024_2025", regex=False)
+    match = params_df.loc[mask]
+    if match.empty:
+        return None
+    return match.iloc[0]
+
+
+def add_alt_metrics(out: dict, row: pd.Series | None, prefix: str) -> None:
+    if row is None:
+        out[f"beta_{prefix}"] = None
+        out[f"t_{prefix}"] = None
+        out[f"p_{prefix}"] = None
+        return
+    out[f"beta_{prefix}"] = float(row["Value"])
+    out[f"t_{prefix}"] = float(row["Robust t-stat."])
+    out[f"p_{prefix}"] = float(row["Robust p-value"])
+
+
+def build_param_summary(
+    model_name: str,
+    results_dir: Path,
+    token: str,
+    label: str,
+    extra: dict | None = None,
+) -> dict:
+    result = load_result(results_dir, model_name)
+    stats_df = result["stats"]
+    out = {
+        "variable": label,
+        "model_name": model_name,
+        "ll": stat_value(stats_df, "Final log likelihood"),
+        "aic": stat_value(stats_df, "Akaike Information Criterion"),
+        "gradient": stat_value(stats_df, "Final gradient norm"),
+        "converge": converged_flag(stats_df),
+    }
+    add_alt_metrics(out, pick_param_row(result["params"], token, "B_QR_RED"), "qr_red")
+    add_alt_metrics(out, pick_param_row(result["params"], token, "B_QR_OTHER"), "qr_other")
+    if extra:
+        out.update(extra)
+    return out
+
+
+def fmt_numeric(df: pd.DataFrame, cols: list[str], digits: int = 3) -> pd.DataFrame:
+    out = df.copy()
+    for col in cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(digits)
+    return out
+
+
+def sample_label(results_dir: Path) -> str:
+    return results_dir.name
+
+
+def build_stability_row(
+    display_name: str,
+    model_name: str,
+    results_dir: Path,
+    tokens: list[tuple[str, str]],
+) -> dict:
+    result = load_result(results_dir, model_name)
+    row = {
+        "modelo": display_name,
+        "sample": sample_label(results_dir),
+    }
+    for token, short in tokens:
+        red = pick_param_row(result["params"], token, "B_QR_RED")
+        other = pick_param_row(result["params"], token, "B_QR_OTHER")
+        row[f"{short}_qr_red"] = None if red is None else float(red["Value"])
+        row[f"{short}_qr_other"] = None if other is None else float(other["Value"])
+    return row
+```
+
+## 3) Baseline contextual de transporte
+
+```{python}
+#| label: transport-baseline-summary
+print("label: transport-baseline-summary")
+transport_specs = [
+    ("LOG_BUS_STOP_DENSITY", "LOG_BUS_STOP_DENSITY"),
+    ("LOG_BUS_LINE_COUNT", "LOG_BUS_LINE_COUNT"),
+    ("LOG_METRO_LINE_COUNT", "LOG_METRO_LINE_COUNT"),
+]
+
+transport_rows = []
+for label, token in transport_specs:
+    transport_rows.append(
+        build_param_summary(
+            model_name="mnl_enriched_interannual_bus_plus_metro_line",
+            results_dir=RESULTS_07,
+            token=token,
+            label=label,
+        )
+    )
+
+df_transport = fmt_numeric(
+    pd.DataFrame(transport_rows)[
+        [
+            "variable",
+            "beta_qr_red",
+            "t_qr_red",
+            "p_qr_red",
+            "beta_qr_other",
+            "t_qr_other",
+            "p_qr_other",
+        ]
+    ],
+    [
+        "beta_qr_red",
+        "t_qr_red",
+        "p_qr_red",
+        "beta_qr_other",
+        "t_qr_other",
+        "p_qr_other",
+    ],
+)
+
+transport_stats = load_result(
+    RESULTS_07, "mnl_enriched_interannual_bus_plus_metro_line"
+)["stats"]
+df_transport
+```
+
+```{python}
+#| label: transport-baseline-stats
+print("label: transport-baseline-stats")
+df_transport_stats = pd.DataFrame(
+    [
+        {
+            "sample_size": stat_value(transport_stats, "Sample size"),
+            "ll": stat_value(transport_stats, "Final log likelihood"),
+            "aic": stat_value(transport_stats, "Akaike Information Criterion"),
+            "gradient": stat_value(transport_stats, "Final gradient norm"),
+            "converge": converged_flag(transport_stats),
+        }
+    ]
+)
+fmt_numeric(df_transport_stats, ["sample_size", "ll", "aic", "gradient"], digits=1)
+```
+
+**Lectura**
+
+- El baseline contextual retenido en esta rama es:
+  - `LOG_BUS_STOP_DENSITY`
+  - `LOG_BUS_LINE_COUNT`
+  - `LOG_METRO_LINE_COUNT`
+- `LOG_BUS_STOP_DENSITY` quedó negativa en `QR_RED` y `QR_OTHER`.
+- `LOG_BUS_LINE_COUNT` quedó positiva en `QR_RED` y `QR_OTHER`.
+- `LOG_METRO_LINE_COUNT` sobrevivió mejor que `METRO_STATION_DENSITY` como proxy metro parsimoniosa.
+
+## 4) Screening Censo / microdata
+
+### Variables evaluadas
+
+- Capital humano / educación:
+  - `prom_escolaridad18`
+  - `share_cine18_universitaria_micro`
+  - `share_cine18_universitaria_o_mas_micro`
+  - `share_cine18_postgrado_micro`
+  - `share_cine18_terciaria_corta_micro`
+- Conectividad y equipamiento del hogar:
+  - `share_internet`
+  - `share_serv_compu`
+  - `share_serv_tel_movil`
+- Vulnerabilidad y estructura social:
+  - `share_discapacidad`
+  - `share_analfabet`
+  - `share_hacinamiento`
+  - `share_inmigrantes`
+  - `prom_edad`
+
+```{python}
+#| label: censo-univariate-summary
+print("label: censo-univariate-summary")
+censo_univariate_specs = [
+    (
+        "mnl_interannual_micro_share_cine18_universitaria",
+        RESULTS_08_UNIV,
+        "SHARE_CINE18_UNIVERSITARIA_MICRO_Z",
+        "share_cine18_universitaria_micro",
+    ),
+    (
+        "mnl_interannual_micro_share_cine18_universitaria_o_mas",
+        RESULTS_08_UNIV,
+        "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z",
+        "share_cine18_universitaria_o_mas_micro",
+    ),
+    (
+        "mnl_interannual_censo_prom_escolaridad18",
+        RESULTS_08_UNIV,
+        "PROM_ESCOLARIDAD18_Z",
+        "prom_escolaridad18",
+    ),
+    (
+        "mnl_interannual_micro_share_cine18_postgrado",
+        RESULTS_08_UNIV,
+        "SHARE_CINE18_POSTGRADO_MICRO_Z",
+        "share_cine18_postgrado_micro",
+    ),
+    (
+        "mnl_interannual_micro_share_cine18_terciaria_corta",
+        RESULTS_08_UNIV,
+        "SHARE_CINE18_TERCIARIA_CORTA_MICRO_Z",
+        "share_cine18_terciaria_corta_micro",
+    ),
+    (
+        "mnl_interannual_censo_share_internet",
+        RESULTS_08_UNIV,
+        "SHARE_INTERNET_Z",
+        "share_internet",
+    ),
+    (
+        "mnl_interannual_censo_share_serv_compu",
+        RESULTS_08_UNIV,
+        "SHARE_SERV_COMPU_Z",
+        "share_serv_compu",
+    ),
+    (
+        "mnl_interannual_censo_share_serv_tel_movil",
+        RESULTS_08_UNIV,
+        "SHARE_SERV_TEL_MOVIL_Z",
+        "share_serv_tel_movil",
+    ),
+    (
+        "mnl_interannual_censo_share_discapacidad",
+        RESULTS_08_UNIV,
+        "SHARE_DISCAPACIDAD_Z",
+        "share_discapacidad",
+    ),
+    (
+        "mnl_interannual_censo_share_analfabet",
+        RESULTS_08_UNIV,
+        "SHARE_ANALFABET_Z",
+        "share_analfabet",
+    ),
+    (
+        "mnl_interannual_censo_share_hacinamiento",
+        RESULTS_08_UNIV,
+        "SHARE_HACINAMIENTO_Z",
+        "share_hacinamiento",
+    ),
+    (
+        "mnl_interannual_censo_share_inmigrantes",
+        RESULTS_08_UNIV,
+        "SHARE_INMIGRANTES_Z",
+        "share_inmigrantes",
+    ),
+    (
+        "mnl_interannual_censo_prom_edad",
+        RESULTS_08_UNIV,
+        "PROM_EDAD_Z",
+        "prom_edad",
+    ),
+]
+
+censo_uni_rows = [
+    build_param_summary(model_name, results_dir, token, label)
+    for model_name, results_dir, token, label in censo_univariate_specs
+]
+
+df_censo_uni = fmt_numeric(
+    pd.DataFrame(censo_uni_rows)
+    .sort_values("ll", ascending=False)
+    [
+        [
+            "variable",
+            "ll",
+            "gradient",
+            "converge",
+            "beta_qr_red",
+            "t_qr_red",
+            "p_qr_red",
+            "beta_qr_other",
+            "t_qr_other",
+            "p_qr_other",
+        ]
+    ],
+    [
+        "ll",
+        "gradient",
+        "beta_qr_red",
+        "t_qr_red",
+        "p_qr_red",
+        "beta_qr_other",
+        "t_qr_other",
+        "p_qr_other",
+    ],
+)
+df_censo_uni
+```
+
+```{python}
+#| label: censo-multivariate-summary
+print("label: censo-multivariate-summary")
+censo_multi_specs = [
+    (
+        "mnl_interannual_censo_full",
+        RESULTS_08_UNIV,
+        "Full censo base",
+        "prom_edad, prom_escolaridad18, share_inmigrantes, share_hacinamiento",
+    ),
+    (
+        "mnl_interannual_censo_micro_full_expanded",
+        RESULTS_08_MULTI,
+        "Full expanded",
+        "share_hacinamiento, share_internet, share_serv_compu, share_serv_tel_movil, share_discapacidad, share_analfabet, share_inmigrantes, share_cine18_universitaria_o_mas_micro",
+    ),
+    (
+        "mnl_interannual_censo_micro_full_parsimonious",
+        RESULTS_08_MULTI,
+        "Parsimonioso",
+        "share_cine18_universitaria_o_mas_micro, share_hacinamiento, share_discapacidad, share_inmigrantes",
+    ),
+    (
+        "mnl_interannual_censo_micro_full_parsimonious_no_discapacidad",
+        RESULTS_08_MULTI,
+        "Parsimonioso sin discapacidad",
+        "share_cine18_universitaria_o_mas_micro, share_hacinamiento, share_inmigrantes",
+    ),
+]
+
+censo_multi_rows = []
+for model_name, results_dir, label, variables in censo_multi_specs:
+    result = load_result(results_dir, model_name)
+    stats_df = result["stats"]
+    censo_multi_rows.append(
+        {
+            "modelo": label,
+            "sample": results_dir.name,
+            "variables": variables,
+            "ll": stat_value(stats_df, "Final log likelihood"),
+            "aic": stat_value(stats_df, "Akaike Information Criterion"),
+            "gradient": stat_value(stats_df, "Final gradient norm"),
+            "converge": converged_flag(stats_df),
+        }
+    )
+
+df_censo_multi = fmt_numeric(
+    pd.DataFrame(censo_multi_rows),
+    ["ll", "aic", "gradient"],
+)
+df_censo_multi["n_variables"] = df_censo_multi["variables"].str.count(",") + 1
+df_censo_multi["variables"] = df_censo_multi["variables"].str.replace(", ", ",\n", regex=False)
+
+with pd.option_context(
+    "display.max_colwidth", None,
+    "display.max_columns", None,
+    "display.width", 2000,
+):
+    display(
+        df_censo_multi[
+            [
+                "modelo",
+                "sample",
+                "n_variables",
+                "variables",
+                "ll",
+                "aic",
+                "gradient",
+                "converge",
+            ]
+        ]
+    )
+```
+
+```{python}
+#| label: censo-multivariate-params
+print("label: censo-multivariate-params")
+censo_multi_param_specs = [
+    (
+        "Full expanded",
+        "mnl_interannual_censo_micro_full_expanded",
+        RESULTS_08_MULTI,
+        [
+            ("share_hacinamiento", "SHARE_HACINAMIENTO_Z"),
+            ("share_internet", "SHARE_INTERNET_Z"),
+            ("share_serv_compu", "SHARE_SERV_COMPU_Z"),
+            ("share_serv_tel_movil", "SHARE_SERV_TEL_MOVIL_Z"),
+            ("share_discapacidad", "SHARE_DISCAPACIDAD_Z"),
+            ("share_analfabet", "SHARE_ANALFABET_Z"),
+            ("share_inmigrantes", "SHARE_INMIGRANTES_Z"),
+            ("share_cine18_universitaria_o_mas_micro", "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z"),
+        ],
+    ),
+    (
+        "Parsimonioso",
+        "mnl_interannual_censo_micro_full_parsimonious",
+        RESULTS_08_MULTI,
+        [
+            ("share_cine18_universitaria_o_mas_micro", "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z"),
+            ("share_hacinamiento", "SHARE_HACINAMIENTO_Z"),
+            ("share_discapacidad", "SHARE_DISCAPACIDAD_Z"),
+            ("share_inmigrantes", "SHARE_INMIGRANTES_Z"),
+        ],
+    ),
+    (
+        "Parsimonioso sin discapacidad",
+        "mnl_interannual_censo_micro_full_parsimonious_no_discapacidad",
+        RESULTS_08_MULTI,
+        [
+            ("share_cine18_universitaria_o_mas_micro", "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z"),
+            ("share_hacinamiento", "SHARE_HACINAMIENTO_Z"),
+            ("share_inmigrantes", "SHARE_INMIGRANTES_Z"),
+        ],
+    ),
+]
+
+censo_multi_param_rows = []
+for model_label, model_name, results_dir, variables in censo_multi_param_specs:
+    for variable_label, token in variables:
+        row = build_param_summary(model_name, results_dir, token, variable_label)
+        censo_multi_param_rows.append(
+            {
+                "modelo": model_label,
+                "variable": variable_label,
+                "beta_qr_red": row["beta_qr_red"],
+                "t_qr_red": row["t_qr_red"],
+                "p_qr_red": row["p_qr_red"],
+                "beta_qr_other": row["beta_qr_other"],
+                "t_qr_other": row["t_qr_other"],
+                "p_qr_other": row["p_qr_other"],
+            }
+        )
+
+df_censo_multi_params = fmt_numeric(
+    pd.DataFrame(censo_multi_param_rows),
+    [
+        "beta_qr_red",
+        "t_qr_red",
+        "p_qr_red",
+        "beta_qr_other",
+        "t_qr_other",
+        "p_qr_other",
+    ],
+)
+df_censo_multi_params
+```
+
+**Lectura**
+
+- En univariados, las variables con mejor evidencia fueron:
+  - `share_cine18_universitaria_micro`
+  - `share_cine18_universitaria_o_mas_micro`
+  - `prom_escolaridad18`
+  - `share_cine18_postgrado_micro`
+- `share_cine18_terciaria_corta_micro` no funcionó como proxy principal de capital humano alto.
+- `share_analfabet`, `prom_edad` y `share_inmigrantes` quedaron debilitadas por convergencia o lectura menos limpia.
+- En multivariados `Censo`, sí hubo shortlist y variantes múltiples, pero no todas son directamente comparables con los univariados porque algunas quedaron en `sample2pct`.
+
+## 5) Screening OSM
+
+### Variables evaluadas
+
+- Primera ronda:
+  - `osm_leisure_park`
+  - `osm_amenity_school`
+  - `osm_shop_supermarket`
+  - `osm_amenity_restaurant`
+  - `osm_shop_mall`
+  - `osm_amenity_university`
+  - `osm_amenity_pharmacy`
+- Segunda ronda:
+  - `osm_shop_convenience`
+  - `osm_leisure_playground`
+  - `osm_office_company`
+  - `osm_leisure_sports_centre`
+  - `osm_office_government`
+
+```{python}
+#| label: osm-univariate-summary
+print("label: osm-univariate-summary")
+osm_univariate_specs = [
+    ("mnl_interannual_osm_park", "OSM_LEISURE_PARK_DENSITY_KM2_Z", "osm_leisure_park"),
+    ("mnl_interannual_osm_school", "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z", "osm_amenity_school"),
+    ("mnl_interannual_osm_supermarket", "OSM_SHOP_SUPERMARKET_DENSITY_KM2_Z", "osm_shop_supermarket"),
+    ("mnl_interannual_osm_restaurant", "OSM_AMENITY_RESTAURANT_DENSITY_KM2_Z", "osm_amenity_restaurant"),
+    ("mnl_interannual_osm_mall", "OSM_SHOP_MALL_DENSITY_KM2_Z", "osm_shop_mall"),
+    ("mnl_interannual_osm_university", "OSM_AMENITY_UNIVERSITY_DENSITY_KM2_Z", "osm_amenity_university"),
+    ("mnl_interannual_osm_pharmacy", "OSM_AMENITY_PHARMACY_DENSITY_KM2_Z", "osm_amenity_pharmacy"),
+    ("mnl_interannual_osm_convenience", "OSM_SHOP_CONVENIENCE_DENSITY_KM2_Z", "osm_shop_convenience"),
+    ("mnl_interannual_osm_playground", "OSM_LEISURE_PLAYGROUND_DENSITY_KM2_Z", "osm_leisure_playground"),
+    ("mnl_interannual_osm_office_company", "OSM_OFFICE_COMPANY_DENSITY_KM2_Z", "osm_office_company"),
+    ("mnl_interannual_osm_sports_centre", "OSM_LEISURE_SPORTS_CENTRE_DENSITY_KM2_Z", "osm_leisure_sports_centre"),
+    ("mnl_interannual_osm_office_government", "OSM_OFFICE_GOVERNMENT_DENSITY_KM2_Z", "osm_office_government"),
+]
+
+osm_uni_rows = [
+    build_param_summary(model_name, RESULTS_10, token, label)
+    for model_name, token, label in osm_univariate_specs
+]
+
+df_osm_uni = fmt_numeric(
+    pd.DataFrame(osm_uni_rows)
+    .sort_values("ll", ascending=False)
+    [
+        [
+            "variable",
+            "ll",
+            "aic",
+            "gradient",
+            "converge",
+            "beta_qr_red",
+            "t_qr_red",
+            "p_qr_red",
+            "beta_qr_other",
+            "t_qr_other",
+            "p_qr_other",
+        ]
+    ],
+    [
+        "ll",
+        "aic",
+        "gradient",
+        "beta_qr_red",
+        "t_qr_red",
+        "p_qr_red",
+        "beta_qr_other",
+        "t_qr_other",
+        "p_qr_other",
+    ],
+)
+df_osm_uni
+```
+
+```{python}
+#| label: osm-multivariate-summary
+print("label: osm-multivariate-summary")
+osm_multi_specs = [
+    (
+        "mnl_interannual_osm_park_school",
+        "Par inicial park + school",
+        "park, school",
+    ),
+    (
+        "mnl_interannual_osm_park_school_supermarket",
+        "Parque + school + supermarket",
+        "park, school, supermarket",
+    ),
+    (
+        "mnl_interannual_osm_school_supermarket",
+        "school + supermarket",
+        "school, supermarket",
+    ),
+    (
+        "mnl_interannual_osm_school_supermarket_restaurant",
+        "school + supermarket + restaurant",
+        "school, supermarket, restaurant",
+    ),
+    (
+        "mnl_interannual_osm_school_supermarket_mall",
+        "school + supermarket + mall",
+        "school, supermarket, mall",
+    ),
+    (
+        "mnl_interannual_osm_school_supermarket_mall_university",
+        "school + supermarket + mall + university",
+        "school, supermarket, mall, university",
+    ),
+    (
+        "mnl_interannual_osm_school_supermarket_mall_university_pharmacy",
+        "school + supermarket + mall + university + pharmacy",
+        "school, supermarket, mall, university, pharmacy",
+    ),
+    (
+        "mnl_interannual_osm_school_supermarket_restaurant_mall",
+        "school + supermarket + restaurant + mall",
+        "school, supermarket, restaurant, mall",
+    ),
+    (
+        "mnl_interannual_osm_school_supermarket_restaurant_mall_university",
+        "school + supermarket + restaurant + mall + university",
+        "school, supermarket, restaurant, mall, university",
+    ),
+    (
+        "mnl_interannual_osm_school_mall",
+        "school + mall",
+        "school, mall",
+    ),
+    (
+        "mnl_interannual_osm_supermarket_mall",
+        "supermarket + mall",
+        "supermarket, mall",
+    ),
+    (
+        "mnl_interannual_osm_full",
+        "Full OSM primera ronda",
+        "park, school, supermarket, restaurant, mall, university, pharmacy",
+    ),
+]
+
+osm_multi_rows = []
+for model_name, label, variables in osm_multi_specs:
+    result = load_result(RESULTS_10, model_name)
+    stats_df = result["stats"]
+    if stats_df is None:
+        continue
+    osm_multi_rows.append(
+        {
+            "modelo": label,
+            "variables": variables,
+            "ll": stat_value(stats_df, "Final log likelihood"),
+            "aic": stat_value(stats_df, "Akaike Information Criterion"),
+            "gradient": stat_value(stats_df, "Final gradient norm"),
+            "converge": converged_flag(stats_df),
+        }
+    )
+
+df_osm_multi = fmt_numeric(
+    pd.DataFrame(osm_multi_rows).sort_values("ll", ascending=False),
+    ["ll", "aic", "gradient"],
+)
+df_osm_multi["n_variables"] = df_osm_multi["variables"].str.count(",") + 1
+df_osm_multi["variables"] = df_osm_multi["variables"].str.replace(", ", ",\n", regex=False)
+
+with pd.option_context(
+    "display.max_colwidth", None,
+    "display.max_columns", None,
+    "display.width", 2000,
+):
+    display(
+        df_osm_multi[
+            [
+                "modelo",
+                "n_variables",
+                "variables",
+                "ll",
+                "aic",
+                "gradient",
+                "converge",
+            ]
+        ]
+    )
+```
+
+```{python}
+#| label: osm-multivariate-params
+print("label: osm-multivariate-params")
+osm_multi_param_specs = [
+    (
+        "park + school",
+        "mnl_interannual_osm_park_school",
+        [
+            ("osm_leisure_park", "OSM_LEISURE_PARK_DENSITY_KM2_Z"),
+            ("osm_amenity_school", "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z"),
+        ],
+    ),
+    (
+        "school + supermarket",
+        "mnl_interannual_osm_school_supermarket",
+        [
+            ("osm_amenity_school", "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z"),
+            ("osm_shop_supermarket", "OSM_SHOP_SUPERMARKET_DENSITY_KM2_Z"),
+        ],
+    ),
+    (
+        "school + supermarket + restaurant",
+        "mnl_interannual_osm_school_supermarket_restaurant",
+        [
+            ("osm_amenity_school", "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z"),
+            ("osm_shop_supermarket", "OSM_SHOP_SUPERMARKET_DENSITY_KM2_Z"),
+            ("osm_amenity_restaurant", "OSM_AMENITY_RESTAURANT_DENSITY_KM2_Z"),
+        ],
+    ),
+    (
+        "school + supermarket + mall",
+        "mnl_interannual_osm_school_supermarket_mall",
+        [
+            ("osm_amenity_school", "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z"),
+            ("osm_shop_supermarket", "OSM_SHOP_SUPERMARKET_DENSITY_KM2_Z"),
+            ("osm_shop_mall", "OSM_SHOP_MALL_DENSITY_KM2_Z"),
+        ],
+    ),
+    (
+        "school + mall",
+        "mnl_interannual_osm_school_mall",
+        [
+            ("osm_amenity_school", "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z"),
+            ("osm_shop_mall", "OSM_SHOP_MALL_DENSITY_KM2_Z"),
+        ],
+    ),
+    (
+        "supermarket + mall",
+        "mnl_interannual_osm_supermarket_mall",
+        [
+            ("osm_shop_supermarket", "OSM_SHOP_SUPERMARKET_DENSITY_KM2_Z"),
+            ("osm_shop_mall", "OSM_SHOP_MALL_DENSITY_KM2_Z"),
+        ],
+    ),
+    (
+        "Full OSM primera ronda",
+        "mnl_interannual_osm_full",
+        [
+            ("osm_leisure_park", "OSM_LEISURE_PARK_DENSITY_KM2_Z"),
+            ("osm_amenity_school", "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z"),
+            ("osm_shop_supermarket", "OSM_SHOP_SUPERMARKET_DENSITY_KM2_Z"),
+            ("osm_amenity_restaurant", "OSM_AMENITY_RESTAURANT_DENSITY_KM2_Z"),
+            ("osm_shop_mall", "OSM_SHOP_MALL_DENSITY_KM2_Z"),
+            ("osm_amenity_university", "OSM_AMENITY_UNIVERSITY_DENSITY_KM2_Z"),
+            ("osm_amenity_pharmacy", "OSM_AMENITY_PHARMACY_DENSITY_KM2_Z"),
+        ],
+    ),
+]
+
+osm_multi_param_rows = []
+for model_label, model_name, variables in osm_multi_param_specs:
+    for variable_label, token in variables:
+        row = build_param_summary(model_name, RESULTS_10, token, variable_label)
+        osm_multi_param_rows.append(
+            {
+                "modelo": model_label,
+                "variable": variable_label,
+                "beta_qr_red": row["beta_qr_red"],
+                "t_qr_red": row["t_qr_red"],
+                "p_qr_red": row["p_qr_red"],
+                "beta_qr_other": row["beta_qr_other"],
+                "t_qr_other": row["t_qr_other"],
+                "p_qr_other": row["p_qr_other"],
+            }
+        )
+
+df_osm_multi_params = fmt_numeric(
+    pd.DataFrame(osm_multi_param_rows),
+    [
+        "beta_qr_red",
+        "t_qr_red",
+        "p_qr_red",
+        "beta_qr_other",
+        "t_qr_other",
+        "p_qr_other",
+    ],
+)
+df_osm_multi_params
+```
+
+**Lectura**
+
+- En univariados OSM, las variables con mejor evidencia econométrica fueron:
+  - `osm_amenity_school`
+  - `osm_shop_supermarket`
+  - `osm_leisure_sports_centre`
+  - `osm_leisure_playground`
+- Variables con señal, pero más cautela:
+  - `osm_shop_mall`
+  - `osm_amenity_university`
+  - `osm_amenity_pharmacy`
+  - `osm_shop_convenience`
+  - `osm_office_company`
+  - `osm_office_government`
+- En multivariados OSM, los bloques se volvieron inestables rápido:
+  - `school + supermarket` fue el mejor par, pero con gradiente alto;
+  - `school + mall` y `supermarket + mall` no quedaron usables;
+  - los progresivos largos tampoco consolidaron un bloque OSM limpio.
+
+## 6) Estabilidad del baseline al agregar controles territoriales
+
+```{python}
+#| label: baseline-contextual-stability
+print("label: baseline-contextual-stability")
+stability_models = [
+    ("Baseline transporte", "mnl_enriched_interannual_bus_plus_metro_line", RESULTS_07),
+    (
+        "share_cine18_universitaria_o_mas_micro",
+        "mnl_interannual_micro_share_cine18_universitaria_o_mas",
+        RESULTS_08_UNIV,
+    ),
+    (
+        "share_cine18_postgrado_micro",
+        "mnl_interannual_micro_share_cine18_postgrado",
+        RESULTS_08_UNIV,
+    ),
+    (
+        "osm_amenity_school",
+        "mnl_interannual_osm_school",
+        RESULTS_10,
+    ),
+    (
+        "osm_leisure_sports_centre",
+        "mnl_interannual_osm_sports_centre",
+        RESULTS_10,
+    ),
+    (
+        "Parsimonioso Censo",
+        "mnl_interannual_censo_micro_full_parsimonious",
+        RESULTS_08_MULTI,
+    ),
+    (
+        "OSM full primera ronda",
+        "mnl_interannual_osm_full",
+        RESULTS_10,
+    ),
+]
+
+contextual_tokens = [
+    ("LOG_DEMAND", "log_demand"),
+    ("LOG_BUS_STOP_DENSITY", "log_bus_stop_density"),
+    ("LOG_BUS_LINE_COUNT", "log_bus_line_count"),
+    ("LOG_METRO_LINE_COUNT", "log_metro_line_count"),
+]
+
+contextual_rows = [
+    build_stability_row(display_name, model_name, results_dir, contextual_tokens)
+    for display_name, model_name, results_dir in stability_models
+]
+
+df_baseline_contextual_stability = fmt_numeric(
+    pd.DataFrame(contextual_rows),
+    [
+        "log_demand_qr_red",
+        "log_demand_qr_other",
+        "log_bus_stop_density_qr_red",
+        "log_bus_stop_density_qr_other",
+        "log_bus_line_count_qr_red",
+        "log_bus_line_count_qr_other",
+        "log_metro_line_count_qr_red",
+        "log_metro_line_count_qr_other",
+    ],
+)
+df_baseline_contextual_stability
+```
+
+```{python}
+#| label: baseline-behavioral-stability
+print("label: baseline-behavioral-stability")
+behavioral_tokens = [
+    ("T_VEH", "t_veh"),
+    ("T_ESPERA_INI", "t_espera_ini"),
+    ("T_ESPERA_TRASB", "t_espera_trasb"),
+    ("N_TRASB", "n_trasb"),
+]
+
+behavioral_rows = [
+    build_stability_row(display_name, model_name, results_dir, behavioral_tokens)
+    for display_name, model_name, results_dir in stability_models
+]
+
+df_baseline_behavioral_stability = fmt_numeric(
+    pd.DataFrame(behavioral_rows),
+    [
+        "t_veh_qr_red",
+        "t_veh_qr_other",
+        "t_espera_ini_qr_red",
+        "t_espera_ini_qr_other",
+        "t_espera_trasb_qr_red",
+        "t_espera_trasb_qr_other",
+        "n_trasb_qr_red",
+        "n_trasb_qr_other",
+    ],
+)
+df_baseline_behavioral_stability
+```
+
+**Lectura**
+
+- Estas tablas no preguntan si la nueva variable “sirve”; preguntan si el baseline se mantiene razonablemente estable cuando se agregan controles territoriales.
+- La tabla contextual permite ver si las variables nuevas reabsorben señal de:
+  - `LOG_DEMAND`
+  - `LOG_BUS_STOP_DENSITY`
+  - `LOG_BUS_LINE_COUNT`
+  - `LOG_METRO_LINE_COUNT`
+- La tabla comportamental permite ver si cambian de forma importante los parámetros principales de utilidad:
+  - `T_VEH`
+  - `T_ESPERA_INI`
+  - `T_ESPERA_TRASB`
+  - `N_TRASB`
+- `OSM full primera ronda` se incluye como stress test del bloque built environment, no como especificación final recomendada.
+
+## 7) Puente breve con ML / SHAP
+
+```{python}
+#| label: ml-shortlist-bridge
+print("label: ml-shortlist-bridge")
+df_ml_shortlist = pd.DataFrame(
+    [
+        {"variable": "share_cine18_postgrado_micro", "shap_r_spatial_shortlist": 0.074255},
+        {"variable": "osm_amenity_university", "shap_r_spatial_shortlist": 0.029954},
+        {"variable": "share_discapacidad", "shap_r_spatial_shortlist": 0.022553},
+        {"variable": "share_cine18_universitaria_o_mas_micro", "shap_r_spatial_shortlist": 0.020094},
+        {"variable": "share_inmigrantes", "shap_r_spatial_shortlist": 0.014540},
+        {"variable": "prom_edad", "shap_r_spatial_shortlist": 0.013512},
+        {"variable": "osm_office_company", "shap_r_spatial_shortlist": 0.013216},
+    ]
+)
+fmt_numeric(df_ml_shortlist, ["shap_r_spatial_shortlist"], digits=6)
+```
+
+**Lectura**
+
+- El frente `ML/SHAP` no reemplaza este screening econométrico.
+- Sí aporta una priorización relativa cuando las variables compiten juntas y frente a `x/y`.
+- La shortlist compacta retenida allá fue:
+  - `share_cine18_postgrado_micro`
+  - `share_cine18_universitaria_o_mas_micro`
+  - `osm_amenity_university`
+  - `share_discapacidad`
+  - `share_inmigrantes`
+  - `prom_edad`
+  - `osm_office_company`
+
+## 8) Conclusiones
+
+### Qué quedó mejor posicionado en esta rama
+
+- Baseline contextual de transporte:
+  - `LOG_BUS_STOP_DENSITY`
+  - `LOG_BUS_LINE_COUNT`
+  - `LOG_METRO_LINE_COUNT`
+- Censo / microdata:
+  - `share_cine18_universitaria_o_mas_micro`
+  - `prom_escolaridad18`
+  - `share_cine18_postgrado_micro`
+- OSM:
+  - `osm_amenity_school`
+  - `osm_shop_supermarket`
+  - `osm_leisure_sports_centre`
+  - `osm_leisure_playground`
+
+### Qué quedó en observación con cautela
+
+- `share_discapacidad`
+- `share_inmigrantes`
+- `prom_edad`
+- `osm_shop_mall`
+- `osm_amenity_university`
+- `osm_amenity_pharmacy`
+- `osm_shop_convenience`
+- `osm_office_company`
+- `osm_office_government`
+
+### Cierre metodológico
+
+- Este repo deja cerrada una historia econométrica principal:
+  - baseline contextual de transporte ya retenido;
+  - screening `Censo` y `OSM` con lectura de signo, significancia y estabilidad numérica.
+- El frente `ML/SHAP` agrega una historia complementaria:
+  - qué variables sobreviven mejor cuando compiten juntas;
+  - y cuáles parecen capturar señal territorial más robusta una vez que se controla por geografía residual.

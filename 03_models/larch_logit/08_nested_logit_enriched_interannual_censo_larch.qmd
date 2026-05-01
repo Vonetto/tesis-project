@@ -1,0 +1,1159 @@
+---
+title: "OD Buffers Enriched Interannual + Censo (Larch)"
+format: html
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  message: true
+---
+
+Este notebook replica en **Larch 6** el notebook [08_nested_logit_enriched_interannual_censo.qmd](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/08_nested_logit_enriched_interannual_censo.qmd), manteniendo:
+
+- la baseline transport-only:
+  - `LOG_BUS_STOP_DENSITY`
+  - `LOG_BUS_LINE_COUNT`
+  - `LOG_METRO_LINE_COUNT`
+- el bloque Censo de origen:
+  - `prom_edad`
+  - `prom_escolaridad18`
+  - `share_inmigrantes`
+  - `share_hacinamiento`
+  - y un bloque adicional de screening:
+    - `share_internet`
+    - `share_serv_compu`
+    - `share_serv_tel_movil`
+    - `share_discapacidad`
+    - `share_analfabet`
+
+::: {.callout-note}
+Alcance de esta versión:
+
+- **solo `MNL`**;
+- orden de estimación:
+  - baseline
+  - bloque Censo full
+  - desgloses de una variable
+  - variante `prom_escolaridad18 + share_hacinamiento`
+- usa los mismos artifacts `model-ready` y la misma lógica de sampleo/estandarización que `08`.
+:::
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+
+import gc
+import os
+import sys
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import polars as pl
+from scipy.stats import norm
+
+import larch as lx
+from larch import P, X
+
+
+def resolve_project_root(start: Path | None = None) -> Path:
+    current = (start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / "config").exists() and (candidate / "lib").exists():
+            return candidate
+    raise RuntimeError("No se pudo resolver PROJECT_ROOT desde el notebook actual.")
+
+
+def estimation_sample_tag(fraction: float | None) -> str:
+    return "full" if fraction is None else f"sample{int(round(fraction * 100))}pct"
+
+
+PROJECT_ROOT = resolve_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lib.censo2024_zona777 import impute_missing_by_neighbor_median
+from lib.interannual_offer_context import assert_left_join_preserves_rows, ensure_unique_keys
+from lib.od_buffers_nested_logit import read_parquet_portable
+
+print("✅ Setup listo")
+print("PROJECT_ROOT:", PROJECT_ROOT)
+print("Larch version:", lx.__version__)
+```
+
+## 2) Config
+
+```{python}
+#| label: config
+print("label: config")
+
+MODEL_PARTITION = "pooled_2024_2025"
+SAMPLE_FRACTION_ESTIMATION = float(os.environ.get("LARCH_SAMPLE_FRACTION", "0.15"))
+ESTIMATION_SAMPLE_TAG = estimation_sample_tag(SAMPLE_FRACTION_ESTIMATION)
+
+SEED = 42
+LARCH_METHOD = os.environ.get("LARCH_METHOD", "slsqp").lower()
+LARCH_MAXITER = int(os.environ.get("LARCH_MAXITER", "500"))
+LARCH_FTOL = float(os.environ.get("LARCH_FTOL", "1e-12"))
+LARCH_OPTIONS = {"maxiter": LARCH_MAXITER, "ftol": LARCH_FTOL}
+LARCH_MAX_CAP = 20.0
+LARCH_FORCE_REBUILD_SAMPLE = os.environ.get("LARCH_FORCE_REBUILD_SAMPLE", "0").lower() in {"1", "true", "yes"}
+
+MODELS_DIR = PROJECT_ROOT / "03_models"
+INTERANNUAL_ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "interannual_enriched"
+INTERANNUAL_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+POOLED_TRIPS_CONTEXT_PATH = INTERANNUAL_ARTIFACTS_DIR / "trips_context_pooled_2024_2025.parquet"
+
+BASELINE_ESTIMATION_SAMPLE_PATH = (
+    INTERANNUAL_ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}.parquet"
+)
+CENSO_FINAL_PATH = (
+    PROJECT_ROOT / "02_eda" / "tmp" / "censo2024_zona777" / "censo2024_zona777_agg_final.parquet"
+)
+ZONAS777_SHP = Path(
+    "/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp"
+)
+
+OUT_CENSO_MODEL_READY = INTERANNUAL_ARTIFACTS_DIR / "censo2024_zona777_model_ready.parquet"
+OUT_CENSO_MODEL_READY_STD = (
+    INTERANNUAL_ARTIFACTS_DIR / f"censo2024_zona777_model_ready_{ESTIMATION_SAMPLE_TAG}.parquet"
+)
+OUT_ESTIMATION_SAMPLE_CENSO = (
+    INTERANNUAL_ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-censo4.parquet"
+)
+
+SOCIO_RAW_VARS = [
+    "prom_edad",
+    "prom_escolaridad18",
+    "share_inmigrantes",
+    "share_hacinamiento",
+]
+SOCIO_SECOND_ROUND_RAW_VARS = [
+    "share_internet",
+    "share_serv_compu",
+    "share_serv_tel_movil",
+    "share_discapacidad",
+    "share_analfabet",
+]
+SOCIO_ALL_RAW_VARS = SOCIO_RAW_VARS + SOCIO_SECOND_ROUND_RAW_VARS
+SOCIO_Z_VARS = [f"{c}_z" for c in SOCIO_RAW_VARS]
+SOCIO_SECOND_ROUND_Z_VARS = [f"{c}_z" for c in SOCIO_SECOND_ROUND_RAW_VARS]
+SOCIO_ALL_Z_VARS = [f"{c}_z" for c in SOCIO_ALL_RAW_VARS]
+SOCIO_PARAM_TAGS = {
+    "prom_edad_z": "PROM_EDAD_Z",
+    "prom_escolaridad18_z": "PROM_ESCOLARIDAD18_Z",
+    "share_inmigrantes_z": "SHARE_INMIGRANTES_Z",
+    "share_hacinamiento_z": "SHARE_HACINAMIENTO_Z",
+    "share_internet_z": "SHARE_INTERNET_Z",
+    "share_serv_compu_z": "SHARE_SERV_COMPU_Z",
+    "share_serv_tel_movil_z": "SHARE_SERV_TEL_MOVIL_Z",
+    "share_discapacidad_z": "SHARE_DISCAPACIDAD_Z",
+    "share_analfabet_z": "SHARE_ANALFABET_Z",
+}
+
+MODEL_NAME_MNL_BASELINE = "mnl_interannual_censo_baseline_larch"
+MODEL_NAME_MNL_CENSO_FULL = "mnl_interannual_censo_full_larch"
+MODEL_NAME_MNL_CENSO_PROM_EDAD = "mnl_interannual_censo_prom_edad_larch"
+MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18 = "mnl_interannual_censo_prom_escolaridad18_larch"
+MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES = "mnl_interannual_censo_share_inmigrantes_larch"
+MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO = "mnl_interannual_censo_share_hacinamiento_larch"
+MODEL_NAME_MNL_CENSO_SHARE_INTERNET = "mnl_interannual_censo_share_internet_larch"
+MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU = "mnl_interannual_censo_share_serv_compu_larch"
+MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL = "mnl_interannual_censo_share_serv_tel_movil_larch"
+MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD = "mnl_interannual_censo_share_discapacidad_larch"
+MODEL_NAME_MNL_CENSO_SHARE_ANALFABET = "mnl_interannual_censo_share_analfabet_larch"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET = "mnl_interannual_censo_escolaridad_internet_larch"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU = "mnl_interannual_censo_escolaridad_serv_compu_larch"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL = "mnl_interannual_censo_escolaridad_serv_tel_movil_larch"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD = "mnl_interannual_censo_escolaridad_discapacidad_larch"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET = "mnl_interannual_censo_escolaridad_analfabet_larch"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO = "mnl_interannual_censo_escolaridad_hacinamiento_larch"
+
+LARCH_RESULTS_ROOT = MODELS_DIR / "larch_logit" / "results" / "08_interannual_censo"
+LARCH_RESULTS_DIR = LARCH_RESULTS_ROOT / f"{MODEL_PARTITION}-larch-{ESTIMATION_SAMPLE_TAG}"
+LARCH_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+RESULT_PATHS = {
+    MODEL_NAME_MNL_BASELINE: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_BASELINE}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_BASELINE}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_FULL: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_FULL}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_FULL}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_PROM_EDAD: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_PROM_EDAD}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_PROM_EDAD}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_INTERNET: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_INTERNET}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_INTERNET}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_ANALFABET: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_ANALFABET}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_ANALFABET}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO: (
+        LARCH_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO}.csv",
+        LARCH_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO}.csv",
+    ),
+}
+
+print("BASELINE_ESTIMATION_SAMPLE_PATH:", BASELINE_ESTIMATION_SAMPLE_PATH)
+print("POOLED_TRIPS_CONTEXT_PATH:", POOLED_TRIPS_CONTEXT_PATH)
+print("OUT_CENSO_MODEL_READY:", OUT_CENSO_MODEL_READY)
+print("OUT_CENSO_MODEL_READY_STD:", OUT_CENSO_MODEL_READY_STD)
+print("OUT_ESTIMATION_SAMPLE_CENSO:", OUT_ESTIMATION_SAMPLE_CENSO)
+print("LARCH_RESULTS_DIR:", LARCH_RESULTS_DIR)
+print("SAMPLE_FRACTION_ESTIMATION:", SAMPLE_FRACTION_ESTIMATION)
+print("LARCH_METHOD:", LARCH_METHOD)
+print("LARCH_OPTIONS:", LARCH_OPTIONS)
+print("LARCH_MAX_CAP:", LARCH_MAX_CAP)
+print("LARCH_FORCE_REBUILD_SAMPLE:", LARCH_FORCE_REBUILD_SAMPLE)
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+
+MODEL_BASE_COLUMNS = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_NO_LAB",
+    "DUMMY_ANIO_2025",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+]
+
+
+def parse_sample_fraction_from_name(path: Path) -> float | None:
+    stem = path.stem
+    if "-sample" not in stem or not stem.endswith("pct"):
+        return None
+    try:
+        pct_str = stem.split("-sample", 1)[1].removesuffix("pct")
+        return int(pct_str) / 100
+    except Exception:
+        return None
+
+
+def materialize_baseline_sample_if_needed(
+    *,
+    target_path: Path,
+    target_fraction: float,
+    model_partition: str,
+    artifacts_dir: Path,
+    pooled_path: Path,
+    seed: int = 42,
+    force_rebuild: bool = False,
+) -> Path:
+    if force_rebuild and target_path.exists():
+        print(f"ℹ️ Rebuilding existing baseline sample: {target_path.name}")
+        target_path.unlink()
+    if target_path.exists():
+        return target_path
+
+    candidates = []
+    for p in artifacts_dir.glob(f"{model_partition}-estimation-sample*pct.parquet"):
+        if "-censo" in p.stem:
+            continue
+        frac = parse_sample_fraction_from_name(p)
+        if frac is not None and frac > target_fraction:
+            candidates.append((frac, p))
+
+    if not candidates:
+        if not pooled_path.exists():
+            available_samples = sorted(
+                p.name for p in artifacts_dir.glob(f"{model_partition}-estimation-*.parquet")
+            )
+            raise FileNotFoundError(
+                "No existe muestra baseline exacta, no hay una muestra mayor desde la cual derivarla "
+                f"y tampoco existe el pooled base. Esperada: {target_path}. "
+                f"Pooled faltante: {pooled_path}. Disponibles: {available_samples}"
+            )
+
+        print(
+            "ℹ️ No existe sample baseline exacto ni una muestra mayor. "
+            f"Derivando {target_path.name} directamente desde {pooled_path.name} "
+            f"con ratio estratificado {target_fraction:.6f}"
+        )
+        df_source = pd.read_parquet(pooled_path)
+        required = {"partition", "choice_nested"}
+        missing = sorted(required - set(df_source.columns))
+        if missing:
+            raise ValueError(f"Faltan columnas para sampleo estratificado en {pooled_path}: {missing}")
+
+        df_target = (
+            df_source.groupby(["partition", "choice_nested"], sort=False, group_keys=False)
+            .sample(frac=target_fraction, random_state=seed)
+            .sort_values(["partition", "choice_nested"], kind="stable")
+            .reset_index(drop=True)
+        )
+        pl.from_pandas(df_target).write_parquet(target_path)
+        print(f"✅ Sample baseline derivado escrito en: {target_path}")
+        return target_path
+
+    source_fraction, source_path = sorted(candidates, key=lambda x: x[0])[0]
+    sample_ratio = target_fraction / source_fraction
+    if not (0 < sample_ratio < 1):
+        raise ValueError(
+            f"No se puede derivar muestra objetivo {target_fraction:.2%} desde {source_fraction:.2%}"
+        )
+
+    print(
+        "ℹ️ No existe sample baseline exacto. "
+        f"Derivando {target_path.name} desde {source_path.name} con ratio estratificado {sample_ratio:.6f}"
+    )
+    df_source = pd.read_parquet(source_path)
+    required = {"partition", "choice_nested"}
+    missing = sorted(required - set(df_source.columns))
+    if missing:
+        raise ValueError(f"Faltan columnas para sampleo estratificado en {source_path}: {missing}")
+
+    df_target = (
+        df_source.groupby(["partition", "choice_nested"], sort=False, group_keys=False)
+        .sample(frac=sample_ratio, random_state=seed)
+        .sort_values(["partition", "choice_nested"], kind="stable")
+        .reset_index(drop=True)
+    )
+    pl.from_pandas(df_target).write_parquet(target_path)
+    print(f"✅ Sample baseline derivado escrito en: {target_path}")
+    return target_path
+
+
+def build_censo_model_ready_table(
+    *,
+    censo_final_path: Path,
+    zonas777_shp: Path,
+    socio_vars: list[str],
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    df_final = pl.read_parquet(censo_final_path)
+    missing = [c for c in ["ZONA777"] + socio_vars if c not in df_final.columns]
+    if missing:
+        raise ValueError(f"Faltan columnas en parquet Censo final: {missing}")
+
+    gdf_zonas = gpd.read_file(zonas777_shp)[["ZONA777", "geometry"]].copy()
+    gdf_zonas = gdf_zonas.set_crs("EPSG:4674", allow_override=True)
+
+    df_pd = pd.DataFrame(df_final.select(["ZONA777"] + socio_vars).to_dicts())
+    df_model_ready_pd, df_audit_pd = impute_missing_by_neighbor_median(
+        gdf_zonas=gdf_zonas,
+        df=df_pd,
+        columns=socio_vars,
+    )
+    df_model_ready = pl.DataFrame(df_model_ready_pd.to_dict(orient="list")).sort("ZONA777")
+    df_audit = pl.DataFrame(df_audit_pd.to_dict(orient="list")) if not df_audit_pd.empty else pl.DataFrame()
+    return df_model_ready, df_audit
+
+
+def standardize_censo_over_used_zones(
+    df_censo_model_ready: pl.DataFrame,
+    df_est_base: pl.DataFrame,
+    raw_vars: list[str],
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    df_used_zones = (
+        df_est_base
+        .select(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .drop_nulls()
+        .unique()
+        .sort("ZONA777")
+    )
+    df_censo_used = df_censo_model_ready.join(df_used_zones, on="ZONA777", how="inner")
+    stats_rows = []
+    df_out = df_censo_model_ready
+
+    for raw_var in raw_vars:
+        mu = df_censo_used.select(pl.col(raw_var).mean()).item()
+        sd = df_censo_used.select(pl.col(raw_var).std()).item()
+        if mu is None:
+            raise ValueError(f"No se pudo calcular media para {raw_var} sobre zonas usadas")
+        if sd is None or sd == 0:
+            sd = 1.0
+        z_var = f"{raw_var}_z"
+        df_out = df_out.with_columns(
+            ((pl.col(raw_var) - pl.lit(float(mu))) / pl.lit(float(sd))).alias(z_var)
+        )
+        stats_rows.append(
+            {
+                "variable": raw_var,
+                "mean_used_zones": float(mu),
+                "std_used_zones": float(sd),
+                "z_variable": z_var,
+            }
+        )
+
+    return df_out, pl.DataFrame(stats_rows)
+
+
+def add_origin_censo_controls(
+    df_trips: pl.DataFrame,
+    df_censo_zone: pl.DataFrame,
+    raw_vars: list[str],
+    z_vars: list[str],
+) -> pl.DataFrame:
+    ensure_unique_keys(df_censo_zone, ["ZONA777"], "df_censo_zone")
+    before_rows = df_trips.height
+    df = (
+        df_trips
+        .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .join(df_censo_zone.select(["ZONA777"] + raw_vars + z_vars), on="ZONA777", how="left")
+        .drop("ZONA777")
+    )
+    assert_left_join_preserves_rows(before_rows, df.height, "join Censo sobre muestra de estimación 08_larch")
+    missing_ratio = df.select(
+        pl.any_horizontal([pl.col(c).is_null() for c in z_vars]).mean().alias("pct_rows_any_missing_socio")
+    ).item()
+    if missing_ratio != 0:
+        raise ValueError(f"Join Censo dejó filas con socio faltante: {missing_ratio:.6%}")
+    return df
+
+
+def load_larch_numeric_df_from_parquet(path: Path, *, socio_cols: list[str] | None = None) -> pd.DataFrame:
+    selected = MODEL_BASE_COLUMNS + list(socio_cols or [])
+    return (
+        read_parquet_portable(str(path))
+        .select([pl.col(c).cast(pl.Float64) for c in selected])
+        .collect()
+        .to_pandas()
+    )
+
+
+def prepare_larch_dataframe(pandas_df: pd.DataFrame, *, socio_cols: list[str] | None = None) -> pd.DataFrame:
+    remap = {0: 1, 1: 2, 2: 3}
+    cols = MODEL_BASE_COLUMNS + list(socio_cols or [])
+    missing = [c for c in cols if c not in pandas_df.columns]
+    if missing:
+        raise ValueError(f"Faltan columnas para Larch: {missing}")
+
+    pdf = pandas_df[cols].copy()
+    pdf["choice_larch"] = pdf["choice_nested"].replace(remap).astype("int32")
+    pdf = pdf.drop(columns=["choice_nested"])
+
+    for col in pdf.columns:
+        if col == "choice_larch":
+            pdf[col] = pdf[col].astype("int32")
+        elif pd.api.types.is_integer_dtype(pdf[col]):
+            pdf[col] = pdf[col].astype("int32")
+        elif pd.api.types.is_float_dtype(pdf[col]):
+            pdf[col] = pdf[col].astype("float64")
+    return pdf
+
+
+def build_larch_stats_frame(model: lx.Model, n_obs: int) -> pd.DataFrame:
+    stats_raw = model.estimation_statistics_raw(compute_loglike_null=True)
+    stats = {
+        "Number of estimated parameters": len(model.pf),
+        "Number of free parameters": int((model.pf["holdfast"] == 0).sum()),
+        "Sample size": int(n_obs),
+    }
+    for key, value in stats_raw.items():
+        if isinstance(key, tuple):
+            label = " | ".join(str(k) for k in key)
+        else:
+            label = str(key)
+        stats[label] = value
+    return pd.DataFrame([stats])
+
+
+def build_larch_params_frame(model: lx.Model) -> pd.DataFrame:
+    pf = model.pf.copy().reset_index().rename(columns={"param_name": "Name", "value": "Value"})
+    robust_std_err = np.asarray(model.parameters["robust_std_err"].values, dtype=float)
+    robust_t = np.where(
+        np.isfinite(robust_std_err) & (robust_std_err > 0),
+        pf["Value"].to_numpy(dtype=float) / robust_std_err,
+        np.nan,
+    )
+    robust_p = np.where(np.isfinite(robust_t), 2 * norm.sf(np.abs(robust_t)), np.nan)
+    lower = pf["minimum"].to_numpy(dtype=float)
+    upper = pf["maximum"].to_numpy(dtype=float)
+    value = pf["Value"].to_numpy(dtype=float)
+    active_lower = np.isfinite(lower) & (np.abs(value - lower) <= 1e-6)
+    active_upper = np.isfinite(upper) & (np.abs(value - upper) <= 1e-6)
+    pf["Robust std err."] = robust_std_err
+    pf["Robust t-stat."] = robust_t
+    pf["Robust p-value"] = robust_p
+    pf["Active bound"] = active_lower | active_upper
+    return pf[
+        [
+            "Name",
+            "Value",
+            "Robust std err.",
+            "Robust t-stat.",
+            "Robust p-value",
+            "minimum",
+            "maximum",
+            "Active bound",
+        ]
+    ].rename(columns={"minimum": "Lower bound", "maximum": "Upper bound"})
+
+
+def load_larch_result_csvs(
+    *,
+    stats_path: Path,
+    params_path: Path,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    if not (stats_path.exists() and params_path.exists()):
+        return None, None
+    return pd.read_csv(stats_path), pd.read_csv(params_path)
+
+
+def larch_stats_to_frame(stats_df: pd.DataFrame) -> pd.DataFrame:
+    if stats_df.empty:
+        return stats_df
+    return stats_df.T.reset_index().rename(columns={"index": "metric", 0: "value"})
+
+
+def build_larch_transport_censo_model(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    socio_cols: list[str] | None = None,
+    max_cap: float = 20.0,
+    title: str | None = None,
+) -> lx.Model:
+    socio_cols = list(socio_cols or [])
+    alts = {1: "BIP", 2: "QR_RED", 3: "QR_OTHER"}
+    ds = lx.Dataset.construct.from_idco(pandas_df, alts=alts)
+    m = lx.Model(ds)
+    m.title = title or f"MNL OD Buffers enriched interannual + Censo ({partition})"
+    m.compute_engine = "numba"
+    m.choice_co_code = "choice_larch"
+    m.availability_co_vars = {1: 1, 2: 1, 3: 1}
+
+    m.utility_co[1] = (
+        P.B_BIP_T_VEH * X.TVH_BIP
+        + P.B_BIP_T_ESPERA_INI * X.TEI_BIP
+        + P.B_BIP_T_ESPERA_TRASB * X.TET_BIP
+        + P.B_BIP_N_TRASB * X.NTR_BIP
+    )
+
+    v_qr_red = (
+        P.ASC_QR_RED
+        + P.B_QR_RED_LAB_PM * X.DUMMY_LAB_PM
+        + P.B_QR_RED_LAB_PT * X.DUMMY_LAB_PT
+        + P.B_QR_RED_NO_LAB * X.DUMMY_NO_LAB
+        + P.B_QR_RED_ANIO_2025 * X.DUMMY_ANIO_2025
+        + P.B_QR_RED_LOG_DEMAND * X.LOG_N_VIAJES_ZONA_INICIO_FRANJA
+        + P.B_QR_RED_LOG_BUS_STOP_DENSITY * X.LOG_BUS_STOP_DENSITY
+        + P.B_QR_RED_LOG_BUS_LINE_COUNT * X.LOG_BUS_LINE_COUNT
+        + P.B_QR_RED_LOG_METRO_LINE_COUNT * X.LOG_METRO_LINE_COUNT
+        + P.B_QR_RED_T_VEH * X.TVH_QR_RED
+        + P.B_QR_RED_T_ESPERA_INI * X.TEI_QR_RED
+        + P.B_QR_RED_T_ESPERA_TRASB * X.TET_QR_RED
+        + P.B_QR_RED_N_TRASB * X.NTR_QR_RED
+    )
+
+    v_qr_other = (
+        P.ASC_QR_OTHER
+        + P.B_QR_OTHER_LAB_PM * X.DUMMY_LAB_PM
+        + P.B_QR_OTHER_LAB_PT * X.DUMMY_LAB_PT
+        + P.B_QR_OTHER_NO_LAB * X.DUMMY_NO_LAB
+        + P.B_QR_OTHER_ANIO_2025 * X.DUMMY_ANIO_2025
+        + P.B_QR_OTHER_LOG_DEMAND * X.LOG_N_VIAJES_ZONA_INICIO_FRANJA
+        + P.B_QR_OTHER_LOG_BUS_STOP_DENSITY * X.LOG_BUS_STOP_DENSITY
+        + P.B_QR_OTHER_LOG_BUS_LINE_COUNT * X.LOG_BUS_LINE_COUNT
+        + P.B_QR_OTHER_LOG_METRO_LINE_COUNT * X.LOG_METRO_LINE_COUNT
+        + P.B_QR_OTHER_T_VEH * X.TVH_QR_OTHER
+        + P.B_QR_OTHER_T_ESPERA_INI * X.TEI_QR_OTHER
+        + P.B_QR_OTHER_T_ESPERA_TRASB * X.TET_QR_OTHER
+        + P.B_QR_OTHER_N_TRASB * X.NTR_QR_OTHER
+    )
+
+    for col in socio_cols:
+        tag = SOCIO_PARAM_TAGS[col]
+        v_qr_red = v_qr_red + getattr(P, f"B_QR_RED_{tag}") * getattr(X, col)
+        v_qr_other = v_qr_other + getattr(P, f"B_QR_OTHER_{tag}") * getattr(X, col)
+
+    m.utility_co[2] = v_qr_red
+    m.utility_co[3] = v_qr_other
+
+    m.initialize_graph(alternative_codes=[1, 2, 3], alternative_names=["BIP", "QR_RED", "QR_OTHER"])
+    m.ordering = [
+        ("ASCs", "ASC_.*"),
+        ("Time Dummies", "B_QR_.*_(LAB_PM|LAB_PT|NO_LAB)"),
+        ("Interannual", "B_QR_.*_ANIO_2025"),
+        ("Demand", "B_QR_.*_LOG_DEMAND"),
+        ("Offer", "B_QR_.*_LOG_(BUS_STOP_DENSITY|BUS_LINE_COUNT|METRO_LINE_COUNT)"),
+        ("LOS", "B_.*_(T_VEH|T_ESPERA_INI|T_ESPERA_TRASB|N_TRASB)"),
+        (
+            "Censo",
+            "B_QR_.*_(PROM_EDAD_Z|PROM_ESCOLARIDAD18_Z|SHARE_INMIGRANTES_Z|SHARE_HACINAMIENTO_Z|SHARE_INTERNET_Z|SHARE_SERV_COMPU_Z|SHARE_SERV_TEL_MOVIL_Z|SHARE_DISCAPACIDAD_Z|SHARE_ANALFABET_Z)",
+        ),
+    ]
+    m.set_cap(max_cap)
+    return m
+
+
+def estimate_larch_transport_plus_censo(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    socio_cols: list[str] | None = None,
+    method: str = "slsqp",
+    options: dict | None = None,
+    max_cap: float = 20.0,
+    quiet: bool = False,
+) -> tuple[lx.Model, pd.DataFrame, pd.DataFrame]:
+    pdf_larch = prepare_larch_dataframe(pandas_df, socio_cols=socio_cols)
+    model = build_larch_transport_censo_model(
+        pdf_larch,
+        partition=partition,
+        socio_cols=socio_cols,
+        max_cap=max_cap,
+        title=model_name,
+    )
+    model.maximize_loglike(method=method, quiet=quiet, options=options or {})
+    model.calculate_parameter_covariance(robust=True)
+    stats = build_larch_stats_frame(model, n_obs=len(pdf_larch))
+    params = build_larch_params_frame(model)
+    return model, stats, params
+
+
+def run_larch_model(
+    *,
+    model_name: str,
+    socio_cols: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    df_model = load_larch_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO, socio_cols=socio_cols)
+    _, stats_df, params_df = estimate_larch_transport_plus_censo(
+        df_model,
+        partition=MODEL_PARTITION,
+        model_name=model_name,
+        socio_cols=socio_cols,
+        method=LARCH_METHOD,
+        options=LARCH_OPTIONS,
+        max_cap=LARCH_MAX_CAP,
+    )
+    params_path, stats_path = RESULT_PATHS[model_name]
+    stats_df.to_csv(stats_path, index=False)
+    params_df.to_csv(params_path, index=False)
+    del df_model
+    gc.collect()
+    return stats_df, params_df
+```
+
+## 4) Build Censo Model-Ready
+
+```{python}
+#| label: build-censo-model-ready
+print("label: build-censo-model-ready")
+
+df_censo_model_ready, df_censo_imputation_audit = build_censo_model_ready_table(
+    censo_final_path=CENSO_FINAL_PATH,
+    zonas777_shp=ZONAS777_SHP,
+    socio_vars=SOCIO_ALL_RAW_VARS,
+)
+df_censo_model_ready.write_parquet(OUT_CENSO_MODEL_READY)
+print(f"✅ Censo model-ready escrito en: {OUT_CENSO_MODEL_READY}")
+if df_censo_imputation_audit.height > 0:
+    display(df_censo_imputation_audit)
+display(df_censo_model_ready.filter(pl.col('ZONA777') == 528))
+```
+
+## 5) Build Estimation Sample + Censo
+
+```{python}
+#| label: build-estimation-sample-censo
+print("label: build-estimation-sample-censo")
+
+baseline_sample_path = materialize_baseline_sample_if_needed(
+    target_path=BASELINE_ESTIMATION_SAMPLE_PATH,
+    target_fraction=SAMPLE_FRACTION_ESTIMATION,
+    model_partition=MODEL_PARTITION,
+    artifacts_dir=INTERANNUAL_ARTIFACTS_DIR,
+    pooled_path=POOLED_TRIPS_CONTEXT_PATH,
+    seed=SEED,
+    force_rebuild=LARCH_FORCE_REBUILD_SAMPLE,
+)
+df_est_base = read_parquet_portable(str(baseline_sample_path)).collect()
+print(f"rows baseline sample 07/08: {df_est_base.height:,}")
+
+df_censo_model_ready_std, df_censo_std_stats = standardize_censo_over_used_zones(
+    df_censo_model_ready,
+    df_est_base,
+    SOCIO_ALL_RAW_VARS,
+)
+df_censo_model_ready_std.write_parquet(OUT_CENSO_MODEL_READY_STD)
+print(f"✅ Censo model-ready + z escrito en: {OUT_CENSO_MODEL_READY_STD}")
+display(df_censo_std_stats)
+
+df_est_censo = add_origin_censo_controls(
+    df_est_base,
+    df_censo_model_ready_std,
+    raw_vars=SOCIO_ALL_RAW_VARS,
+    z_vars=SOCIO_ALL_Z_VARS,
+)
+df_est_censo.write_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+print(f"✅ Muestra de estimación + Censo escrita en: {OUT_ESTIMATION_SAMPLE_CENSO}")
+display(
+    df_est_censo.select(
+        pl.len().alias("rows"),
+        *[pl.col(c).mean().alias(f"{c}_mean") for c in SOCIO_ALL_Z_VARS],
+        *[pl.col(c).std().alias(f"{c}_std") for c in SOCIO_ALL_Z_VARS],
+    )
+)
+```
+
+## 6) MNL Baseline
+
+```{python}
+#| label: mnl-baseline
+print("label: mnl-baseline")
+
+stats_mnl_baseline, params_mnl_baseline = run_larch_model(
+    model_name=MODEL_NAME_MNL_BASELINE,
+    socio_cols=[],
+)
+display(stats_mnl_baseline)
+display(params_mnl_baseline.head(12))
+```
+
+## 7) MNL + Censo Full
+
+```{python}
+#| label: mnl-censo-full
+print("label: mnl-censo-full")
+
+stats_mnl_censo_full, params_mnl_censo_full = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_FULL,
+    socio_cols=SOCIO_Z_VARS,
+)
+display(stats_mnl_censo_full)
+display(params_mnl_censo_full.head(16))
+```
+
+## 8) MNL + prom_edad
+
+```{python}
+#| label: mnl-censo-prom-edad
+print("label: mnl-censo-prom-edad")
+
+stats_mnl_censo_prom_edad, params_mnl_censo_prom_edad = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_PROM_EDAD,
+    socio_cols=["prom_edad_z"],
+)
+display(stats_mnl_censo_prom_edad)
+display(params_mnl_censo_prom_edad.head(14))
+```
+
+## 9) MNL + prom_escolaridad18
+
+```{python}
+#| label: mnl-censo-prom-escolaridad18
+print("label: mnl-censo-prom-escolaridad18")
+
+stats_mnl_censo_prom_escolaridad18, params_mnl_censo_prom_escolaridad18 = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18,
+    socio_cols=["prom_escolaridad18_z"],
+)
+display(stats_mnl_censo_prom_escolaridad18)
+display(params_mnl_censo_prom_escolaridad18.head(14))
+```
+
+## 10) MNL + share_inmigrantes
+
+```{python}
+#| label: mnl-censo-share-inmigrantes
+print("label: mnl-censo-share-inmigrantes")
+
+stats_mnl_censo_share_inmigrantes, params_mnl_censo_share_inmigrantes = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES,
+    socio_cols=["share_inmigrantes_z"],
+)
+display(stats_mnl_censo_share_inmigrantes)
+display(params_mnl_censo_share_inmigrantes.head(14))
+```
+
+## 11) MNL + share_hacinamiento
+
+```{python}
+#| label: mnl-censo-share-hacinamiento
+print("label: mnl-censo-share-hacinamiento")
+
+stats_mnl_censo_share_hacinamiento, params_mnl_censo_share_hacinamiento = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO,
+    socio_cols=["share_hacinamiento_z"],
+)
+display(stats_mnl_censo_share_hacinamiento)
+display(params_mnl_censo_share_hacinamiento.head(14))
+```
+
+## 12) MNL + prom_escolaridad18 + share_hacinamiento
+
+```{python}
+#| label: mnl-censo-escolaridad-hacinamiento
+print("label: mnl-censo-escolaridad-hacinamiento")
+
+stats_mnl_censo_escolaridad_hacinamiento, params_mnl_censo_escolaridad_hacinamiento = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO,
+    socio_cols=["prom_escolaridad18_z", "share_hacinamiento_z"],
+)
+display(stats_mnl_censo_escolaridad_hacinamiento)
+display(params_mnl_censo_escolaridad_hacinamiento.head(16))
+```
+
+## 13) MNL + share_internet
+
+```{python}
+#| label: mnl-censo-share-internet
+print("label: mnl-censo-share-internet")
+
+stats_mnl_censo_share_internet, params_mnl_censo_share_internet = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_INTERNET,
+    socio_cols=["share_internet_z"],
+)
+display(stats_mnl_censo_share_internet)
+display(params_mnl_censo_share_internet.head(14))
+```
+
+## 14) MNL + share_serv_compu
+
+```{python}
+#| label: mnl-censo-share-serv-compu
+print("label: mnl-censo-share-serv-compu")
+
+stats_mnl_censo_share_serv_compu, params_mnl_censo_share_serv_compu = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU,
+    socio_cols=["share_serv_compu_z"],
+)
+display(stats_mnl_censo_share_serv_compu)
+display(params_mnl_censo_share_serv_compu.head(14))
+```
+
+## 15) MNL + share_serv_tel_movil
+
+```{python}
+#| label: mnl-censo-share-serv-tel-movil
+print("label: mnl-censo-share-serv-tel-movil")
+
+stats_mnl_censo_share_serv_tel_movil, params_mnl_censo_share_serv_tel_movil = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL,
+    socio_cols=["share_serv_tel_movil_z"],
+)
+display(stats_mnl_censo_share_serv_tel_movil)
+display(params_mnl_censo_share_serv_tel_movil.head(14))
+```
+
+## 16) MNL + share_discapacidad
+
+```{python}
+#| label: mnl-censo-share-discapacidad
+print("label: mnl-censo-share-discapacidad")
+
+stats_mnl_censo_share_discapacidad, params_mnl_censo_share_discapacidad = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD,
+    socio_cols=["share_discapacidad_z"],
+)
+display(stats_mnl_censo_share_discapacidad)
+display(params_mnl_censo_share_discapacidad.head(14))
+```
+
+## 17) MNL + share_analfabet
+
+```{python}
+#| label: mnl-censo-share-analfabet
+print("label: mnl-censo-share-analfabet")
+
+stats_mnl_censo_share_analfabet, params_mnl_censo_share_analfabet = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_ANALFABET,
+    socio_cols=["share_analfabet_z"],
+)
+display(stats_mnl_censo_share_analfabet)
+display(params_mnl_censo_share_analfabet.head(14))
+```
+
+## 18) MNL + prom_escolaridad18 + share_internet
+
+```{python}
+#| label: mnl-censo-escolaridad-internet
+print("label: mnl-censo-escolaridad-internet")
+
+stats_mnl_censo_escolaridad_internet, params_mnl_censo_escolaridad_internet = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET,
+    socio_cols=["prom_escolaridad18_z", "share_internet_z"],
+)
+display(stats_mnl_censo_escolaridad_internet)
+display(params_mnl_censo_escolaridad_internet.head(16))
+```
+
+## 19) MNL + prom_escolaridad18 + share_serv_compu
+
+```{python}
+#| label: mnl-censo-escolaridad-serv-compu
+print("label: mnl-censo-escolaridad-serv-compu")
+
+stats_mnl_censo_escolaridad_serv_compu, params_mnl_censo_escolaridad_serv_compu = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU,
+    socio_cols=["prom_escolaridad18_z", "share_serv_compu_z"],
+)
+display(stats_mnl_censo_escolaridad_serv_compu)
+display(params_mnl_censo_escolaridad_serv_compu.head(16))
+```
+
+## 20) MNL + prom_escolaridad18 + share_serv_tel_movil
+
+```{python}
+#| label: mnl-censo-escolaridad-serv-tel-movil
+print("label: mnl-censo-escolaridad-serv-tel-movil")
+
+stats_mnl_censo_escolaridad_serv_tel_movil, params_mnl_censo_escolaridad_serv_tel_movil = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL,
+    socio_cols=["prom_escolaridad18_z", "share_serv_tel_movil_z"],
+)
+display(stats_mnl_censo_escolaridad_serv_tel_movil)
+display(params_mnl_censo_escolaridad_serv_tel_movil.head(16))
+```
+
+## 21) MNL + prom_escolaridad18 + share_discapacidad
+
+```{python}
+#| label: mnl-censo-escolaridad-discapacidad
+print("label: mnl-censo-escolaridad-discapacidad")
+
+stats_mnl_censo_escolaridad_discapacidad, params_mnl_censo_escolaridad_discapacidad = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD,
+    socio_cols=["prom_escolaridad18_z", "share_discapacidad_z"],
+)
+display(stats_mnl_censo_escolaridad_discapacidad)
+display(params_mnl_censo_escolaridad_discapacidad.head(16))
+```
+
+## 22) MNL + prom_escolaridad18 + share_analfabet
+
+```{python}
+#| label: mnl-censo-escolaridad-analfabet
+print("label: mnl-censo-escolaridad-analfabet")
+
+stats_mnl_censo_escolaridad_analfabet, params_mnl_censo_escolaridad_analfabet = run_larch_model(
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET,
+    socio_cols=["prom_escolaridad18_z", "share_analfabet_z"],
+)
+display(stats_mnl_censo_escolaridad_analfabet)
+display(params_mnl_censo_escolaridad_analfabet.head(16))
+```
+
+## 23) Load Results
+
+```{python}
+#| label: load-results
+print("label: load-results")
+
+loaded_results = {}
+for model_name, (params_path, stats_path) in RESULT_PATHS.items():
+    stats_loaded, params_loaded = load_larch_result_csvs(
+        stats_path=stats_path,
+        params_path=params_path,
+    )
+    loaded_results[model_name] = {
+        "stats": stats_loaded,
+        "params": params_loaded,
+    }
+    if stats_loaded is not None and params_loaded is not None:
+        print(f"✅ {model_name} -> loaded")
+    else:
+        print(f"⚠️ {model_name} -> missing")
+```
+
+## 24) Results
+
+```{python}
+#| label: mnl-baseline-results
+print("label: mnl-baseline-results")
+if loaded_results[MODEL_NAME_MNL_BASELINE]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_BASELINE]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_BASELINE]["params"])
+```
+
+```{python}
+#| label: mnl-censo-full-results
+print("label: mnl-censo-full-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_FULL]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_FULL]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_FULL]["params"])
+```
+
+```{python}
+#| label: mnl-censo-prom-edad-results
+print("label: mnl-censo-prom-edad-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_PROM_EDAD]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_PROM_EDAD]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_PROM_EDAD]["params"])
+```
+
+```{python}
+#| label: mnl-censo-prom-escolaridad18-results
+print("label: mnl-censo-prom-escolaridad18-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-inmigrantes-results
+print("label: mnl-censo-share-inmigrantes-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-hacinamiento-results
+print("label: mnl-censo-share-hacinamiento-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-hacinamiento-results
+print("label: mnl-censo-escolaridad-hacinamiento-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-internet-results
+print("label: mnl-censo-share-internet-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INTERNET]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INTERNET]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INTERNET]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-serv-compu-results
+print("label: mnl-censo-share-serv-compu-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-serv-tel-movil-results
+print("label: mnl-censo-share-serv-tel-movil-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-discapacidad-results
+print("label: mnl-censo-share-discapacidad-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-analfabet-results
+print("label: mnl-censo-share-analfabet-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_ANALFABET]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_ANALFABET]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_ANALFABET]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-internet-results
+print("label: mnl-censo-escolaridad-internet-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-serv-compu-results
+print("label: mnl-censo-escolaridad-serv-compu-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-serv-tel-movil-results
+print("label: mnl-censo-escolaridad-serv-tel-movil-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-discapacidad-results
+print("label: mnl-censo-escolaridad-discapacidad-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-analfabet-results
+print("label: mnl-censo-escolaridad-analfabet-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET]["stats"] is not None:
+    display(larch_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET]["params"])
+```

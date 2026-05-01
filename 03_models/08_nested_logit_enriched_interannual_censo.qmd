@@ -1,0 +1,2673 @@
+---
+TITLE: "Tesis — 08 | Interanual Enriquecido + Censo Origen"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Construir una segunda versión del modelo interanual enriquecido, ahora incorporando un bloque acotado de variables Censo de **origen** sobre una baseline de transporte ya cerrada:
+
+- `LOG_BUS_STOP_DENSITY`
+- `LOG_BUS_LINE_COUNT`
+- `LOG_METRO_LINE_COUNT`
+
+La idea es no seguir extendiendo `07_nested_logit_enriched_interannual.qmd`, sino usarlo como baseline transport-only y montar aquí la capa socio-demográfica.
+
+::: {.callout-note}
+## Alcance de esta versión
+- La baseline de transporte se fija en:
+  - `BUS_STOP_DENSITY`
+  - `BUS_LINE_COUNT`
+  - `METRO_LINE_COUNT`
+- El bloque Censo activo se restringe a:
+  - `prom_edad`
+  - `prom_escolaridad18`
+  - `share_inmigrantes`
+  - `share_hacinamiento`
+- El orden de estimación será:
+  - baseline
+  - bloque completo
+  - desgloses
+- `MNL` es el modelo principal
+- `Nested` queda como contraste secundario
+:::
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+import gc
+import sys
+from pathlib import Path
+
+import geopandas as gpd
+import pandas as pd
+import polars as pl
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró la raíz del proyecto.")
+
+import biogeme.biogeme_logging as blog
+import biogeme.database as db
+import biogeme.biogeme as bio
+from biogeme.results_processing import pandas_output as br
+from biogeme import models, nests
+from biogeme.expressions import Beta, Variable
+
+from lib.interannual_offer_context import assert_left_join_preserves_rows, ensure_unique_keys
+from lib.censo2024_zona777 import impute_missing_by_neighbor_median
+from lib.censo2024_microdata_base import MicrodataPaths
+from lib.censo2024_microdata_zona777 import build_spatialized_microdata_outputs
+from lib.od_buffers_nested_logit import read_parquet_portable
+
+logger = blog.get_screen_logger(level=blog.INFO)
+```
+
+## 2) Configuración
+
+```{python}
+#| label: config
+print("label: config")
+MODEL_PARTITION = "pooled_2024_2025"
+SAMPLE_FRACTION_ESTIMATION = 0.05
+SUMMARY_RESULTS_SAMPLE_TAG = "sample5pct"
+PRESENTATION_RESULTS_SAMPLE_TAGS = ["sample5pct", "sample2pct"]
+
+def estimation_sample_tag(fraction: float | None) -> str:
+    return "full" if fraction is None else f"sample{int(fraction * 100)}pct"
+
+ESTIMATION_SAMPLE_TAG = estimation_sample_tag(SAMPLE_FRACTION_ESTIMATION)
+
+MODELS_DIR = PROJECT_ROOT / "03_models"
+INTERANNUAL_ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "interannual_enriched"
+INTERANNUAL_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+BASELINE_ESTIMATION_SAMPLE_PATH = (
+    INTERANNUAL_ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}.parquet"
+)
+CENSO_FINAL_PATH = (
+    PROJECT_ROOT / "02_eda" / "tmp" / "censo2024_zona777" / "censo2024_zona777_agg_final.parquet"
+)
+MICRODATA_ZONA777_DIR = (
+    PROJECT_ROOT / "02_eda" / "tmp" / "censo2024_microdata_zona777" / "full_softmax_tau003"
+)
+MICRODATA_ZONA777_PATH = MICRODATA_ZONA777_DIR / "censo2024_microdata_zona777_features.parquet"
+ZONAS777_SHP = Path("/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp")
+PERSONAS_ZIP = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/personas_censo2024.zip")
+HOGARES_ZIP = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/hogares_censo2024.zip")
+VIVIENDAS_ZIP = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/viviendas_censo2024.zip")
+BASE_ZIP = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/Base_manzana_entidad_CPV24.zip")
+CARTO_MZ = Path("/Volumes/KINGSTON/tesis-project/raw/censo2024/cartografia_parquet/Cartografia_censo2024_Pais_Manzanas.parquet")
+MICRODATA_TAU = 0.03
+MICRODATA_SEED = 42
+
+OUT_CENSO_MODEL_READY = INTERANNUAL_ARTIFACTS_DIR / "censo2024_zona777_model_ready.parquet"
+OUT_MICRODATA_MODEL_READY = INTERANNUAL_ARTIFACTS_DIR / "censo2024_microdata_zona777_model_ready.parquet"
+OUT_CENSO_MODEL_READY_STD = (
+    INTERANNUAL_ARTIFACTS_DIR / f"censo2024_zona777_model_ready_{ESTIMATION_SAMPLE_TAG}.parquet"
+)
+OUT_ESTIMATION_SAMPLE_CENSO = (
+    INTERANNUAL_ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-censo4.parquet"
+)
+OUT_CENSO_MICRO_MODEL_READY_STD = (
+    INTERANNUAL_ARTIFACTS_DIR / f"censo2024_zona777_model_ready_{ESTIMATION_SAMPLE_TAG}_microdata.parquet"
+)
+OUT_ESTIMATION_SAMPLE_CENSO_MICRO = (
+    INTERANNUAL_ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-censo4-micro.parquet"
+)
+
+SOCIO_RAW_VARS = [
+    "prom_edad",
+    "prom_escolaridad18",
+    "share_inmigrantes",
+    "share_hacinamiento",
+]
+SOCIO_SECOND_ROUND_RAW_VARS = [
+    "share_internet",
+    "share_serv_compu",
+    "share_serv_tel_movil",
+    "share_discapacidad",
+    "share_analfabet",
+]
+SOCIO_ALL_RAW_VARS = SOCIO_RAW_VARS + SOCIO_SECOND_ROUND_RAW_VARS
+SOCIO_Z_VARS = [f"{c}_z" for c in SOCIO_RAW_VARS]
+SOCIO_SECOND_ROUND_Z_VARS = [f"{c}_z" for c in SOCIO_SECOND_ROUND_RAW_VARS]
+SOCIO_ALL_Z_VARS = [f"{c}_z" for c in SOCIO_ALL_RAW_VARS]
+SOCIO_MICRO_RAW_VARS = [
+    "share_cine18_universitaria_micro",
+    "share_cine18_universitaria_o_mas_micro",
+    "share_cine18_terciaria_corta_micro",
+    "share_cine18_postgrado_micro",
+    "share_independiente_micro",
+]
+SOCIO_MICRO_Z_VARS = [f"{c}_z" for c in SOCIO_MICRO_RAW_VARS]
+SOCIO_PARAM_TAGS = {
+    "prom_edad_z": "PROM_EDAD_Z",
+    "prom_escolaridad18_z": "PROM_ESCOLARIDAD18_Z",
+    "share_inmigrantes_z": "SHARE_INMIGRANTES_Z",
+    "share_hacinamiento_z": "SHARE_HACINAMIENTO_Z",
+    "share_internet_z": "SHARE_INTERNET_Z",
+    "share_serv_compu_z": "SHARE_SERV_COMPU_Z",
+    "share_serv_tel_movil_z": "SHARE_SERV_TEL_MOVIL_Z",
+    "share_discapacidad_z": "SHARE_DISCAPACIDAD_Z",
+    "share_analfabet_z": "SHARE_ANALFABET_Z",
+    "share_cine18_universitaria_micro_z": "SHARE_CINE18_UNIVERSITARIA_MICRO_Z",
+    "share_cine18_universitaria_o_mas_micro_z": "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z",
+    "share_cine18_terciaria_corta_micro_z": "SHARE_CINE18_TERCIARIA_CORTA_MICRO_Z",
+    "share_cine18_postgrado_micro_z": "SHARE_CINE18_POSTGRADO_MICRO_Z",
+    "share_independiente_micro_z": "SHARE_INDEPENDIENTE_MICRO_Z",
+}
+
+MODEL_NAME_MNL_BASELINE = "mnl_interannual_censo_baseline"
+MODEL_NAME_MNL_CENSO_FULL = "mnl_interannual_censo_full"
+MODEL_NAME_MNL_CENSO_PROM_EDAD = "mnl_interannual_censo_prom_edad"
+MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18 = "mnl_interannual_censo_prom_escolaridad18"
+MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES = "mnl_interannual_censo_share_inmigrantes"
+MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO = "mnl_interannual_censo_share_hacinamiento"
+MODEL_NAME_MNL_CENSO_SHARE_INTERNET = "mnl_interannual_censo_share_internet"
+MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU = "mnl_interannual_censo_share_serv_compu"
+MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL = "mnl_interannual_censo_share_serv_tel_movil"
+MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD = "mnl_interannual_censo_share_discapacidad"
+MODEL_NAME_MNL_CENSO_SHARE_ANALFABET = "mnl_interannual_censo_share_analfabet"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO = "mnl_interannual_censo_escolaridad_hacinamiento"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET = "mnl_interannual_censo_escolaridad_internet"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU = "mnl_interannual_censo_escolaridad_serv_compu"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL = "mnl_interannual_censo_escolaridad_serv_tel_movil"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD = "mnl_interannual_censo_escolaridad_discapacidad"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET = "mnl_interannual_censo_escolaridad_analfabet"
+MODEL_NAME_MNL_MICRO_UNIVERSITARIA = "mnl_interannual_micro_share_cine18_universitaria"
+MODEL_NAME_MNL_MICRO_UNIVERSITARIA_O_MAS = "mnl_interannual_micro_share_cine18_universitaria_o_mas"
+MODEL_NAME_MNL_MICRO_TERCIARIA_CORTA = "mnl_interannual_micro_share_cine18_terciaria_corta"
+MODEL_NAME_MNL_MICRO_POSTGRADO = "mnl_interannual_micro_share_cine18_postgrado"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_TERCIARIA_CORTA = "mnl_interannual_censo_escolaridad_micro_terciaria_corta"
+MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_POSTGRADO = "mnl_interannual_censo_escolaridad_micro_postgrado"
+MODEL_NAME_MNL_MICRO_UNIVERSITARIA_TERCIARIA_CORTA = "mnl_interannual_micro_universitaria_terciaria_corta"
+MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS = "mnl_interannual_censo_micro_full_parsimonious"
+MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS_NO_DISCAPACIDAD = "mnl_interannual_censo_micro_full_parsimonious_no_discapacidad"
+MODEL_NAME_MNL_CENSO_MICRO_FULL_EXPANDED = "mnl_interannual_censo_micro_full_expanded"
+MODEL_NAME_NESTED_BASELINE = "nested_interannual_censo_baseline"
+MODEL_NAME_NESTED_CENSO_FULL = "nested_interannual_censo_full"
+
+BIOGEME_RESULTS_ROOT = MODELS_DIR / "biogeme-logit" / "results" / "08_interannual_censo"
+BIOGEME_RESULTS_DIR = BIOGEME_RESULTS_ROOT / f"{MODEL_PARTITION}-biogeme-{ESTIMATION_SAMPLE_TAG}"
+BIOGEME_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+SUMMARY_BIOGEME_RESULTS_DIR = (
+    BIOGEME_RESULTS_ROOT / f"{MODEL_PARTITION}-biogeme-{SUMMARY_RESULTS_SAMPLE_TAG}"
+)
+
+RESULT_PATHS = {
+    MODEL_NAME_MNL_BASELINE: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_BASELINE}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_BASELINE}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_FULL: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_FULL}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_FULL}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_PROM_EDAD: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_PROM_EDAD}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_PROM_EDAD}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_INTERNET: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_INTERNET}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_INTERNET}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_SHARE_ANALFABET: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_SHARE_ANALFABET}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_SHARE_ANALFABET}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET}.csv",
+    ),
+    MODEL_NAME_MNL_MICRO_UNIVERSITARIA: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_MICRO_UNIVERSITARIA}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_MICRO_UNIVERSITARIA}.csv",
+    ),
+    MODEL_NAME_MNL_MICRO_UNIVERSITARIA_O_MAS: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_MICRO_UNIVERSITARIA_O_MAS}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_MICRO_UNIVERSITARIA_O_MAS}.csv",
+    ),
+    MODEL_NAME_MNL_MICRO_TERCIARIA_CORTA: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_MICRO_TERCIARIA_CORTA}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_MICRO_TERCIARIA_CORTA}.csv",
+    ),
+    MODEL_NAME_MNL_MICRO_POSTGRADO: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_MICRO_POSTGRADO}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_MICRO_POSTGRADO}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_TERCIARIA_CORTA: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_TERCIARIA_CORTA}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_TERCIARIA_CORTA}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_POSTGRADO: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_POSTGRADO}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_POSTGRADO}.csv",
+    ),
+    MODEL_NAME_MNL_MICRO_UNIVERSITARIA_TERCIARIA_CORTA: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_MICRO_UNIVERSITARIA_TERCIARIA_CORTA}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_MICRO_UNIVERSITARIA_TERCIARIA_CORTA}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS_NO_DISCAPACIDAD: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS_NO_DISCAPACIDAD}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS_NO_DISCAPACIDAD}.csv",
+    ),
+    MODEL_NAME_MNL_CENSO_MICRO_FULL_EXPANDED: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_CENSO_MICRO_FULL_EXPANDED}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_CENSO_MICRO_FULL_EXPANDED}.csv",
+    ),
+    MODEL_NAME_NESTED_BASELINE: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_NESTED_BASELINE}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_NESTED_BASELINE}.csv",
+    ),
+    MODEL_NAME_NESTED_CENSO_FULL: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_NESTED_CENSO_FULL}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_NESTED_CENSO_FULL}.csv",
+    ),
+}
+
+BIOGEME_LARGE_RUN_MODE = True
+BIOGEME_THREADS = 1
+BIOGEME_SECOND_DERIVATIVES = "never"
+BIOGEME_OPTIMIZATION_ALGORITHM = "simple_bounds_BFGS"
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+MODEL_NUMERIC_COLUMNS = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_NO_LAB",
+    "DUMMY_ANIO_2025",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+] + SOCIO_ALL_Z_VARS + SOCIO_MICRO_Z_VARS
+
+
+def remove_biogeme_iter_file(model_name: str, project_root: Path) -> None:
+    candidates = [
+        project_root / f"{model_name}.iter",
+        project_root / f"__{model_name}.iter",
+        Path.cwd() / f"{model_name}.iter",
+        Path.cwd() / f"__{model_name}.iter",
+    ]
+    seen = set()
+    for iter_path in candidates:
+        if iter_path in seen:
+            continue
+        seen.add(iter_path)
+        if iter_path.exists():
+            iter_path.unlink()
+            print(f"🗑️ Iter eliminado: {iter_path}")
+
+
+def biogeme_stats_to_frame(stats: dict) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "metric": key,
+                "value": val[0] if isinstance(val, tuple) else val,
+            }
+            for key, val in stats.items()
+        ]
+    )
+
+
+def write_biogeme_result_csvs(
+    *,
+    params_df: pd.DataFrame,
+    stats: dict,
+    params_path: Path,
+    stats_path: Path,
+) -> None:
+    params_df.to_csv(params_path, index=False)
+    biogeme_stats_to_frame(stats).to_csv(stats_path, index=False)
+
+
+def load_biogeme_result_csvs(
+    *,
+    params_path: Path,
+    stats_path: Path,
+) -> tuple[dict | None, pd.DataFrame | None]:
+    if not (params_path.exists() and stats_path.exists()):
+        return None, None
+    params_df = pd.read_csv(params_path)
+    stats_df = pd.read_csv(stats_path)
+    stats = dict(zip(stats_df["metric"], stats_df["value"]))
+    return stats, params_df
+
+
+def load_biogeme_result_for_model_name(
+    model_name: str,
+    *,
+    results_dir: Path,
+) -> tuple[dict | None, pd.DataFrame | None]:
+    return load_biogeme_result_csvs(
+        params_path=results_dir / f"params_{model_name}.csv",
+        stats_path=results_dir / f"stats_{model_name}.csv",
+    )
+
+
+def get_result_with_summary_fallback(model_name: str) -> dict[str, dict | pd.DataFrame | None]:
+    current_loaded_results = globals().get("loaded_results", {})
+    loaded = current_loaded_results.get(model_name, {})
+    stats_obj = loaded.get("stats")
+    params_df = loaded.get("params")
+    if stats_obj is not None and params_df is not None:
+        return {
+            "stats": stats_obj,
+            "params": params_df,
+            "source_sample_tag": ESTIMATION_SAMPLE_TAG,
+        }
+
+    candidate_sample_tags = [ESTIMATION_SAMPLE_TAG] + [
+        tag for tag in PRESENTATION_RESULTS_SAMPLE_TAGS if tag != ESTIMATION_SAMPLE_TAG
+    ]
+    for sample_tag in candidate_sample_tags:
+        results_dir = BIOGEME_RESULTS_ROOT / f"{MODEL_PARTITION}-biogeme-{sample_tag}"
+        fallback_stats, fallback_params = load_biogeme_result_for_model_name(
+            model_name,
+            results_dir=results_dir,
+        )
+        if fallback_stats is not None and fallback_params is not None:
+            return {
+                "stats": fallback_stats,
+                "params": fallback_params,
+                "source_sample_tag": sample_tag,
+            }
+    return {
+        "stats": None,
+        "params": None,
+        "source_sample_tag": None,
+    }
+
+
+def display_param_subset(df_params: pd.DataFrame, preferred: list[str]) -> pd.DataFrame:
+    cols = [c for c in preferred if c in df_params.columns]
+    if not cols:
+        return df_params.head(12)
+    return df_params[cols].head(20)
+
+
+def load_biogeme_numeric_df_from_parquet(path: Path) -> pd.DataFrame:
+    return (
+        read_parquet_portable(str(path))
+        .select([pl.col(c).cast(pl.Float64) for c in MODEL_NUMERIC_COLUMNS])
+        .collect()
+        .to_pandas()
+    )
+
+
+def parse_sample_fraction_from_name(path: Path) -> float | None:
+    stem = path.stem
+    if "-sample" not in stem or not stem.endswith("pct"):
+        return None
+    try:
+        pct_str = stem.split("-sample", 1)[1].removesuffix("pct")
+        return int(pct_str) / 100
+    except Exception:
+        return None
+
+
+def materialize_baseline_sample_if_needed(
+    *,
+    target_path: Path,
+    target_fraction: float,
+    model_partition: str,
+    artifacts_dir: Path,
+    seed: int = 42,
+) -> Path:
+    if target_path.exists():
+        return target_path
+
+    candidates = []
+    for p in artifacts_dir.glob(f"{model_partition}-estimation-sample*pct.parquet"):
+        if "-censo" in p.stem:
+            continue
+        frac = parse_sample_fraction_from_name(p)
+        if frac is not None and frac > target_fraction:
+            candidates.append((frac, p))
+
+    if not candidates:
+        available_samples = sorted(
+            p.name for p in artifacts_dir.glob(f"{model_partition}-estimation-*.parquet")
+        )
+        raise FileNotFoundError(
+            "No existe muestra baseline exacta y tampoco una muestra mayor desde la cual derivarla. "
+            f"Esperada: {target_path}. Disponibles: {available_samples}"
+        )
+
+    source_fraction, source_path = sorted(candidates, key=lambda x: x[0])[0]
+    sample_ratio = target_fraction / source_fraction
+    if not (0 < sample_ratio < 1):
+        raise ValueError(
+            f"No se puede derivar muestra objetivo {target_fraction:.2%} desde {source_fraction:.2%}"
+        )
+
+    print(
+        "ℹ️ No existe sample baseline exacto. "
+        f"Derivando {target_path.name} desde {source_path.name} con ratio estratificado {sample_ratio:.6f}"
+    )
+    df_source = pd.read_parquet(source_path)
+    required = {"partition", "choice_nested"}
+    missing = sorted(required - set(df_source.columns))
+    if missing:
+        raise ValueError(f"Faltan columnas para sampleo estratificado en {source_path}: {missing}")
+
+    df_target = (
+        df_source.groupby(["partition", "choice_nested"], sort=False, group_keys=False)
+        .sample(frac=sample_ratio, random_state=seed)
+        .sort_values(["partition", "choice_nested"], kind="stable")
+        .reset_index(drop=True)
+    )
+    pl.from_pandas(df_target).write_parquet(target_path)
+    print(f"✅ Sample baseline derivado escrito en: {target_path}")
+    return target_path
+
+
+def build_censo_model_ready_table(
+    *,
+    censo_final_path: Path,
+    zonas777_shp: Path,
+    socio_vars: list[str],
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    df_final = pl.read_parquet(censo_final_path)
+    missing = [c for c in ["ZONA777"] + socio_vars if c not in df_final.columns]
+    if missing:
+        raise ValueError(f"Faltan columnas en parquet Censo final: {missing}")
+
+    gdf_zonas = gpd.read_file(zonas777_shp)[["ZONA777", "geometry"]].copy()
+    gdf_zonas = gdf_zonas.set_crs("EPSG:4674", allow_override=True)
+
+    df_pd = pd.DataFrame(df_final.select(["ZONA777"] + socio_vars).to_dicts())
+    df_model_ready_pd, df_audit_pd = impute_missing_by_neighbor_median(
+        gdf_zonas=gdf_zonas,
+        df=df_pd,
+        columns=socio_vars,
+    )
+    df_model_ready = pl.DataFrame(df_model_ready_pd.to_dict(orient="list")).sort("ZONA777")
+    df_audit = pl.DataFrame(df_audit_pd.to_dict(orient="list")) if not df_audit_pd.empty else pl.DataFrame()
+    return df_model_ready, df_audit
+
+
+def build_zone_model_ready_table(
+    *,
+    zone_parquet_path: Path,
+    zonas777_shp: Path,
+    socio_vars: list[str],
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    df_final = pl.read_parquet(zone_parquet_path)
+    missing = [c for c in ["ZONA777"] + socio_vars if c not in df_final.columns]
+    if missing:
+        raise ValueError(f"Faltan columnas en parquet zonal: {missing}")
+
+    gdf_zonas = gpd.read_file(zonas777_shp)[["ZONA777", "geometry"]].copy()
+    gdf_zonas = gdf_zonas.set_crs("EPSG:4674", allow_override=True)
+    df_zonas_unique = (
+        gdf_zonas[["ZONA777"]]
+        .drop_duplicates(subset=["ZONA777"], keep="first")
+        .sort_values("ZONA777", kind="stable")
+        .reset_index(drop=True)
+    )
+
+    df_pd = pd.DataFrame(df_final.select(["ZONA777"] + socio_vars).to_dicts())
+    df_pd = (
+        df_zonas_unique
+        .merge(df_pd, on="ZONA777", how="left", validate="one_to_one")
+        .sort_values("ZONA777", kind="stable")
+        .reset_index(drop=True)
+    )
+    df_model_ready_pd, df_audit_pd = impute_missing_by_neighbor_median(
+        gdf_zonas=gdf_zonas,
+        df=df_pd,
+        columns=socio_vars,
+    )
+    df_model_ready = pl.DataFrame(df_model_ready_pd.to_dict(orient="list")).sort("ZONA777")
+    df_audit = pl.DataFrame(df_audit_pd.to_dict(orient="list")) if not df_audit_pd.empty else pl.DataFrame()
+    return df_model_ready, df_audit
+
+
+def standardize_censo_over_used_zones(
+    df_censo_model_ready: pl.DataFrame,
+    df_est_base: pl.DataFrame,
+    raw_vars: list[str],
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    df_used_zones = (
+        df_est_base
+        .select(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .drop_nulls()
+        .unique()
+        .sort("ZONA777")
+    )
+    df_censo_used = df_censo_model_ready.join(df_used_zones, on="ZONA777", how="inner")
+    stats_rows = []
+    df_out = df_censo_model_ready
+
+    for raw_var in raw_vars:
+        mu = df_censo_used.select(pl.col(raw_var).mean()).item()
+        sd = df_censo_used.select(pl.col(raw_var).std()).item()
+        if mu is None:
+            raise ValueError(f"No se pudo calcular media para {raw_var} sobre zonas usadas")
+        if sd is None or sd == 0:
+            sd = 1.0
+        z_var = f"{raw_var}_z"
+        df_out = df_out.with_columns(
+            ((pl.col(raw_var) - pl.lit(float(mu))) / pl.lit(float(sd))).alias(z_var)
+        )
+        stats_rows.append(
+            {
+                "variable": raw_var,
+                "mean_used_zones": float(mu),
+                "std_used_zones": float(sd),
+                "z_variable": z_var,
+            }
+        )
+
+    return df_out, pl.DataFrame(stats_rows)
+
+
+def add_origin_censo_controls(
+    df_trips: pl.DataFrame,
+    df_censo_zone: pl.DataFrame,
+    raw_vars: list[str],
+    z_vars: list[str],
+) -> pl.DataFrame:
+    ensure_unique_keys(df_censo_zone, ["ZONA777"], "df_censo_zone")
+    before_rows = df_trips.height
+    df = (
+        df_trips
+        .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .join(df_censo_zone.select(["ZONA777"] + raw_vars + z_vars), on="ZONA777", how="left")
+        .drop("ZONA777")
+    )
+    assert_left_join_preserves_rows(before_rows, df.height, "join Censo sobre muestra de estimación 07")
+    missing_ratio = df.select(
+        pl.any_horizontal([pl.col(c).is_null() for c in z_vars]).mean().alias("pct_rows_any_missing_socio")
+    ).item()
+    if missing_ratio != 0:
+        raise ValueError(f"Join Censo dejó filas con socio faltante: {missing_ratio:.6%}")
+    return df
+
+
+def estimate_mnl_transport_plus_censo(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    socio_cols: list[str] | None = None,
+    clean_run_no_iter: bool = False,
+    project_root: Path | None = None,
+):
+    database = db.Database(model_name, pandas_df)
+    socio_cols = socio_cols or []
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+
+    CHOICE = Variable("choice_nested")
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+    DUMMY_ANIO_2025 = Variable("DUMMY_ANIO_2025")
+    LOG_DEMAND = Variable("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+    LOG_BUS_STOP_DENSITY = Variable("LOG_BUS_STOP_DENSITY")
+    LOG_BUS_LINE_COUNT = Variable("LOG_BUS_LINE_COUNT")
+    LOG_METRO_LINE_COUNT = Variable("LOG_METRO_LINE_COUNT")
+
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+    TET_BIP = Variable("TET_BIP")
+    TET_QR_RED = Variable("TET_QR_RED")
+    TET_QR_OTHER = Variable("TET_QR_OTHER")
+    NTR_BIP = Variable("NTR_BIP")
+    NTR_QR_RED = Variable("NTR_QR_RED")
+    NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    ASC_QR_RED = Beta(f"ASC_QR_RED_{partition}", 0, None, None, 0)
+    ASC_QR_OTHER = Beta(f"ASC_QR_OTHER_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PM = Beta(f"B_QR_RED_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PM = Beta(f"B_QR_OTHER_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PT = Beta(f"B_QR_RED_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PT = Beta(f"B_QR_OTHER_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_RED_NO_LAB = Beta(f"B_QR_RED_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_NO_LAB = Beta(f"B_QR_OTHER_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_RED_ANIO_2025 = Beta(f"B_QR_RED_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_OTHER_ANIO_2025 = Beta(f"B_QR_OTHER_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_DEMAND = Beta(f"B_QR_RED_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_DEMAND = Beta(f"B_QR_OTHER_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_RED_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_OTHER_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_LINE_COUNT = Beta(f"B_QR_RED_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_METRO_LINE_COUNT = Beta(f"B_QR_RED_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_METRO_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+
+    B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_VEH = Beta(f"B_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_TRASB = Beta(f"B_BIP_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_TRASB = Beta(f"B_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_BIP_N_TRASB = Beta(f"B_BIP_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_N_TRASB = Beta(f"B_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_N_TRASB = Beta(f"B_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+
+    socio_var_exprs = {c: Variable(c) for c in socio_cols}
+    socio_betas_red = {
+        c: Beta(f"B_QR_RED_{SOCIO_PARAM_TAGS[c]}_{partition}", 0, None, None, 0)
+        for c in socio_cols
+    }
+    socio_betas_other = {
+        c: Beta(f"B_QR_OTHER_{SOCIO_PARAM_TAGS[c]}_{partition}", 0, None, None, 0)
+        for c in socio_cols
+    }
+
+    V_BIP = (
+        B_BIP_T_VEH * TVH_BIP
+        + B_BIP_T_ESPERA_INI * TEI_BIP
+        + B_BIP_T_ESPERA_TRASB * TET_BIP
+        + B_BIP_N_TRASB * NTR_BIP
+    )
+    V_QR_RED = (
+        ASC_QR_RED
+        + B_QR_RED_LAB_PM * LAB_PM
+        + B_QR_RED_LAB_PT * LAB_PT
+        + B_QR_RED_NO_LAB * NO_LAB
+        + B_QR_RED_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_RED_LOG_DEMAND * LOG_DEMAND
+        + B_QR_RED_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_RED_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_RED_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_RED_T_VEH * TVH_QR_RED
+        + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+        + B_QR_RED_N_TRASB * NTR_QR_RED
+    )
+    for c in socio_cols:
+        V_QR_RED += socio_betas_red[c] * socio_var_exprs[c]
+
+    V_QR_OTHER = (
+        ASC_QR_OTHER
+        + B_QR_OTHER_LAB_PM * LAB_PM
+        + B_QR_OTHER_LAB_PT * LAB_PT
+        + B_QR_OTHER_NO_LAB * NO_LAB
+        + B_QR_OTHER_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_OTHER_LOG_DEMAND * LOG_DEMAND
+        + B_QR_OTHER_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_OTHER_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_OTHER_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+        + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+    )
+    for c in socio_cols:
+        V_QR_OTHER += socio_betas_other[c] * socio_var_exprs[c]
+
+    V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+    av = {CHOICE_BIP: 1, CHOICE_QR_RED: 1, CHOICE_QR_OTHER: 1}
+    logprob = models.loglogit(V, av, CHOICE)
+
+    if clean_run_no_iter and project_root is not None:
+        remove_biogeme_iter_file(model_name, project_root)
+
+    biogeme = bio.BIOGEME(database, logprob)
+    biogeme.model_name = model_name
+    if BIOGEME_LARGE_RUN_MODE:
+        try:
+            biogeme.biogeme_parameters.set_value("generate_html", False)
+            biogeme.biogeme_parameters.set_value("generate_yaml", False)
+            biogeme.biogeme_parameters.set_value("save_iterations", False)
+            biogeme.biogeme_parameters.set_value("number_of_threads", BIOGEME_THREADS)
+            biogeme.biogeme_parameters.set_value("calculating_second_derivatives", BIOGEME_SECOND_DERIVATIVES)
+            biogeme.biogeme_parameters.set_value("optimization_algorithm", BIOGEME_OPTIMIZATION_ALGORITHM)
+        except Exception:
+            pass
+    results = biogeme.estimate()
+    return results.get_general_statistics(), br.get_pandas_estimated_parameters(results)
+
+
+def estimate_nested_transport_plus_censo(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    socio_cols: list[str] | None = None,
+    clean_run_no_iter: bool = False,
+    project_root: Path | None = None,
+):
+    database = db.Database(model_name, pandas_df)
+    socio_cols = socio_cols or []
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+
+    CHOICE = Variable("choice_nested")
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+    DUMMY_ANIO_2025 = Variable("DUMMY_ANIO_2025")
+    LOG_DEMAND = Variable("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+    LOG_BUS_STOP_DENSITY = Variable("LOG_BUS_STOP_DENSITY")
+    LOG_BUS_LINE_COUNT = Variable("LOG_BUS_LINE_COUNT")
+    LOG_METRO_LINE_COUNT = Variable("LOG_METRO_LINE_COUNT")
+
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+    TET_BIP = Variable("TET_BIP")
+    TET_QR_RED = Variable("TET_QR_RED")
+    TET_QR_OTHER = Variable("TET_QR_OTHER")
+    NTR_BIP = Variable("NTR_BIP")
+    NTR_QR_RED = Variable("NTR_QR_RED")
+    NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    MU_QR = Beta(f"MU_QR_{partition}", 1.5, 1, 100, 0)
+    nest_bip = nests.OneNestForNestedLogit(1.0, [CHOICE_BIP], name="BIP")
+    nest_qr = nests.OneNestForNestedLogit(MU_QR, [CHOICE_QR_RED, CHOICE_QR_OTHER], name="QR")
+    NESTS = nests.NestsForNestedLogit(
+        choice_set=[CHOICE_BIP, CHOICE_QR_RED, CHOICE_QR_OTHER],
+        tuple_of_nests=(nest_bip, nest_qr),
+    )
+
+    ASC_QR_RED = Beta(f"ASC_QR_RED_{partition}", 0, None, None, 0)
+    ASC_QR_OTHER = Beta(f"ASC_QR_OTHER_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PM = Beta(f"B_QR_RED_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PM = Beta(f"B_QR_OTHER_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PT = Beta(f"B_QR_RED_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PT = Beta(f"B_QR_OTHER_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_RED_NO_LAB = Beta(f"B_QR_RED_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_NO_LAB = Beta(f"B_QR_OTHER_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_RED_ANIO_2025 = Beta(f"B_QR_RED_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_OTHER_ANIO_2025 = Beta(f"B_QR_OTHER_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_DEMAND = Beta(f"B_QR_RED_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_DEMAND = Beta(f"B_QR_OTHER_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_RED_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_OTHER_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_LINE_COUNT = Beta(f"B_QR_RED_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_METRO_LINE_COUNT = Beta(f"B_QR_RED_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_METRO_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+
+    B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_VEH = Beta(f"B_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_TRASB = Beta(f"B_BIP_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_TRASB = Beta(f"B_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_BIP_N_TRASB = Beta(f"B_BIP_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_N_TRASB = Beta(f"B_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_N_TRASB = Beta(f"B_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+
+    socio_var_exprs = {c: Variable(c) for c in socio_cols}
+    socio_betas_red = {
+        c: Beta(f"B_QR_RED_{SOCIO_PARAM_TAGS[c]}_{partition}", 0, None, None, 0)
+        for c in socio_cols
+    }
+    socio_betas_other = {
+        c: Beta(f"B_QR_OTHER_{SOCIO_PARAM_TAGS[c]}_{partition}", 0, None, None, 0)
+        for c in socio_cols
+    }
+
+    V_BIP = (
+        B_BIP_T_VEH * TVH_BIP
+        + B_BIP_T_ESPERA_INI * TEI_BIP
+        + B_BIP_T_ESPERA_TRASB * TET_BIP
+        + B_BIP_N_TRASB * NTR_BIP
+    )
+    V_QR_RED = (
+        ASC_QR_RED
+        + B_QR_RED_LAB_PM * LAB_PM
+        + B_QR_RED_LAB_PT * LAB_PT
+        + B_QR_RED_NO_LAB * NO_LAB
+        + B_QR_RED_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_RED_LOG_DEMAND * LOG_DEMAND
+        + B_QR_RED_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_RED_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_RED_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_RED_T_VEH * TVH_QR_RED
+        + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+        + B_QR_RED_N_TRASB * NTR_QR_RED
+    )
+    for c in socio_cols:
+        V_QR_RED += socio_betas_red[c] * socio_var_exprs[c]
+
+    V_QR_OTHER = (
+        ASC_QR_OTHER
+        + B_QR_OTHER_LAB_PM * LAB_PM
+        + B_QR_OTHER_LAB_PT * LAB_PT
+        + B_QR_OTHER_NO_LAB * NO_LAB
+        + B_QR_OTHER_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_OTHER_LOG_DEMAND * LOG_DEMAND
+        + B_QR_OTHER_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_OTHER_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_OTHER_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+        + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+    )
+    for c in socio_cols:
+        V_QR_OTHER += socio_betas_other[c] * socio_var_exprs[c]
+
+    V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+    logprob = models.lognested(V, None, NESTS, CHOICE)
+
+    if clean_run_no_iter and project_root is not None:
+        remove_biogeme_iter_file(model_name, project_root)
+
+    biogeme = bio.BIOGEME(database, logprob)
+    biogeme.model_name = model_name
+    if BIOGEME_LARGE_RUN_MODE:
+        try:
+            biogeme.biogeme_parameters.set_value("generate_html", False)
+            biogeme.biogeme_parameters.set_value("generate_yaml", False)
+            biogeme.biogeme_parameters.set_value("save_iterations", False)
+            biogeme.biogeme_parameters.set_value("number_of_threads", BIOGEME_THREADS)
+            biogeme.biogeme_parameters.set_value("calculating_second_derivatives", BIOGEME_SECOND_DERIVATIVES)
+            biogeme.biogeme_parameters.set_value("optimization_algorithm", BIOGEME_OPTIMIZATION_ALGORITHM)
+        except Exception:
+            pass
+    results = biogeme.estimate()
+    return results.get_general_statistics(), br.get_pandas_estimated_parameters(results)
+```
+
+## 4) Construir artifact Censo model-ready
+
+```{python}
+#| label: build-censo-model-ready
+print("label: build-censo-model-ready")
+df_censo_model_ready, df_censo_imputation_audit = build_censo_model_ready_table(
+    censo_final_path=CENSO_FINAL_PATH,
+    zonas777_shp=ZONAS777_SHP,
+    socio_vars=SOCIO_ALL_RAW_VARS,
+)
+df_censo_model_ready.write_parquet(OUT_CENSO_MODEL_READY)
+print(f"✅ Censo model-ready escrito en: {OUT_CENSO_MODEL_READY}")
+display(df_censo_imputation_audit)
+display(df_censo_model_ready.filter(pl.col("ZONA777") == 528))
+```
+
+## 5) Construir muestra de estimación con Censo
+
+```{python}
+#| label: build-estimation-sample-censo
+print("label: build-estimation-sample-censo")
+baseline_sample_path = materialize_baseline_sample_if_needed(
+    target_path=BASELINE_ESTIMATION_SAMPLE_PATH,
+    target_fraction=SAMPLE_FRACTION_ESTIMATION,
+    model_partition=MODEL_PARTITION,
+    artifacts_dir=INTERANNUAL_ARTIFACTS_DIR,
+)
+df_est_base = read_parquet_portable(str(baseline_sample_path)).collect()
+print(f"rows baseline sample 07: {df_est_base.height:,}")
+
+df_censo_model_ready_std, df_censo_std_stats = standardize_censo_over_used_zones(
+    df_censo_model_ready,
+    df_est_base,
+    SOCIO_ALL_RAW_VARS,
+)
+df_censo_model_ready_std.write_parquet(OUT_CENSO_MODEL_READY_STD)
+print(f"✅ Censo model-ready + z escrito en: {OUT_CENSO_MODEL_READY_STD}")
+display(df_censo_std_stats)
+
+df_est_censo = add_origin_censo_controls(
+    df_est_base,
+    df_censo_model_ready_std,
+    raw_vars=SOCIO_ALL_RAW_VARS,
+    z_vars=SOCIO_ALL_Z_VARS,
+)
+df_est_censo.write_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+print(f"✅ Muestra de estimación + Censo escrita en: {OUT_ESTIMATION_SAMPLE_CENSO}")
+display(
+    df_est_censo.select(
+        pl.len().alias("rows"),
+        *[pl.col(c).mean().alias(f"{c}_mean") for c in SOCIO_ALL_Z_VARS],
+        *[pl.col(c).std().alias(f"{c}_std") for c in SOCIO_ALL_Z_VARS],
+    )
+)
+del df_est_base, df_est_censo
+gc.collect()
+```
+
+## 5b) Construir artifact microdatos spatialized model-ready
+
+```{python}
+#| label: build-microdata-model-ready
+print("label: build-microdata-model-ready")
+required_micro_cols = set(SOCIO_MICRO_RAW_VARS)
+if MICRODATA_ZONA777_PATH.exists():
+    existing_micro_cols = set(pl.scan_parquet(MICRODATA_ZONA777_PATH).collect_schema().names())
+    should_rebuild_micro_full = not required_micro_cols.issubset(existing_micro_cols)
+else:
+    should_rebuild_micro_full = True
+
+if should_rebuild_micro_full:
+    MICRODATA_ZONA777_DIR.mkdir(parents=True, exist_ok=True)
+    if MICRODATA_ZONA777_PATH.exists():
+        print("ℹ️ El parquet full existente no tiene todas las variables micro requeridas. Reconstruyéndolo ahora...")
+    else:
+        print("ℹ️ No existe parquet full de microdatos spatialized. Construyéndolo ahora...")
+    micro_artifacts = build_spatialized_microdata_outputs(
+        micro_paths=MicrodataPaths(
+            personas_zip=PERSONAS_ZIP,
+            hogares_zip=HOGARES_ZIP,
+            viviendas_zip=VIVIENDAS_ZIP,
+        ),
+        base_zip=BASE_ZIP,
+        carto_parquet=CARTO_MZ,
+        zonas777_shp=ZONAS777_SHP,
+        tau=MICRODATA_TAU,
+        seed=MICRODATA_SEED,
+        comuna_codes=None,
+    )
+    pl.from_pandas(micro_artifacts.zona777_features).write_parquet(MICRODATA_ZONA777_PATH)
+    print(f"✅ Microdatos ZONA777 full escritos en: {MICRODATA_ZONA777_PATH}")
+    del micro_artifacts
+    gc.collect()
+else:
+    print(f"ℹ️ Reusando parquet microdatos ZONA777 existente: {MICRODATA_ZONA777_PATH}")
+
+df_micro_model_ready, df_micro_imputation_audit = build_zone_model_ready_table(
+    zone_parquet_path=MICRODATA_ZONA777_PATH,
+    zonas777_shp=ZONAS777_SHP,
+    socio_vars=SOCIO_MICRO_RAW_VARS,
+)
+df_micro_model_ready.write_parquet(OUT_MICRODATA_MODEL_READY)
+print(f"✅ Microdatos model-ready escritos en: {OUT_MICRODATA_MODEL_READY}")
+with (pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000)):
+    display(df_micro_imputation_audit)
+    display(df_micro_model_ready.head(5))
+```
+
+## 5c) Construir muestra de estimación con Censo + microdatos
+
+```{python}
+#| label: build-estimation-sample-censo-micro
+print("label: build-estimation-sample-censo-micro")
+df_est_base = read_parquet_portable(str(BASELINE_ESTIMATION_SAMPLE_PATH)).collect()
+print(f"rows baseline sample 07: {df_est_base.height:,}")
+
+df_censo_micro_model_ready = (
+    df_censo_model_ready
+    .join(df_micro_model_ready, on="ZONA777", how="inner")
+)
+df_censo_micro_model_ready_std, df_censo_micro_std_stats = standardize_censo_over_used_zones(
+    df_censo_micro_model_ready,
+    df_est_base,
+    SOCIO_ALL_RAW_VARS + SOCIO_MICRO_RAW_VARS,
+)
+df_censo_micro_model_ready_std.write_parquet(OUT_CENSO_MICRO_MODEL_READY_STD)
+print(f"✅ Censo + microdatos model-ready + z escrito en: {OUT_CENSO_MICRO_MODEL_READY_STD}")
+with (pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000)):
+    display(df_censo_micro_std_stats)
+
+df_est_censo_micro = add_origin_censo_controls(
+    df_est_base,
+    df_censo_micro_model_ready_std,
+    raw_vars=SOCIO_ALL_RAW_VARS + SOCIO_MICRO_RAW_VARS,
+    z_vars=SOCIO_ALL_Z_VARS + SOCIO_MICRO_Z_VARS,
+)
+df_est_censo_micro.write_parquet(OUT_ESTIMATION_SAMPLE_CENSO_MICRO)
+print(f"✅ Muestra de estimación + Censo + microdatos escrita en: {OUT_ESTIMATION_SAMPLE_CENSO_MICRO}")
+with (pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000)):
+    display(
+    df_est_censo_micro.select(
+        pl.len().alias("rows"),
+        *[pl.col(c).mean().alias(f"{c}_mean") for c in SOCIO_MICRO_Z_VARS],
+        *[pl.col(c).std().alias(f"{c}_std") for c in SOCIO_MICRO_Z_VARS],
+    )
+)
+del df_est_base, df_est_censo_micro
+gc.collect()
+```
+
+## 6) Baseline MNL transport-only
+
+```{python}
+#| label: mnl-baseline
+print("label: mnl-baseline")
+df_model_mnl_baseline = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_baseline, params_mnl_baseline = estimate_mnl_transport_plus_censo(
+    df_model_mnl_baseline,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_BASELINE,
+    socio_cols=[],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_baseline,
+    stats=stats_mnl_baseline,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_BASELINE][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_BASELINE][1],
+)
+display(display_param_subset(params_mnl_baseline, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_mnl_baseline
+gc.collect()
+```
+
+## 7) MNL + bloque Censo completo
+
+```{python}
+#| label: mnl-censo-full
+print("label: mnl-censo-full")
+df_model_mnl_censo_full = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_full, params_mnl_censo_full = estimate_mnl_transport_plus_censo(
+    df_model_mnl_censo_full,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_FULL,
+    socio_cols=SOCIO_Z_VARS,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_full,
+    stats=stats_mnl_censo_full,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_FULL][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_FULL][1],
+)
+display(display_param_subset(params_mnl_censo_full, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_mnl_censo_full
+gc.collect()
+```
+
+## 8) MNL + desgloses Censo
+
+```{python}
+#| label: mnl-censo-prom-edad
+print("label: mnl-censo-prom-edad")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_prom_edad, params_mnl_censo_prom_edad = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_PROM_EDAD,
+    socio_cols=["prom_edad_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_prom_edad,
+    stats=stats_mnl_censo_prom_edad,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_PROM_EDAD][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_PROM_EDAD][1],
+)
+display(display_param_subset(params_mnl_censo_prom_edad, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-prom-escolaridad18
+print("label: mnl-censo-prom-escolaridad18")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_prom_escolaridad18, params_mnl_censo_prom_escolaridad18 = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18,
+    socio_cols=["prom_escolaridad18_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_prom_escolaridad18,
+    stats=stats_mnl_censo_prom_escolaridad18,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18][1],
+)
+display(display_param_subset(params_mnl_censo_prom_escolaridad18, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-share-inmigrantes
+print("label: mnl-censo-share-inmigrantes")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_share_inmigrantes, params_mnl_censo_share_inmigrantes = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES,
+    socio_cols=["share_inmigrantes_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_share_inmigrantes,
+    stats=stats_mnl_censo_share_inmigrantes,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES][1],
+)
+display(display_param_subset(params_mnl_censo_share_inmigrantes, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-share-hacinamiento
+print("label: mnl-censo-share-hacinamiento")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_share_hacinamiento, params_mnl_censo_share_hacinamiento = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO,
+    socio_cols=["share_hacinamiento_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_share_hacinamiento,
+    stats=stats_mnl_censo_share_hacinamiento,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO][1],
+)
+display(display_param_subset(params_mnl_censo_share_hacinamiento, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-hacinamiento
+print("label: mnl-censo-escolaridad-hacinamiento")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_escolaridad_hacinamiento, params_mnl_censo_escolaridad_hacinamiento = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO,
+    socio_cols=["prom_escolaridad18_z", "share_hacinamiento_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_escolaridad_hacinamiento,
+    stats=stats_mnl_censo_escolaridad_hacinamiento,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO][1],
+)
+
+display(
+    display_param_subset(
+        params_mnl_censo_escolaridad_hacinamiento,
+        ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"],
+    )
+)
+
+del df_model
+gc.collect()
+   
+
+```
+
+```{python}
+#| label: mnl-censo-share-internet
+print("label: mnl-censo-share-internet")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_share_internet, params_mnl_censo_share_internet = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_INTERNET,
+    socio_cols=["share_internet_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_share_internet,
+    stats=stats_mnl_censo_share_internet,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_INTERNET][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_INTERNET][1],
+)
+display(display_param_subset(params_mnl_censo_share_internet, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-share-serv-compu
+print("label: mnl-censo-share-serv-compu")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_share_serv_compu, params_mnl_censo_share_serv_compu = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU,
+    socio_cols=["share_serv_compu_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_share_serv_compu,
+    stats=stats_mnl_censo_share_serv_compu,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU][1],
+)
+display(display_param_subset(params_mnl_censo_share_serv_compu, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-share-serv-tel-movil
+print("label: mnl-censo-share-serv-tel-movil")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_share_serv_tel_movil, params_mnl_censo_share_serv_tel_movil = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL,
+    socio_cols=["share_serv_tel_movil_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_share_serv_tel_movil,
+    stats=stats_mnl_censo_share_serv_tel_movil,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL][1],
+)
+display(display_param_subset(params_mnl_censo_share_serv_tel_movil, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-share-discapacidad
+print("label: mnl-censo-share-discapacidad")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_share_discapacidad, params_mnl_censo_share_discapacidad = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD,
+    socio_cols=["share_discapacidad_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_share_discapacidad,
+    stats=stats_mnl_censo_share_discapacidad,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD][1],
+)
+display(display_param_subset(params_mnl_censo_share_discapacidad, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-share-analfabet
+print("label: mnl-censo-share-analfabet")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_share_analfabet, params_mnl_censo_share_analfabet = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_SHARE_ANALFABET,
+    socio_cols=["share_analfabet_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_share_analfabet,
+    stats=stats_mnl_censo_share_analfabet,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_ANALFABET][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_SHARE_ANALFABET][1],
+)
+display(display_param_subset(params_mnl_censo_share_analfabet, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-internet
+print("label: mnl-censo-escolaridad-internet")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_escolaridad_internet, params_mnl_censo_escolaridad_internet = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET,
+    socio_cols=["prom_escolaridad18_z", "share_internet_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_escolaridad_internet,
+    stats=stats_mnl_censo_escolaridad_internet,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET][1],
+)
+display(display_param_subset(params_mnl_censo_escolaridad_internet, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-serv-compu
+print("label: mnl-censo-escolaridad-serv-compu")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_escolaridad_serv_compu, params_mnl_censo_escolaridad_serv_compu = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU,
+    socio_cols=["prom_escolaridad18_z", "share_serv_compu_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_escolaridad_serv_compu,
+    stats=stats_mnl_censo_escolaridad_serv_compu,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU][1],
+)
+display(display_param_subset(params_mnl_censo_escolaridad_serv_compu, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-serv-tel-movil
+print("label: mnl-censo-escolaridad-serv-tel-movil")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_escolaridad_serv_tel_movil, params_mnl_censo_escolaridad_serv_tel_movil = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL,
+    socio_cols=["prom_escolaridad18_z", "share_serv_tel_movil_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_escolaridad_serv_tel_movil,
+    stats=stats_mnl_censo_escolaridad_serv_tel_movil,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL][1],
+)
+display(display_param_subset(params_mnl_censo_escolaridad_serv_tel_movil, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-discapacidad
+print("label: mnl-censo-escolaridad-discapacidad")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_escolaridad_discapacidad, params_mnl_censo_escolaridad_discapacidad = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD,
+    socio_cols=["prom_escolaridad18_z", "share_discapacidad_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_escolaridad_discapacidad,
+    stats=stats_mnl_censo_escolaridad_discapacidad,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD][1],
+)
+display(display_param_subset(params_mnl_censo_escolaridad_discapacidad, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-analfabet
+print("label: mnl-censo-escolaridad-analfabet")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_mnl_censo_escolaridad_analfabet, params_mnl_censo_escolaridad_analfabet = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET,
+    socio_cols=["prom_escolaridad18_z", "share_analfabet_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_escolaridad_analfabet,
+    stats=stats_mnl_censo_escolaridad_analfabet,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET][1],
+)
+display(display_param_subset(params_mnl_censo_escolaridad_analfabet, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+## 8b) MNL + proxies microdatos spatialized
+
+```{python}
+#| label: mnl-micro-share-cine18-universitaria
+print("label: mnl-micro-share-cine18-universitaria")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO_MICRO)
+stats_mnl_micro_universitaria, params_mnl_micro_universitaria = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_MICRO_UNIVERSITARIA,
+    socio_cols=["share_cine18_universitaria_micro_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_micro_universitaria,
+    stats=stats_mnl_micro_universitaria,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_MICRO_UNIVERSITARIA][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_MICRO_UNIVERSITARIA][1],
+)
+display(display_param_subset(params_mnl_micro_universitaria, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-micro-share-cine18-universitaria-o-mas
+print("label: mnl-micro-share-cine18-universitaria-o-mas")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO_MICRO)
+stats_mnl_micro_universitaria_o_mas, params_mnl_micro_universitaria_o_mas = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_MICRO_UNIVERSITARIA_O_MAS,
+    socio_cols=["share_cine18_universitaria_o_mas_micro_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_micro_universitaria_o_mas,
+    stats=stats_mnl_micro_universitaria_o_mas,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_MICRO_UNIVERSITARIA_O_MAS][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_MICRO_UNIVERSITARIA_O_MAS][1],
+)
+display(display_param_subset(params_mnl_micro_universitaria_o_mas, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-micro-share-cine18-terciaria-corta
+print("label: mnl-micro-share-cine18-terciaria-corta")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO_MICRO)
+stats_mnl_micro_terciaria_corta, params_mnl_micro_terciaria_corta = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_MICRO_TERCIARIA_CORTA,
+    socio_cols=["share_cine18_terciaria_corta_micro_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_micro_terciaria_corta,
+    stats=stats_mnl_micro_terciaria_corta,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_MICRO_TERCIARIA_CORTA][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_MICRO_TERCIARIA_CORTA][1],
+)
+display(display_param_subset(params_mnl_micro_terciaria_corta, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-micro-share-cine18-postgrado
+print("label: mnl-micro-share-cine18-postgrado")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO_MICRO)
+stats_mnl_micro_postgrado, params_mnl_micro_postgrado = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_MICRO_POSTGRADO,
+    socio_cols=["share_cine18_postgrado_micro_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_micro_postgrado,
+    stats=stats_mnl_micro_postgrado,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_MICRO_POSTGRADO][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_MICRO_POSTGRADO][1],
+)
+display(display_param_subset(params_mnl_micro_postgrado, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-micro-terciaria-corta
+print("label: mnl-censo-escolaridad-micro-terciaria-corta")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO_MICRO)
+stats_mnl_censo_escolaridad_micro_terciaria_corta, params_mnl_censo_escolaridad_micro_terciaria_corta = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_TERCIARIA_CORTA,
+    socio_cols=["prom_escolaridad18_z", "share_cine18_terciaria_corta_micro_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_escolaridad_micro_terciaria_corta,
+    stats=stats_mnl_censo_escolaridad_micro_terciaria_corta,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_TERCIARIA_CORTA][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_TERCIARIA_CORTA][1],
+)
+display(
+    display_param_subset(
+        params_mnl_censo_escolaridad_micro_terciaria_corta,
+        ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"],
+    )
+)
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-micro-postgrado
+print("label: mnl-censo-escolaridad-micro-postgrado")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO_MICRO)
+stats_mnl_censo_escolaridad_micro_postgrado, params_mnl_censo_escolaridad_micro_postgrado = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_POSTGRADO,
+    socio_cols=["prom_escolaridad18_z", "share_cine18_postgrado_micro_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_escolaridad_micro_postgrado,
+    stats=stats_mnl_censo_escolaridad_micro_postgrado,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_POSTGRADO][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_POSTGRADO][1],
+)
+display(
+    display_param_subset(
+        params_mnl_censo_escolaridad_micro_postgrado,
+        ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"],
+    )
+)
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-micro-universitaria-terciaria-corta
+print("label: mnl-micro-universitaria-terciaria-corta")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO_MICRO)
+stats_mnl_micro_universitaria_terciaria_corta, params_mnl_micro_universitaria_terciaria_corta = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_MICRO_UNIVERSITARIA_TERCIARIA_CORTA,
+    socio_cols=["share_cine18_universitaria_micro_z", "share_cine18_terciaria_corta_micro_z"],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_micro_universitaria_terciaria_corta,
+    stats=stats_mnl_micro_universitaria_terciaria_corta,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_MICRO_UNIVERSITARIA_TERCIARIA_CORTA][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_MICRO_UNIVERSITARIA_TERCIARIA_CORTA][1],
+)
+display(display_param_subset(params_mnl_micro_universitaria_terciaria_corta, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-micro-full-parsimonious
+print("label: mnl-censo-micro-full-parsimonious")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO_MICRO)
+stats_mnl_censo_micro_full_parsimonious, params_mnl_censo_micro_full_parsimonious = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS,
+    socio_cols=[
+        "share_cine18_universitaria_o_mas_micro_z",
+        "share_hacinamiento_z",
+        "share_discapacidad_z",
+        "share_inmigrantes_z",
+    ],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_micro_full_parsimonious,
+    stats=stats_mnl_censo_micro_full_parsimonious,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS][1],
+)
+display(display_param_subset(params_mnl_censo_micro_full_parsimonious, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-micro-full-expanded
+print("label: mnl-censo-micro-full-expanded")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO_MICRO)
+stats_mnl_censo_micro_full_expanded, params_mnl_censo_micro_full_expanded = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_MICRO_FULL_EXPANDED,
+    socio_cols=[
+        "share_hacinamiento_z",
+        "share_internet_z",
+        "share_serv_compu_z",
+        "share_serv_tel_movil_z",
+        "share_discapacidad_z",
+        "share_analfabet_z",
+        "share_inmigrantes_z",
+        "share_cine18_universitaria_o_mas_micro_z",
+    ],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_micro_full_expanded,
+    stats=stats_mnl_censo_micro_full_expanded,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_MICRO_FULL_EXPANDED][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_MICRO_FULL_EXPANDED][1],
+)
+display(display_param_subset(params_mnl_censo_micro_full_expanded, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: mnl-censo-micro-full-parsimonious-no-discapacidad
+print("label: mnl-censo-micro-full-parsimonious-no-discapacidad")
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO_MICRO)
+stats_mnl_censo_micro_full_parsimonious_no_discapacidad, params_mnl_censo_micro_full_parsimonious_no_discapacidad = estimate_mnl_transport_plus_censo(
+    df_model,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS_NO_DISCAPACIDAD,
+    socio_cols=[
+        "share_cine18_universitaria_o_mas_micro_z",
+        "share_hacinamiento_z",
+        "share_inmigrantes_z",
+    ],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_censo_micro_full_parsimonious_no_discapacidad,
+    stats=stats_mnl_censo_micro_full_parsimonious_no_discapacidad,
+    params_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS_NO_DISCAPACIDAD][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS_NO_DISCAPACIDAD][1],
+)
+display(display_param_subset(params_mnl_censo_micro_full_parsimonious_no_discapacidad, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+## 9) Nested como contraste
+
+```{python}
+#| label: nested-baseline
+print("label: nested-baseline")
+df_model_nested_baseline = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_nested_baseline, params_nested_baseline = estimate_nested_transport_plus_censo(
+    df_model_nested_baseline,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_NESTED_BASELINE,
+    socio_cols=[],
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_nested_baseline,
+    stats=stats_nested_baseline,
+    params_path=RESULT_PATHS[MODEL_NAME_NESTED_BASELINE][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_NESTED_BASELINE][1],
+)
+display(display_param_subset(params_nested_baseline, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_nested_baseline
+gc.collect()
+```
+
+```{python}
+#| label: nested-censo-full
+print("label: nested-censo-full")
+df_model_nested_censo_full = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_CENSO)
+stats_nested_censo_full, params_nested_censo_full = estimate_nested_transport_plus_censo(
+    df_model_nested_censo_full,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_NESTED_CENSO_FULL,
+    socio_cols=SOCIO_Z_VARS,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_nested_censo_full,
+    stats=stats_nested_censo_full,
+    params_path=RESULT_PATHS[MODEL_NAME_NESTED_CENSO_FULL][0],
+    stats_path=RESULT_PATHS[MODEL_NAME_NESTED_CENSO_FULL][1],
+)
+display(display_param_subset(params_nested_censo_full, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_nested_censo_full
+gc.collect()
+```
+
+## 10) Cargar resultados guardados
+
+```{python}
+#| label: load-results
+print("label: load-results")
+loaded_results = {}
+for model_name, (params_path, stats_path) in RESULT_PATHS.items():
+    stats_loaded, params_loaded = load_biogeme_result_csvs(
+        params_path=params_path,
+        stats_path=stats_path,
+    )
+    loaded_results[model_name] = {
+        "stats": stats_loaded,
+        "params": params_loaded,
+    }
+    print(
+        model_name,
+        "->",
+        "loaded" if (stats_loaded is not None and params_loaded is not None) else "missing",
+    )
+```
+
+## 11) Resúmenes rápidos
+
+```{python}
+#| label: mnl-baseline-results
+print("label: mnl-baseline-results")
+if loaded_results[MODEL_NAME_MNL_BASELINE]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_BASELINE]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_BASELINE]["params"])
+```
+
+```{python}
+#| label: mnl-censo-full-results
+print("label: mnl-censo-full-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_FULL]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_FULL]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_FULL]["params"])
+```
+
+```{python}
+#| label: mnl-censo-prom-edad-results
+print("label: mnl-censo-prom-edad-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_PROM_EDAD]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_PROM_EDAD]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_PROM_EDAD]["params"])
+
+```
+
+```{python}
+#| label: mnl-censo-prom-escolaridad18-results
+print("label: mnl-censo-prom-escolaridad18-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18]["params"])
+
+```
+
+```{python}
+#| label: mnl-censo-share-inmigrantes-results
+print("label: mnl-censo-share-inmigrantes-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES]["params"])
+
+```
+
+```{python}
+#| label: mnl-censo-share-hacinamiento-results
+print("label: mnl-censo-share-hacinamiento-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO]["params"])
+
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-hacinamiento-results
+print("label: mnl-censo-escolaridad-hacinamiento-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_HACINAMIENTO]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-internet-results
+print("label: mnl-censo-share-internet-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INTERNET]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INTERNET]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_INTERNET]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-serv-compu-results
+print("label: mnl-censo-share-serv-compu-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-serv-tel-movil-results
+print("label: mnl-censo-share-serv-tel-movil-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-discapacidad-results
+print("label: mnl-censo-share-discapacidad-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD]["params"])
+```
+
+```{python}
+#| label: mnl-censo-share-analfabet-results
+print("label: mnl-censo-share-analfabet-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_SHARE_ANALFABET]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_ANALFABET]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_SHARE_ANALFABET]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-internet-results
+print("label: mnl-censo-escolaridad-internet-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_INTERNET]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-serv-compu-results
+print("label: mnl-censo-escolaridad-serv-compu-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_COMPU]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-serv-tel-movil-results
+print("label: mnl-censo-escolaridad-serv-tel-movil-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_SERV_TEL_MOVIL]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-discapacidad-results
+print("label: mnl-censo-escolaridad-discapacidad-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_DISCAPACIDAD]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-analfabet-results
+print("label: mnl-censo-escolaridad-analfabet-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_ANALFABET]["params"])
+
+```
+
+```{python}
+#| label: mnl-micro-share-cine18-universitaria-results
+print("label: mnl-micro-share-cine18-universitaria-results")
+if loaded_results[MODEL_NAME_MNL_MICRO_UNIVERSITARIA]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_MICRO_UNIVERSITARIA]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_MICRO_UNIVERSITARIA]["params"])
+```
+
+```{python}
+#| label: mnl-micro-share-cine18-universitaria-o-mas-results
+print("label: mnl-micro-share-cine18-universitaria-o-mas-results")
+if loaded_results[MODEL_NAME_MNL_MICRO_UNIVERSITARIA_O_MAS]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_MICRO_UNIVERSITARIA_O_MAS]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_MICRO_UNIVERSITARIA_O_MAS]["params"])
+```
+
+```{python}
+#| label: mnl-micro-share-cine18-terciaria-corta-results
+print("label: mnl-micro-share-cine18-terciaria-corta-results")
+if loaded_results[MODEL_NAME_MNL_MICRO_TERCIARIA_CORTA]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_MICRO_TERCIARIA_CORTA]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_MICRO_TERCIARIA_CORTA]["params"])
+```
+
+```{python}
+#| label: mnl-micro-share-cine18-postgrado-results
+print("label: mnl-micro-share-cine18-postgrado-results")
+if loaded_results[MODEL_NAME_MNL_MICRO_POSTGRADO]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_MICRO_POSTGRADO]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_MICRO_POSTGRADO]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-micro-terciaria-corta-results
+print("label: mnl-censo-escolaridad-micro-terciaria-corta-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_TERCIARIA_CORTA]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_TERCIARIA_CORTA]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_TERCIARIA_CORTA]["params"])
+```
+
+```{python}
+#| label: mnl-censo-escolaridad-micro-postgrado-results
+print("label: mnl-censo-escolaridad-micro-postgrado-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_POSTGRADO]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_POSTGRADO]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_ESCOLARIDAD_MICRO_POSTGRADO]["params"])
+```
+
+```{python}
+#| label: mnl-micro-universitaria-terciaria-corta-results
+print("label: mnl-micro-universitaria-terciaria-corta-results")
+if loaded_results[MODEL_NAME_MNL_MICRO_UNIVERSITARIA_TERCIARIA_CORTA]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_MICRO_UNIVERSITARIA_TERCIARIA_CORTA]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_MICRO_UNIVERSITARIA_TERCIARIA_CORTA]["params"])
+```
+
+```{python}
+#| label: mnl-censo-micro-full-parsimonious-results
+print("label: mnl-censo-micro-full-parsimonious-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS]["params"])
+```
+
+```{python}
+#| label: mnl-censo-micro-full-expanded-results
+print("label: mnl-censo-micro-full-expanded-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_MICRO_FULL_EXPANDED]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_MICRO_FULL_EXPANDED]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_MICRO_FULL_EXPANDED]["params"])
+```
+
+```{python}
+#| label: mnl-censo-micro-full-parsimonious-no-discapacidad-results
+print("label: mnl-censo-micro-full-parsimonious-no-discapacidad-results")
+if loaded_results[MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS_NO_DISCAPACIDAD]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS_NO_DISCAPACIDAD]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS_NO_DISCAPACIDAD]["params"])
+```
+
+```{python}
+#| label: nested-baseline-results
+print("label: nested-baseline-results")
+if loaded_results[MODEL_NAME_NESTED_BASELINE]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_NESTED_BASELINE]["stats"]))
+    display(loaded_results[MODEL_NAME_NESTED_BASELINE]["params"])
+```
+
+```{python}
+#| label: nested-censo-full-results
+print("label: nested-censo-full-results")
+if loaded_results[MODEL_NAME_NESTED_CENSO_FULL]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_NESTED_CENSO_FULL]["stats"]))
+    display(loaded_results[MODEL_NAME_NESTED_CENSO_FULL]["params"])
+```
+
+## 12) Cierre de selección de variables Censo / microdatos
+
+```{python}
+#| label: censo-variable-selection-summary
+print("label: censo-variable-selection-summary")
+
+def _metric_value(stats_obj, metric_name: str):
+    if stats_obj is None:
+        return None
+    if isinstance(stats_obj, pd.DataFrame):
+        subset = stats_obj.loc[stats_obj["metric"] == metric_name, "value"]
+        return None if subset.empty else subset.iloc[0]
+    stats_df = biogeme_stats_to_frame(stats_obj)
+    subset = stats_df.loc[stats_df["metric"] == metric_name, "value"]
+    return None if subset.empty else subset.iloc[0]
+
+
+def _param_value(params_df: pd.DataFrame | None, prefix: str, tag: str):
+    if params_df is None:
+        return None
+    target = f"{prefix}_{tag}_{MODEL_PARTITION}"
+    subset = params_df.loc[params_df["Name"] == target, "Value"]
+    return None if subset.empty else subset.iloc[0]
+
+
+single_var_specs = [
+    {
+        "variable": "prom_edad",
+        "dimension": "demográfica",
+        "model_name": MODEL_NAME_MNL_CENSO_PROM_EDAD,
+        "tag": SOCIO_PARAM_TAGS["prom_edad_z"],
+        "interpretation": "promedio de edad de la zona de origen",
+        "status": "probada, no priorizada",
+        "for_ml_shap": "no",
+    },
+    {
+        "variable": "prom_escolaridad18",
+        "dimension": "capital_humano",
+        "model_name": MODEL_NAME_MNL_CENSO_PROM_ESCOLARIDAD18,
+        "tag": SOCIO_PARAM_TAGS["prom_escolaridad18_z"],
+        "interpretation": "benchmark agregado de escolaridad adulta",
+        "status": "benchmark explícito",
+        "for_ml_shap": "sí, benchmark",
+    },
+    {
+        "variable": "share_inmigrantes",
+        "dimension": "demográfica",
+        "model_name": MODEL_NAME_MNL_CENSO_SHARE_INMIGRANTES,
+        "tag": SOCIO_PARAM_TAGS["share_inmigrantes_z"],
+        "interpretation": "proporción de inmigrantes en la zona de origen",
+        "status": "probada, no priorizada",
+        "for_ml_shap": "no",
+    },
+    {
+        "variable": "share_hacinamiento",
+        "dimension": "vulnerabilidad_material",
+        "model_name": MODEL_NAME_MNL_CENSO_SHARE_HACINAMIENTO,
+        "tag": SOCIO_PARAM_TAGS["share_hacinamiento_z"],
+        "interpretation": "proxy inversa de ingreso / vulnerabilidad material",
+        "status": "secundaria potencial",
+        "for_ml_shap": "todavía no",
+    },
+    {
+        "variable": "share_internet",
+        "dimension": "socioeconómica_compuesta",
+        "model_name": MODEL_NAME_MNL_CENSO_SHARE_INTERNET,
+        "tag": SOCIO_PARAM_TAGS["share_internet_z"],
+        "interpretation": "proxy compuesta de conectividad + estatus",
+        "status": "probada, interpretable con cautela",
+        "for_ml_shap": "todavía no",
+    },
+    {
+        "variable": "share_serv_compu",
+        "dimension": "socioeconómica_compuesta",
+        "model_name": MODEL_NAME_MNL_CENSO_SHARE_SERV_COMPU,
+        "tag": SOCIO_PARAM_TAGS["share_serv_compu_z"],
+        "interpretation": "acceso a computador/servicio en el hogar",
+        "status": "probada, no priorizada",
+        "for_ml_shap": "no",
+    },
+    {
+        "variable": "share_serv_tel_movil",
+        "dimension": "socioeconómica_compuesta",
+        "model_name": MODEL_NAME_MNL_CENSO_SHARE_SERV_TEL_MOVIL,
+        "tag": SOCIO_PARAM_TAGS["share_serv_tel_movil_z"],
+        "interpretation": "acceso a telefonía móvil en el hogar",
+        "status": "probada, no priorizada",
+        "for_ml_shap": "no",
+    },
+    {
+        "variable": "share_discapacidad",
+        "dimension": "vulnerabilidad",
+        "model_name": MODEL_NAME_MNL_CENSO_SHARE_DISCAPACIDAD,
+        "tag": SOCIO_PARAM_TAGS["share_discapacidad_z"],
+        "interpretation": "proporción de población con discapacidad",
+        "status": "probada, no priorizada",
+        "for_ml_shap": "no",
+    },
+    {
+        "variable": "share_analfabet",
+        "dimension": "vulnerabilidad_educativa",
+        "model_name": MODEL_NAME_MNL_CENSO_SHARE_ANALFABET,
+        "tag": SOCIO_PARAM_TAGS["share_analfabet_z"],
+        "interpretation": "proporción de analfabetismo 15+",
+        "status": "probada, no priorizada",
+        "for_ml_shap": "no",
+    },
+    {
+        "variable": "share_cine18_universitaria_micro",
+        "dimension": "capital_humano",
+        "model_name": MODEL_NAME_MNL_MICRO_UNIVERSITARIA,
+        "tag": SOCIO_PARAM_TAGS["share_cine18_universitaria_micro_z"],
+        "interpretation": "adultos con educación universitaria exacta",
+        "status": "referencia desagregada",
+        "for_ml_shap": "no principal",
+    },
+    {
+        "variable": "share_cine18_universitaria_o_mas_micro",
+        "dimension": "capital_humano",
+        "model_name": MODEL_NAME_MNL_MICRO_UNIVERSITARIA_O_MAS,
+        "tag": SOCIO_PARAM_TAGS["share_cine18_universitaria_o_mas_micro_z"],
+        "interpretation": "adultos con al menos educación universitaria",
+        "status": "principal candidata",
+        "for_ml_shap": "sí, principal",
+    },
+    {
+        "variable": "share_cine18_postgrado_micro",
+        "dimension": "estatus_alto",
+        "model_name": MODEL_NAME_MNL_MICRO_POSTGRADO,
+        "tag": SOCIO_PARAM_TAGS["share_cine18_postgrado_micro_z"],
+        "interpretation": "adultos con postgrado",
+        "status": "sensibilidad",
+        "for_ml_shap": "sí, sensibilidad",
+    },
+    {
+        "variable": "share_cine18_terciaria_corta_micro",
+        "dimension": "técnico_laboral",
+        "model_name": MODEL_NAME_MNL_MICRO_TERCIARIA_CORTA,
+        "tag": SOCIO_PARAM_TAGS["share_cine18_terciaria_corta_micro_z"],
+        "interpretation": "adultos con terciaria corta",
+        "status": "descartada como proxy principal",
+        "for_ml_shap": "no",
+    },
+]
+
+summary_rows = []
+for spec in single_var_specs:
+    result = get_result_with_summary_fallback(spec["model_name"])
+    stats_obj = result.get("stats")
+    params_df = result.get("params")
+    summary_rows.append(
+        {
+            "dimension": spec["dimension"],
+            "variable": spec["variable"],
+            "interpretation": spec["interpretation"],
+            "model_name": spec["model_name"],
+            "ll": _metric_value(stats_obj, "Final log likelihood"),
+            "aic": _metric_value(stats_obj, "Akaike Information Criterion"),
+            "gradient": _metric_value(stats_obj, "Final gradient norm"),
+            "beta_qr_red": _param_value(params_df, "B_QR_RED", spec["tag"]),
+            "beta_qr_other": _param_value(params_df, "B_QR_OTHER", spec["tag"]),
+            "results_sample_tag": result.get("source_sample_tag"),
+            "status": spec["status"],
+            "for_ml_shap": spec["for_ml_shap"],
+        }
+    )
+
+df_censo_var_summary = (
+    pl.DataFrame(summary_rows)
+    .with_columns(
+        pl.col("ll").cast(pl.Float64, strict=False).round(1),
+        pl.col("aic").cast(pl.Float64, strict=False).round(1),
+        pl.col("gradient").cast(pl.Float64, strict=False).round(1),
+        pl.col("beta_qr_red").cast(pl.Float64, strict=False).round(3),
+        pl.col("beta_qr_other").cast(pl.Float64, strict=False).round(3),
+    )
+    .sort(["dimension", "aic"])
+)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_censo_var_summary)
+```
+
+```{python}
+#| label: censo-final-shortlist
+print("label: censo-final-shortlist")
+final_shortlist = pl.DataFrame(
+    {
+        "role": [
+            "principal",
+            "benchmark",
+            "sensibilidad",
+        ],
+        "variable": [
+            "share_cine18_universitaria_o_mas_micro",
+            "prom_escolaridad18",
+            "share_cine18_postgrado_micro",
+        ],
+        "reason": [
+            "mejor definición metodológica de nivel académico alto como proxy de ingreso/capital humano",
+            "proxy agregada clásica para comparación explícita",
+            "captura élite educativa / estatus alto como chequeo de sensibilidad",
+        ],
+        "usar_en_ml_shap": [
+            "sí",
+            "sí",
+            "sí, solo sensibilidad",
+        ],
+    }
+)
+display(final_shortlist)
+```
+
+```{python}
+#| label: censo-conceptual-table
+print("label: censo-conceptual-table")
+df_censo_conceptual = pl.DataFrame(
+    {
+        "variable": [
+            "share_cine18_universitaria_o_mas",
+            "share_cine18_postgrado",
+            "share_cine18_terciaria_corta",
+            "prom_escolaridad18",
+            "share_internet",
+            "share_serv_compu",
+            "share_serv_tel_movil",
+            "share_discapacidad",
+            "share_analfabet",
+            "share_hacinamiento",
+            "share_inmigrantes",
+            "prom_edad",
+        ],
+        "fuente": [
+            "Microdatos Censo spatialized",
+            "Microdatos Censo spatialized",
+            "Microdatos Censo spatialized",
+            "Censo agregado ZONA777",
+            "Censo agregado ZONA777",
+            "Censo agregado ZONA777",
+            "Censo agregado ZONA777",
+            "Censo agregado ZONA777",
+            "Censo agregado ZONA777",
+            "Censo agregado ZONA777",
+            "Censo agregado ZONA777",
+            "Censo agregado ZONA777",
+        ],
+        "dimension": [
+            "PROXY_INGRESOS/capital_humano_alto",
+            "estatus_alto_elite_educativa",
+            "dimension_tecnico_laboral",
+            "capital_humano_educacion",
+            "conectividad_estatus",
+            "equipamiento_hogar_estatus",
+            "conectividad_basica",
+            "vulnerabilidad",
+            "vulnerabilidad_educativa",
+            "vulnerabilidad_material",
+            "composicion_demografica",
+            "demografica",
+        ],
+        "interpretacion_sustantiva": [
+            "proporción de adultos con al menos educación universitaria",
+            "proporción de adultos con postgrado",
+            "proporción de adultos con terciaria corta",
+            "escolaridad promedio de la población adulta",
+            "proporción con acceso a internet",
+            "proporción con acceso a computador",
+            "proporción con acceso a telefonía móvil",
+            "proporción de población con discapacidad",
+            "proporción de analfabetismo 15+",
+            "proxy inversa de ingreso / precariedad residencial",
+            "proporción de inmigrantes en la zona",
+            "promedio de edad de la zona de origen",
+        ],
+        "signo_esperado_vs_qr": [
+            "positivo",
+            "positivo",
+            "ambiguo / no necesariamente positivo",
+            "positivo",
+            "positivo",
+            "positivo",
+            "positivo",
+            "negativo",
+            "negativo",
+            "negativo",
+            "ambiguo / empírico",
+            "ambiguo / empírico",
+        ],
+        "estatus": [
+            "principal candidata",
+            "sensibilidad",
+            "descartada como proxy principal",
+            "benchmark",
+            "probada, no priorizada",
+            "probada, no priorizada",
+            "probada, no priorizada",
+            "probada, no priorizada",
+            "probada, no priorizada",
+            "secundaria potencial",
+            "probada, no priorizada",
+            "probada, no priorizada",
+        ],
+    }
+)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    display(df_censo_conceptual)
+```
+
+```{python}
+#| label: censo-results-comparison-table
+print("label: censo-results-comparison-table")
+
+CONVERGENCE_GRADIENT_THRESHOLD = 50.0
+PRESENTATION_LABELS = {
+    "prom_edad": "Edad promedio",
+    "prom_escolaridad18": "Escolaridad promedio",
+    "share_inmigrantes": "Inmigrantes",
+    "share_hacinamiento": "Hacinamiento",
+    "share_internet": "Internet",
+    "share_serv_compu": "Computador",
+    "share_serv_tel_movil": "Tel. movil",
+    "share_discapacidad": "Discapacidad",
+    "share_analfabet": "Analfabetismo",
+    "share_cine18_universitaria_micro": "Universitaria",
+    "share_cine18_universitaria_o_mas_micro": "Universitaria o mas",
+    "share_cine18_postgrado_micro": "Postgrado",
+    "share_cine18_terciaria_corta_micro": "Terciaria corta",
+}
+
+def _param_pvalue(params_df: pd.DataFrame | None, prefix: str, tag: str):
+    if params_df is None:
+        return None
+    target = f"{prefix}_{tag}_{MODEL_PARTITION}"
+    p_col = next(
+        (
+            col
+            for col in ["Robust p-value", "Rob. p-value", "p-value"]
+            if col in params_df.columns
+        ),
+        None,
+    )
+    if p_col is None:
+        return None
+    subset = params_df.loc[params_df["Name"] == target, p_col]
+    return None if subset.empty else subset.iloc[0]
+
+
+def _converged_flag(stats_obj):
+    gradient = _metric_value(stats_obj, "Final gradient norm")
+    if gradient is None:
+        return None
+    return "sí" if float(gradient) <= CONVERGENCE_GRADIENT_THRESHOLD else "no"
+
+
+comparison_rows = []
+for spec in single_var_specs:
+    result = get_result_with_summary_fallback(spec["model_name"])
+    stats_obj = result.get("stats")
+    params_df = result.get("params")
+    comparison_rows.append(
+        {
+            "modelo": PRESENTATION_LABELS.get(spec["variable"], spec["variable"]),
+            "ll": _metric_value(stats_obj, "Final log likelihood"),
+            "converge": _converged_flag(stats_obj),
+            "beta_qr_red": _param_value(params_df, "B_QR_RED", spec["tag"]),
+            "beta_qr_other": _param_value(params_df, "B_QR_OTHER", spec["tag"]),
+            "p_value_b_qr_red": _param_pvalue(params_df, "B_QR_RED", spec["tag"]),
+            "p_value_b_qr_other": _param_pvalue(params_df, "B_QR_OTHER", spec["tag"]),
+        }
+    )
+
+df_censo_results_comparison_univariate = (
+    pl.DataFrame(comparison_rows)
+    .with_columns(
+        pl.col("ll").cast(pl.Float64, strict=False).round(1),
+        pl.col("beta_qr_red").cast(pl.Float64, strict=False).round(3),
+        pl.col("beta_qr_other").cast(pl.Float64, strict=False).round(3),
+        pl.col("p_value_b_qr_red").cast(pl.Float64, strict=False),
+        pl.col("p_value_b_qr_other").cast(pl.Float64, strict=False),
+    )
+    .with_columns(
+        pl.col("p_value_b_qr_red").map_elements(
+            lambda x: None if x is None else f"{x:.3e}",
+            return_dtype=pl.Utf8,
+        ).alias("p_value_qr_red"),
+        pl.col("p_value_b_qr_other").map_elements(
+            lambda x: None if x is None else f"{x:.3e}",
+            return_dtype=pl.Utf8,
+        ).alias("p_value_qr_other"),
+    )
+    .select(
+        "modelo",
+        "ll",
+        "converge",
+        "beta_qr_red",
+        "beta_qr_other",
+        "p_value_qr_red",
+        "p_value_qr_other",
+    )
+    .sort("ll", descending=True)
+)
+
+multivariate_rows = []
+for label, model_name in [
+    ("Full", MODEL_NAME_MNL_CENSO_FULL),
+    ("Parsimonioso", MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS),
+]:
+    result = get_result_with_summary_fallback(model_name)
+    stats_obj = result.get("stats")
+    multivariate_rows.append(
+        {
+            "modelo": label,
+            "ll": _metric_value(stats_obj, "Final log likelihood"),
+            "aic": _metric_value(stats_obj, "Akaike Information Criterion"),
+            "gradient": _metric_value(stats_obj, "Final gradient norm"),
+            "converge": _converged_flag(stats_obj),
+            "sample_tag": result.get("source_sample_tag"),
+        }
+    )
+
+df_censo_results_comparison_multivariate = (
+    pl.DataFrame(multivariate_rows)
+    .with_columns(
+        pl.col("ll").cast(pl.Float64, strict=False).round(1),
+        pl.col("aic").cast(pl.Float64, strict=False).round(1),
+        pl.col("gradient").cast(pl.Float64, strict=False).round(1),
+    )
+)
+
+print("Univariados (comparables entre si; sample5pct)")
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_censo_results_comparison_univariate)
+
+print("Multivariados exploratorios (no comparables directamente con los univariados por sample distinto)")
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_censo_results_comparison_multivariate)
+print(
+    f"Nota: `converge` se codifica como `sí/no` usando `Final gradient norm <= {CONVERGENCE_GRADIENT_THRESHOLD:.0f}` como regla práctica."
+)
+print(f"Nota: los p-values se muestran en notación científica.")
+print(f"Nota: los univariados usan resultados de `sample5pct`; `Parsimonioso` usa `sample2pct`.")
+```
+
+```{python}
+#| label: censo-full-vs-parsimonious-params
+print("label: censo-full-vs-parsimonious-params")
+
+def _best_pvalue_column(params_df: pd.DataFrame | None) -> str | None:
+    if params_df is None:
+        return None
+    for col in ["Robust p-value", "Rob. p-value", "p-value"]:
+        if col in params_df.columns:
+            return col
+    return None
+
+
+def _prepare_param_compare_frame(params_df: pd.DataFrame | None, label: str) -> pd.DataFrame:
+    if params_df is None:
+        return pd.DataFrame(columns=["parameter", f"value_{label}", f"p_value_{label}"])
+    p_col = _best_pvalue_column(params_df)
+    cols = ["Name", "Value"] + ([p_col] if p_col is not None else [])
+    out = params_df[cols].copy()
+    out["parameter"] = out["Name"].str.replace(f"_{MODEL_PARTITION}$", "", regex=True)
+    rename_map = {"Value": f"value_{label}"}
+    if p_col is not None:
+        rename_map[p_col] = f"p_value_{label}"
+    out = out.rename(columns=rename_map)
+    keep_cols = ["parameter", f"value_{label}"]
+    if p_col is not None:
+        keep_cols.append(f"p_value_{label}")
+    return out[keep_cols]
+
+
+def _parameter_block(parameter: str) -> str:
+    if parameter.startswith("ASC_"):
+        return "ASC"
+    if "SHARE_" in parameter or "PROM_" in parameter:
+        return "Socio"
+    return "Controles"
+
+
+baseline_result = get_result_with_summary_fallback(MODEL_NAME_MNL_BASELINE)
+full_result = get_result_with_summary_fallback(MODEL_NAME_MNL_CENSO_FULL)
+parsimonious_result = get_result_with_summary_fallback(MODEL_NAME_MNL_CENSO_MICRO_FULL_PARSIMONIOUS)
+
+df_baseline_compare = _prepare_param_compare_frame(baseline_result.get("params"), "baseline")
+df_full_compare = _prepare_param_compare_frame(full_result.get("params"), "full")
+df_pars_compare = _prepare_param_compare_frame(parsimonious_result.get("params"), "parsimonious")
+
+df_full_vs_parsimonious_params = (
+    pl.from_pandas(
+        df_baseline_compare
+        .merge(df_full_compare, on="parameter", how="outer")
+        .merge(df_pars_compare, on="parameter", how="outer")
+    )
+    .with_columns(
+        pl.col("value_baseline").cast(pl.Float64, strict=False).round(3),
+        pl.col("value_full").cast(pl.Float64, strict=False).round(3),
+        pl.col("value_parsimonious").cast(pl.Float64, strict=False).round(3),
+        pl.col("p_value_baseline").cast(pl.Float64, strict=False),
+        pl.col("p_value_full").cast(pl.Float64, strict=False),
+        pl.col("p_value_parsimonious").cast(pl.Float64, strict=False),
+    )
+    .with_columns(
+        pl.when(
+            pl.col("value_baseline").is_not_null()
+            & pl.col("value_full").is_not_null()
+            & pl.col("value_parsimonious").is_not_null()
+        )
+        .then(pl.lit("los tres"))
+        .when(
+            pl.col("value_baseline").is_not_null()
+            & pl.col("value_full").is_not_null()
+            & pl.col("value_parsimonious").is_null()
+        )
+        .then(pl.lit("baseline + full"))
+        .when(
+            pl.col("value_baseline").is_not_null()
+            & pl.col("value_parsimonious").is_not_null()
+            & pl.col("value_full").is_null()
+        )
+        .then(pl.lit("baseline + parsimonioso"))
+        .when(
+            pl.col("value_full").is_not_null()
+            & pl.col("value_parsimonious").is_not_null()
+            & pl.col("value_baseline").is_null()
+        )
+        .then(pl.lit("full + parsimonioso"))
+        .when(pl.col("value_baseline").is_not_null())
+        .then(pl.lit("solo baseline"))
+        .when(pl.col("value_full").is_not_null())
+        .then(pl.lit("solo full"))
+        .otherwise(pl.lit("solo parsimonioso"))
+        .alias("scope"),
+        pl.col("parameter").map_elements(_parameter_block, return_dtype=pl.Utf8).alias("bloque"),
+        pl.col("p_value_baseline").map_elements(
+            lambda x: None if x is None else f"{x:.3e}",
+            return_dtype=pl.Utf8,
+        ).alias("p_value_baseline_fmt"),
+        pl.col("p_value_full").map_elements(
+            lambda x: None if x is None else f"{x:.3e}",
+            return_dtype=pl.Utf8,
+        ).alias("p_value_full_fmt"),
+        pl.col("p_value_parsimonious").map_elements(
+            lambda x: None if x is None else f"{x:.3e}",
+            return_dtype=pl.Utf8,
+        ).alias("p_value_parsimonious_fmt"),
+    )
+    .select(
+        "bloque",
+        "scope",
+        "parameter",
+        "value_baseline",
+        "p_value_baseline_fmt",
+        "value_full",
+        "p_value_full_fmt",
+        "value_parsimonious",
+        "p_value_parsimonious_fmt",
+    )
+    .rename(
+        {
+            "parameter": "parametro",
+            "value_baseline": "beta_baseline",
+            "p_value_baseline_fmt": "p_value_baseline",
+            "value_full": "beta_full",
+            "p_value_full_fmt": "p_value_full",
+            "value_parsimonious": "beta_parsimonious",
+            "p_value_parsimonious_fmt": "p_value_parsimonious",
+        }
+    )
+    .sort(["bloque", "scope", "parametro"])
+)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1200):
+    display(df_full_vs_parsimonious_params)
+print("Nota: `Baseline` y `Full` corresponden a `sample5pct`; `Parsimonioso` corresponde a `sample2pct`.")
+print("Nota: `scope` indica en cuáles modelos aparece cada parámetro.")
+```

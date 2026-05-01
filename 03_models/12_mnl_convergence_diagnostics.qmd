@@ -1,0 +1,444 @@
+---
+TITLE: "Tesis — 12 | Diagnóstico de Convergencia MNL"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Auditar de forma separada por qué varias corridas `MNL` con `Censo` y `OSM` muestran gradientes finales altos o no convergen limpiamente.
+
+Este notebook **no corrige** la especificación todavía. Su objetivo es dejar evidencia sobre:
+
+- integridad de las muestras de estimación;
+- presencia de `null` o columnas degeneradas;
+- rangos/extremos después de la estandarización;
+- colinealidad simple entre variables nuevas y controles existentes;
+- y auditoría de la especificación efectiva que hoy se está estimando.
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+import sys
+from pathlib import Path
+
+import polars as pl
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró la raíz del proyecto.")
+
+from lib.od_buffers_nested_logit import read_parquet_portable
+```
+
+## 2) Configuración
+
+```{python}
+#| label: config
+print("label: config")
+ARTIFACTS_DIR = PROJECT_ROOT / "03_models" / "artifacts" / "interannual_enriched"
+
+PATHS = {
+    "baseline_sample5": ARTIFACTS_DIR / "pooled_2024_2025-estimation-sample5pct.parquet",
+    "censo_sample5": ARTIFACTS_DIR / "pooled_2024_2025-estimation-sample5pct-censo4.parquet",
+    "censo_micro_sample5": ARTIFACTS_DIR / "pooled_2024_2025-estimation-sample5pct-censo4-micro.parquet",
+    "censo_micro_sample2": ARTIFACTS_DIR / "pooled_2024_2025-estimation-sample2pct-censo4-micro.parquet",
+    "osm_sample2": ARTIFACTS_DIR / "pooled_2024_2025-estimation-sample2pct-osm.parquet",
+}
+
+BASELINE_COLS = [
+    "choice_nested",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+]
+
+CENSO_Z_COLS = [
+    "prom_edad_z",
+    "prom_escolaridad18_z",
+    "share_inmigrantes_z",
+    "share_hacinamiento_z",
+    "share_internet_z",
+    "share_serv_compu_z",
+    "share_serv_tel_movil_z",
+    "share_discapacidad_z",
+    "share_analfabet_z",
+    "share_cine18_universitaria_micro_z",
+    "share_cine18_universitaria_o_mas_micro_z",
+    "share_cine18_terciaria_corta_micro_z",
+    "share_cine18_postgrado_micro_z",
+]
+
+OSM_Z_COLS = [
+    "osm_leisure_park_density_km2_z",
+    "osm_amenity_school_density_km2_z",
+    "osm_shop_supermarket_density_km2_z",
+    "osm_amenity_restaurant_density_km2_z",
+    "osm_shop_mall_density_km2_z",
+    "osm_amenity_university_density_km2_z",
+    "osm_amenity_pharmacy_density_km2_z",
+    "osm_shop_convenience_density_km2_z",
+    "osm_leisure_playground_density_km2_z",
+    "osm_office_company_density_km2_z",
+    "osm_leisure_sports_centre_density_km2_z",
+    "osm_office_government_density_km2_z",
+]
+
+KEY_CONTEXT_COLS = [
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+]
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+def load_df(path: Path) -> pl.DataFrame:
+    return read_parquet_portable(str(path)).collect()
+
+
+def existing_cols(df: pl.DataFrame, cols: list[str]) -> list[str]:
+    return [c for c in cols if c in df.columns]
+
+
+def sample_overview(df: pl.DataFrame, name: str) -> pl.DataFrame:
+    return pl.DataFrame(
+        [
+            {
+                "sample": name,
+                "rows": df.height,
+                "cols": df.width,
+                "zona_inicio_null_pct": df.select(pl.col("zona_inicio_viaje").is_null().mean()).item()
+                if "zona_inicio_viaje" in df.columns
+                else None,
+            }
+        ]
+    )
+
+
+def null_summary(df: pl.DataFrame, cols: list[str]) -> pl.DataFrame:
+    cols = existing_cols(df, cols)
+    rows = []
+    for c in cols:
+        rows.append(
+            {
+                "variable": c,
+                "null_pct": df.select(pl.col(c).is_null().mean()).item(),
+                "n_unique": df.select(pl.col(c).n_unique()).item(),
+            }
+        )
+    return pl.DataFrame(rows).sort(["null_pct", "n_unique"], descending=[True, False])
+
+
+def variance_summary(df: pl.DataFrame, cols: list[str]) -> pl.DataFrame:
+    cols = existing_cols(df, cols)
+    rows = []
+    for c in cols:
+        rows.append(
+            {
+                "variable": c,
+                "mean": df.select(pl.col(c).mean()).item(),
+                "std": df.select(pl.col(c).std()).item(),
+                "min": df.select(pl.col(c).min()).item(),
+                "max": df.select(pl.col(c).max()).item(),
+                "n_unique": df.select(pl.col(c).n_unique()).item(),
+            }
+        )
+    return pl.DataFrame(rows).sort("std")
+
+
+def extreme_z_summary(df: pl.DataFrame, cols: list[str]) -> pl.DataFrame:
+    cols = existing_cols(df, cols)
+    rows = []
+    for c in cols:
+        abs_expr = pl.col(c).abs()
+        rows.append(
+            {
+                "variable": c,
+                "max_abs": df.select(abs_expr.max()).item(),
+                "p99_abs": df.select(abs_expr.quantile(0.99)).item(),
+                "p999_abs": df.select(abs_expr.quantile(0.999)).item(),
+            }
+        )
+    return pl.DataFrame(rows).sort("max_abs", descending=True)
+
+
+def pairwise_corr_long(df: pl.DataFrame, cols: list[str]) -> pl.DataFrame:
+    cols = existing_cols(df, cols)
+    rows = []
+    for i, left in enumerate(cols):
+        for right in cols[i + 1 :]:
+            corr = df.select(pl.corr(left, right)).item()
+            rows.append(
+                {
+                    "left": left,
+                    "right": right,
+                    "corr": corr,
+                    "abs_corr": None if corr is None else abs(float(corr)),
+                }
+            )
+    return pl.DataFrame(rows).sort("abs_corr", descending=True)
+
+
+def raw_from_z(z_var: str) -> str:
+    return z_var[:-2] if z_var.endswith("_z") else z_var
+
+
+def extreme_zone_rows(df: pl.DataFrame, z_var: str, top_n: int = 10) -> pl.DataFrame:
+    raw_var = raw_from_z(z_var)
+    needed = ["zona_inicio_viaje", z_var, raw_var]
+    needed = [c for c in needed if c in df.columns]
+    if len(needed) < 3:
+        return pl.DataFrame()
+
+    zone_values = (
+        df.select(needed)
+        .unique()
+        .with_columns(pl.col(z_var).abs().alias("abs_z"))
+    )
+    zone_trip_counts = (
+        df.group_by("zona_inicio_viaje")
+        .len()
+        .rename({"len": "n_trips_sample"})
+    )
+    return (
+        zone_values
+        .join(zone_trip_counts, on="zona_inicio_viaje", how="left")
+        .sort("abs_z", descending=True)
+        .head(top_n)
+        .select(
+            "zona_inicio_viaje",
+            raw_var,
+            z_var,
+            "abs_z",
+            "n_trips_sample",
+        )
+    )
+```
+
+## 4) Cargar muestras de diagnóstico
+
+```{python}
+#| label: load-samples
+print("label: load-samples")
+dfs = {name: load_df(path) for name, path in PATHS.items() if path.exists()}
+pl.concat([sample_overview(df, name) for name, df in dfs.items()], how="diagonal")
+```
+
+## 5) Auditoría de integridad básica
+
+```{python}
+#| label: baseline-null-audit
+print("label: baseline-null-audit")
+for name in ["baseline_sample5", "censo_sample5", "censo_micro_sample5", "censo_micro_sample2", "osm_sample2"]:
+    if name not in dfs:
+        continue
+    print(f"### {name}")
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+        display(null_summary(dfs[name], BASELINE_COLS))
+```
+
+```{python}
+#| label: censo-null-audit
+print("label: censo-null-audit")
+for name in ["censo_sample5", "censo_micro_sample5", "censo_micro_sample2"]:
+    if name not in dfs:
+        continue
+    print(f"### {name}")
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+        display(null_summary(dfs[name], CENSO_Z_COLS))
+```
+
+```{python}
+#| label: osm-null-audit
+print("label: osm-null-audit")
+if "osm_sample2" in dfs:
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+        display(null_summary(dfs["osm_sample2"], OSM_Z_COLS))
+```
+
+**Lectura esperada**
+
+- Si aquí aparecen `null_pct > 0` en variables activas del modelo, la no convergencia puede venir de datos mal armados.
+- Si `n_unique <= 1` en alguna variable explicativa, tenemos una columna degenerada.
+
+## 6) Auditoría de varianza y extremos
+
+```{python}
+#| label: censo-variance-audit
+print("label: censo-variance-audit")
+for name in ["censo_micro_sample5", "censo_micro_sample2"]:
+    if name not in dfs:
+        continue
+    print(f"### {name}")
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+        display(variance_summary(dfs[name], CENSO_Z_COLS))
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+        display(extreme_z_summary(dfs[name], CENSO_Z_COLS))
+```
+
+```{python}
+#| label: osm-variance-audit
+print("label: osm-variance-audit")
+if "osm_sample2" in dfs:
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+        display(variance_summary(dfs["osm_sample2"], OSM_Z_COLS))
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+        display(extreme_z_summary(dfs["osm_sample2"], OSM_Z_COLS))
+```
+
+**Lectura esperada**
+
+- `std = 0` o casi `0` implica mala identificación.
+- `max_abs` o cuantiles extremos muy altos sugieren colas pesadas u outliers tras la estandarización.
+
+## 6b) Zonas responsables de los extremos en Censo
+
+```{python}
+#| label: censo-extreme-zones
+print("label: censo-extreme-zones")
+censo_extreme_vars = [
+    "share_analfabet_z",
+    "share_serv_tel_movil_z",
+    "share_internet_z",
+    "prom_edad_z",
+    "share_hacinamiento_z",
+    "share_inmigrantes_z",
+]
+
+if "censo_micro_sample2" in dfs:
+    for z_var in existing_cols(dfs["censo_micro_sample2"], censo_extreme_vars):
+        print(f"### {z_var}")
+        with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+            display(extreme_zone_rows(dfs["censo_micro_sample2"], z_var, top_n=10))
+```
+
+## 6c) Zonas responsables de los extremos en OSM
+
+```{python}
+#| label: osm-extreme-zones
+print("label: osm-extreme-zones")
+osm_extreme_vars = [
+    "osm_office_government_density_km2_z",
+    "osm_shop_mall_density_km2_z",
+    "osm_amenity_pharmacy_density_km2_z",
+    "osm_amenity_university_density_km2_z",
+    "osm_amenity_restaurant_density_km2_z",
+]
+
+if "osm_sample2" in dfs:
+    for z_var in existing_cols(dfs["osm_sample2"], osm_extreme_vars):
+        print(f"### {z_var}")
+        with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+            display(extreme_zone_rows(dfs["osm_sample2"], z_var, top_n=10))
+```
+
+## 7) Correlaciones simples entre variables nuevas y controles existentes
+
+```{python}
+#| label: censo-corr-audit
+print("label: censo-corr-audit")
+if "censo_micro_sample2" in dfs:
+    cols = KEY_CONTEXT_COLS + existing_cols(dfs["censo_micro_sample2"], CENSO_Z_COLS)
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+        display(pairwise_corr_long(dfs["censo_micro_sample2"], cols).head(40))
+```
+
+```{python}
+#| label: osm-corr-audit
+print("label: osm-corr-audit")
+if "osm_sample2" in dfs:
+    cols = KEY_CONTEXT_COLS + existing_cols(dfs["osm_sample2"], OSM_Z_COLS)
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+        display(pairwise_corr_long(dfs["osm_sample2"], cols).head(40))
+```
+
+**Lectura esperada**
+
+- Esto no prueba colinealidad severa por sí solo.
+- Pero sí permite ver rápidamente si algunas variables nuevas están funcionando como proxies casi directos de:
+  - `LOG_DEMAND`
+  - `LOG_BUS_STOP_DENSITY`
+  - `LOG_BUS_LINE_COUNT`
+  - `LOG_METRO_LINE_COUNT`
+
+## 8) Auditoría de la especificación actual
+
+### Hallazgo 1: las variables nuevas hoy no entran en `BIP`
+
+En la especificación actual de:
+
+- [`08_nested_logit_enriched_interannual_censo.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/08_nested_logit_enriched_interannual_censo.qmd)
+- [`10_nested_logit_enriched_interannual_osm.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/10_nested_logit_enriched_interannual_osm.qmd)
+
+las variables nuevas se agregan solo a:
+
+- `V_QR_RED`
+- `V_QR_OTHER`
+
+y **no** a:
+
+- `V_BIP`
+
+Eso significa que el screening actual no responde la pregunta completa que pidió la profesora.
+
+### Hallazgo 2: los joins no deberían estar dejando `null` silenciosos
+
+Tanto `add_origin_censo_controls` como `add_origin_osm_controls`:
+
+- hacen `left join`;
+- chequean preservación de filas;
+- y lanzan error si queda algún `z_var` faltante.
+
+Por lo tanto, si aparece un problema de convergencia, la sospecha principal se desplaza hacia:
+
+- especificación;
+- escalamiento;
+- colinealidad;
+- o una patología más fina del optimizer / diseño de utilidad.
+
+## 9) Próximos pasos sugeridos
+
+1. Confirmar con este notebook si hay:
+   - `nulls`
+   - columnas degeneradas
+   - outliers severos
+   - correlaciones problemáticas
+2. Si la integridad de datos está limpia:
+   - abrir la siguiente tarea sobre la especificación:
+     - incluir coeficientes de variables nuevas para `BIP`
+     - y rehacer el screening stepwise.
+3. Solo después de eso:
+   - rerun de `Censo`
+   - rerun de `OSM`
+   - integración conjunta.

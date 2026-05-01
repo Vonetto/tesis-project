@@ -1,0 +1,556 @@
+---
+TITLE: "Tesis — 09 | Auditoría Cross-Framework Interanual"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Auditar la consistencia entre **Biogeme** y **Larch** para el modelo interanual enriquecido, priorizando:
+
+1. comparabilidad real de la muestra y la especificación;
+2. estabilidad de coeficientes entre frameworks;
+3. identificación de parámetros frágiles o con cambio de signo.
+
+::: {.callout-note}
+Este notebook no asume de entrada que uno de los dos frameworks “está bien”.
+
+La lectura correcta es:
+- si ambos usan la misma muestra y la misma especificación, un `MNL` bien alineado debería dar coeficientes bastante parecidos;
+- si no pasa, hay que distinguir entre:
+  - diferencia de muestra,
+  - diferencia de implementación,
+  - o especificación débilmente identificada.
+:::
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import polars as pl
+
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró la raíz del proyecto.")
+
+from lib.od_buffers_nested_logit import read_parquet_portable
+
+print("✅ Setup listo")
+print("PROJECT_ROOT:", PROJECT_ROOT)
+```
+
+## 2) Config
+
+```{python}
+#| label: config
+print("label: config")
+
+MODEL_PARTITION = "pooled_2024_2025"
+
+# Ajusta estos tags según los runs que quieras comparar.
+BIOGEME_SAMPLE_TAG = os.environ.get("BIOGEME_AUDIT_SAMPLE_TAG", "sample5pct")
+LARCH_SAMPLE_TAG = os.environ.get("LARCH_AUDIT_SAMPLE_TAG", "sample5pct")
+
+MODELS_DIR = PROJECT_ROOT / "03_models"
+ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "interannual_enriched"
+
+BIOGEME_RESULTS_DIR = (
+    MODELS_DIR
+    / "biogeme-logit"
+    / "results"
+    / "08_interannual_censo"
+    / f"{MODEL_PARTITION}-biogeme-{BIOGEME_SAMPLE_TAG}"
+)
+LARCH_RESULTS_DIR = (
+    MODELS_DIR
+    / "larch_logit"
+    / "results"
+    / "08_interannual_censo"
+    / f"{MODEL_PARTITION}-larch-{LARCH_SAMPLE_TAG}"
+)
+
+BIOGEME_SAMPLE_PATH = ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{BIOGEME_SAMPLE_TAG}-censo4.parquet"
+LARCH_SAMPLE_PATH = ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{LARCH_SAMPLE_TAG}-censo4.parquet"
+
+MODEL_REGISTRY = {
+    "baseline": {
+        "biogeme": "mnl_interannual_censo_baseline",
+        "larch": "mnl_interannual_censo_baseline_larch",
+    },
+    "censo_full": {
+        "biogeme": "mnl_interannual_censo_full",
+        "larch": "mnl_interannual_censo_full_larch",
+    },
+    "prom_edad": {
+        "biogeme": "mnl_interannual_censo_prom_edad",
+        "larch": "mnl_interannual_censo_prom_edad_larch",
+    },
+    "prom_escolaridad18": {
+        "biogeme": "mnl_interannual_censo_prom_escolaridad18",
+        "larch": "mnl_interannual_censo_prom_escolaridad18_larch",
+    },
+    "share_inmigrantes": {
+        "biogeme": "mnl_interannual_censo_share_inmigrantes",
+        "larch": "mnl_interannual_censo_share_inmigrantes_larch",
+    },
+    "share_hacinamiento": {
+        "biogeme": "mnl_interannual_censo_share_hacinamiento",
+        "larch": "mnl_interannual_censo_share_hacinamiento_larch",
+    },
+    "escolaridad_hacinamiento": {
+        "biogeme": "mnl_interannual_censo_escolaridad_hacinamiento",
+        "larch": "mnl_interannual_censo_escolaridad_hacinamiento_larch",
+    },
+}
+
+AUDIT_NUMERIC_COLUMNS = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_NO_LAB",
+    "DUMMY_ANIO_2025",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+    "prom_edad_z",
+    "prom_escolaridad18_z",
+    "share_inmigrantes_z",
+    "share_hacinamiento_z",
+]
+
+print("BIOGEME_RESULTS_DIR:", BIOGEME_RESULTS_DIR)
+print("LARCH_RESULTS_DIR:", LARCH_RESULTS_DIR)
+print("BIOGEME_SAMPLE_PATH:", BIOGEME_SAMPLE_PATH)
+print("LARCH_SAMPLE_PATH:", LARCH_SAMPLE_PATH)
+print("Misma muestra tag:", BIOGEME_SAMPLE_TAG == LARCH_SAMPLE_TAG)
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+
+
+def load_sample_summary(path: Path, *, label: str) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame([{"label": label, "exists": False}])
+    df = read_parquet_portable(str(path)).select([pl.col(c) for c in AUDIT_NUMERIC_COLUMNS if c in pl.scan_parquet(str(path)).collect_schema().names()]).collect()
+    counts = df.group_by("choice_nested").len().sort("choice_nested").to_dicts()
+    out = {
+        "label": label,
+        "exists": True,
+        "rows": df.height,
+        "choice_counts": counts,
+    }
+    for c in [x for x in AUDIT_NUMERIC_COLUMNS if x != "choice_nested" and x in df.columns]:
+        out[f"{c}_mean"] = float(df.select(pl.col(c).mean()).item())
+        out[f"{c}_std"] = float(df.select(pl.col(c).std()).item())
+    return pd.DataFrame([out])
+
+
+def normalize_param_name(name: str, partition: str = MODEL_PARTITION) -> str:
+    s = str(name)
+    s = s.replace(f"_{partition}", "")
+    return s
+
+
+def load_params_generic(path: Path, *, framework: str) -> pd.DataFrame | None:
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    name_col = "Param" if "Param" in df.columns else "Name" if "Name" in df.columns else None
+    if name_col is None:
+        raise ValueError(f"No se encontró columna Param/Name en {path}")
+    value_col = "Value"
+    if value_col not in df.columns:
+        raise ValueError(f"No se encontró columna Value en {path}")
+    p_col = "Robust p-value" if "Robust p-value" in df.columns else "Rob. p-value" if "Rob. p-value" in df.columns else None
+    t_col = "Robust t-stat." if "Robust t-stat." in df.columns else "Rob. t-test" if "Rob. t-test" in df.columns else None
+    out = df[[name_col, value_col] + ([p_col] if p_col else []) + ([t_col] if t_col else [])].copy()
+    out = out.rename(columns={name_col: "param_raw", value_col: "value"})
+    out["param"] = out["param_raw"].map(normalize_param_name)
+    out["framework"] = framework
+    return out
+
+
+def params_path_for(framework: str, model_name: str) -> Path:
+    base = BIOGEME_RESULTS_DIR if framework == "biogeme" else LARCH_RESULTS_DIR
+    return base / f"params_{model_name}.csv"
+
+
+def stats_path_for(framework: str, model_name: str) -> Path:
+    base = BIOGEME_RESULTS_DIR if framework == "biogeme" else LARCH_RESULTS_DIR
+    return base / f"stats_{model_name}.csv"
+
+
+def compare_param_tables(df_bio: pd.DataFrame, df_larch: pd.DataFrame) -> pd.DataFrame:
+    comp = (
+        df_bio[["param", "value"]].rename(columns={"value": "biogeme_value"})
+        .merge(
+            df_larch[["param", "value"]].rename(columns={"value": "larch_value"}),
+            on="param",
+            how="inner",
+        )
+    )
+    comp["abs_diff"] = (comp["biogeme_value"] - comp["larch_value"]).abs()
+    denom = (comp["biogeme_value"].abs() + comp["larch_value"].abs()) / 2
+    comp["rel_diff_pct"] = np.where(denom > 0, comp["abs_diff"] / denom * 100, np.nan)
+    bio_sign = np.sign(comp["biogeme_value"])
+    larch_sign = np.sign(comp["larch_value"])
+    comp["sign_flip"] = (bio_sign != 0) & (larch_sign != 0) & (bio_sign != larch_sign)
+    return comp.sort_values(["sign_flip", "rel_diff_pct"], ascending=[False, False]).reset_index(drop=True)
+
+
+def summarize_param_stability(comp: pd.DataFrame, *, model_key: str) -> pd.DataFrame:
+    if comp.empty:
+        return pd.DataFrame([{"model_key": model_key, "n_common_params": 0}])
+    return pd.DataFrame(
+        [
+            {
+                "model_key": model_key,
+                "n_common_params": int(len(comp)),
+                "n_sign_flips": int(comp["sign_flip"].sum()),
+                "pct_sign_flips": round(float(comp["sign_flip"].mean() * 100), 2),
+                "mean_abs_diff": float(comp["abs_diff"].mean()),
+                "median_abs_diff": float(comp["abs_diff"].median()),
+                "mean_rel_diff_pct": float(comp["rel_diff_pct"].dropna().mean()),
+                "median_rel_diff_pct": float(comp["rel_diff_pct"].dropna().median()),
+                "params_rel_diff_gt_10pct": int((comp["rel_diff_pct"] > 10).sum()),
+            }
+        ]
+    )
+
+
+def load_stats_frame(path: Path, *, framework: str) -> pd.DataFrame | None:
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    if {"metric", "value"}.issubset(df.columns):
+        return df.assign(framework=framework)
+    if len(df) == 1:
+        return df.T.reset_index().rename(columns={"index": "metric", 0: "value"}).assign(framework=framework)
+    return df
+
+
+def get_metric_value(stats_df: pd.DataFrame | None, candidates: list[str]) -> float | None:
+    if stats_df is None or stats_df.empty or "metric" not in stats_df.columns:
+        return None
+    for key in candidates:
+        row = stats_df[stats_df["metric"] == key]
+        if not row.empty:
+            try:
+                return float(row.iloc[0]["value"])
+            except Exception:
+                return None
+    return None
+
+
+def baseline_manual_loglike(
+    df: pd.DataFrame,
+    params: dict[str, float],
+) -> float:
+    def p(name: str) -> float:
+        return float(params[name])
+
+    v_bip = (
+        p("B_BIP_T_VEH") * df["TVH_BIP"].to_numpy()
+        + p("B_BIP_T_ESPERA_INI") * df["TEI_BIP"].to_numpy()
+        + p("B_BIP_T_ESPERA_TRASB") * df["TET_BIP"].to_numpy()
+        + p("B_BIP_N_TRASB") * df["NTR_BIP"].to_numpy()
+    )
+
+    v_red = (
+        p("ASC_QR_RED")
+        + p("B_QR_RED_LAB_PM") * df["DUMMY_LAB_PM"].to_numpy()
+        + p("B_QR_RED_LAB_PT") * df["DUMMY_LAB_PT"].to_numpy()
+        + p("B_QR_RED_NO_LAB") * df["DUMMY_NO_LAB"].to_numpy()
+        + p("B_QR_RED_ANIO_2025") * df["DUMMY_ANIO_2025"].to_numpy()
+        + p("B_QR_RED_LOG_DEMAND") * df["LOG_N_VIAJES_ZONA_INICIO_FRANJA"].to_numpy()
+        + p("B_QR_RED_LOG_BUS_STOP_DENSITY") * df["LOG_BUS_STOP_DENSITY"].to_numpy()
+        + p("B_QR_RED_LOG_BUS_LINE_COUNT") * df["LOG_BUS_LINE_COUNT"].to_numpy()
+        + p("B_QR_RED_LOG_METRO_LINE_COUNT") * df["LOG_METRO_LINE_COUNT"].to_numpy()
+        + p("B_QR_RED_T_VEH") * df["TVH_QR_RED"].to_numpy()
+        + p("B_QR_RED_T_ESPERA_INI") * df["TEI_QR_RED"].to_numpy()
+        + p("B_QR_RED_T_ESPERA_TRASB") * df["TET_QR_RED"].to_numpy()
+        + p("B_QR_RED_N_TRASB") * df["NTR_QR_RED"].to_numpy()
+    )
+
+    v_other = (
+        p("ASC_QR_OTHER")
+        + p("B_QR_OTHER_LAB_PM") * df["DUMMY_LAB_PM"].to_numpy()
+        + p("B_QR_OTHER_LAB_PT") * df["DUMMY_LAB_PT"].to_numpy()
+        + p("B_QR_OTHER_NO_LAB") * df["DUMMY_NO_LAB"].to_numpy()
+        + p("B_QR_OTHER_ANIO_2025") * df["DUMMY_ANIO_2025"].to_numpy()
+        + p("B_QR_OTHER_LOG_DEMAND") * df["LOG_N_VIAJES_ZONA_INICIO_FRANJA"].to_numpy()
+        + p("B_QR_OTHER_LOG_BUS_STOP_DENSITY") * df["LOG_BUS_STOP_DENSITY"].to_numpy()
+        + p("B_QR_OTHER_LOG_BUS_LINE_COUNT") * df["LOG_BUS_LINE_COUNT"].to_numpy()
+        + p("B_QR_OTHER_LOG_METRO_LINE_COUNT") * df["LOG_METRO_LINE_COUNT"].to_numpy()
+        + p("B_QR_OTHER_T_VEH") * df["TVH_QR_OTHER"].to_numpy()
+        + p("B_QR_OTHER_T_ESPERA_INI") * df["TEI_QR_OTHER"].to_numpy()
+        + p("B_QR_OTHER_T_ESPERA_TRASB") * df["TET_QR_OTHER"].to_numpy()
+        + p("B_QR_OTHER_N_TRASB") * df["NTR_QR_OTHER"].to_numpy()
+    )
+
+    vmax = np.maximum.reduce([v_bip, v_red, v_other])
+    logsum = vmax + np.log(
+        np.exp(v_bip - vmax) + np.exp(v_red - vmax) + np.exp(v_other - vmax)
+    )
+
+    choice = df["choice_nested"].to_numpy()
+    chosen_v = np.where(choice == 0, v_bip, np.where(choice == 1, v_red, v_other))
+    return float(np.sum(chosen_v - logsum))
+```
+
+## 4) Inventory
+
+```{python}
+#| label: inventory
+print("label: inventory")
+
+rows = []
+for model_key, names in MODEL_REGISTRY.items():
+    for fw in ["biogeme", "larch"]:
+        params_path = params_path_for(fw, names[fw])
+        stats_path = stats_path_for(fw, names[fw])
+        rows.append(
+            {
+                "model_key": model_key,
+                "framework": fw,
+                "params_exists": params_path.exists(),
+                "stats_exists": stats_path.exists(),
+                "params_path": str(params_path),
+                "stats_path": str(stats_path),
+            }
+        )
+inventory_df = pd.DataFrame(rows)
+display(inventory_df)
+```
+
+## 5) Sample Parity
+
+```{python}
+#| label: sample-parity
+print("label: sample-parity")
+
+sample_summary = pd.concat(
+    [
+        load_sample_summary(BIOGEME_SAMPLE_PATH, label=f"biogeme::{BIOGEME_SAMPLE_TAG}"),
+        load_sample_summary(LARCH_SAMPLE_PATH, label=f"larch::{LARCH_SAMPLE_TAG}"),
+    ],
+    ignore_index=True,
+)
+display(sample_summary)
+
+if BIOGEME_SAMPLE_TAG != LARCH_SAMPLE_TAG:
+    print("⚠️ Advertencia: los frameworks no están usando la misma muestra tag. Esta comparación no es una auditoría pura de implementación.")
+else:
+    print("✅ Ambos frameworks apuntan a la misma muestra tag.")
+```
+
+## 6) Cross-Framework Stability Summary
+
+```{python}
+#| label: cross-framework-stability-summary
+print("label: cross-framework-stability-summary")
+
+stability_rows = []
+param_comparisons = {}
+
+for model_key, names in MODEL_REGISTRY.items():
+    bio_params = load_params_generic(params_path_for("biogeme", names["biogeme"]), framework="biogeme")
+    larch_params = load_params_generic(params_path_for("larch", names["larch"]), framework="larch")
+    if bio_params is None or larch_params is None:
+        continue
+    comp = compare_param_tables(bio_params, larch_params)
+    param_comparisons[model_key] = comp
+    stability_rows.append(summarize_param_stability(comp, model_key=model_key))
+
+if stability_rows:
+    display(pd.concat(stability_rows, ignore_index=True).sort_values(["n_sign_flips", "median_rel_diff_pct"], ascending=[False, False]))
+else:
+    print("⚠️ No hay modelos con resultados presentes en ambos frameworks.")
+```
+
+## 7) Baseline Detail
+
+```{python}
+#| label: baseline-detail
+print("label: baseline-detail")
+
+if "baseline" in param_comparisons:
+    baseline_comp = param_comparisons["baseline"]
+    display(baseline_comp)
+    print("Parámetros con flip de signo:")
+    display(baseline_comp[baseline_comp["sign_flip"]])
+else:
+    print("⚠️ No hay comparación baseline disponible.")
+```
+
+## 8) prom_escolaridad18 Detail
+
+```{python}
+#| label: prom-escolaridad18-detail
+print("label: prom-escolaridad18-detail")
+
+if "prom_escolaridad18" in param_comparisons:
+    display(param_comparisons["prom_escolaridad18"])
+else:
+    print("⚠️ No hay comparación prom_escolaridad18 disponible.")
+```
+
+## 9) Censo Full Detail
+
+```{python}
+#| label: censo-full-detail
+print("label: censo-full-detail")
+
+if "censo_full" in param_comparisons:
+    display(param_comparisons["censo_full"])
+else:
+    print("⚠️ No hay comparación censo_full disponible.")
+```
+
+## 10) Stats Snapshot
+
+```{python}
+#| label: stats-snapshot
+print("label: stats-snapshot")
+
+stats_rows = []
+for model_key, names in MODEL_REGISTRY.items():
+    for fw in ["biogeme", "larch"]:
+        stats_df = load_stats_frame(stats_path_for(fw, names[fw]), framework=fw)
+        if stats_df is None or stats_df.empty:
+            continue
+        value_map = dict(zip(stats_df["metric"], stats_df["value"]))
+        stats_rows.append(
+            {
+                "model_key": model_key,
+                "framework": fw,
+                "sample_size": value_map.get("Sample size"),
+                "final_ll": value_map.get("Final log likelihood") or value_map.get("Log Likelihood at Convergence | Aggregate"),
+                "rho": value_map.get("Rho-square for the init. model") or value_map.get("Rho Squared w.r.t. Null Parameters | Aggregate"),
+                "gradient": value_map.get("Final gradient norm"),
+            }
+        )
+if stats_rows:
+    display(pd.DataFrame(stats_rows).sort_values(["model_key", "framework"]))
+else:
+    print("⚠️ No se pudieron cargar stats comparables.")
+```
+
+## 11) Manual LL Check For Baseline
+
+```{python}
+#| label: baseline-manual-ll-check
+print("label: baseline-manual-ll-check")
+
+baseline_bio_params = load_params_generic(
+    params_path_for("biogeme", MODEL_REGISTRY["baseline"]["biogeme"]),
+    framework="biogeme",
+)
+baseline_larch_params = load_params_generic(
+    params_path_for("larch", MODEL_REGISTRY["baseline"]["larch"]),
+    framework="larch",
+)
+baseline_bio_stats = load_stats_frame(
+    stats_path_for("biogeme", MODEL_REGISTRY["baseline"]["biogeme"]),
+    framework="biogeme",
+)
+baseline_larch_stats = load_stats_frame(
+    stats_path_for("larch", MODEL_REGISTRY["baseline"]["larch"]),
+    framework="larch",
+)
+
+if baseline_bio_params is None or baseline_larch_params is None:
+    print("⚠️ Faltan params baseline para el chequeo manual.")
+else:
+    baseline_df = (
+        read_parquet_portable(str(BIOGEME_SAMPLE_PATH))
+        .select([pl.col(c).cast(pl.Float64) for c in AUDIT_NUMERIC_COLUMNS])
+        .collect()
+        .to_pandas()
+    )
+    bio_map = dict(zip(baseline_bio_params["param"], baseline_bio_params["value"]))
+    larch_map = dict(zip(baseline_larch_params["param"], baseline_larch_params["value"]))
+
+    manual_ll_bio = baseline_manual_loglike(baseline_df, bio_map)
+    manual_ll_larch = baseline_manual_loglike(baseline_df, larch_map)
+
+    reported_ll_bio = get_metric_value(baseline_bio_stats, ["Final log likelihood"])
+    reported_ll_larch = get_metric_value(
+        baseline_larch_stats,
+        ["Log Likelihood at Convergence | Aggregate"],
+    )
+
+    display(
+        pd.DataFrame(
+            [
+                {
+                    "framework": "biogeme_params_on_same_sample",
+                    "reported_ll": reported_ll_bio,
+                    "manual_ll": manual_ll_bio,
+                    "abs_diff": None if reported_ll_bio is None else abs(manual_ll_bio - reported_ll_bio),
+                },
+                {
+                    "framework": "larch_params_on_same_sample",
+                    "reported_ll": reported_ll_larch,
+                    "manual_ll": manual_ll_larch,
+                    "abs_diff": None if reported_ll_larch is None else abs(manual_ll_larch - reported_ll_larch),
+                },
+            ]
+        )
+    )
+```
+
+## 12) Reading Guide
+
+```{python}
+#| label: reading-guide
+print("label: reading-guide")
+print(
+    '''
+Cómo leer esta auditoría:
+
+1. Si `BIOGEME_SAMPLE_TAG != LARCH_SAMPLE_TAG`, la comparación mezcla efecto-framework con efecto-muestra.
+2. `n_sign_flips` alto en baseline es una alerta fuerte.
+3. `median_rel_diff_pct` es más útil que `mean_rel_diff_pct` para no dejarse dominar por pocos outliers.
+4. Si un modelo parsimonioso tiene menos flips y menor diferencia relativa que el full, eso sugiere mejor identificación.
+5. La decisión no debería basarse en "quién gana", sino en qué especificaciones son más estables entre frameworks y muestras.
+'''
+)
+```

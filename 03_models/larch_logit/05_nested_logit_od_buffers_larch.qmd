@@ -292,19 +292,16 @@ DROP_CHOSEN_SINGLETONS = True
 LARCH_METHOD = "slsqp"
 LARCH_MAX_CAP = 20.0
 
-NOTEBOOK_TMP_DIR = PROJECT_ROOT / "03_models" / "tmp" / "od_buffers_nested_logit"
+OD_ARTIFACTS_DIR = PROJECT_ROOT / "03_models" / "artifacts" / "od_buffers"
+OD_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+LARCH_RESULTS_ROOT = PROJECT_ROOT / "03_models" / "larch_logit" / "results" / "05_od_buffers"
+LARCH_RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR_NESTED = (
-    PROJECT_ROOT
-    / "03_models"
-    / "larch_logit"
-    / "model_outputs_nl_larch"
+    LARCH_RESULTS_ROOT
     / f"{PARTITION}-nested-od-buffers-option1-v2-{format_sample_tag(SAMPLE_FRACTION)}"
 )
 OUTPUT_DIR_MNL = (
-    PROJECT_ROOT
-    / "03_models"
-    / "larch_logit"
-    / "model_outputs_nl_larch"
+    LARCH_RESULTS_ROOT
     / f"{PARTITION}-mnl-od-buffers-option1-v2-{format_sample_tag(SAMPLE_FRACTION)}"
 )
 OUTPUT_DIR_NESTED.mkdir(parents=True, exist_ok=True)
@@ -353,7 +350,7 @@ df_od_context = build_od_alt_specific_context_table(
     config=cfg,
 )
 
-path_od_context = NOTEBOOK_TMP_DIR / f"od_context_{PARTITION}.parquet"
+path_od_context = OD_ARTIFACTS_DIR / f"od_context_{PARTITION}.parquet"
 df_od_context.write_parquet(path_od_context)
 
 print("✅ OD context guardado en:", path_od_context)
@@ -367,7 +364,7 @@ display(df_od_context.head(5))
 
 print("label: build-option1-dataset-v2")
 
-path_trips_context_v2 = NOTEBOOK_TMP_DIR / f"trips_context_v2_{PARTITION}.parquet"
+path_trips_context_v2 = OD_ARTIFACTS_DIR / f"trips_context_v2_{PARTITION}.parquet"
 
 df_trips_v2 = build_trip_dataset_with_alt_specific_context(
     lf,
@@ -574,8 +571,9 @@ print("label: compare-vs-biogeme")
 biogeme_dir = (
     PROJECT_ROOT
     / "03_models"
-    / "tmp"
-    / "od_buffers_nested_logit"
+    / "biogeme-logit"
+    / "results"
+    / "05_od_buffers"
     / f"{PARTITION}-option1-v2-{format_sample_tag(SAMPLE_FRACTION)}"
 )
 biogeme_stats_path = biogeme_dir / f"stats_nested_logit_od_context_{PARTITION}.csv"

@@ -1,0 +1,2707 @@
+---
+title: "Tesis — 15 | Opciones de parametrización para variables comunes en MNL"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: false
+---
+
+# Objetivo
+
+Este notebook aísla la duda metodológica sobre cómo parametrizar variables comunes al viaje o a la zona en el modelo MNL.
+
+La comparación se enfoca en dos opciones:
+
+- **Opción A (`bip_only_alt_specific`)**: `BIP` se estima directamente solo para variables que varían entre alternativas dentro del viaje (`T_VEH`, `T_ESPERA_INI`, `T_ESPERA_TRASB`, `N_TRASB`). Para variables comunes al viaje/zona, `BIP` queda normalizado a cero.
+- **Opción B (`bip_reportable_sum_zero`)**: `BIP` se estima directamente para variables que varían entre alternativas y se reporta para variables comunes mediante una restricción de suma cero.
+
+El notebook parte desde el modelo conjunto `main + shelter + subway_entrance` seleccionado como sensibilidad sustantiva de infraestructura y genera resultados comparables para decidir cómo reportar la especificación en el informe.
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+import gc
+import sys
+import traceback
+from pathlib import Path
+
+import geopandas as gpd
+import pandas as pd
+import polars as pl
+import yaml
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró la raíz del proyecto.")
+
+import biogeme.biogeme_logging as blog
+import biogeme.database as db
+import biogeme.biogeme as bio
+from biogeme import models, nests
+from biogeme.expressions import Beta, Variable
+from biogeme.results_processing import pandas_output as br
+
+from lib.interannual_offer_context import assert_left_join_preserves_rows, ensure_unique_keys
+from lib.censo2024_zona777 import impute_missing_by_neighbor_median
+from lib.od_buffers_nested_logit import read_parquet_portable
+
+logger = blog.get_screen_logger(level=blog.INFO)
+```
+
+## 2) Configuración
+
+```{python}
+#| label: config
+print("label: config")
+MODEL_PARTITION = "pooled_2024_2025"
+ESTIMATION_SAMPLE_TAG = "sample2pct"
+RUN_ESTIMATION = True
+
+# Útil para correr solo una parte del barrido sin editar la lista maestra.
+# Si es `list` o `tuple`, el notebook respeta exactamente ese orden.
+# Si es `set`, solo filtra.
+ACTIVE_PRESET = "joint_mnl_censo_osm_method_options"
+ACTIVE_MODEL_LABELS = None
+# Ejemplo:
+# ACTIVE_MODEL_LABELS = [
+#     "mnl_baseline_baseline",
+#     "nested_baseline_baseline",
+#     "mnl_censo_uni_share_cine18_universitaria_o_mas_micro_z",
+#     "nested_censo_uni_share_cine18_universitaria_o_mas_micro_z",
+# ]
+
+MODELS_DIR = PROJECT_ROOT / "03_models"
+ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "interannual_enriched"
+RESULTS_ROOT = MODELS_DIR / "biogeme-logit" / "results" / "15_mnl_common_variable_parametrization_options"
+RESULTS_DIR = RESULTS_ROOT / f"{MODEL_PARTITION}-biogeme-{ESTIMATION_SAMPLE_TAG}"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+BASELINE_SAMPLE_PATH = ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}.parquet"
+CENSO_SAMPLE_PATH = ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-censo4-micro.parquet"
+OSM_SAMPLE_PATH = ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-osm.parquet"
+JOINT_SAMPLE_PATH = (
+    ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-censo4-micro-osm.parquet"
+)
+
+CENSO_MODEL_READY_STD_PATH = (
+    ARTIFACTS_DIR / f"censo2024_zona777_model_ready_{ESTIMATION_SAMPLE_TAG}_microdata.parquet"
+)
+OSM_MODEL_READY_STD_PATH = (
+    ARTIFACTS_DIR / f"osm_zona777_model_ready_{ESTIMATION_SAMPLE_TAG}.parquet"
+)
+CENSO_MODEL_READY_FULL_PATH = ARTIFACTS_DIR / "censo2024_microdata_zona777_model_ready.parquet"
+CENSO_BASE_MODEL_READY_FULL_PATH = ARTIFACTS_DIR / "censo2024_zona777_model_ready.parquet"
+OSM_MODEL_READY_FULL_PATH = ARTIFACTS_DIR / "osm_zona777_model_ready.parquet"
+
+BASE_MODEL_COLUMNS = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_NO_LAB",
+    "DUMMY_ANIO_2025",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+]
+
+CENSO_EXTRA_COLS = [
+    "prom_edad_z",
+    "prom_escolaridad18_z",
+    "share_inmigrantes_z",
+    "share_hacinamiento_z",
+    "share_internet_z",
+    "share_serv_compu_z",
+    "share_serv_tel_movil_z",
+    "share_discapacidad_z",
+    "share_analfabet_z",
+    "share_cine18_universitaria_micro_z",
+    "share_cine18_universitaria_o_mas_micro_z",
+    "share_cine18_terciaria_corta_micro_z",
+    "share_cine18_postgrado_micro_z",
+]
+
+CENSO_STEPWISE_MAIN_COLS = [
+    "share_cine18_universitaria_o_mas_micro_z",
+    "share_hacinamiento_z",
+    "share_discapacidad_z",
+    "share_inmigrantes_z",
+]
+
+CENSO_STEPWISE_ESCOLARIDAD_COLS = [
+    "prom_escolaridad18_z",
+    "share_hacinamiento_z",
+    "share_discapacidad_z",
+    "share_inmigrantes_z",
+]
+
+CENSO_CONNECTIVITY_SENSITIVITY_SPECS = [
+    ("main_4_plus_internet", CENSO_STEPWISE_MAIN_COLS + ["share_internet_z"]),
+    ("main_4_plus_compu", CENSO_STEPWISE_MAIN_COLS + ["share_serv_compu_z"]),
+    (
+        "main_4_plus_internet_compu",
+        CENSO_STEPWISE_MAIN_COLS + ["share_internet_z", "share_serv_compu_z"],
+    ),
+    (
+        "internet_hacinamiento_discapacidad_inmigrantes",
+        ["share_internet_z", "share_hacinamiento_z", "share_discapacidad_z", "share_inmigrantes_z"],
+    ),
+    (
+        "compu_hacinamiento_discapacidad_inmigrantes",
+        ["share_serv_compu_z", "share_hacinamiento_z", "share_discapacidad_z", "share_inmigrantes_z"],
+    ),
+]
+
+CENSO_PARAM_TAGS = {
+    "prom_edad_z": "PROM_EDAD_Z",
+    "prom_escolaridad18_z": "PROM_ESCOLARIDAD18_Z",
+    "share_inmigrantes_z": "SHARE_INMIGRANTES_Z",
+    "share_hacinamiento_z": "SHARE_HACINAMIENTO_Z",
+    "share_internet_z": "SHARE_INTERNET_Z",
+    "share_serv_compu_z": "SHARE_SERV_COMPU_Z",
+    "share_serv_tel_movil_z": "SHARE_SERV_TEL_MOVIL_Z",
+    "share_discapacidad_z": "SHARE_DISCAPACIDAD_Z",
+    "share_analfabet_z": "SHARE_ANALFABET_Z",
+    "share_cine18_universitaria_micro_z": "SHARE_CINE18_UNIVERSITARIA_MICRO_Z",
+    "share_cine18_universitaria_o_mas_micro_z": "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z",
+    "share_cine18_terciaria_corta_micro_z": "SHARE_CINE18_TERCIARIA_CORTA_MICRO_Z",
+    "share_cine18_postgrado_micro_z": "SHARE_CINE18_POSTGRADO_MICRO_Z",
+}
+
+OSM_ALIAS_TO_Z = {
+    "park": "osm_leisure_park_density_km2_z",
+    "school": "osm_amenity_school_density_km2_z",
+    "supermarket": "osm_shop_supermarket_density_km2_z",
+    "restaurant": "osm_amenity_restaurant_density_km2_z",
+    "mall": "osm_shop_mall_density_km2_z",
+    "university": "osm_amenity_university_density_km2_z",
+    "pharmacy": "osm_amenity_pharmacy_density_km2_z",
+    "convenience": "osm_shop_convenience_density_km2_z",
+    "playground": "osm_leisure_playground_density_km2_z",
+    "office_company": "osm_office_company_density_km2_z",
+    "sports_centre": "osm_leisure_sports_centre_density_km2_z",
+    "office_government": "osm_office_government_density_km2_z",
+    "transport_shelter": "osm_transport_shelter_yes_density_km2_z",
+    "transport_bench": "osm_transport_bench_yes_density_km2_z",
+    "subway_entrance": "osm_railway_subway_entrance_density_km2_z",
+}
+
+OSM_EXTRA_COLS = list(OSM_ALIAS_TO_Z.values())
+
+OSM_STEPWISE_CONVENIENCE_COLS = [
+    OSM_ALIAS_TO_Z["sports_centre"],
+    OSM_ALIAS_TO_Z["convenience"],
+    OSM_ALIAS_TO_Z["office_company"],
+    OSM_ALIAS_TO_Z["playground"],
+]
+
+OSM_STEPWISE_RESTAURANT_COLS = [
+    OSM_ALIAS_TO_Z["sports_centre"],
+    OSM_ALIAS_TO_Z["restaurant"],
+    OSM_ALIAS_TO_Z["office_company"],
+    OSM_ALIAS_TO_Z["playground"],
+]
+
+OSM_STEPWISE_SCHOOL_SENSITIVITY_SPECS = [
+    ("convenience_4_plus_school", OSM_STEPWISE_CONVENIENCE_COLS + [OSM_ALIAS_TO_Z["school"]]),
+    ("restaurant_4_plus_school", OSM_STEPWISE_RESTAURANT_COLS + [OSM_ALIAS_TO_Z["school"]]),
+]
+
+OSM_SECOND_ROUND_SPECS = [
+    (
+        "second_sports_convenience_school",
+        [OSM_ALIAS_TO_Z["sports_centre"], OSM_ALIAS_TO_Z["convenience"], OSM_ALIAS_TO_Z["school"]],
+    ),
+    (
+        "second_sports_convenience_playground_school",
+        [
+            OSM_ALIAS_TO_Z["sports_centre"],
+            OSM_ALIAS_TO_Z["convenience"],
+            OSM_ALIAS_TO_Z["playground"],
+            OSM_ALIAS_TO_Z["school"],
+        ],
+    ),
+    (
+        "second_sports_convenience_office_school",
+        [
+            OSM_ALIAS_TO_Z["sports_centre"],
+            OSM_ALIAS_TO_Z["convenience"],
+            OSM_ALIAS_TO_Z["office_company"],
+            OSM_ALIAS_TO_Z["school"],
+        ],
+    ),
+    (
+        "second_sports_convenience_office_playground_school",
+        OSM_STEPWISE_CONVENIENCE_COLS + [OSM_ALIAS_TO_Z["school"]],
+    ),
+    (
+        "second_sports_university",
+        [OSM_ALIAS_TO_Z["sports_centre"], OSM_ALIAS_TO_Z["university"]],
+    ),
+    (
+        "second_sports_university_office",
+        [OSM_ALIAS_TO_Z["sports_centre"], OSM_ALIAS_TO_Z["university"], OSM_ALIAS_TO_Z["office_company"]],
+    ),
+    (
+        "second_sports_university_office_playground",
+        [
+            OSM_ALIAS_TO_Z["sports_centre"],
+            OSM_ALIAS_TO_Z["university"],
+            OSM_ALIAS_TO_Z["office_company"],
+            OSM_ALIAS_TO_Z["playground"],
+        ],
+    ),
+    (
+        "second_sports_university_office_school",
+        [
+            OSM_ALIAS_TO_Z["sports_centre"],
+            OSM_ALIAS_TO_Z["university"],
+            OSM_ALIAS_TO_Z["office_company"],
+            OSM_ALIAS_TO_Z["school"],
+        ],
+    ),
+    (
+        "second_sports_convenience_school_university",
+        [
+            OSM_ALIAS_TO_Z["sports_centre"],
+            OSM_ALIAS_TO_Z["convenience"],
+            OSM_ALIAS_TO_Z["school"],
+            OSM_ALIAS_TO_Z["university"],
+        ],
+    ),
+    (
+        "second_sports_convenience_playground_school_university",
+        [
+            OSM_ALIAS_TO_Z["sports_centre"],
+            OSM_ALIAS_TO_Z["convenience"],
+            OSM_ALIAS_TO_Z["playground"],
+            OSM_ALIAS_TO_Z["school"],
+            OSM_ALIAS_TO_Z["university"],
+        ],
+    ),
+]
+
+OSM_MAIN_COLS = [
+    OSM_ALIAS_TO_Z["sports_centre"],
+    OSM_ALIAS_TO_Z["convenience"],
+    OSM_ALIAS_TO_Z["playground"],
+    OSM_ALIAS_TO_Z["school"],
+    OSM_ALIAS_TO_Z["university"],
+]
+
+OSM_PARSIMONIOUS_COLS = [
+    OSM_ALIAS_TO_Z["sports_centre"],
+    OSM_ALIAS_TO_Z["convenience"],
+    OSM_ALIAS_TO_Z["school"],
+    OSM_ALIAS_TO_Z["university"],
+]
+
+CENSO_MAIN_PLUS_COMPU_COLS = CENSO_STEPWISE_MAIN_COLS + ["share_serv_compu_z"]
+
+OSM_INFRA_INCREMENTAL_COLS = [
+    OSM_ALIAS_TO_Z["transport_shelter"],
+    OSM_ALIAS_TO_Z["transport_bench"],
+    OSM_ALIAS_TO_Z["subway_entrance"],
+]
+
+JOINT_CENSO_TO_OSM_ROUTE_A_SPECS = [
+    ("censo_main_4", CENSO_STEPWISE_MAIN_COLS),
+    ("censo_main_4_plus_sports", CENSO_STEPWISE_MAIN_COLS + [OSM_ALIAS_TO_Z["sports_centre"]]),
+    (
+        "censo_main_4_plus_sports_convenience",
+        CENSO_STEPWISE_MAIN_COLS + [OSM_ALIAS_TO_Z["sports_centre"], OSM_ALIAS_TO_Z["convenience"]],
+    ),
+    (
+        "censo_main_4_plus_sports_convenience_playground",
+        CENSO_STEPWISE_MAIN_COLS
+        + [OSM_ALIAS_TO_Z["sports_centre"], OSM_ALIAS_TO_Z["convenience"], OSM_ALIAS_TO_Z["playground"]],
+    ),
+    (
+        "censo_main_4_plus_sports_convenience_playground_school",
+        CENSO_STEPWISE_MAIN_COLS
+        + [
+            OSM_ALIAS_TO_Z["sports_centre"],
+            OSM_ALIAS_TO_Z["convenience"],
+            OSM_ALIAS_TO_Z["playground"],
+            OSM_ALIAS_TO_Z["school"],
+        ],
+    ),
+    ("censo_main_4_plus_osm_main", CENSO_STEPWISE_MAIN_COLS + OSM_MAIN_COLS),
+    ("censo_main_4_plus_osm_parsimonious", CENSO_STEPWISE_MAIN_COLS + OSM_PARSIMONIOUS_COLS),
+    ("censo_main_4_compu_plus_osm_main", CENSO_MAIN_PLUS_COMPU_COLS + OSM_MAIN_COLS),
+]
+
+JOINT_CENSO_OSM_INFRA_INCREMENTAL_SPECS = [
+    (
+        "censo_main_4_plus_osm_main_plus_transport_shelter",
+        CENSO_STEPWISE_MAIN_COLS + OSM_MAIN_COLS + [OSM_ALIAS_TO_Z["transport_shelter"]],
+    ),
+    (
+        "censo_main_4_plus_osm_main_plus_transport_shelter_bench",
+        CENSO_STEPWISE_MAIN_COLS
+        + OSM_MAIN_COLS
+        + [OSM_ALIAS_TO_Z["transport_shelter"], OSM_ALIAS_TO_Z["transport_bench"]],
+    ),
+    (
+        "censo_main_4_plus_osm_main_plus_transport_shelter_bench_subway_entrance",
+        CENSO_STEPWISE_MAIN_COLS + OSM_MAIN_COLS + OSM_INFRA_INCREMENTAL_COLS,
+    ),
+]
+
+JOINT_CENSO_OSM_INFRA_DIRECT_CHECK_SPECS = [
+    (
+        "censo_main_4_plus_osm_main_plus_subway_entrance",
+        CENSO_STEPWISE_MAIN_COLS + OSM_MAIN_COLS + [OSM_ALIAS_TO_Z["subway_entrance"]],
+    ),
+    (
+        "censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance",
+        CENSO_STEPWISE_MAIN_COLS
+        + OSM_MAIN_COLS
+        + [OSM_ALIAS_TO_Z["transport_shelter"], OSM_ALIAS_TO_Z["subway_entrance"]],
+    ),
+]
+
+COMMON_PARAM_CURRENT = "current"
+COMMON_PARAM_BIP_BASE = "bip_only_alt_specific"
+COMMON_PARAM_SUM_ZERO = "bip_reportable_sum_zero"
+
+JOINT_CENSO_OSM_METHOD_OPTION_SPECS = [
+    (
+        "censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance_option_a_bip_only_alt_specific",
+        CENSO_STEPWISE_MAIN_COLS
+        + OSM_MAIN_COLS
+        + [OSM_ALIAS_TO_Z["transport_shelter"], OSM_ALIAS_TO_Z["subway_entrance"]],
+        COMMON_PARAM_BIP_BASE,
+    ),
+    (
+        "censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance_option_b_bip_reportable_sum_zero",
+        CENSO_STEPWISE_MAIN_COLS
+        + OSM_MAIN_COLS
+        + [OSM_ALIAS_TO_Z["transport_shelter"], OSM_ALIAS_TO_Z["subway_entrance"]],
+        COMMON_PARAM_SUM_ZERO,
+    ),
+]
+
+OSM_PARAM_TAGS = {
+    OSM_ALIAS_TO_Z["park"]: "OSM_LEISURE_PARK_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["school"]: "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["supermarket"]: "OSM_SHOP_SUPERMARKET_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["restaurant"]: "OSM_AMENITY_RESTAURANT_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["mall"]: "OSM_SHOP_MALL_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["university"]: "OSM_AMENITY_UNIVERSITY_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["pharmacy"]: "OSM_AMENITY_PHARMACY_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["convenience"]: "OSM_SHOP_CONVENIENCE_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["playground"]: "OSM_LEISURE_PLAYGROUND_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["office_company"]: "OSM_OFFICE_COMPANY_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["sports_centre"]: "OSM_LEISURE_SPORTS_CENTRE_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["office_government"]: "OSM_OFFICE_GOVERNMENT_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["transport_shelter"]: "OSM_TRANSPORT_SHELTER_YES_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["transport_bench"]: "OSM_TRANSPORT_BENCH_YES_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["subway_entrance"]: "OSM_RAILWAY_SUBWAY_ENTRANCE_DENSITY_KM2_Z",
+}
+
+if ACTIVE_PRESET == "censo_sequential_mnl_then_nested":
+    ACTIVE_MODEL_LABELS = (
+        ["mnl_baseline_baseline"]
+        + [f"mnl_censo_uni_{col}" for col in CENSO_EXTRA_COLS]
+        + ["nested_baseline_baseline"]
+        + [f"nested_censo_uni_{col}" for col in CENSO_EXTRA_COLS]
+    )
+elif ACTIVE_PRESET == "osm_sequential_mnl_then_nested":
+    ACTIVE_MODEL_LABELS = (
+        ["mnl_baseline_baseline"]
+        + [f"mnl_osm_uni_{col}" for col in OSM_EXTRA_COLS]
+        + ["nested_baseline_baseline"]
+        + [f"nested_osm_uni_{col}" for col in OSM_EXTRA_COLS]
+    )
+elif ACTIVE_PRESET == "osm_mnl_only":
+    ACTIVE_MODEL_LABELS = ["mnl_baseline_baseline"] + [
+        f"mnl_osm_uni_{col}" for col in OSM_EXTRA_COLS
+    ]
+elif ACTIVE_PRESET == "osm_nested_only":
+    ACTIVE_MODEL_LABELS = ["nested_baseline_baseline"] + [
+        f"nested_osm_uni_{col}" for col in OSM_EXTRA_COLS
+    ]
+elif ACTIVE_PRESET == "osm_mnl_stepwise_convenience":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_osm_stepwise_convenience_{i}"
+        for i in range(1, len(OSM_STEPWISE_CONVENIENCE_COLS) + 1)
+    ]
+elif ACTIVE_PRESET == "osm_mnl_stepwise_restaurant":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_osm_stepwise_restaurant_{i}"
+        for i in range(1, len(OSM_STEPWISE_RESTAURANT_COLS) + 1)
+    ]
+elif ACTIVE_PRESET == "osm_mnl_stepwise_school_sensitivity":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_osm_stepwise_{label}"
+        for label, _ in OSM_STEPWISE_SCHOOL_SENSITIVITY_SPECS
+    ]
+elif ACTIVE_PRESET == "osm_mnl_stepwise_all":
+    ACTIVE_MODEL_LABELS = (
+        [
+            f"mnl_osm_stepwise_convenience_{i}"
+            for i in range(1, len(OSM_STEPWISE_CONVENIENCE_COLS) + 1)
+        ]
+        + [
+            f"mnl_osm_stepwise_restaurant_{i}"
+            for i in range(2, len(OSM_STEPWISE_RESTAURANT_COLS) + 1)
+        ]
+        + [
+            f"mnl_osm_stepwise_{label}"
+            for label, _ in OSM_STEPWISE_SCHOOL_SENSITIVITY_SPECS
+        ]
+    )
+elif ACTIVE_PRESET == "osm_mnl_second_round":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_osm_{label}"
+        for label, _ in OSM_SECOND_ROUND_SPECS
+    ]
+elif ACTIVE_PRESET == "joint_mnl_censo_to_osm_route_a":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_joint_{label}"
+        for label, _ in JOINT_CENSO_TO_OSM_ROUTE_A_SPECS
+    ]
+elif ACTIVE_PRESET == "joint_mnl_censo_to_osm_route_a_missing":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_joint_{label}"
+        for label, _ in JOINT_CENSO_TO_OSM_ROUTE_A_SPECS[3:]
+    ]
+elif ACTIVE_PRESET == "joint_mnl_censo_osm_infra_incremental":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_joint_{label}"
+        for label, _ in JOINT_CENSO_OSM_INFRA_INCREMENTAL_SPECS
+    ]
+elif ACTIVE_PRESET == "joint_mnl_censo_osm_infra_direct_checks":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_joint_{label}"
+        for label, _ in JOINT_CENSO_OSM_INFRA_DIRECT_CHECK_SPECS
+    ]
+elif ACTIVE_PRESET == "joint_mnl_censo_osm_method_options":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_joint_{label}"
+        for label, _, _ in JOINT_CENSO_OSM_METHOD_OPTION_SPECS
+    ]
+elif ACTIVE_PRESET == "censo_mnl_stepwise_main":
+    ACTIVE_MODEL_LABELS = ["mnl_baseline_baseline"] + [
+        f"mnl_censo_stepwise_main_{i}"
+        for i in range(1, len(CENSO_STEPWISE_MAIN_COLS) + 1)
+    ]
+elif ACTIVE_PRESET == "censo_mnl_stepwise_escolaridad":
+    ACTIVE_MODEL_LABELS = ["mnl_baseline_baseline"] + [
+        f"mnl_censo_stepwise_escolaridad_{i}"
+        for i in range(1, len(CENSO_STEPWISE_ESCOLARIDAD_COLS) + 1)
+    ]
+elif ACTIVE_PRESET == "censo_mnl_stepwise_all":
+    ACTIVE_MODEL_LABELS = (
+        ["mnl_baseline_baseline"]
+        + [
+            f"mnl_censo_stepwise_main_{i}"
+            for i in range(1, len(CENSO_STEPWISE_MAIN_COLS) + 1)
+        ]
+        + [
+            f"mnl_censo_stepwise_escolaridad_{i}"
+            for i in range(1, len(CENSO_STEPWISE_ESCOLARIDAD_COLS) + 1)
+        ]
+    )
+elif ACTIVE_PRESET == "censo_mnl_connectivity_sensitivity":
+    ACTIVE_MODEL_LABELS = (
+        ["mnl_baseline_baseline"]
+        + [
+            f"mnl_censo_stepwise_main_{i}"
+            for i in range(1, len(CENSO_STEPWISE_MAIN_COLS) + 1)
+        ]
+        + [
+            f"mnl_censo_connectivity_{label}"
+            for label, _ in CENSO_CONNECTIVITY_SENSITIVITY_SPECS
+        ]
+    )
+elif ACTIVE_PRESET == "censo_mnl_connectivity_new_only":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_censo_connectivity_{label}"
+        for label, _ in CENSO_CONNECTIVITY_SENSITIVITY_SPECS
+    ]
+elif ACTIVE_PRESET == "censo_mnl_connectivity_alternatives_only":
+    ACTIVE_MODEL_LABELS = [
+        "mnl_censo_connectivity_internet_hacinamiento_discapacidad_inmigrantes",
+        "mnl_censo_connectivity_compu_hacinamiento_discapacidad_inmigrantes",
+    ]
+elif ACTIVE_PRESET == "censo_mnl_connectivity_resume_main_2":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_censo_connectivity_{label}"
+        for label, _ in CENSO_CONNECTIVITY_SENSITIVITY_SPECS
+        if label != "main_1"
+    ]
+
+BIOGEME_OPTIMIZER = {
+    "label": "automatic_default",
+    "optimization_algorithm": "automatic",
+    "calculating_second_derivatives": "analytical",
+    "second_derivatives": None,
+}
+
+print("RUN_ESTIMATION =", RUN_ESTIMATION)
+print("ACTIVE_PRESET =", ACTIVE_PRESET)
+print("BASELINE_SAMPLE_PATH:", BASELINE_SAMPLE_PATH)
+print("CENSO_SAMPLE_PATH:", CENSO_SAMPLE_PATH)
+print("OSM_SAMPLE_PATH:", OSM_SAMPLE_PATH)
+print("JOINT_SAMPLE_PATH:", JOINT_SAMPLE_PATH)
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+def remove_biogeme_iter_file(model_name: str, project_root: Path) -> None:
+    candidates = [
+        project_root / f"{model_name}.iter",
+        project_root / f"__{model_name}.iter",
+        Path.cwd() / f"{model_name}.iter",
+        Path.cwd() / f"__{model_name}.iter",
+    ]
+    seen = set()
+    for iter_path in candidates:
+        if iter_path in seen:
+            continue
+        seen.add(iter_path)
+        if iter_path.exists():
+            iter_path.unlink()
+
+
+def unique_ordered(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
+
+
+def result_artifact_dir(model_label: str) -> Path:
+    out_dir = RESULTS_DIR / model_label
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def stats_to_frame(stats: dict) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"metric": key, "value": val[0] if isinstance(val, tuple) else val}
+            for key, val in stats.items()
+        ]
+    )
+
+
+def load_stats_from_csv(stats_path: Path) -> dict | None:
+    if not stats_path.exists():
+        return None
+    stats_df = pd.read_csv(stats_path)
+    if not {"metric", "value"}.issubset(stats_df.columns):
+        raise ValueError(f"stats CSV mal formado: {stats_path}")
+    return dict(zip(stats_df["metric"], stats_df["value"]))
+
+
+def metric_value(stats: dict, metric: str):
+    value = stats.get(metric)
+    if isinstance(value, tuple):
+        return value[0]
+    return value
+
+
+def param_value(params_df: pd.DataFrame, name: str, candidates: list[str]):
+    for col in candidates:
+        if col in params_df.columns:
+            subset = params_df.loc[params_df["Name"] == name, col]
+            if not subset.empty:
+                return subset.iloc[0]
+    return None
+
+
+def parse_yaml_diagnostics(yaml_path: Path) -> dict:
+    if not yaml_path.exists():
+        return {}
+    with yaml_path.open("r", encoding="utf-8") as fh:
+        payload = yaml.safe_load(fh) or {}
+    opt = payload.get("optimization_messages", {}) or {}
+    return {
+        "yaml_convergence": payload.get("convergence"),
+        "yaml_relative_gradient": opt.get("Relative gradient"),
+        "yaml_cause_of_termination": opt.get("Cause of termination"),
+        "yaml_algorithm": opt.get("Algorithm"),
+        "yaml_n_iterations": opt.get("Number of iterations"),
+        "yaml_n_grad_evals": opt.get("Number of gradient evaluations"),
+        "yaml_n_hessian_evals": opt.get("Number of hessian evaluations"),
+    }
+
+
+def configure_biogeme_run(biogeme_model: bio.BIOGEME, optimizer: dict) -> None:
+    biogeme_model.biogeme_parameters.set_value("generate_html", False)
+    biogeme_model.biogeme_parameters.set_value("generate_yaml", False)
+    biogeme_model.biogeme_parameters.set_value("save_iterations", False)
+    biogeme_model.biogeme_parameters.set_value("number_of_threads", 1)
+    biogeme_model.biogeme_parameters.set_value(
+        "calculating_second_derivatives",
+        optimizer["calculating_second_derivatives"],
+    )
+    biogeme_model.biogeme_parameters.set_value(
+        "optimization_algorithm",
+        optimizer["optimization_algorithm"],
+    )
+    if optimizer["second_derivatives"] is not None:
+        biogeme_model.biogeme_parameters.set_value(
+            "second_derivatives",
+            optimizer["second_derivatives"],
+        )
+
+
+def load_biogeme_numeric_df_from_parquet(path: Path, extra_cols: list[str]) -> pd.DataFrame:
+    cols = unique_ordered(BASE_MODEL_COLUMNS + extra_cols)
+    lazy_df = read_parquet_portable(str(path))
+    schema_names = lazy_df.collect_schema().names()
+    missing = sorted(set(cols) - set(schema_names))
+    if missing:
+        raise ValueError(f"Faltan columnas requeridas en {path.name}: {missing}")
+    return (
+        lazy_df
+        .select([pl.col(c).cast(pl.Float64) for c in cols])
+        .collect()
+        .to_pandas()
+    )
+
+
+def parse_sample_fraction_from_tag(sample_tag: str) -> float | None:
+    if sample_tag == "full":
+        return None
+    if not (sample_tag.startswith("sample") and sample_tag.endswith("pct")):
+        return None
+    try:
+        return int(sample_tag.removeprefix("sample").removesuffix("pct")) / 100
+    except Exception:
+        return None
+
+
+def parse_sample_fraction_from_name(path: Path) -> float | None:
+    stem = path.stem
+    if "-sample" not in stem or not stem.endswith("pct"):
+        return None
+    try:
+        pct_str = stem.split("-sample", 1)[1].removesuffix("pct")
+        return int(pct_str) / 100
+    except Exception:
+        return None
+
+
+def materialize_baseline_sample_if_needed(
+    *,
+    target_path: Path,
+    target_fraction: float,
+    model_partition: str,
+    artifacts_dir: Path,
+    seed: int = 42,
+) -> Path:
+    if target_path.exists():
+        return target_path
+
+    candidates = []
+    for p in artifacts_dir.glob(f"{model_partition}-estimation-sample*pct.parquet"):
+        if any(tag in p.stem for tag in ["-censo", "-micro", "-osm"]):
+            continue
+        frac = parse_sample_fraction_from_name(p)
+        if frac is not None and frac > target_fraction:
+            candidates.append((frac, p))
+
+    if not candidates:
+        available = sorted(p.name for p in artifacts_dir.glob(f"{model_partition}-estimation-*.parquet"))
+        raise FileNotFoundError(
+            "No existe muestra baseline exacta y tampoco una muestra mayor desde la cual derivarla. "
+            f"Esperada: {target_path}. Disponibles: {available}"
+        )
+
+    source_fraction, source_path = sorted(candidates, key=lambda x: x[0])[0]
+    sample_ratio = target_fraction / source_fraction
+    if not (0 < sample_ratio < 1):
+        raise ValueError(
+            f"No se puede derivar muestra objetivo {target_fraction:.2%} desde {source_fraction:.2%}"
+        )
+
+    print(
+        "ℹ️ Derivando baseline sample faltante "
+        f"{target_path.name} desde {source_path.name} con ratio {sample_ratio:.6f}"
+    )
+    df_source = pd.read_parquet(source_path)
+    required = {"partition", "choice_nested"}
+    missing = sorted(required - set(df_source.columns))
+    if missing:
+        raise ValueError(f"Faltan columnas para sampleo estratificado en {source_path}: {missing}")
+
+    df_target = (
+        df_source.groupby(["partition", "choice_nested"], sort=False, group_keys=False)
+        .sample(frac=sample_ratio, random_state=seed)
+        .sort_values(["partition", "choice_nested"], kind="stable")
+        .reset_index(drop=True)
+    )
+    pl.from_pandas(df_target).write_parquet(target_path)
+    print(f"✅ Baseline sample derivado escrito en: {target_path}")
+    return target_path
+
+
+def standardize_over_used_zones(
+    df_zone_model_ready: pl.DataFrame,
+    df_est_base: pl.DataFrame,
+    raw_vars: list[str],
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    df_used_zones = (
+        df_est_base
+        .select(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .drop_nulls()
+        .unique()
+        .sort("ZONA777")
+    )
+    df_used = df_zone_model_ready.join(df_used_zones, on="ZONA777", how="inner")
+    stats_rows = []
+    df_out = df_zone_model_ready
+
+    for raw_var in raw_vars:
+        mu = df_used.select(pl.col(raw_var).mean()).item()
+        sd = df_used.select(pl.col(raw_var).std()).item()
+        if mu is None:
+            raise ValueError(f"No se pudo calcular media para {raw_var} sobre zonas usadas")
+        if sd is None or sd == 0:
+            sd = 1.0
+        z_var = f"{raw_var}_z"
+        df_out = df_out.with_columns(
+            ((pl.col(raw_var) - pl.lit(float(mu))) / pl.lit(float(sd))).alias(z_var)
+        )
+        stats_rows.append(
+            {
+                "variable": raw_var,
+                "mean_used_zones": float(mu),
+                "std_used_zones": float(sd),
+                "z_variable": z_var,
+            }
+        )
+
+    return df_out, pl.DataFrame(stats_rows)
+
+
+def add_origin_controls(
+    *,
+    df_trips: pl.DataFrame,
+    df_zone: pl.DataFrame,
+    raw_vars: list[str],
+    z_vars: list[str],
+    context_name: str,
+) -> pl.DataFrame:
+    ensure_unique_keys(df_zone, ["ZONA777"], f"df_{context_name}_zone")
+    before_rows = df_trips.height
+    df = (
+        df_trips
+        .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .join(df_zone.select(["ZONA777"] + raw_vars + z_vars), on="ZONA777", how="left")
+        .drop("ZONA777")
+    )
+    assert_left_join_preserves_rows(before_rows, df.height, f"join {context_name} sobre muestra de estimación")
+    missing_ratio = (
+        df.select(pl.any_horizontal([pl.col(c).is_null() for c in z_vars]).mean().alias("pct"))
+        .item()
+    )
+    if missing_ratio != 0:
+        raise ValueError(f"Join {context_name} dejó filas con variables faltantes: {missing_ratio:.6%}")
+    return df
+
+
+def read_zone_model_ready_sources(paths) -> pl.DataFrame:
+    if isinstance(paths, (str, Path)):
+        paths = [Path(paths)]
+    else:
+        paths = [Path(p) for p in paths]
+
+    missing_paths = [p for p in paths if not p.exists()]
+    if missing_paths:
+        raise FileNotFoundError(f"No existen zone model-ready full requeridos: {missing_paths}")
+
+    df_zone = None
+    for path in paths:
+        df_next = pl.read_parquet(path)
+        ensure_unique_keys(df_next, ["ZONA777"], path.name)
+        if df_zone is None:
+            df_zone = df_next
+            continue
+
+        duplicate_cols = sorted((set(df_zone.columns) & set(df_next.columns)) - {"ZONA777"})
+        if duplicate_cols:
+            raise ValueError(f"Columnas duplicadas al combinar fuentes zone model-ready: {duplicate_cols}")
+        df_zone = df_zone.join(df_next, on="ZONA777", how="inner")
+
+    return df_zone
+
+
+def ensure_sample_specific_zone_controls(
+    *,
+    baseline_sample_path: Path,
+    zone_model_ready_full_path,
+    zone_model_ready_std_path: Path,
+    estimation_sample_path: Path,
+    raw_vars: list[str],
+    context_name: str,
+) -> tuple[Path, Path]:
+    z_vars = [f"{c}_z" for c in raw_vars]
+    required_zone_cols = ["ZONA777"] + raw_vars + z_vars
+    if zone_model_ready_std_path.exists() and estimation_sample_path.exists():
+        std_cols = set(read_parquet_portable(str(zone_model_ready_std_path)).collect_schema().names())
+        est_cols = set(read_parquet_portable(str(estimation_sample_path)).collect_schema().names())
+        missing_std = sorted(set(required_zone_cols) - std_cols)
+        missing_est = sorted(set(raw_vars + z_vars) - est_cols)
+        if not missing_std and not missing_est:
+            return zone_model_ready_std_path, estimation_sample_path
+        print(
+            f"ℹ️ Re-materializando artefactos {context_name}: "
+            f"faltan columnas zone={missing_std}, sample={missing_est}"
+        )
+
+    if zone_model_ready_std_path.exists():
+        zone_model_ready_std_path.unlink()
+    if estimation_sample_path.exists():
+        estimation_sample_path.unlink()
+
+    if not baseline_sample_path.exists():
+        raise FileNotFoundError(f"No existe baseline sample requerido: {baseline_sample_path}")
+
+    print(f"ℹ️ Materializando artefactos {context_name} para {estimation_sample_path.name}...")
+    df_est_base = read_parquet_portable(str(baseline_sample_path)).collect()
+    df_zone_full = read_zone_model_ready_sources(zone_model_ready_full_path)
+    missing_raw = sorted(set(raw_vars) - set(df_zone_full.columns))
+    if missing_raw:
+        raise ValueError(f"Faltan variables raw en fuentes {context_name}: {missing_raw}")
+    df_zone_std, _ = standardize_over_used_zones(df_zone_full, df_est_base, raw_vars)
+    df_zone_std.write_parquet(zone_model_ready_std_path)
+
+    df_est = add_origin_controls(
+        df_trips=df_est_base,
+        df_zone=df_zone_std,
+        raw_vars=raw_vars,
+        z_vars=z_vars,
+        context_name=context_name,
+    )
+    df_est.write_parquet(estimation_sample_path)
+    print(f"✅ Artefactos {context_name} escritos:")
+    print(f"   - zone std: {zone_model_ready_std_path}")
+    print(f"   - sample:   {estimation_sample_path}")
+    return zone_model_ready_std_path, estimation_sample_path
+
+
+def ensure_estimation_artifacts_for_active_models() -> None:
+    target_fraction = parse_sample_fraction_from_tag(ESTIMATION_SAMPLE_TAG)
+    if target_fraction is not None:
+        materialize_baseline_sample_if_needed(
+            target_path=BASELINE_SAMPLE_PATH,
+            target_fraction=target_fraction,
+            model_partition=MODEL_PARTITION,
+            artifacts_dir=ARTIFACTS_DIR,
+        )
+    elif not BASELINE_SAMPLE_PATH.exists():
+        raise FileNotFoundError(f"No existe baseline sample requerido: {BASELINE_SAMPLE_PATH}")
+
+    active_blocks = {spec["block"] for spec in MODEL_SPECS}
+
+    if "censo" in active_blocks or "joint" in active_blocks:
+        ensure_sample_specific_zone_controls(
+            baseline_sample_path=BASELINE_SAMPLE_PATH,
+            zone_model_ready_full_path=[CENSO_BASE_MODEL_READY_FULL_PATH, CENSO_MODEL_READY_FULL_PATH],
+            zone_model_ready_std_path=CENSO_MODEL_READY_STD_PATH,
+            estimation_sample_path=CENSO_SAMPLE_PATH,
+            raw_vars=[c.removesuffix("_z") for c in CENSO_EXTRA_COLS],
+            context_name="Censo micro",
+        )
+
+    if "osm" in active_blocks or "joint" in active_blocks:
+        ensure_sample_specific_zone_controls(
+            baseline_sample_path=BASELINE_SAMPLE_PATH,
+            zone_model_ready_full_path=OSM_MODEL_READY_FULL_PATH,
+            zone_model_ready_std_path=OSM_MODEL_READY_STD_PATH,
+            estimation_sample_path=OSM_SAMPLE_PATH,
+            raw_vars=[c.removesuffix("_z") for c in OSM_EXTRA_COLS],
+            context_name="OSM",
+        )
+
+
+def build_joint_sample_if_needed(
+    *,
+    target_path: Path,
+    baseline_sample_path: Path,
+    censo_zone_std_path: Path,
+    osm_zone_std_path: Path,
+    censo_cols: list[str],
+    osm_cols: list[str],
+) -> Path:
+    if target_path.exists():
+        required_cols = set(censo_cols + osm_cols)
+        existing_cols = set(read_parquet_portable(str(target_path)).collect_schema().names())
+        missing_cols = sorted(required_cols - existing_cols)
+        if not missing_cols:
+            print(f"ℹ️ Reusando muestra conjunta existente: {target_path}")
+            return target_path
+        print(
+            "ℹ️ Re-materializando muestra conjunta: "
+            f"faltan columnas {missing_cols} en {target_path.name}"
+        )
+        target_path.unlink()
+
+    if not baseline_sample_path.exists():
+        raise FileNotFoundError(f"No existe baseline sample: {baseline_sample_path}")
+    if not censo_zone_std_path.exists():
+        raise FileNotFoundError(f"No existe Censo model-ready std: {censo_zone_std_path}")
+    if not osm_zone_std_path.exists():
+        raise FileNotFoundError(f"No existe OSM model-ready std: {osm_zone_std_path}")
+
+    print(f"ℹ️ Construyendo muestra conjunta Censo + OSM sobre baseline {baseline_sample_path.name}...")
+    df_base = read_parquet_portable(str(baseline_sample_path)).collect()
+    before_rows = df_base.height
+
+    df_censo = (
+        pl.scan_parquet(str(censo_zone_std_path))
+        .select(["ZONA777"] + censo_cols)
+        .collect()
+    )
+    df_osm = (
+        pl.scan_parquet(str(osm_zone_std_path))
+        .select(["ZONA777"] + osm_cols)
+        .collect()
+    )
+
+    df_joint = (
+        df_base
+        .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .join(df_censo, on="ZONA777", how="left")
+        .join(df_osm, on="ZONA777", how="left")
+        .drop("ZONA777")
+    )
+
+    if df_joint.height != before_rows:
+        raise ValueError(
+            f"El join conjunto cambió filas: antes={before_rows:,}, después={df_joint.height:,}"
+        )
+
+    joined_cols = censo_cols + osm_cols
+    any_missing = (
+        df_joint
+        .select(pl.any_horizontal([pl.col(c).is_null() for c in joined_cols]).mean().alias("pct"))
+        .item()
+    )
+    if any_missing != 0:
+        raise ValueError(
+            f"La muestra conjunta dejó filas con variables territoriales faltantes: {any_missing:.6%}"
+        )
+
+    df_joint.write_parquet(target_path)
+    print(f"✅ Muestra conjunta escrita en: {target_path}")
+    return target_path
+
+
+def estimate_choice_model_with_extras(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    extra_cols: list[str],
+    param_tags: dict[str, str],
+    model_family: str,
+    optimizer: dict,
+    common_variable_parametrization: str = COMMON_PARAM_CURRENT,
+):
+    if common_variable_parametrization not in {
+        COMMON_PARAM_CURRENT,
+        COMMON_PARAM_BIP_BASE,
+        COMMON_PARAM_SUM_ZERO,
+    }:
+        raise ValueError(
+            "common_variable_parametrization debe ser "
+            f"{COMMON_PARAM_CURRENT!r}, {COMMON_PARAM_BIP_BASE!r} o {COMMON_PARAM_SUM_ZERO!r}. "
+            f"Recibido: {common_variable_parametrization!r}"
+        )
+
+    database = db.Database(model_name, pandas_df)
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+
+    CHOICE = Variable("choice_nested")
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+    DUMMY_ANIO_2025 = Variable("DUMMY_ANIO_2025")
+    LOG_DEMAND = Variable("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+    LOG_BUS_STOP_DENSITY = Variable("LOG_BUS_STOP_DENSITY")
+    LOG_BUS_LINE_COUNT = Variable("LOG_BUS_LINE_COUNT")
+    LOG_METRO_LINE_COUNT = Variable("LOG_METRO_LINE_COUNT")
+
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+    TET_BIP = Variable("TET_BIP")
+    TET_QR_RED = Variable("TET_QR_RED")
+    TET_QR_OTHER = Variable("TET_QR_OTHER")
+    NTR_BIP = Variable("NTR_BIP")
+    NTR_QR_RED = Variable("NTR_QR_RED")
+    NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    if model_family == "nested":
+        MU_QR = Beta(f"MU_QR_{partition}", 1.5, 1, 100, 0)
+        nest_bip = nests.OneNestForNestedLogit(1.0, [CHOICE_BIP], name="BIP")
+        nest_qr = nests.OneNestForNestedLogit(MU_QR, [CHOICE_QR_RED, CHOICE_QR_OTHER], name="QR")
+        NESTS = nests.NestsForNestedLogit(
+            choice_set=[CHOICE_BIP, CHOICE_QR_RED, CHOICE_QR_OTHER],
+            tuple_of_nests=(nest_bip, nest_qr),
+        )
+    else:
+        MU_QR = None
+
+    ASC_QR_RED = Beta(f"ASC_QR_RED_{partition}", 0, None, None, 0)
+    ASC_QR_OTHER = Beta(f"ASC_QR_OTHER_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PM = Beta(f"B_QR_RED_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PM = Beta(f"B_QR_OTHER_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PT = Beta(f"B_QR_RED_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PT = Beta(f"B_QR_OTHER_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_RED_NO_LAB = Beta(f"B_QR_RED_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_NO_LAB = Beta(f"B_QR_OTHER_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_RED_ANIO_2025 = Beta(f"B_QR_RED_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_OTHER_ANIO_2025 = Beta(f"B_QR_OTHER_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_DEMAND = Beta(f"B_QR_RED_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_DEMAND = Beta(f"B_QR_OTHER_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_RED_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_OTHER_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_LINE_COUNT = Beta(f"B_QR_RED_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_METRO_LINE_COUNT = Beta(f"B_QR_RED_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_METRO_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+
+    def common_base_betas(stem: str, red_beta, other_beta):
+        if common_variable_parametrization == COMMON_PARAM_SUM_ZERO:
+            return -red_beta - other_beta, red_beta, other_beta
+        return 0, red_beta, other_beta
+
+    B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_VEH = Beta(f"B_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_TRASB = Beta(f"B_BIP_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_TRASB = Beta(f"B_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_BIP_N_TRASB = Beta(f"B_BIP_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_N_TRASB = Beta(f"B_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_N_TRASB = Beta(f"B_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+
+    extra_var_exprs = {c: Variable(c) for c in extra_cols}
+    extra_betas_red = {
+        c: Beta(f"B_QR_RED_{param_tags[c]}_{partition}", 0, None, None, 0)
+        for c in extra_cols
+    }
+    extra_betas_other = {
+        c: Beta(f"B_QR_OTHER_{param_tags[c]}_{partition}", 0, None, None, 0)
+        for c in extra_cols
+    }
+    if common_variable_parametrization == COMMON_PARAM_CURRENT:
+        extra_betas_bip = {
+            c: Beta(f"B_BIP_{param_tags[c]}_{partition}", 0, None, None, 0)
+            for c in extra_cols
+        }
+    elif common_variable_parametrization == COMMON_PARAM_BIP_BASE:
+        extra_betas_bip = {c: 0 for c in extra_cols}
+    else:
+        extra_betas_bip = {
+            c: -extra_betas_red[c] - extra_betas_other[c]
+            for c in extra_cols
+        }
+
+    (
+        B_BIP_LAB_PM,
+        B_QR_RED_LAB_PM,
+        B_QR_OTHER_LAB_PM,
+    ) = common_base_betas("LAB_PM", B_QR_RED_LAB_PM, B_QR_OTHER_LAB_PM)
+    (
+        B_BIP_LAB_PT,
+        B_QR_RED_LAB_PT,
+        B_QR_OTHER_LAB_PT,
+    ) = common_base_betas("LAB_PT", B_QR_RED_LAB_PT, B_QR_OTHER_LAB_PT)
+    (
+        B_BIP_NO_LAB,
+        B_QR_RED_NO_LAB,
+        B_QR_OTHER_NO_LAB,
+    ) = common_base_betas("NO_LAB", B_QR_RED_NO_LAB, B_QR_OTHER_NO_LAB)
+    (
+        B_BIP_ANIO_2025,
+        B_QR_RED_ANIO_2025,
+        B_QR_OTHER_ANIO_2025,
+    ) = common_base_betas("ANIO_2025", B_QR_RED_ANIO_2025, B_QR_OTHER_ANIO_2025)
+    (
+        B_BIP_LOG_DEMAND,
+        B_QR_RED_LOG_DEMAND,
+        B_QR_OTHER_LOG_DEMAND,
+    ) = common_base_betas("LOG_DEMAND", B_QR_RED_LOG_DEMAND, B_QR_OTHER_LOG_DEMAND)
+    (
+        B_BIP_LOG_BUS_STOP_DENSITY,
+        B_QR_RED_LOG_BUS_STOP_DENSITY,
+        B_QR_OTHER_LOG_BUS_STOP_DENSITY,
+    ) = common_base_betas(
+        "LOG_BUS_STOP_DENSITY",
+        B_QR_RED_LOG_BUS_STOP_DENSITY,
+        B_QR_OTHER_LOG_BUS_STOP_DENSITY,
+    )
+    (
+        B_BIP_LOG_BUS_LINE_COUNT,
+        B_QR_RED_LOG_BUS_LINE_COUNT,
+        B_QR_OTHER_LOG_BUS_LINE_COUNT,
+    ) = common_base_betas(
+        "LOG_BUS_LINE_COUNT",
+        B_QR_RED_LOG_BUS_LINE_COUNT,
+        B_QR_OTHER_LOG_BUS_LINE_COUNT,
+    )
+    (
+        B_BIP_LOG_METRO_LINE_COUNT,
+        B_QR_RED_LOG_METRO_LINE_COUNT,
+        B_QR_OTHER_LOG_METRO_LINE_COUNT,
+    ) = common_base_betas(
+        "LOG_METRO_LINE_COUNT",
+        B_QR_RED_LOG_METRO_LINE_COUNT,
+        B_QR_OTHER_LOG_METRO_LINE_COUNT,
+    )
+
+    V_BIP = (
+        B_BIP_LAB_PM * LAB_PM
+        + B_BIP_LAB_PT * LAB_PT
+        + B_BIP_NO_LAB * NO_LAB
+        + B_BIP_ANIO_2025 * DUMMY_ANIO_2025
+        + B_BIP_LOG_DEMAND * LOG_DEMAND
+        + B_BIP_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_BIP_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_BIP_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_BIP_T_VEH * TVH_BIP
+        + B_BIP_T_ESPERA_INI * TEI_BIP
+        + B_BIP_T_ESPERA_TRASB * TET_BIP
+        + B_BIP_N_TRASB * NTR_BIP
+    )
+    for c in extra_cols:
+        V_BIP += extra_betas_bip[c] * extra_var_exprs[c]
+
+    V_QR_RED = (
+        ASC_QR_RED
+        + B_QR_RED_LAB_PM * LAB_PM
+        + B_QR_RED_LAB_PT * LAB_PT
+        + B_QR_RED_NO_LAB * NO_LAB
+        + B_QR_RED_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_RED_LOG_DEMAND * LOG_DEMAND
+        + B_QR_RED_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_RED_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_RED_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_RED_T_VEH * TVH_QR_RED
+        + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+        + B_QR_RED_N_TRASB * NTR_QR_RED
+    )
+    for c in extra_cols:
+        V_QR_RED += extra_betas_red[c] * extra_var_exprs[c]
+
+    V_QR_OTHER = (
+        ASC_QR_OTHER
+        + B_QR_OTHER_LAB_PM * LAB_PM
+        + B_QR_OTHER_LAB_PT * LAB_PT
+        + B_QR_OTHER_NO_LAB * NO_LAB
+        + B_QR_OTHER_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_OTHER_LOG_DEMAND * LOG_DEMAND
+        + B_QR_OTHER_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_OTHER_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_OTHER_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+        + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+    )
+    for c in extra_cols:
+        V_QR_OTHER += extra_betas_other[c] * extra_var_exprs[c]
+
+    V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+    av = {CHOICE_BIP: 1, CHOICE_QR_RED: 1, CHOICE_QR_OTHER: 1}
+    if model_family == "nested":
+        logprob = models.lognested(V, None, NESTS, CHOICE)
+    else:
+        logprob = models.loglogit(V, av, CHOICE)
+
+    remove_biogeme_iter_file(model_name, PROJECT_ROOT)
+    biogeme = bio.BIOGEME(database, logprob)
+    biogeme.model_name = model_name
+    configure_biogeme_run(biogeme, optimizer)
+
+    results = biogeme.estimate()
+    stats = results.get_general_statistics()
+    params_df = br.get_pandas_estimated_parameters(results)
+    return results, stats, params_df, MU_QR is not None
+
+
+def new_variable_parameter_rows(
+    *,
+    params_df: pd.DataFrame,
+    model_label: str,
+    model_family: str,
+    block: str,
+    extra_cols: list[str],
+    param_tags: dict[str, str],
+    common_variable_parametrization: str = COMMON_PARAM_CURRENT,
+):
+    rows = []
+    for col in extra_cols:
+        tag = param_tags[col]
+        for alternative, prefix in [
+            ("BIP", "B_BIP"),
+            ("QR_RED", "B_QR_RED"),
+            ("QR_OTHER", "B_QR_OTHER"),
+        ]:
+            param_name = f"{prefix}_{tag}_{MODEL_PARTITION}"
+            beta = param_value(params_df, param_name, ["Value"])
+            robust_t = param_value(
+                params_df,
+                param_name,
+                ["Robust t-stat.", "Rob. t-test", "t-test"],
+            )
+            robust_p = param_value(
+                params_df,
+                param_name,
+                ["Robust p-value", "Rob. p-value", "p-value"],
+            )
+            if alternative == "BIP" and common_variable_parametrization == COMMON_PARAM_BIP_BASE:
+                beta = 0.0
+                robust_t = None
+                robust_p = None
+                param_name = f"{param_name} [normalized]"
+            elif alternative == "BIP" and common_variable_parametrization == COMMON_PARAM_SUM_ZERO:
+                red_name = f"B_QR_RED_{tag}_{MODEL_PARTITION}"
+                other_name = f"B_QR_OTHER_{tag}_{MODEL_PARTITION}"
+                red_beta = param_value(params_df, red_name, ["Value"])
+                other_beta = param_value(params_df, other_name, ["Value"])
+                beta = None if red_beta is None or other_beta is None else -red_beta - other_beta
+                robust_t = None
+                robust_p = None
+                param_name = f"-({red_name} + {other_name})"
+            rows.append(
+                {
+                    "model": model_label,
+                    "family": model_family,
+                    "block": block,
+                    "variable": col,
+                    "alternative": alternative,
+                    "parameter": param_name,
+                    "beta": beta,
+                    "robust_t": robust_t,
+                    "robust_p": robust_p,
+                }
+            )
+    return rows
+
+
+def base_model_parameter_rows(
+    *,
+    params_df: pd.DataFrame,
+    model_label: str,
+    model_family: str,
+    block: str,
+    common_variable_parametrization: str = COMMON_PARAM_CURRENT,
+):
+    common_param_specs = [
+        ("LAB_PM", "B_QR_RED_LAB_PM", "B_QR_OTHER_LAB_PM"),
+        ("LAB_PT", "B_QR_RED_LAB_PT", "B_QR_OTHER_LAB_PT"),
+        ("NO_LAB", "B_QR_RED_NO_LAB", "B_QR_OTHER_NO_LAB"),
+        ("ANIO_2025", "B_QR_RED_ANIO_2025", "B_QR_OTHER_ANIO_2025"),
+        ("LOG_DEMAND", "B_QR_RED_LOG_DEMAND", "B_QR_OTHER_LOG_DEMAND"),
+        ("LOG_BUS_STOP_DENSITY", "B_QR_RED_LOG_BUS_STOP_DENSITY", "B_QR_OTHER_LOG_BUS_STOP_DENSITY"),
+        ("LOG_BUS_LINE_COUNT", "B_QR_RED_LOG_BUS_LINE_COUNT", "B_QR_OTHER_LOG_BUS_LINE_COUNT"),
+        ("LOG_METRO_LINE_COUNT", "B_QR_RED_LOG_METRO_LINE_COUNT", "B_QR_OTHER_LOG_METRO_LINE_COUNT"),
+    ]
+    param_specs = [
+        ("ASC", "QR_RED", "ASC_QR_RED"),
+        ("ASC", "QR_OTHER", "ASC_QR_OTHER"),
+        ("T_VEH", "BIP", "B_BIP_T_VEH"),
+        ("T_VEH", "QR_RED", "B_QR_RED_T_VEH"),
+        ("T_VEH", "QR_OTHER", "B_QR_OTHER_T_VEH"),
+        ("T_ESPERA_INI", "BIP", "B_BIP_T_ESPERA_INI"),
+        ("T_ESPERA_INI", "QR_RED", "B_QR_RED_T_ESPERA_INI"),
+        ("T_ESPERA_INI", "QR_OTHER", "B_QR_OTHER_T_ESPERA_INI"),
+        ("T_ESPERA_TRASB", "BIP", "B_BIP_T_ESPERA_TRASB"),
+        ("T_ESPERA_TRASB", "QR_RED", "B_QR_RED_T_ESPERA_TRASB"),
+        ("T_ESPERA_TRASB", "QR_OTHER", "B_QR_OTHER_T_ESPERA_TRASB"),
+        ("N_TRASB", "BIP", "B_BIP_N_TRASB"),
+        ("N_TRASB", "QR_RED", "B_QR_RED_N_TRASB"),
+        ("N_TRASB", "QR_OTHER", "B_QR_OTHER_N_TRASB"),
+    ]
+    rows = []
+    for variable, red_prefix, other_prefix in common_param_specs:
+        red_name = f"{red_prefix}_{MODEL_PARTITION}"
+        other_name = f"{other_prefix}_{MODEL_PARTITION}"
+        if common_variable_parametrization == COMMON_PARAM_BIP_BASE:
+            rows.append(
+                {
+                    "model": model_label,
+                    "family": model_family,
+                    "block": block,
+                    "variable": variable,
+                    "alternative": "BIP",
+                    "parameter": f"B_BIP_{variable}_{MODEL_PARTITION} [normalized]",
+                    "beta": 0.0,
+                    "robust_t": None,
+                    "robust_p": None,
+                }
+            )
+        elif common_variable_parametrization == COMMON_PARAM_SUM_ZERO:
+            red_beta = param_value(params_df, red_name, ["Value"])
+            other_beta = param_value(params_df, other_name, ["Value"])
+            rows.append(
+                {
+                    "model": model_label,
+                    "family": model_family,
+                    "block": block,
+                    "variable": variable,
+                    "alternative": "BIP",
+                    "parameter": f"-({red_name} + {other_name})",
+                    "beta": None if red_beta is None or other_beta is None else -red_beta - other_beta,
+                    "robust_t": None,
+                    "robust_p": None,
+                }
+            )
+        for alternative, param_name in [("QR_RED", red_name), ("QR_OTHER", other_name)]:
+            rows.append(
+                {
+                    "model": model_label,
+                    "family": model_family,
+                    "block": block,
+                    "variable": variable,
+                    "alternative": alternative,
+                    "parameter": param_name,
+                    "beta": param_value(params_df, param_name, ["Value"]),
+                    "robust_t": param_value(
+                        params_df,
+                        param_name,
+                        ["Robust t-stat.", "Rob. t-test", "t-test"],
+                    ),
+                    "robust_p": param_value(
+                        params_df,
+                        param_name,
+                        ["Robust p-value", "Rob. p-value", "p-value"],
+                    ),
+                }
+            )
+    for variable, alternative, param_prefix in param_specs:
+        param_name = f"{param_prefix}_{MODEL_PARTITION}"
+        rows.append(
+            {
+                "model": model_label,
+                "family": model_family,
+                "block": block,
+                "variable": variable,
+                "alternative": alternative,
+                "parameter": param_name,
+                "beta": param_value(params_df, param_name, ["Value"]),
+                "robust_t": param_value(
+                    params_df,
+                    param_name,
+                    ["Robust t-stat.", "Rob. t-test", "t-test"],
+                ),
+                "robust_p": param_value(
+                    params_df,
+                    param_name,
+                    ["Robust p-value", "Rob. p-value", "p-value"],
+                ),
+            }
+        )
+    return rows
+
+
+def mu_parameter_row(*, params_df: pd.DataFrame, model_label: str, block: str):
+    param_name = f"MU_QR_{MODEL_PARTITION}"
+    value = param_value(params_df, param_name, ["Value"])
+    if value is None:
+        return None
+    return {
+        "model": model_label,
+        "family": "nested",
+        "block": block,
+        "parameter": param_name,
+        "value": value,
+        "robust_t": param_value(params_df, param_name, ["Robust t-stat.", "Rob. t-test", "t-test"]),
+        "robust_p": param_value(params_df, param_name, ["Robust p-value", "Rob. p-value", "p-value"]),
+    }
+
+
+def build_model_specs() -> list[dict]:
+    specs = []
+
+    def add_spec(
+        *,
+        family: str,
+        block: str,
+        label_suffix: str,
+        sample_path: Path,
+        extra_cols: list[str],
+        param_tags: dict[str, str],
+        common_variable_parametrization: str = COMMON_PARAM_CURRENT,
+    ):
+        model_label = f"{family}_{block}_{label_suffix}"
+        specs.append(
+            {
+                "family": family,
+                "block": block,
+                "label": model_label,
+                "sample_path": sample_path,
+                "extra_cols": extra_cols,
+                "param_tags": param_tags,
+                "common_variable_parametrization": common_variable_parametrization,
+            }
+        )
+
+    for family in ["mnl", "nested"]:
+        add_spec(
+            family=family,
+            block="baseline",
+            label_suffix="baseline",
+            sample_path=BASELINE_SAMPLE_PATH,
+            extra_cols=[],
+            param_tags={},
+        )
+
+        for col in CENSO_EXTRA_COLS:
+            add_spec(
+                family=family,
+                block="censo",
+                label_suffix=f"uni_{col}",
+                sample_path=CENSO_SAMPLE_PATH,
+                extra_cols=[col],
+                param_tags=CENSO_PARAM_TAGS,
+            )
+        add_spec(
+            family=family,
+            block="censo",
+            label_suffix="full",
+            sample_path=CENSO_SAMPLE_PATH,
+            extra_cols=CENSO_EXTRA_COLS,
+            param_tags=CENSO_PARAM_TAGS,
+        )
+        for i in range(1, len(CENSO_STEPWISE_MAIN_COLS) + 1):
+            add_spec(
+                family=family,
+                block="censo",
+                label_suffix=f"stepwise_main_{i}",
+                sample_path=CENSO_SAMPLE_PATH,
+                extra_cols=CENSO_STEPWISE_MAIN_COLS[:i],
+                param_tags=CENSO_PARAM_TAGS,
+            )
+        for i in range(1, len(CENSO_STEPWISE_ESCOLARIDAD_COLS) + 1):
+            add_spec(
+                family=family,
+                block="censo",
+                label_suffix=f"stepwise_escolaridad_{i}",
+                sample_path=CENSO_SAMPLE_PATH,
+                extra_cols=CENSO_STEPWISE_ESCOLARIDAD_COLS[:i],
+                param_tags=CENSO_PARAM_TAGS,
+            )
+        for label, cols in CENSO_CONNECTIVITY_SENSITIVITY_SPECS:
+            add_spec(
+                family=family,
+                block="censo",
+                label_suffix=f"connectivity_{label}",
+                sample_path=CENSO_SAMPLE_PATH,
+                extra_cols=cols,
+                param_tags=CENSO_PARAM_TAGS,
+            )
+
+        for col in OSM_EXTRA_COLS:
+            add_spec(
+                family=family,
+                block="osm",
+                label_suffix=f"uni_{col}",
+                sample_path=OSM_SAMPLE_PATH,
+                extra_cols=[col],
+                param_tags=OSM_PARAM_TAGS,
+            )
+        add_spec(
+            family=family,
+            block="osm",
+            label_suffix="full",
+            sample_path=OSM_SAMPLE_PATH,
+            extra_cols=OSM_EXTRA_COLS,
+            param_tags=OSM_PARAM_TAGS,
+        )
+        for i in range(1, len(OSM_STEPWISE_CONVENIENCE_COLS) + 1):
+            add_spec(
+                family=family,
+                block="osm",
+                label_suffix=f"stepwise_convenience_{i}",
+                sample_path=OSM_SAMPLE_PATH,
+                extra_cols=OSM_STEPWISE_CONVENIENCE_COLS[:i],
+                param_tags=OSM_PARAM_TAGS,
+            )
+        for i in range(1, len(OSM_STEPWISE_RESTAURANT_COLS) + 1):
+            add_spec(
+                family=family,
+                block="osm",
+                label_suffix=f"stepwise_restaurant_{i}",
+                sample_path=OSM_SAMPLE_PATH,
+                extra_cols=OSM_STEPWISE_RESTAURANT_COLS[:i],
+                param_tags=OSM_PARAM_TAGS,
+            )
+        for label, cols in OSM_STEPWISE_SCHOOL_SENSITIVITY_SPECS:
+            add_spec(
+                family=family,
+                block="osm",
+                label_suffix=f"stepwise_{label}",
+                sample_path=OSM_SAMPLE_PATH,
+                extra_cols=cols,
+                param_tags=OSM_PARAM_TAGS,
+            )
+        for label, cols in OSM_SECOND_ROUND_SPECS:
+            add_spec(
+                family=family,
+                block="osm",
+                label_suffix=label,
+                sample_path=OSM_SAMPLE_PATH,
+                extra_cols=cols,
+                param_tags=OSM_PARAM_TAGS,
+            )
+        for label, cols in JOINT_CENSO_TO_OSM_ROUTE_A_SPECS:
+            add_spec(
+                family=family,
+                block="joint",
+                label_suffix=label,
+                sample_path=JOINT_SAMPLE_PATH,
+                extra_cols=cols,
+                param_tags={**CENSO_PARAM_TAGS, **OSM_PARAM_TAGS},
+            )
+        for label, cols in JOINT_CENSO_OSM_INFRA_INCREMENTAL_SPECS:
+            add_spec(
+                family=family,
+                block="joint",
+                label_suffix=label,
+                sample_path=JOINT_SAMPLE_PATH,
+                extra_cols=cols,
+                param_tags={**CENSO_PARAM_TAGS, **OSM_PARAM_TAGS},
+            )
+        for label, cols in JOINT_CENSO_OSM_INFRA_DIRECT_CHECK_SPECS:
+            add_spec(
+                family=family,
+                block="joint",
+                label_suffix=label,
+                sample_path=JOINT_SAMPLE_PATH,
+                extra_cols=cols,
+                param_tags={**CENSO_PARAM_TAGS, **OSM_PARAM_TAGS},
+            )
+        for label, cols, common_param in JOINT_CENSO_OSM_METHOD_OPTION_SPECS:
+            add_spec(
+                family=family,
+                block="joint",
+                label_suffix=label,
+                sample_path=JOINT_SAMPLE_PATH,
+                extra_cols=cols,
+                param_tags={**CENSO_PARAM_TAGS, **OSM_PARAM_TAGS},
+                common_variable_parametrization=common_param,
+            )
+
+        add_spec(
+            family=family,
+            block="joint",
+            label_suffix="full",
+            sample_path=JOINT_SAMPLE_PATH,
+            extra_cols=CENSO_EXTRA_COLS + OSM_EXTRA_COLS,
+            param_tags={**CENSO_PARAM_TAGS, **OSM_PARAM_TAGS},
+        )
+
+    return specs
+
+
+def select_model_specs(model_specs: list[dict], active_labels):
+    if active_labels is None:
+        return model_specs
+
+    by_label = {spec["label"]: spec for spec in model_specs}
+
+    if isinstance(active_labels, (list, tuple)):
+        missing = [label for label in active_labels if label not in by_label]
+        if missing:
+            raise ValueError(f"ACTIVE_MODEL_LABELS contiene modelos inexistentes: {missing}")
+        return [by_label[label] for label in active_labels]
+
+    active_set = set(active_labels)
+    missing = sorted(active_set - set(by_label))
+    if missing:
+        raise ValueError(f"ACTIVE_MODEL_LABELS contiene modelos inexistentes: {missing}")
+    return [spec for spec in model_specs if spec["label"] in active_set]
+
+
+MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+```
+
+## 4) Presets de corrida
+
+```{python}
+#| label: run-presets
+print("label: run-presets")
+CENSO_UNIVARIATE_MNL_NESTED_SEQUENCE = [
+    "mnl_baseline_baseline",
+    "nested_baseline_baseline",
+]
+for col in CENSO_EXTRA_COLS:
+    CENSO_UNIVARIATE_MNL_NESTED_SEQUENCE.extend(
+        [
+            f"mnl_censo_uni_{col}",
+            f"nested_censo_uni_{col}",
+        ]
+    )
+
+# Presets separados para correr en paralelo real:
+# - un kernel / proceso para MNL
+# - otro kernel / proceso para Nested
+CENSO_UNIVARIATE_MNL_SEQUENCE = ["mnl_baseline_baseline"] + [
+    f"mnl_censo_uni_{col}" for col in CENSO_EXTRA_COLS
+]
+CENSO_UNIVARIATE_NESTED_SEQUENCE = ["nested_baseline_baseline"] + [
+    f"nested_censo_uni_{col}" for col in CENSO_EXTRA_COLS
+]
+CENSO_SEQUENTIAL_MNL_THEN_NESTED_SEQUENCE = (
+    CENSO_UNIVARIATE_MNL_SEQUENCE + CENSO_UNIVARIATE_NESTED_SEQUENCE
+)
+CENSO_MNL_STEPWISE_MAIN_SEQUENCE = ["mnl_baseline_baseline"] + [
+    f"mnl_censo_stepwise_main_{i}"
+    for i in range(1, len(CENSO_STEPWISE_MAIN_COLS) + 1)
+]
+CENSO_MNL_STEPWISE_ESCOLARIDAD_SEQUENCE = ["mnl_baseline_baseline"] + [
+    f"mnl_censo_stepwise_escolaridad_{i}"
+    for i in range(1, len(CENSO_STEPWISE_ESCOLARIDAD_COLS) + 1)
+]
+CENSO_MNL_STEPWISE_ALL_SEQUENCE = (
+    CENSO_MNL_STEPWISE_MAIN_SEQUENCE
+    + [
+        label
+        for label in CENSO_MNL_STEPWISE_ESCOLARIDAD_SEQUENCE
+        if label != "mnl_baseline_baseline"
+    ]
+)
+CENSO_MNL_CONNECTIVITY_SENSITIVITY_SEQUENCE = ["mnl_baseline_baseline"] + [
+    f"mnl_censo_stepwise_main_{i}"
+    for i in range(1, len(CENSO_STEPWISE_MAIN_COLS) + 1)
+] + [
+    f"mnl_censo_connectivity_{label}"
+    for label, _ in CENSO_CONNECTIVITY_SENSITIVITY_SPECS
+]
+CENSO_MNL_CONNECTIVITY_NEW_ONLY_SEQUENCE = [
+    f"mnl_censo_connectivity_{label}"
+    for label, _ in CENSO_CONNECTIVITY_SENSITIVITY_SPECS
+]
+CENSO_MNL_CONNECTIVITY_ALTERNATIVES_ONLY_SEQUENCE = [
+    "mnl_censo_connectivity_internet_hacinamiento_discapacidad_inmigrantes",
+    "mnl_censo_connectivity_compu_hacinamiento_discapacidad_inmigrantes",
+]
+CENSO_MNL_CONNECTIVITY_RESUME_MAIN_2_SEQUENCE = [
+    f"mnl_censo_connectivity_{label}"
+    for label, _ in CENSO_CONNECTIVITY_SENSITIVITY_SPECS
+    if label != "main_1"
+]
+OSM_UNIVARIATE_MNL_SEQUENCE = ["mnl_baseline_baseline"] + [
+    f"mnl_osm_uni_{col}" for col in OSM_EXTRA_COLS
+]
+OSM_UNIVARIATE_NESTED_SEQUENCE = ["nested_baseline_baseline"] + [
+    f"nested_osm_uni_{col}" for col in OSM_EXTRA_COLS
+]
+OSM_SEQUENTIAL_MNL_THEN_NESTED_SEQUENCE = (
+    OSM_UNIVARIATE_MNL_SEQUENCE + OSM_UNIVARIATE_NESTED_SEQUENCE
+)
+OSM_MNL_STEPWISE_CONVENIENCE_SEQUENCE = [
+    f"mnl_osm_stepwise_convenience_{i}"
+    for i in range(1, len(OSM_STEPWISE_CONVENIENCE_COLS) + 1)
+]
+OSM_MNL_STEPWISE_RESTAURANT_SEQUENCE = [
+    f"mnl_osm_stepwise_restaurant_{i}"
+    for i in range(1, len(OSM_STEPWISE_RESTAURANT_COLS) + 1)
+]
+OSM_MNL_STEPWISE_SCHOOL_SENSITIVITY_SEQUENCE = [
+    f"mnl_osm_stepwise_{label}"
+    for label, _ in OSM_STEPWISE_SCHOOL_SENSITIVITY_SPECS
+]
+OSM_MNL_STEPWISE_ALL_SEQUENCE = (
+    OSM_MNL_STEPWISE_CONVENIENCE_SEQUENCE
+    + OSM_MNL_STEPWISE_RESTAURANT_SEQUENCE[1:]
+    + OSM_MNL_STEPWISE_SCHOOL_SENSITIVITY_SEQUENCE
+)
+OSM_MNL_SECOND_ROUND_SEQUENCE = [
+    f"mnl_osm_{label}"
+    for label, _ in OSM_SECOND_ROUND_SPECS
+]
+JOINT_MNL_CENSO_TO_OSM_ROUTE_A_SEQUENCE = [
+    f"mnl_joint_{label}"
+    for label, _ in JOINT_CENSO_TO_OSM_ROUTE_A_SPECS
+]
+JOINT_MNL_CENSO_TO_OSM_ROUTE_A_MISSING_SEQUENCE = JOINT_MNL_CENSO_TO_OSM_ROUTE_A_SEQUENCE[3:]
+
+# Para correr exactamente esta secuencia:
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = CENSO_UNIVARIATE_MNL_NESTED_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1200):
+    display(
+        pl.DataFrame(
+            [
+                {"position": i + 1, "model": label}
+                for i, label in enumerate(CENSO_UNIVARIATE_MNL_NESTED_SEQUENCE)
+            ]
+        )
+    )
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1200):
+    display(
+        pl.DataFrame(
+            [
+                {"preset": "mnl_parallel", "position": i + 1, "model": label}
+                for i, label in enumerate(CENSO_UNIVARIATE_MNL_SEQUENCE)
+            ]
+            + [
+                {"preset": "nested_parallel", "position": i + 1, "model": label}
+                for i, label in enumerate(CENSO_UNIVARIATE_NESTED_SEQUENCE)
+            ]
+            + [
+                {"preset": "censo_sequential_mnl_then_nested", "position": i + 1, "model": label}
+                for i, label in enumerate(CENSO_SEQUENTIAL_MNL_THEN_NESTED_SEQUENCE)
+            ]
+            + [
+                {"preset": "censo_mnl_stepwise_main", "position": i + 1, "model": label}
+                for i, label in enumerate(CENSO_MNL_STEPWISE_MAIN_SEQUENCE)
+            ]
+            + [
+                {"preset": "censo_mnl_stepwise_escolaridad", "position": i + 1, "model": label}
+                for i, label in enumerate(CENSO_MNL_STEPWISE_ESCOLARIDAD_SEQUENCE)
+            ]
+            + [
+                {"preset": "censo_mnl_stepwise_all", "position": i + 1, "model": label}
+                for i, label in enumerate(CENSO_MNL_STEPWISE_ALL_SEQUENCE)
+            ]
+            + [
+                {"preset": "censo_mnl_connectivity_sensitivity", "position": i + 1, "model": label}
+                for i, label in enumerate(CENSO_MNL_CONNECTIVITY_SENSITIVITY_SEQUENCE)
+            ]
+            + [
+                {"preset": "censo_mnl_connectivity_new_only", "position": i + 1, "model": label}
+                for i, label in enumerate(CENSO_MNL_CONNECTIVITY_NEW_ONLY_SEQUENCE)
+            ]
+            + [
+                {"preset": "censo_mnl_connectivity_alternatives_only", "position": i + 1, "model": label}
+                for i, label in enumerate(CENSO_MNL_CONNECTIVITY_ALTERNATIVES_ONLY_SEQUENCE)
+            ]
+            + [
+                {"preset": "censo_mnl_connectivity_resume_main_2", "position": i + 1, "model": label}
+                for i, label in enumerate(CENSO_MNL_CONNECTIVITY_RESUME_MAIN_2_SEQUENCE)
+            ]
+            + [
+                {"preset": "osm_mnl_parallel", "position": i + 1, "model": label}
+                for i, label in enumerate(OSM_UNIVARIATE_MNL_SEQUENCE)
+            ]
+            + [
+                {"preset": "osm_nested_parallel", "position": i + 1, "model": label}
+                for i, label in enumerate(OSM_UNIVARIATE_NESTED_SEQUENCE)
+            ]
+            + [
+                {"preset": "osm_mnl_stepwise_convenience", "position": i + 1, "model": label}
+                for i, label in enumerate(OSM_MNL_STEPWISE_CONVENIENCE_SEQUENCE)
+            ]
+            + [
+                {"preset": "osm_mnl_stepwise_restaurant", "position": i + 1, "model": label}
+                for i, label in enumerate(OSM_MNL_STEPWISE_RESTAURANT_SEQUENCE)
+            ]
+            + [
+                {"preset": "osm_mnl_stepwise_school_sensitivity", "position": i + 1, "model": label}
+                for i, label in enumerate(OSM_MNL_STEPWISE_SCHOOL_SENSITIVITY_SEQUENCE)
+            ]
+            + [
+                {"preset": "osm_mnl_stepwise_all", "position": i + 1, "model": label}
+                for i, label in enumerate(OSM_MNL_STEPWISE_ALL_SEQUENCE)
+            ]
+            + [
+                {"preset": "osm_mnl_second_round", "position": i + 1, "model": label}
+                for i, label in enumerate(OSM_MNL_SECOND_ROUND_SEQUENCE)
+            ]
+            + [
+                {"preset": "joint_mnl_censo_to_osm_route_a", "position": i + 1, "model": label}
+                for i, label in enumerate(JOINT_MNL_CENSO_TO_OSM_ROUTE_A_SEQUENCE)
+            ]
+            + [
+                {"preset": "joint_mnl_censo_to_osm_route_a_missing", "position": i + 1, "model": label}
+                for i, label in enumerate(JOINT_MNL_CENSO_TO_OSM_ROUTE_A_MISSING_SEQUENCE)
+            ]
+            + [
+                {"preset": "osm_sequential_mnl_then_nested", "position": i + 1, "model": label}
+                for i, label in enumerate(OSM_SEQUENTIAL_MNL_THEN_NESTED_SEQUENCE)
+            ]
+        )
+    )
+```
+
+```{python}
+#| label: activate-censo-univariate-sequence
+print("label: activate-censo-univariate-sequence")
+# Descomenta estas líneas para dejar corriendo exactamente:
+# baseline mnl
+# baseline nested
+# baseline + var 1 mnl
+# baseline + var 1 nested
+# ...
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = CENSO_UNIVARIATE_MNL_NESTED_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-censo-univariate-mnl-only
+print("label: activate-censo-univariate-mnl-only")
+# Para correr solo MNL en este kernel / proceso:
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = CENSO_UNIVARIATE_MNL_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia MNL activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-censo-univariate-nested-only
+print("label: activate-censo-univariate-nested-only")
+# Para correr solo Nested en este kernel / proceso:
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = CENSO_UNIVARIATE_NESTED_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia Nested activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-censo-mnl-stepwise-main
+print("label: activate-censo-mnl-stepwise-main")
+# Para correr la secuencia Censo MNL principal:
+# baseline
+# + universitaria_o_mas
+# + hacinamiento
+# + discapacidad
+# + inmigrantes
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = CENSO_MNL_STEPWISE_MAIN_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia Censo MNL stepwise principal activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-censo-mnl-stepwise-escolaridad
+print("label: activate-censo-mnl-stepwise-escolaridad")
+# Para correr la sensibilidad Censo MNL con escolaridad:
+# baseline
+# + prom_escolaridad18
+# + hacinamiento
+# + discapacidad
+# + inmigrantes
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = CENSO_MNL_STEPWISE_ESCOLARIDAD_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia Censo MNL stepwise escolaridad activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-censo-mnl-stepwise-all
+print("label: activate-censo-mnl-stepwise-all")
+# Para correr ambas secuencias Censo MNL en una sola tanda.
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = CENSO_MNL_STEPWISE_ALL_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencias Censo MNL stepwise activas:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-censo-mnl-connectivity-sensitivity
+print("label: activate-censo-mnl-connectivity-sensitivity")
+# Para correr la sensibilidad acotada Censo MNL:
+# baseline
+# main_1 ... main_4
+# main_4 + internet
+# main_4 + compu
+# main_4 + internet + compu
+# internet + hacinamiento + discapacidad + inmigrantes
+# compu + hacinamiento + discapacidad + inmigrantes
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = CENSO_MNL_CONNECTIVITY_SENSITIVITY_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia Censo MNL conectividad activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-censo-mnl-connectivity-new-only
+print("label: activate-censo-mnl-connectivity-new-only")
+# Para estimar solo las sensibilidades nuevas de conectividad.
+# Los modelos baseline y main_1..main_4 ya existen como artefactos stepwise.
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = CENSO_MNL_CONNECTIVITY_NEW_ONLY_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia Censo MNL conectividad nuevas activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-censo-mnl-connectivity-alternatives-only
+print("label: activate-censo-mnl-connectivity-alternatives-only")
+# Para estimar solo las dos alternativas sin educacion:
+# internet + hacinamiento + discapacidad + inmigrantes
+# compu + hacinamiento + discapacidad + inmigrantes
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = CENSO_MNL_CONNECTIVITY_ALTERNATIVES_ONLY_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia Censo MNL conectividad alternativas activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-censo-mnl-connectivity-resume-main-2
+print("label: activate-censo-mnl-connectivity-resume-main-2")
+# Para reanudar la sensibilidad Censo MNL desde main_2:
+# main_2
+# main_3
+# main_4
+# main_4 + internet
+# main_4 + compu
+# main_4 + internet + compu
+# internet + hacinamiento + discapacidad + inmigrantes
+# compu + hacinamiento + discapacidad + inmigrantes
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = CENSO_MNL_CONNECTIVITY_RESUME_MAIN_2_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia Censo MNL conectividad resume main_2 activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-osm-univariate-sequence
+print("label: activate-osm-univariate-sequence")
+# Para correr OSM secuencial en este kernel / proceso:
+# baseline MNL
+# todas las univariadas OSM MNL
+# baseline Nested
+# todas las univariadas OSM Nested
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = OSM_SEQUENTIAL_MNL_THEN_NESTED_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia OSM activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-osm-univariate-mnl-only
+print("label: activate-osm-univariate-mnl-only")
+# Para correr solo OSM MNL en este kernel / proceso:
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = OSM_UNIVARIATE_MNL_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia OSM MNL activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-osm-univariate-nested-only
+print("label: activate-osm-univariate-nested-only")
+# Para correr solo OSM Nested en este kernel / proceso:
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = OSM_UNIVARIATE_NESTED_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia OSM Nested activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-osm-mnl-stepwise-all
+print("label: activate-osm-mnl-stepwise-all")
+# Para correr las tres rondas OSM MNL stepwise durante la noche:
+# 1) sports_centre -> convenience -> office_company -> playground
+# 2) sports_centre -> restaurant -> office_company -> playground
+# 3) sensibilidad school sobre el modelo 4 de cada ruta
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = OSM_MNL_STEPWISE_ALL_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Secuencia OSM MNL stepwise all activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-osm-mnl-second-round
+print("label: activate-osm-mnl-second-round")
+# Segunda ronda OSM MNL:
+# A) simplificar el ganador convenience + school
+# B) probar university por consistencia con ML/SHAP
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = OSM_MNL_SECOND_ROUND_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Segunda ronda OSM MNL activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-joint-mnl-censo-to-osm-route-a
+print("label: activate-joint-mnl-censo-to-osm-route-a")
+# Ruta conjunta A: partir desde Censo main_4 y agregar OSM principal paso a paso.
+#
+# RUN_ESTIMATION = True
+# ACTIVE_MODEL_LABELS = JOINT_MNL_CENSO_TO_OSM_ROUTE_A_SEQUENCE
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Ruta conjunta Censo -> OSM activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-joint-mnl-censo-osm-infra-incremental
+print("label: activate-joint-mnl-censo-osm-infra-incremental")
+# Ronda incremental de microinfraestructura OSM sobre `censo_main_4 + osm_main`:
+# 1) + transport_shelter
+# 2) + transport_shelter + transport_bench
+# 3) + transport_shelter + transport_bench + subway_entrance
+#
+# RUN_ESTIMATION = True
+# ACTIVE_PRESET = "joint_mnl_censo_osm_infra_incremental"
+# ACTIVE_MODEL_LABELS = None
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Ruta Censo + OSM + microinfra activa:", len(MODEL_SPECS), "modelos")
+```
+
+```{python}
+#| label: activate-joint-mnl-censo-osm-infra-direct-checks
+print("label: activate-joint-mnl-censo-osm-infra-direct-checks")
+# Checks directos de microinfraestructura OSM sobre `censo_main_4 + osm_main`:
+# 1) + subway_entrance
+# 2) + transport_shelter + subway_entrance
+#
+# RUN_ESTIMATION = True
+# ACTIVE_PRESET = "joint_mnl_censo_osm_infra_direct_checks"
+# ACTIVE_MODEL_LABELS = None
+# MODEL_SPECS = select_model_specs(build_model_specs(), ACTIVE_MODEL_LABELS)
+#
+# print("Checks Censo + OSM + microinfra directa activos:", len(MODEL_SPECS), "modelos")
+```
+
+## 5) Preparar muestra conjunta Censo + OSM
+
+```{python}
+#| label: prepare-sample-artifacts
+print("label: prepare-sample-artifacts")
+ensure_estimation_artifacts_for_active_models()
+```
+
+```{python}
+#| label: prepare-joint-sample
+print("label: prepare-joint-sample")
+if RUN_ESTIMATION and any(spec["block"] == "joint" for spec in MODEL_SPECS):
+    build_joint_sample_if_needed(
+        target_path=JOINT_SAMPLE_PATH,
+        baseline_sample_path=BASELINE_SAMPLE_PATH,
+        censo_zone_std_path=CENSO_MODEL_READY_STD_PATH,
+        osm_zone_std_path=OSM_MODEL_READY_STD_PATH,
+        censo_cols=CENSO_EXTRA_COLS,
+        osm_cols=OSM_EXTRA_COLS,
+    )
+else:
+    if not RUN_ESTIMATION:
+        print("RUN_ESTIMATION = False. No se materializó la muestra conjunta.")
+    else:
+        print("No hay modelos joint activos en MODEL_SPECS. No se materializó la muestra conjunta.")
+```
+
+## 6) Diseño de estimación
+
+```{python}
+#| label: estimation-design
+print("label: estimation-design")
+df_design = pl.DataFrame(
+    [
+        {
+            "family": spec["family"],
+            "block": spec["block"],
+            "model": spec["label"],
+            "sample_path": spec["sample_path"].name,
+            "n_extra_vars": len(spec["extra_cols"]),
+            "common_param": spec["common_variable_parametrization"],
+            "extra_vars": ", ".join(spec["extra_cols"]),
+        }
+        for spec in MODEL_SPECS
+    ]
+)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1400):
+    display(df_design)
+```
+
+## 7) Ejecutar screening territorial
+
+```{python}
+#| label: run-screening
+print("label: run-screening")
+summary_rows = []
+parameter_rows = []
+base_parameter_rows = []
+mu_rows = []
+
+if RUN_ESTIMATION:
+    for spec in MODEL_SPECS:
+        pandas_df = load_biogeme_numeric_df_from_parquet(
+            spec["sample_path"],
+            spec["extra_cols"],
+        )
+        sample_size_for_error = len(pandas_df)
+        results = stats = params_df = None
+        out_dir = result_artifact_dir(spec["label"])
+        params_path = out_dir / f"params_{spec['label']}.csv"
+        stats_path = out_dir / f"stats_{spec['label']}.csv"
+        yaml_path = out_dir / f"{spec['label']}.yaml"
+
+        print(f"Estimando: {spec['label']}")
+        try:
+            results, stats, params_df, has_mu = estimate_choice_model_with_extras(
+                pandas_df,
+                partition=MODEL_PARTITION,
+                model_name=spec["label"],
+                extra_cols=spec["extra_cols"],
+                param_tags=spec["param_tags"],
+                model_family=spec["family"],
+                optimizer=BIOGEME_OPTIMIZER,
+                common_variable_parametrization=spec["common_variable_parametrization"],
+            )
+
+            params_df.to_csv(params_path, index=False)
+            stats_to_frame(stats).to_csv(stats_path, index=False)
+            results.dump_yaml_file(str(yaml_path))
+            yaml_diag = parse_yaml_diagnostics(yaml_path)
+
+            summary_rows.append(
+                {
+                    "family": spec["family"],
+                    "block": spec["block"],
+                    "model": spec["label"],
+                    "sample_path": spec["sample_path"].name,
+                    "n_extra_vars": len(spec["extra_cols"]),
+                    "common_param": spec["common_variable_parametrization"],
+                    "n_params": metric_value(stats, "Number of estimated parameters"),
+                    "sample_size": metric_value(stats, "Sample size"),
+                    "ll_init": metric_value(stats, "Init log likelihood"),
+                    "ll_final": metric_value(stats, "Final log likelihood"),
+                    "aic": metric_value(stats, "Akaike Information Criterion"),
+                    "bic": metric_value(stats, "Bayesian Information Criterion"),
+                    "gradient_norm": metric_value(stats, "Final gradient norm"),
+                    "status": "ok",
+                    "error_type": None,
+                    "error_message": None,
+                    **yaml_diag,
+                }
+            )
+
+            parameter_rows.extend(
+                new_variable_parameter_rows(
+                    params_df=params_df,
+                    model_label=spec["label"],
+                    model_family=spec["family"],
+                    block=spec["block"],
+                    extra_cols=spec["extra_cols"],
+                    param_tags=spec["param_tags"],
+                    common_variable_parametrization=spec["common_variable_parametrization"],
+                )
+            )
+            base_parameter_rows.extend(
+                base_model_parameter_rows(
+                    params_df=params_df,
+                    model_label=spec["label"],
+                    model_family=spec["family"],
+                    block=spec["block"],
+                    common_variable_parametrization=spec["common_variable_parametrization"],
+                )
+            )
+
+            if has_mu:
+                mu_row = mu_parameter_row(
+                    params_df=params_df,
+                    model_label=spec["label"],
+                    block=spec["block"],
+                )
+                if mu_row is not None:
+                    mu_rows.append(mu_row)
+
+        except Exception as exc:
+            print(f"ERROR en {spec['label']}: {type(exc).__name__}: {exc}")
+            summary_rows.append(
+                {
+                    "family": spec["family"],
+                    "block": spec["block"],
+                    "model": spec["label"],
+                    "sample_path": spec["sample_path"].name,
+                    "n_extra_vars": len(spec["extra_cols"]),
+                    "common_param": spec["common_variable_parametrization"],
+                    "n_params": None,
+                    "sample_size": sample_size_for_error,
+                    "ll_init": None,
+                    "ll_final": None,
+                    "aic": None,
+                    "bic": None,
+                    "gradient_norm": None,
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                    "yaml_convergence": None,
+                    "yaml_relative_gradient": None,
+                    "yaml_cause_of_termination": None,
+                    "yaml_algorithm": None,
+                    "yaml_n_iterations": None,
+                    "yaml_n_grad_evals": None,
+                    "yaml_n_hessian_evals": None,
+                }
+            )
+            (out_dir / f"{spec['label']}.error.txt").write_text(
+                "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                encoding="utf-8",
+            )
+
+        del pandas_df, results, stats, params_df
+        gc.collect()
+
+    if summary_rows:
+        pd.DataFrame(summary_rows).to_csv(RESULTS_DIR / "convergence_summary.csv", index=False)
+    if parameter_rows:
+        pd.DataFrame(parameter_rows).to_csv(RESULTS_DIR / "new_variable_parameters_long.csv", index=False)
+    if base_parameter_rows:
+        pd.DataFrame(base_parameter_rows).to_csv(RESULTS_DIR / "base_parameters_long.csv", index=False)
+    if mu_rows:
+        pd.DataFrame(mu_rows).to_csv(RESULTS_DIR / "nested_mu_summary.csv", index=False)
+else:
+    print("RUN_ESTIMATION = False. No se ejecutaron estimaciones.")
+```
+
+## 8) Cargar resultados ya generados
+
+```{python}
+#| label: load-results
+print("label: load-results")
+summary_rows = globals().get("summary_rows", [])
+parameter_rows = globals().get("parameter_rows", [])
+base_parameter_rows = globals().get("base_parameter_rows", [])
+mu_rows = globals().get("mu_rows", [])
+
+if summary_rows and parameter_rows and base_parameter_rows:
+    print("Ya hay resultados en memoria desde `run-screening`. No se cargó nada desde disco.")
+else:
+    summary_rows = []
+    parameter_rows = []
+    base_parameter_rows = []
+    mu_rows = []
+    loaded_models = []
+    missing_models = []
+
+    for spec in MODEL_SPECS:
+        out_dir = result_artifact_dir(spec["label"])
+        params_path = out_dir / f"params_{spec['label']}.csv"
+        stats_path = out_dir / f"stats_{spec['label']}.csv"
+        yaml_path = out_dir / f"{spec['label']}.yaml"
+
+        if not (params_path.exists() and stats_path.exists() and yaml_path.exists()):
+            missing_models.append(spec["label"])
+            continue
+
+        params_df = pd.read_csv(params_path)
+        stats = load_stats_from_csv(stats_path)
+        if stats is None:
+            missing_models.append(spec["label"])
+            continue
+
+        yaml_diag = parse_yaml_diagnostics(yaml_path)
+        summary_rows.append(
+            {
+                "family": spec["family"],
+                "block": spec["block"],
+                "model": spec["label"],
+                "sample_path": spec["sample_path"].name,
+                "n_extra_vars": len(spec["extra_cols"]),
+                "common_param": spec["common_variable_parametrization"],
+                "n_params": metric_value(stats, "Number of estimated parameters"),
+                "sample_size": metric_value(stats, "Sample size"),
+                "ll_init": metric_value(stats, "Init log likelihood"),
+                "ll_final": metric_value(stats, "Final log likelihood"),
+                "aic": metric_value(stats, "Akaike Information Criterion"),
+                "bic": metric_value(stats, "Bayesian Information Criterion"),
+                "gradient_norm": metric_value(stats, "Final gradient norm"),
+                "status": "loaded",
+                "error_type": None,
+                "error_message": None,
+                **yaml_diag,
+            }
+        )
+
+        parameter_rows.extend(
+            new_variable_parameter_rows(
+                params_df=params_df,
+                model_label=spec["label"],
+                model_family=spec["family"],
+                block=spec["block"],
+                extra_cols=spec["extra_cols"],
+                param_tags=spec["param_tags"],
+                common_variable_parametrization=spec["common_variable_parametrization"],
+            )
+        )
+        base_parameter_rows.extend(
+            base_model_parameter_rows(
+                params_df=params_df,
+                model_label=spec["label"],
+                model_family=spec["family"],
+                block=spec["block"],
+                common_variable_parametrization=spec["common_variable_parametrization"],
+            )
+        )
+
+        if spec["family"] == "nested":
+            mu_row = mu_parameter_row(
+                params_df=params_df,
+                model_label=spec["label"],
+                block=spec["block"],
+            )
+            if mu_row is not None:
+                mu_rows.append(mu_row)
+
+        loaded_models.append(spec["label"])
+
+    print(f"Modelos cargados desde disco: {len(loaded_models)}")
+    if loaded_models:
+        with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=12000):
+            display(pl.DataFrame({"loaded_model": loaded_models}))
+    if missing_models:
+        print(f"Modelos sin artefactos completos: {len(missing_models)}")
+        with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=12000):
+            display(pl.DataFrame({"missing_model": missing_models}))
+```
+
+## 9) Resumen de convergencia
+
+```{python}
+#| label: convergence-summary
+print("label: convergence-summary")
+if summary_rows:
+    df_summary = (
+        pl.DataFrame(summary_rows)
+        .with_columns(
+            pl.col("ll_init").cast(pl.Float64, strict=False).round(1),
+            pl.col("ll_final").cast(pl.Float64, strict=False).round(1),
+            pl.col("aic").cast(pl.Float64, strict=False).round(1),
+            pl.col("bic").cast(pl.Float64, strict=False).round(1),
+            pl.col("gradient_norm").cast(pl.Float64, strict=False),
+            pl.col("yaml_relative_gradient").cast(pl.Float64, strict=False),
+        )
+        .sort(["block", "family", "model"])
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1600):
+        display(df_summary)
+else:
+    print("No hay resultados en memoria. Activa RUN_ESTIMATION para ejecutar el screening.")
+```
+
+## 10) Parámetros de variables nuevas — formato largo
+
+```{python}
+#| label: new-variable-parameters-long
+print("label: new-variable-parameters-long")
+if parameter_rows:
+    df_params_long = (
+        pl.DataFrame(parameter_rows)
+        .with_columns(
+            pl.col("beta").cast(pl.Float64, strict=False).round(4),
+            pl.col("robust_t").cast(pl.Float64, strict=False).round(3),
+            pl.col("robust_p").cast(pl.Float64, strict=False),
+        )
+        .rename({"robust_p": "p_error"})
+        .sort(["block", "family", "model", "variable", "alternative"])
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+        display(df_params_long)
+else:
+    print("No hay parámetros en memoria. Activa RUN_ESTIMATION para ejecutar el screening.")
+```
+
+## 11) Parámetros de variables nuevas — formato horizontal
+
+```{python}
+#| label: new-variable-parameters-wide
+print("label: new-variable-parameters-wide")
+if parameter_rows:
+    df_params_pd = pd.DataFrame(parameter_rows)
+    df_wide = df_params_pd.pivot_table(
+        index=["block", "family", "model", "variable"],
+        columns="alternative",
+        values=["beta", "robust_t", "robust_p"],
+        aggfunc="first",
+    )
+    df_wide.columns = [
+        f"{metric}_{alt.lower()}"
+        for metric, alt in df_wide.columns.to_flat_index()
+    ]
+    df_wide = (
+        df_wide
+        .reset_index()
+        .rename(
+            columns={
+                "beta_bip": "beta_bip",
+                "robust_t_bip": "t_bip",
+                "robust_p_bip": "p_error_bip",
+                "beta_qr_red": "beta_qr_red",
+                "robust_t_qr_red": "t_qr_red",
+                "robust_p_qr_red": "p_error_qr_red",
+                "beta_qr_other": "beta_qr_other",
+                "robust_t_qr_other": "t_qr_other",
+                "robust_p_qr_other": "p_error_qr_other",
+            }
+        )
+        .sort_values(["block", "family", "model", "variable"], kind="stable")
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1800):
+        display(pl.from_pandas(df_wide))
+else:
+    print("No hay parámetros en memoria. Activa RUN_ESTIMATION para ejecutar el screening.")
+```
+
+## 12) Parámetros base — formato horizontal
+
+```{python}
+#| label: base-parameters-wide
+print("label: base-parameters-wide")
+base_parameter_rows = globals().get("base_parameter_rows", [])
+
+if not base_parameter_rows:
+    loaded_base_models = []
+    for spec in MODEL_SPECS:
+        params_path = result_artifact_dir(spec["label"]) / f"params_{spec['label']}.csv"
+        if not params_path.exists():
+            continue
+        params_df = pd.read_csv(params_path)
+        base_parameter_rows.extend(
+            base_model_parameter_rows(
+                params_df=params_df,
+                model_label=spec["label"],
+                model_family=spec["family"],
+                block=spec["block"],
+            )
+        )
+        loaded_base_models.append(spec["label"])
+    if loaded_base_models:
+        print(f"Parámetros base cargados desde disco: {len(loaded_base_models)} modelos")
+
+if base_parameter_rows:
+    df_base_params_pd = pd.DataFrame(base_parameter_rows)
+    df_base_wide = df_base_params_pd.pivot_table(
+        index=["block", "family", "model", "variable"],
+        columns="alternative",
+        values=["beta", "robust_t", "robust_p"],
+        aggfunc="first",
+    )
+    df_base_wide.columns = [
+        f"{metric}_{alt.lower()}"
+        for metric, alt in df_base_wide.columns.to_flat_index()
+    ]
+    df_base_wide = (
+        df_base_wide
+        .reset_index()
+        .rename(
+            columns={
+                "beta_bip": "beta_bip",
+                "robust_t_bip": "t_bip",
+                "robust_p_bip": "p_error_bip",
+                "beta_qr_red": "beta_qr_red",
+                "robust_t_qr_red": "t_qr_red",
+                "robust_p_qr_red": "p_error_qr_red",
+                "beta_qr_other": "beta_qr_other",
+                "robust_t_qr_other": "t_qr_other",
+                "robust_p_qr_other": "p_error_qr_other",
+            }
+        )
+        .sort_values(["block", "family", "model", "variable"], kind="stable")
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=2200):
+        display(pl.from_pandas(df_base_wide))
+else:
+    print("No hay parámetros base en memoria. Activa RUN_ESTIMATION o carga resultados desde disco.")
+```
+
+## 13) Comparación focalizada — Opción A vs Opción B
+
+```{python}
+#| label: focused-model-display-helpers
+print("label: focused-model-display-helpers")
+FOCUSED_OPTION_A_MODEL = (
+    "mnl_joint_censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance"
+    "_option_a_bip_only_alt_specific"
+)
+FOCUSED_OPTION_B_MODEL = (
+    "mnl_joint_censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance"
+    "_option_b_bip_reportable_sum_zero"
+)
+
+
+def wide_parameters_for_model(rows: list[dict], model_label: str) -> pl.DataFrame:
+    if not rows:
+        return pl.DataFrame()
+    df_pd = pd.DataFrame(rows)
+    df_pd = df_pd[df_pd["model"] == model_label].copy()
+    if df_pd.empty:
+        return pl.DataFrame()
+
+    df_wide = df_pd.pivot_table(
+        index=["block", "family", "model", "variable"],
+        columns="alternative",
+        values=["beta", "robust_t", "robust_p"],
+        aggfunc="first",
+    )
+    df_wide.columns = [
+        f"{metric}_{alt.lower()}"
+        for metric, alt in df_wide.columns.to_flat_index()
+    ]
+    df_wide = (
+        df_wide
+        .reset_index()
+        .rename(
+            columns={
+                "robust_t_bip": "t_bip",
+                "robust_p_bip": "p_error_bip",
+                "robust_t_qr_other": "t_qr_other",
+                "robust_p_qr_other": "p_error_qr_other",
+                "robust_t_qr_red": "t_qr_red",
+                "robust_p_qr_red": "p_error_qr_red",
+            }
+        )
+        .sort_values(["block", "family", "model", "variable"], kind="stable")
+    )
+    return pl.from_pandas(df_wide)
+
+
+def display_focused_model_stats(model_label: str) -> None:
+    stats_path = result_artifact_dir(model_label) / f"stats_{model_label}.csv"
+    if not stats_path.exists():
+        print(f"No hay stats para {model_label}: {stats_path}")
+        return
+    display(pd.read_csv(stats_path))
+
+
+def display_focused_model_params(model_label: str) -> None:
+    params_path = result_artifact_dir(model_label) / f"params_{model_label}.csv"
+    if not params_path.exists():
+        print(f"No hay parámetros para {model_label}: {params_path}")
+        return
+    with pd.option_context("display.max_rows", None, "display.max_columns", None):
+        display(pd.read_csv(params_path))
+```
+
+```{python}
+#| label: stats-option-a-bip-only-alt-specific
+print("label: stats-option-a-bip-only-alt-specific")
+display_focused_model_stats(FOCUSED_OPTION_A_MODEL)
+```
+
+```{python}
+#| label: params-option-a-bip-only-alt-specific
+print("label: params-option-a-bip-only-alt-specific")
+display_focused_model_params(FOCUSED_OPTION_A_MODEL)
+```
+
+```{python}
+#| label: stats-option-b-bip-reportable-sum-zero
+print("label: stats-option-b-bip-reportable-sum-zero")
+display_focused_model_stats(FOCUSED_OPTION_B_MODEL)
+```
+
+```{python}
+#| label: params-option-b-bip-reportable-sum-zero
+print("label: params-option-b-bip-reportable-sum-zero")
+display_focused_model_params(FOCUSED_OPTION_B_MODEL)
+```
+
+## 14) Parámetro de nido `MU_QR`
+
+```{python}
+#| label: nested-mu-summary
+print("label: nested-mu-summary")
+if mu_rows:
+    df_mu = (
+        pl.DataFrame(mu_rows)
+        .with_columns(
+            pl.col("value").cast(pl.Float64, strict=False).round(4),
+            pl.col("robust_t").cast(pl.Float64, strict=False).round(3),
+            pl.col("robust_p").cast(pl.Float64, strict=False),
+        )
+        .sort(["block", "model"])
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1200):
+        display(df_mu)
+else:
+    print("No hay resultados nested en memoria. Activa RUN_ESTIMATION para ejecutar el screening.")
+```
+
+## 15) Lectura esperada
+
+- La convergencia correcta debe leerse desde:
+  - `yaml_convergence`
+  - `yaml_cause_of_termination`
+  - `yaml_relative_gradient`
+- `Final gradient norm` queda solo como diagnóstico auxiliar.
+- Cada variable nueva debe quedar reportada en formato horizontal por alternativa:
+  - `beta_bip`, `t_bip`, `p_error_bip`
+  - `beta_qr_red`, `t_qr_red`, `p_error_qr_red`
+  - `beta_qr_other`, `t_qr_other`, `p_error_qr_other`
+- Para `Nested`, además debe revisarse:
+  - `MU_QR`
+- Este notebook deja preparados:
+  - univariados `Censo`
+  - bloque `Censo full`
+  - univariados `OSM`
+  - bloque `OSM full`
+  - bloque conjunto `Censo + OSM full`
+- Si se quiere correr una parte chica primero, usar:
+  - `ACTIVE_MODEL_LABELS`
+  - manteniendo `RUN_ESTIMATION = True`

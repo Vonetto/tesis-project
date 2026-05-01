@@ -43,6 +43,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -64,20 +65,33 @@ from biogeme.results_processing import pandas_output as br
 from biogeme import models, nests
 from biogeme.expressions import Beta, Variable
 
+from config import HORAS_PUNTA_MANANA, HORAS_PUNTA_TARDE, USE_LOCAL_PATHS, LOCAL_BRONZE_PATH, GCS_BRONZE_PATH
+from lib.interannual_offer_context import (
+    assert_left_join_preserves_rows,
+    build_zona777_area_table_from_gdf,
+    ensure_columns_non_null,
+    ensure_unique_keys,
+    filter_to_valid_origin_zones,
+)
+from lib.gtfs_manifest import build_manifest, pick_version_for_date
 from lib.od_buffers_nested_logit import (
     OdContextConfig,
+    add_time_dummies_v2,
     build_od_alt_specific_context_table,
     build_trip_dataset_with_alt_specific_context,
     load_caracterizacion,
     read_parquet_portable,
     resolve_caracterizacion_path,
 )
+from lib.transbordos_metro.metro_graph_builder import normalize_station_name
 
 logger = blog.get_screen_logger(level=blog.INFO)
 
 MODELS_DIR = PROJECT_ROOT / "03_models"
-NOTEBOOK_TMP_DIR = MODELS_DIR / "tmp" / "nested_enriched_interannual"
-NOTEBOOK_TMP_DIR.mkdir(parents=True, exist_ok=True)
+INTERANNUAL_ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "interannual_enriched"
+INTERANNUAL_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+BIOGEME_RESULTS_ROOT = MODELS_DIR / "biogeme-logit" / "results" / "07_interannual_enriched"
+BIOGEME_RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
 ```
 
 ## 2) Configuración
@@ -91,6 +105,16 @@ PARQUET_BY_PARTITION = {
     "2024-W17": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2024-W17.parquet",
     "2025-W17": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet",
 }
+BRONZE_BASE_PATH = Path(LOCAL_BRONZE_PATH) if USE_LOCAL_PATHS else None
+BUS_PROFILES_BY_PARTITION = {
+    p: (
+        BRONZE_BASE_PATH / "perfiles_de_carga_consolidados" / f"iso_year={int(p.split('-W')[0])}" / f"iso_week={int(p.split('-W')[1])}" / "data-0.parquet"
+        if BRONZE_BASE_PATH is not None
+        else f"{GCS_BRONZE_PATH}/perfiles_de_carga_consolidados/iso_year={int(p.split('-W')[0])}/iso_week={int(p.split('-W')[1])}/data-0.parquet"
+    )
+    for p in PARTITIONS
+}
+ZONAS777_SHP = Path("/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp")
 
 OD_CONFIG = OdContextConfig(
     include_time_dummies=False,
@@ -99,12 +123,58 @@ OD_CONFIG = OdContextConfig(
     require_all_alternatives=True,
 )
 
-OUT_OD_CONTEXT = NOTEBOOK_TMP_DIR / "od_context_pooled_2024_2025.parquet"
-OUT_TRIPS_CONTEXT = NOTEBOOK_TMP_DIR / "trips_context_pooled_2024_2025.parquet"
+OUT_OD_CONTEXT = INTERANNUAL_ARTIFACTS_DIR / "od_context_pooled_2024_2025.parquet"
+OUT_TRIPS_CONTEXT = INTERANNUAL_ARTIFACTS_DIR / "trips_context_pooled_2024_2025.parquet"
+OUT_BUS_STOP_ZONA_CROSSWALK = INTERANNUAL_ARTIFACTS_DIR / "bus_stop_zona_modal_crosswalk_2024_2025.parquet"
+OUT_BUS_STOP_ZONA_CROSSWALK_OFFER_READY = INTERANNUAL_ARTIFACTS_DIR / "bus_stop_zona_modal_crosswalk_2024_2025_offer_ready.parquet"
+OUT_METRO_STATION_ZONA_CROSSWALK = INTERANNUAL_ARTIFACTS_DIR / "metro_station_zona_modal_crosswalk_2024_2025.parquet"
+OUT_ZONA_AREA = INTERANNUAL_ARTIFACTS_DIR / "zona777_area_2024_2025.parquet"
+OUT_BUS_INFRA_CONTEXT = INTERANNUAL_ARTIFACTS_DIR / "bus_stop_density_zona_2024_2025.parquet"
+OUT_METRO_INFRA_CONTEXT = INTERANNUAL_ARTIFACTS_DIR / "metro_station_density_zona_2024_2025.parquet"
+OUT_BUS_LINE_COUNT_CONTEXT = INTERANNUAL_ARTIFACTS_DIR / "bus_line_count_zona_inicio_franja_2024_2025.parquet"
+OUT_METRO_LINE_COUNT_CONTEXT = INTERANNUAL_ARTIFACTS_DIR / "metro_line_count_zona_inicio_franja_2024_2025.parquet"
 MODEL_PARTITION = "pooled_2024_2025"
 MODEL_NAME_SMOKE = "nested_enriched_interannual_smoke"
 MODEL_NAME_FULL = "nested_enriched_interannual_full"
-SAMPLE_FRACTION_ESTIMATION = 0.25
+MODEL_NAME_NESTED_BUS_ONLY = "nested_enriched_interannual_bus_only"
+MODEL_NAME_NESTED_METRO_ONLY = "nested_enriched_interannual_metro_only"
+MODEL_NAME_MNL_FULL = "mnl_enriched_interannual_full"
+MODEL_NAME_MNL_BUS_ONLY = "mnl_enriched_interannual_bus_only"
+MODEL_NAME_MNL_METRO_ONLY = "mnl_enriched_interannual_metro_only"
+MODEL_NAME_MNL_BUS_PLUS_METRO_STATION = "mnl_enriched_interannual_bus_plus_metro_station"
+MODEL_NAME_MNL_BUS_PLUS_METRO_LINE = "mnl_enriched_interannual_bus_plus_metro_line"
+MODEL_NAME_MNL_DENSITY_ONLY = "mnl_enriched_interannual_density_only"
+SAMPLE_FRACTION_ESTIMATION = 0.12
+
+def estimation_sample_tag(fraction: float | None) -> str:
+    return "full" if fraction is None else f"sample{int(fraction * 100)}pct"
+
+ESTIMATION_SAMPLE_TAG = estimation_sample_tag(SAMPLE_FRACTION_ESTIMATION)
+OUT_ESTIMATION_SAMPLE = INTERANNUAL_ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}.parquet"
+BIOGEME_RESULTS_DIR = BIOGEME_RESULTS_ROOT / f"{MODEL_PARTITION}-biogeme-{ESTIMATION_SAMPLE_TAG}"
+BIOGEME_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+NESTED_PARAMS_CSV = BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_FULL}.csv"
+NESTED_STATS_CSV = BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_FULL}.csv"
+NESTED_BUS_ONLY_PARAMS_CSV = BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_NESTED_BUS_ONLY}.csv"
+NESTED_BUS_ONLY_STATS_CSV = BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_NESTED_BUS_ONLY}.csv"
+NESTED_METRO_ONLY_PARAMS_CSV = BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_NESTED_METRO_ONLY}.csv"
+NESTED_METRO_ONLY_STATS_CSV = BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_NESTED_METRO_ONLY}.csv"
+MNL_PARAMS_CSV = BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_FULL}.csv"
+MNL_STATS_CSV = BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_FULL}.csv"
+MNL_BUS_ONLY_PARAMS_CSV = BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_BUS_ONLY}.csv"
+MNL_BUS_ONLY_STATS_CSV = BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_BUS_ONLY}.csv"
+MNL_METRO_ONLY_PARAMS_CSV = BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_METRO_ONLY}.csv"
+MNL_METRO_ONLY_STATS_CSV = BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_METRO_ONLY}.csv"
+MNL_BUS_PLUS_METRO_STATION_PARAMS_CSV = BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_BUS_PLUS_METRO_STATION}.csv"
+MNL_BUS_PLUS_METRO_STATION_STATS_CSV = BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_BUS_PLUS_METRO_STATION}.csv"
+MNL_BUS_PLUS_METRO_LINE_PARAMS_CSV = BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_BUS_PLUS_METRO_LINE}.csv"
+MNL_BUS_PLUS_METRO_LINE_STATS_CSV = BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_BUS_PLUS_METRO_LINE}.csv"
+MNL_DENSITY_ONLY_PARAMS_CSV = BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_DENSITY_ONLY}.csv"
+MNL_DENSITY_ONLY_STATS_CSV = BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_DENSITY_ONLY}.csv"
+BIOGEME_LARGE_RUN_MODE = True
+BIOGEME_THREADS = 1
+
+BIOGEME_OPTIMIZATION_ALGORITHM = "simple_bounds_BFGS"
 ```
 
 ## 3) Helpers
@@ -116,7 +186,7 @@ def year_from_partition(partition: str) -> int:
     return int(partition.split("-W")[0])
 
 
-def build_partition_trip_context(partition: str) -> tuple[pl.DataFrame, pl.DataFrame]:
+def build_partition_trip_context(partition: str) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     parquet_path = PARQUET_BY_PARTITION[partition]
     if not parquet_path.exists():
         raise FileNotFoundError(f"No existe parquet final para {partition}: {parquet_path}")
@@ -130,6 +200,30 @@ def build_partition_trip_context(partition: str) -> tuple[pl.DataFrame, pl.DataF
     df_caract = load_caracterizacion(caract_path)
     print(f"   caracterización: {caract_path}")
     print(f"   usuarios caracterización: {df_caract.height:,}")
+
+    lf_demand = read_parquet_portable(str(parquet_path)).select(
+        ["zona_inicio_viaje", "tiempo_inicio_viaje", "tipodia"]
+    )
+    lf_demand = add_time_dummies_v2(lf_demand)
+    df_demand_base = (
+        lf_demand.filter(pl.col("zona_inicio_viaje").is_not_null())
+        .with_columns(
+            pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("zona_inicio_viaje"),
+            pl.when(pl.col("DUMMY_LAB_PM") == 1)
+            .then(pl.lit("LAB_PM"))
+            .when(pl.col("DUMMY_LAB_PT") == 1)
+            .then(pl.lit("LAB_PT"))
+            .when(pl.col("DUMMY_LAB_VALLE") == 1)
+            .then(pl.lit("LAB_VALLE"))
+            .otherwise(pl.lit("NO_LAB"))
+            .alias("franja_v2")
+        )
+        .group_by(["zona_inicio_viaje", "franja_v2"])
+        .agg(pl.len().alias("N_VIAJES_ZONA_INICIO_FRANJA_RAW"))
+        .collect()
+        .with_columns(pl.lit(partition).alias("partition"))
+    )
+    print(f"   demand base raw: {df_demand_base.height:,} celdas")
 
     df_od_alt = build_od_alt_specific_context_table(
         lf,
@@ -160,10 +254,20 @@ def build_partition_trip_context(partition: str) -> tuple[pl.DataFrame, pl.DataF
         raise ValueError("Falta NTR_BIP en dataset alt-specific; revisar construcción de n_trasbordos.")
 
     print(f"   trips alt-specific: {df_trips.height:,} filas")
-    return df_od_alt, df_trips
+    return df_od_alt, df_trips, df_demand_base
 
 
-def add_origin_demand_controls(df_trips: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
+def build_zona777_area_table(zonas777_shp: Path) -> pl.DataFrame:
+    if not zonas777_shp.exists():
+        raise FileNotFoundError(f"No existe shapefile de ZONA777: {zonas777_shp}")
+    gdf = gpd.read_file(zonas777_shp)
+    return build_zona777_area_table_from_gdf(gdf)
+
+
+def add_origin_demand_controls(
+    df_trips: pl.DataFrame,
+    df_demand_base: pl.DataFrame,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
     required = {
         "zona_inicio_viaje",
         "partition",
@@ -175,6 +279,10 @@ def add_origin_demand_controls(df_trips: pl.DataFrame) -> tuple[pl.DataFrame, pl
     missing = sorted(required - set(df_trips.columns))
     if missing:
         raise ValueError(f"Faltan columnas para construir control de demanda: {missing}")
+    required_base = {"partition", "zona_inicio_viaje", "franja_v2", "N_VIAJES_ZONA_INICIO_FRANJA_RAW"}
+    missing_base = sorted(required_base - set(df_demand_base.columns))
+    if missing_base:
+        raise ValueError(f"Faltan columnas en base de demanda: {missing_base}")
 
     df = (
         df_trips.with_columns(
@@ -189,17 +297,614 @@ def add_origin_demand_controls(df_trips: pl.DataFrame) -> tuple[pl.DataFrame, pl
         )
     )
 
+    df = (
+        df.join(df_demand_base, on=["partition", "zona_inicio_viaje", "franja_v2"], how="left")
+        .with_columns(
+            (pl.col("N_VIAJES_ZONA_INICIO_FRANJA_RAW").fill_null(0) - 1)
+            .clip(lower_bound=0)
+            .alias("N_VIAJES_ZONA_INICIO_FRANJA")
+        )
+        .with_columns(
+            pl.col("N_VIAJES_ZONA_INICIO_FRANJA").log1p().alias("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+        )
+    )
     df_demand = (
-        df.group_by(["partition", "zona_inicio_viaje", "franja_v2"])
-        .agg(pl.len().alias("N_VIAJES_ZONA_INICIO_FRANJA"))
+        df_demand_base
+        .with_columns(
+            (pl.col("N_VIAJES_ZONA_INICIO_FRANJA_RAW") - 1)
+            .clip(lower_bound=0)
+            .alias("N_VIAJES_ZONA_INICIO_FRANJA")
+        )
         .with_columns(
             pl.col("N_VIAJES_ZONA_INICIO_FRANJA").log1p().alias("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
         )
         .sort(["partition", "zona_inicio_viaje", "franja_v2"])
     )
-
-    df = df.join(df_demand, on=["partition", "zona_inicio_viaje", "franja_v2"], how="left")
     return df, df_demand
+
+
+def build_stop_zona_modal_crosswalk(
+    *,
+    partitions: list[str],
+    valid_transport_types: set[str],
+    ambiguity_threshold: float = 0.80,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    pieces = []
+    for partition in partitions:
+        parquet_path = PARQUET_BY_PARTITION[partition]
+        lf = read_parquet_portable(str(parquet_path))
+        for i in range(1, 7):
+            pieces.append(
+                lf.select(
+                    pl.lit(partition).alias("partition"),
+                    pl.col(f"tipo_transporte_{i}").alias("tipo_transporte"),
+                    pl.col(f"paradero_subida_{i}").alias("stop"),
+                    pl.col(f"zona_subida_{i}").alias("zona"),
+                )
+            )
+            pieces.append(
+                lf.select(
+                    pl.lit(partition).alias("partition"),
+                    pl.col(f"tipo_transporte_{i}").alias("tipo_transporte"),
+                    pl.col(f"paradero_bajada_{i}").alias("stop"),
+                    pl.col(f"zona_bajada_{i}").alias("zona"),
+                )
+            )
+
+    df_pairs = (
+        pl.concat(pieces, how="vertical_relaxed")
+        .filter(
+            pl.col("tipo_transporte").is_in(sorted(valid_transport_types))
+            & pl.col("stop").is_not_null()
+            & (pl.col("stop").str.strip_chars() != "")
+            & pl.col("zona").is_not_null()
+            & (pl.col("zona").str.strip_chars() != "")
+        )
+        .collect()
+    )
+
+    stop_stats = df_pairs.group_by("stop").agg(
+        pl.len().alias("n_obs"),
+        pl.n_unique("zona").alias("n_zonas"),
+    )
+    stop_zone = df_pairs.group_by(["stop", "zona"]).len().rename({"len": "n_obs_zona"})
+    crosswalk = (
+        stop_zone.sort(["stop", "n_obs_zona", "zona"], descending=[False, True, False])
+        .group_by("stop")
+        .first()
+        .join(stop_stats, on="stop", how="left")
+        .with_columns(
+            (pl.col("n_obs_zona") / pl.col("n_obs")).alias("modal_share"),
+            pl.col("zona").alias("zona_modal"),
+        )
+        .with_columns(
+            (pl.col("modal_share") < ambiguity_threshold).alias("is_ambiguous_for_offer"),
+            (pl.col("n_zonas") > 1).alias("has_multiple_zones"),
+        )
+        .select(
+            "stop",
+            "zona_modal",
+            "n_obs",
+            "n_obs_zona",
+            "n_zonas",
+            "modal_share",
+            "has_multiple_zones",
+            "is_ambiguous_for_offer",
+        )
+        .sort(["is_ambiguous_for_offer", "modal_share", "n_obs"], descending=[True, False, True])
+    )
+
+    part_stop_zone = df_pairs.group_by(["partition", "stop", "zona"]).len().rename({"len": "n_obs_zona"})
+    part_modal = (
+        part_stop_zone.sort(["partition", "stop", "n_obs_zona", "zona"], descending=[False, False, True, False])
+        .group_by(["partition", "stop"])
+        .first()
+    )
+    part_wide = part_modal.select("partition", "stop", pl.col("zona").alias("zona_modal")).pivot(
+        on="partition",
+        index="stop",
+        values="zona_modal",
+    )
+    if all(partition in part_wide.columns for partition in partitions):
+        same_modal = (
+            part_wide.filter(pl.all_horizontal([pl.col(p).is_not_null() for p in partitions]))
+            .with_columns((pl.col(partitions[0]) == pl.col(partitions[1])).alias("same_modal_zone"))
+        )
+        n_both_years = same_modal.height
+        pct_same_modal_zone_between_years = float(same_modal["same_modal_zone"].mean()) if same_modal.height else None
+    else:
+        n_both_years = 0
+        pct_same_modal_zone_between_years = None
+
+    summary = pl.DataFrame(
+        {
+            "metric": [
+                "n_obs_pairs",
+                "n_unique_stops",
+                "n_stops_unique_zone",
+                "pct_stops_unique_zone",
+                "n_stops_modal_share_ge_95",
+                "pct_stops_modal_share_ge_95",
+                "n_stops_modal_share_lt_80",
+                "pct_stops_modal_share_lt_80",
+                "n_stops_both_years",
+                "pct_same_modal_zone_between_years",
+            ],
+            "value": [
+                float(df_pairs.height),
+                float(crosswalk.height),
+                float(crosswalk.filter(pl.col("n_zonas") == 1).height),
+                float(crosswalk.filter(pl.col("n_zonas") == 1).height / max(crosswalk.height, 1)),
+                float(crosswalk.filter(pl.col("modal_share") >= 0.95).height),
+                float(crosswalk.filter(pl.col("modal_share") >= 0.95).height / max(crosswalk.height, 1)),
+                float(crosswalk.filter(pl.col("modal_share") < ambiguity_threshold).height),
+                float(crosswalk.filter(pl.col("modal_share") < ambiguity_threshold).height / max(crosswalk.height, 1)),
+                float(n_both_years),
+                pct_same_modal_zone_between_years,
+            ],
+        },
+        schema_overrides={"metric": pl.Utf8, "value": pl.Float64},
+    )
+
+    return crosswalk, summary
+
+
+DAY_COLS = {
+    0: "monday",
+    1: "tuesday",
+    2: "wednesday",
+    3: "thursday",
+    4: "friday",
+    5: "saturday",
+    6: "sunday",
+}
+
+
+def week_dates_from_partition(partition: str) -> list[date]:
+    year_s, week_s = partition.split("-W")
+    year = int(year_s)
+    week = int(week_s)
+    return [date.fromisocalendar(year, week, d) for d in range(1, 8)]
+
+
+def yyyymmdd(value: date) -> int:
+    return value.year * 10000 + value.month * 100 + value.day
+
+
+def parse_hms_to_seconds(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    hh, mm, ss = str(raw).split(":")
+    return int(hh) * 3600 + int(mm) * 60 + int(ss)
+
+
+def station_from_stop_name_for_offer(name: str | None) -> str:
+    if name is None:
+        return ""
+    import re
+    import unicodedata
+
+    text = str(name)
+    text_ascii = "".join(
+        c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn"
+    )
+    base = re.sub(r"(?i)\s*DIRECCION.*$", "", text_ascii).strip()
+    base = re.sub(r"(?i)\s+DIR\s+.*$", "", base).strip()
+    base = base.replace("(M)", "").replace("(m)", "").strip()
+    return normalize_station_name(base)
+
+
+def active_service_ids_for_date(
+    calendar: pl.DataFrame,
+    calendar_dates: pl.DataFrame,
+    service_date: date,
+) -> set[str]:
+    day_col = DAY_COLS[service_date.weekday()]
+    active = set(
+        calendar.filter(
+            (pl.col(day_col) == 1)
+            & (pl.col("start_date") <= yyyymmdd(service_date))
+            & (pl.col("end_date") >= yyyymmdd(service_date))
+        )["service_id"].to_list()
+    )
+    if calendar_dates.height > 0:
+        exceptions = calendar_dates.filter(pl.col("date") == yyyymmdd(service_date))
+        added = set(exceptions.filter(pl.col("exception_type") == 1)["service_id"].to_list())
+        removed = set(exceptions.filter(pl.col("exception_type") == 2)["service_id"].to_list())
+        active = (active | added) - removed
+    return active
+
+
+def franja_v2_from_service_date_hour(service_date: date, hour: int) -> str:
+    is_laboral = service_date.weekday() < 5
+    if is_laboral and hour in HORAS_PUNTA_MANANA:
+        return "LAB_PM"
+    if is_laboral and hour in HORAS_PUNTA_TARDE:
+        return "LAB_PT"
+    if is_laboral:
+        return "LAB_VALLE"
+    return "NO_LAB"
+
+
+def build_bus_stop_density_by_zone(
+    *,
+    zona_area: pl.DataFrame,
+    bus_crosswalk_offer_ready: pl.DataFrame,
+) -> pl.DataFrame:
+    ensure_unique_keys(zona_area, ["zona_inicio_viaje"], "zona_area")
+    df_counts = (
+        bus_crosswalk_offer_ready
+        .select(
+            pl.col("stop"),
+            pl.col("zona_modal").cast(pl.Int64, strict=False).alias("zona_inicio_viaje"),
+        )
+        .drop_nulls()
+        .group_by("zona_inicio_viaje")
+        .agg(pl.col("stop").n_unique().alias("N_BUS_STOPS"))
+    )
+    df_out = (
+        zona_area.join(df_counts, on="zona_inicio_viaje", how="left")
+        .with_columns(pl.col("N_BUS_STOPS").fill_null(0).cast(pl.Float64))
+        .with_columns(
+            (pl.col("N_BUS_STOPS") / pl.col("AREA_KM2")).fill_nan(0.0).fill_null(0.0).alias("BUS_STOP_DENSITY"),
+        )
+        .with_columns(
+            pl.col("BUS_STOP_DENSITY").log1p().alias("LOG_BUS_STOP_DENSITY")
+        )
+        .sort("zona_inicio_viaje")
+    )
+    ensure_unique_keys(df_out, ["zona_inicio_viaje"], "df_bus_infra")
+    return df_out
+
+
+def build_bus_line_count_by_zone_franja(
+    *,
+    partition: str,
+    bus_crosswalk_offer_ready: pl.DataFrame,
+    valid_zonas: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    profiles_path = BUS_PROFILES_BY_PARTITION[partition]
+    path_str = str(profiles_path)
+    lf = read_parquet_portable(path_str).select(
+        [
+            pl.col("ServicioUsuario").cast(pl.Utf8).alias("bus_line"),
+            pl.col("Paradero").cast(pl.Utf8).alias("stop"),
+            pl.col("timestamp"),
+        ]
+    ).drop_nulls(["bus_line", "stop", "timestamp"])
+
+    lf = lf.with_columns(
+        pl.col("timestamp").dt.truncate("1h").alias("tiempo_inicio_viaje"),
+        pl.when(pl.col("timestamp").dt.weekday().is_in([6, 7]))
+        .then(pl.lit(1))
+        .otherwise(pl.lit(0))
+        .cast(pl.Int8)
+        .alias("tipodia"),
+    ).drop("timestamp")
+
+    lf = add_time_dummies_v2(lf).with_columns(
+        pl.when(pl.col("DUMMY_LAB_PM") == 1)
+        .then(pl.lit("LAB_PM"))
+        .when(pl.col("DUMMY_LAB_PT") == 1)
+        .then(pl.lit("LAB_PT"))
+        .when(pl.col("DUMMY_LAB_VALLE") == 1)
+        .then(pl.lit("LAB_VALLE"))
+        .otherwise(pl.lit("NO_LAB"))
+        .alias("franja_v2")
+    )
+
+    df_zone_hour = (
+        lf.join(
+            bus_crosswalk_offer_ready.lazy().select(
+                pl.col("stop"),
+                pl.col("zona_modal").cast(pl.Int64, strict=False).alias("zona_inicio_viaje"),
+            ),
+            on="stop",
+            how="inner",
+        )
+        .group_by(["zona_inicio_viaje", "franja_v2", "tiempo_inicio_viaje"])
+        .agg(pl.col("bus_line").n_unique().alias("bus_line_count_h"))
+        .collect()
+    )
+
+    df_out = (
+        df_zone_hour.group_by(["zona_inicio_viaje", "franja_v2"])
+        .agg(
+            pl.len().alias("n_hour_cells"),
+            pl.col("bus_line_count_h").mean().alias("BUS_LINE_COUNT"),
+        )
+        .with_columns(
+            pl.col("BUS_LINE_COUNT").log1p().alias("LOG_BUS_LINE_COUNT"),
+            pl.lit(partition).alias("partition"),
+        )
+        .sort(["partition", "zona_inicio_viaje", "franja_v2"])
+    )
+    if valid_zonas is not None:
+        df_out, filter_diag = filter_to_valid_origin_zones(
+            df_out,
+            valid_zonas,
+            f"df_bus_line_count[{partition}]",
+        )
+        if filter_diag["rows_dropped"] > 0:
+            print(f"   filtro zonas BUS_LINE_COUNT {partition}: {filter_diag}")
+    ensure_unique_keys(df_out, ["partition", "zona_inicio_viaje", "franja_v2"], "df_bus_line_count")
+    return df_out
+
+
+def build_metro_station_density_by_zone(
+    *,
+    zona_area: pl.DataFrame,
+    metro_crosswalk_offer_ready: pl.DataFrame,
+) -> pl.DataFrame:
+    ensure_unique_keys(zona_area, ["zona_inicio_viaje"], "zona_area")
+    df_counts = (
+        metro_crosswalk_offer_ready
+        .select(
+            pl.col("stop").cast(pl.Utf8).alias("station"),
+            pl.col("zona_modal").cast(pl.Int64, strict=False).alias("zona_inicio_viaje"),
+        )
+        .drop_nulls()
+        .group_by("zona_inicio_viaje")
+        .agg(pl.col("station").n_unique().alias("N_METRO_STATIONS"))
+    )
+    df_out = (
+        zona_area.join(df_counts, on="zona_inicio_viaje", how="left")
+        .with_columns(pl.col("N_METRO_STATIONS").fill_null(0).cast(pl.Float64))
+        .with_columns(
+            (pl.col("N_METRO_STATIONS") / pl.col("AREA_KM2")).fill_nan(0.0).fill_null(0.0).alias("METRO_STATION_DENSITY"),
+        )
+        .with_columns(
+            pl.col("METRO_STATION_DENSITY").log1p().alias("LOG_METRO_STATION_DENSITY")
+        )
+        .sort("zona_inicio_viaje")
+    )
+    ensure_unique_keys(df_out, ["zona_inicio_viaje"], "df_metro_infra")
+    return df_out
+
+
+def build_metro_line_count_by_zone_franja(
+    *,
+    partition: str,
+    metro_crosswalk_offer_ready: pl.DataFrame,
+    valid_zonas: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    manifest = build_manifest(PROJECT_ROOT / "config" / "GTFS")
+    week_dates = week_dates_from_partition(partition)
+    version = pick_version_for_date(week_dates[0], manifest)
+    if version is None:
+        raise ValueError(f"No GTFS version found for partition {partition}")
+
+    gtfs_dir = version.path
+
+    routes = pl.read_csv(
+        gtfs_dir / "routes.txt",
+        schema_overrides={"route_id": pl.Utf8, "route_short_name": pl.Utf8, "route_type": pl.Int64},
+    ).filter(pl.col("route_type") == 1).with_columns(
+        pl.when(pl.col("route_short_name").is_not_null() & (pl.col("route_short_name").str.len_chars() > 0))
+        .then(pl.col("route_short_name"))
+        .otherwise(pl.col("route_id"))
+        .alias("metro_line")
+    )
+    metro_route_ids = routes["route_id"].to_list()
+
+    trips_metro = pl.read_csv(
+        gtfs_dir / "trips.txt",
+        schema_overrides={
+            "route_id": pl.Utf8,
+            "trip_id": pl.Utf8,
+            "service_id": pl.Utf8,
+            "direction_id": pl.Int64,
+        },
+    ).filter(pl.col("route_id").is_in(metro_route_ids)).join(
+        routes.select(["route_id", "metro_line"]),
+        on="route_id",
+        how="left",
+    )
+
+    calendar = pl.read_csv(
+        gtfs_dir / "calendar.txt",
+        schema_overrides={
+            "service_id": pl.Utf8,
+            "monday": pl.Int64,
+            "tuesday": pl.Int64,
+            "wednesday": pl.Int64,
+            "thursday": pl.Int64,
+            "friday": pl.Int64,
+            "saturday": pl.Int64,
+            "sunday": pl.Int64,
+            "start_date": pl.Int64,
+            "end_date": pl.Int64,
+        },
+    )
+    calendar_dates_path = gtfs_dir / "calendar_dates.txt"
+    if calendar_dates_path.exists():
+        calendar_dates = pl.read_csv(
+            calendar_dates_path,
+            schema_overrides={"service_id": pl.Utf8, "date": pl.Int64, "exception_type": pl.Int64},
+        )
+    else:
+        calendar_dates = pl.DataFrame(schema={"service_id": pl.Utf8, "date": pl.Int64, "exception_type": pl.Int64})
+
+    freq = pl.read_csv(
+        gtfs_dir / "frequencies.txt",
+        schema_overrides={
+            "trip_id": pl.Utf8,
+            "start_time": pl.Utf8,
+            "end_time": pl.Utf8,
+            "headway_secs": pl.Int64,
+        },
+    ).with_columns(
+        pl.col("start_time").map_elements(parse_hms_to_seconds, return_dtype=pl.Int64).alias("start_sec"),
+        pl.col("end_time").map_elements(parse_hms_to_seconds, return_dtype=pl.Int64).alias("end_sec"),
+    )
+
+    stops = pl.read_csv(
+        gtfs_dir / "stops.txt",
+        schema_overrides={"stop_id": pl.Utf8, "stop_name": pl.Utf8, "wheelchair_boarding": pl.Utf8},
+        truncate_ragged_lines=True,
+    )
+    stop_times = pl.read_csv(
+        gtfs_dir / "stop_times.txt",
+        schema_overrides={"trip_id": pl.Utf8, "stop_id": pl.Utf8, "stop_sequence": pl.Int64},
+    )
+
+    station_coverage = (
+        stop_times.join(
+            trips_metro.select(["trip_id", "route_id", "direction_id", "metro_line"]),
+            on="trip_id",
+            how="inner",
+        )
+        .join(stops.select(["stop_id", "stop_name"]), on="stop_id", how="left")
+        .with_columns(
+            pl.col("stop_name").map_elements(station_from_stop_name_for_offer, return_dtype=pl.Utf8).alias("station_norm")
+        )
+        .select(["route_id", "direction_id", "metro_line", "station_norm"])
+        .filter(pl.col("station_norm").is_not_null() & (pl.col("station_norm") != ""))
+        .unique()
+    )
+
+    freq_join = freq.join(
+        trips_metro.select(["trip_id", "route_id", "metro_line", "service_id", "direction_id"]),
+        on="trip_id",
+        how="inner",
+    ).select(["route_id", "metro_line", "service_id", "direction_id", "start_sec", "end_sec"])
+
+    station_zone = metro_crosswalk_offer_ready.select(
+        pl.col("stop").map_elements(station_from_stop_name_for_offer, return_dtype=pl.Utf8).alias("station_norm"),
+        pl.col("zona_modal").cast(pl.Int64, strict=False).alias("zona_inicio_viaje"),
+    ).unique()
+
+    frames = []
+    for service_date in week_dates:
+        active_service_ids = active_service_ids_for_date(calendar, calendar_dates, service_date)
+        if not active_service_ids:
+            continue
+        freq_active = freq_join.filter(pl.col("service_id").is_in(sorted(active_service_ids)))
+        for hour in range(24):
+            hour_sec = hour * 3600
+            current = freq_active.filter(
+                (pl.col("start_sec") <= hour_sec)
+                & (pl.col("end_sec") > hour_sec)
+            )
+            if current.height == 0:
+                continue
+            franja_v2 = franja_v2_from_service_date_hour(service_date, hour)
+            station_hour = (
+                current.join(station_coverage, on=["route_id", "direction_id", "metro_line"], how="inner")
+                .join(station_zone, on="station_norm", how="inner")
+                .group_by("zona_inicio_viaje")
+                .agg(pl.col("metro_line").n_unique().alias("metro_line_count_h"))
+                .with_columns(
+                    pl.lit(partition).alias("partition"),
+                    pl.lit(franja_v2).alias("franja_v2"),
+                    pl.lit(service_date.isoformat()).alias("service_date"),
+                    pl.lit(hour).alias("hour"),
+                )
+            )
+            frames.append(station_hour)
+
+    if not frames:
+        return pl.DataFrame(
+            schema={
+                "zona_inicio_viaje": pl.Int64,
+                "partition": pl.Utf8,
+                "franja_v2": pl.Utf8,
+                "n_hour_cells": pl.UInt32,
+                "METRO_LINE_COUNT": pl.Float64,
+                "LOG_METRO_LINE_COUNT": pl.Float64,
+            }
+        )
+
+    df_hour = pl.concat(frames, how="diagonal_relaxed")
+    df_out = (
+        df_hour.group_by(["zona_inicio_viaje", "partition", "franja_v2"])
+        .agg(
+            pl.len().alias("n_hour_cells"),
+            pl.col("metro_line_count_h").mean().alias("METRO_LINE_COUNT"),
+        )
+        .with_columns(
+            pl.col("METRO_LINE_COUNT").log1p().alias("LOG_METRO_LINE_COUNT")
+        )
+        .sort(["partition", "zona_inicio_viaje", "franja_v2"])
+    )
+    if valid_zonas is not None:
+        df_out, filter_diag = filter_to_valid_origin_zones(
+            df_out,
+            valid_zonas,
+            f"df_metro_line_count[{partition}]",
+        )
+        if filter_diag["rows_dropped"] > 0:
+            print(f"   filtro zonas METRO_LINE_COUNT {partition}: {filter_diag}")
+    ensure_unique_keys(df_out, ["partition", "zona_inicio_viaje", "franja_v2"], "df_metro_line_count")
+    return df_out
+
+
+def add_origin_offer_controls(
+    df_trips: pl.DataFrame,
+    df_bus_infra: pl.DataFrame,
+    df_metro_infra: pl.DataFrame,
+    df_bus_line_count: pl.DataFrame,
+    df_metro_line_count: pl.DataFrame,
+) -> pl.DataFrame:
+    required = {"partition", "zona_inicio_viaje", "franja_v2"}
+    missing = sorted(required - set(df_trips.columns))
+    if missing:
+        raise ValueError(f"Faltan columnas para join de oferta: {missing}")
+
+    keys = ["partition", "zona_inicio_viaje", "franja_v2"]
+    ensure_unique_keys(df_bus_infra, ["zona_inicio_viaje"], "df_bus_infra")
+    ensure_unique_keys(df_metro_infra, ["zona_inicio_viaje"], "df_metro_infra")
+    ensure_unique_keys(df_bus_line_count, keys, "df_bus_line_count")
+    ensure_unique_keys(df_metro_line_count, keys, "df_metro_line_count")
+    before_rows = df_trips.height
+    df = (
+        df_trips.join(
+            df_bus_infra.select(["zona_inicio_viaje", "N_BUS_STOPS", "BUS_STOP_DENSITY", "LOG_BUS_STOP_DENSITY"]),
+            on="zona_inicio_viaje",
+            how="left",
+        )
+        .join(
+            df_metro_infra.select(["zona_inicio_viaje", "N_METRO_STATIONS", "METRO_STATION_DENSITY", "LOG_METRO_STATION_DENSITY"]),
+            on="zona_inicio_viaje",
+            how="left",
+        )
+        .join(
+            df_bus_line_count.select(keys + ["BUS_LINE_COUNT", "LOG_BUS_LINE_COUNT"]),
+            on=keys,
+            how="left",
+        )
+        .join(
+            df_metro_line_count.select(keys + ["METRO_LINE_COUNT", "LOG_METRO_LINE_COUNT"]),
+            on=keys,
+            how="left",
+        )
+    )
+    assert_left_join_preserves_rows(before_rows, df.height, "join de oferta sobre trips_context pooled")
+    ensure_columns_non_null(
+        df,
+        [
+            "N_BUS_STOPS",
+            "BUS_STOP_DENSITY",
+            "LOG_BUS_STOP_DENSITY",
+            "N_METRO_STATIONS",
+            "METRO_STATION_DENSITY",
+            "LOG_METRO_STATION_DENSITY",
+        ],
+        "join de infraestructura zonal",
+    )
+    df = df.with_columns(
+        pl.col("N_BUS_STOPS").fill_null(0.0),
+        pl.col("BUS_STOP_DENSITY").fill_null(0.0),
+        pl.col("LOG_BUS_STOP_DENSITY").fill_null(0.0),
+        pl.col("N_METRO_STATIONS").fill_null(0.0),
+        pl.col("METRO_STATION_DENSITY").fill_null(0.0),
+        pl.col("LOG_METRO_STATION_DENSITY").fill_null(0.0),
+        pl.col("BUS_LINE_COUNT").fill_null(0.0),
+        pl.col("LOG_BUS_LINE_COUNT").fill_null(0.0),
+        pl.col("METRO_LINE_COUNT").fill_null(0.0),
+        pl.col("LOG_METRO_LINE_COUNT").fill_null(0.0),
+    )
+    return df
 
 
 def stratified_sample_partition_choice(
@@ -246,6 +951,8 @@ def estimate_nested_option1_alt_specific_enriched(
     clean_run_no_iter: bool = False,
     project_root: Path | None = None,
     quick: bool = False,
+    include_bus_offer: bool = True,
+    include_metro_offer: bool = True,
 ):
     database = db.Database(model_name, pandas_df)
 
@@ -260,6 +967,10 @@ def estimate_nested_option1_alt_specific_enriched(
     NO_LAB = Variable("DUMMY_NO_LAB")
     DUMMY_ANIO_2025 = Variable("DUMMY_ANIO_2025")
     LOG_DEMAND = Variable("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+    LOG_BUS_STOP_DENSITY = Variable("LOG_BUS_STOP_DENSITY")
+    LOG_METRO_STATION_DENSITY = Variable("LOG_METRO_STATION_DENSITY")
+    LOG_BUS_LINE_COUNT = Variable("LOG_BUS_LINE_COUNT")
+    LOG_METRO_LINE_COUNT = Variable("LOG_METRO_LINE_COUNT")
 
     TVH_BIP = Variable("TVH_BIP")
     TVH_QR_RED = Variable("TVH_QR_RED")
@@ -299,6 +1010,14 @@ def estimate_nested_option1_alt_specific_enriched(
     B_QR_OTHER_ANIO_2025 = Beta(f"B_QR_OTHER_ANIO_2025_{partition}", 0, None, None, 0)
     B_QR_RED_LOG_DEMAND = Beta(f"B_QR_RED_LOG_DEMAND_{partition}", 0, None, None, 0)
     B_QR_OTHER_LOG_DEMAND = Beta(f"B_QR_OTHER_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_RED_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_OTHER_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_METRO_STATION_DENSITY = Beta(f"B_QR_RED_LOG_METRO_STATION_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_METRO_STATION_DENSITY = Beta(f"B_QR_OTHER_LOG_METRO_STATION_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_LINE_COUNT = Beta(f"B_QR_RED_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_METRO_LINE_COUNT = Beta(f"B_QR_RED_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_METRO_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
 
     B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
     B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
@@ -334,6 +1053,16 @@ def estimate_nested_option1_alt_specific_enriched(
         + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
         + B_QR_RED_N_TRASB * NTR_QR_RED
     )
+    if include_bus_offer:
+        V_QR_RED += (
+            B_QR_RED_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+            + B_QR_RED_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        )
+    if include_metro_offer:
+        V_QR_RED += (
+            B_QR_RED_LOG_METRO_STATION_DENSITY * LOG_METRO_STATION_DENSITY
+            + B_QR_RED_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        )
     V_QR_OTHER = (
         ASC_QR_OTHER
         + B_QR_OTHER_LAB_PM * LAB_PM
@@ -346,6 +1075,16 @@ def estimate_nested_option1_alt_specific_enriched(
         + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
         + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
     )
+    if include_bus_offer:
+        V_QR_OTHER += (
+            B_QR_OTHER_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+            + B_QR_OTHER_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        )
+    if include_metro_offer:
+        V_QR_OTHER += (
+            B_QR_OTHER_LOG_METRO_STATION_DENSITY * LOG_METRO_STATION_DENSITY
+            + B_QR_OTHER_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        )
 
     V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
     logprob = models.lognested(V, None, NESTS, CHOICE)
@@ -355,10 +1094,190 @@ def estimate_nested_option1_alt_specific_enriched(
 
     biogeme = bio.BIOGEME(database, logprob)
     biogeme.model_name = model_name
+    if BIOGEME_LARGE_RUN_MODE:
+        try:
+            biogeme.biogeme_parameters.set_value("generate_html", False)
+            biogeme.biogeme_parameters.set_value("generate_yaml", False)
+            biogeme.biogeme_parameters.set_value("save_iterations", False)
+            biogeme.biogeme_parameters.set_value("number_of_threads", BIOGEME_THREADS)
+            biogeme.biogeme_parameters.set_value("calculating_second_derivatives", BIOGEME_SECOND_DERIVATIVES)
+            biogeme.biogeme_parameters.set_value("optimization_algorithm", BIOGEME_OPTIMIZATION_ALGORITHM)
+        except Exception:
+            pass
     if quick:
         results = biogeme.quick_estimate()
     else:
         results = biogeme.estimate()
+
+    stats = results.get_general_statistics()
+    params = br.get_pandas_estimated_parameters(results)
+    return stats, params
+
+
+def estimate_mnl_option1_alt_specific_enriched(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    clean_run_no_iter: bool = False,
+    project_root: Path | None = None,
+    include_bus_offer: bool = True,
+    include_metro_offer: bool = True,
+    include_bus_stop_density: bool | None = None,
+    include_bus_line_count: bool | None = None,
+    include_metro_station_density: bool | None = None,
+    include_metro_line_count: bool | None = None,
+):
+    database = db.Database(model_name, pandas_df)
+
+    if include_bus_stop_density is None:
+        include_bus_stop_density = include_bus_offer
+    if include_bus_line_count is None:
+        include_bus_line_count = include_bus_offer
+    if include_metro_station_density is None:
+        include_metro_station_density = include_metro_offer
+    if include_metro_line_count is None:
+        include_metro_line_count = include_metro_offer
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+
+    CHOICE = Variable("choice_nested")
+
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+    DUMMY_ANIO_2025 = Variable("DUMMY_ANIO_2025")
+    LOG_DEMAND = Variable("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+    LOG_BUS_STOP_DENSITY = Variable("LOG_BUS_STOP_DENSITY")
+    LOG_METRO_STATION_DENSITY = Variable("LOG_METRO_STATION_DENSITY")
+    LOG_BUS_LINE_COUNT = Variable("LOG_BUS_LINE_COUNT")
+    LOG_METRO_LINE_COUNT = Variable("LOG_METRO_LINE_COUNT")
+
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+
+    TET_BIP = Variable("TET_BIP")
+    TET_QR_RED = Variable("TET_QR_RED")
+    TET_QR_OTHER = Variable("TET_QR_OTHER")
+
+    NTR_BIP = Variable("NTR_BIP")
+    NTR_QR_RED = Variable("NTR_QR_RED")
+    NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    ASC_QR_RED = Beta(f"ASC_QR_RED_{partition}", 0, None, None, 0)
+    ASC_QR_OTHER = Beta(f"ASC_QR_OTHER_{partition}", 0, None, None, 0)
+
+    B_QR_RED_LAB_PM = Beta(f"B_QR_RED_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PM = Beta(f"B_QR_OTHER_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PT = Beta(f"B_QR_RED_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PT = Beta(f"B_QR_OTHER_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_RED_NO_LAB = Beta(f"B_QR_RED_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_NO_LAB = Beta(f"B_QR_OTHER_NO_LAB_{partition}", 0, None, None, 0)
+
+    B_QR_RED_ANIO_2025 = Beta(f"B_QR_RED_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_OTHER_ANIO_2025 = Beta(f"B_QR_OTHER_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_DEMAND = Beta(f"B_QR_RED_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_DEMAND = Beta(f"B_QR_OTHER_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_RED_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_OTHER_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_METRO_STATION_DENSITY = Beta(f"B_QR_RED_LOG_METRO_STATION_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_METRO_STATION_DENSITY = Beta(f"B_QR_OTHER_LOG_METRO_STATION_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_LINE_COUNT = Beta(f"B_QR_RED_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_METRO_LINE_COUNT = Beta(f"B_QR_RED_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_METRO_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+
+    B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_VEH = Beta(f"B_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+
+    B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+
+    B_BIP_T_ESPERA_TRASB = Beta(f"B_BIP_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_TRASB = Beta(f"B_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+
+    B_BIP_N_TRASB = Beta(f"B_BIP_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_N_TRASB = Beta(f"B_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_N_TRASB = Beta(f"B_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+
+    V_BIP = (
+        B_BIP_T_VEH * TVH_BIP
+        + B_BIP_T_ESPERA_INI * TEI_BIP
+        + B_BIP_T_ESPERA_TRASB * TET_BIP
+        + B_BIP_N_TRASB * NTR_BIP
+    )
+    V_QR_RED = (
+        ASC_QR_RED
+        + B_QR_RED_LAB_PM * LAB_PM
+        + B_QR_RED_LAB_PT * LAB_PT
+        + B_QR_RED_NO_LAB * NO_LAB
+        + B_QR_RED_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_RED_LOG_DEMAND * LOG_DEMAND
+        + B_QR_RED_T_VEH * TVH_QR_RED
+        + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+        + B_QR_RED_N_TRASB * NTR_QR_RED
+    )
+    if include_bus_stop_density:
+        V_QR_RED += B_QR_RED_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+    if include_bus_line_count:
+        V_QR_RED += B_QR_RED_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+    if include_metro_station_density:
+        V_QR_RED += B_QR_RED_LOG_METRO_STATION_DENSITY * LOG_METRO_STATION_DENSITY
+    if include_metro_line_count:
+        V_QR_RED += B_QR_RED_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+
+    V_QR_OTHER = (
+        ASC_QR_OTHER
+        + B_QR_OTHER_LAB_PM * LAB_PM
+        + B_QR_OTHER_LAB_PT * LAB_PT
+        + B_QR_OTHER_NO_LAB * NO_LAB
+        + B_QR_OTHER_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_OTHER_LOG_DEMAND * LOG_DEMAND
+        + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+        + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+    )
+    if include_bus_stop_density:
+        V_QR_OTHER += B_QR_OTHER_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+    if include_bus_line_count:
+        V_QR_OTHER += B_QR_OTHER_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+    if include_metro_station_density:
+        V_QR_OTHER += B_QR_OTHER_LOG_METRO_STATION_DENSITY * LOG_METRO_STATION_DENSITY
+    if include_metro_line_count:
+        V_QR_OTHER += B_QR_OTHER_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+
+    V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+    av = {CHOICE_BIP: 1, CHOICE_QR_RED: 1, CHOICE_QR_OTHER: 1}
+    logprob = models.loglogit(V, av, CHOICE)
+
+    if clean_run_no_iter and project_root is not None:
+        remove_biogeme_iter_file(model_name, project_root)
+
+    biogeme = bio.BIOGEME(database, logprob)
+    biogeme.model_name = model_name
+    if BIOGEME_LARGE_RUN_MODE:
+        try:
+            biogeme.biogeme_parameters.set_value("generate_html", False)
+            biogeme.biogeme_parameters.set_value("generate_yaml", False)
+            biogeme.biogeme_parameters.set_value("save_iterations", False)
+            biogeme.biogeme_parameters.set_value("number_of_threads", BIOGEME_THREADS)
+            biogeme.biogeme_parameters.set_value("calculating_second_derivatives", BIOGEME_SECOND_DERIVATIVES)
+            biogeme.biogeme_parameters.set_value("optimization_algorithm", BIOGEME_OPTIMIZATION_ALGORITHM)
+        except Exception:
+            pass
+    results = biogeme.estimate()
 
     stats = results.get_general_statistics()
     params = br.get_pandas_estimated_parameters(results)
@@ -372,6 +1291,10 @@ MODEL_NUMERIC_COLUMNS = [
     "DUMMY_NO_LAB",
     "DUMMY_ANIO_2025",
     "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_METRO_STATION_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
     "TVH_BIP",
     "TVH_QR_RED",
     "TVH_QR_OTHER",
@@ -402,25 +1325,307 @@ def display_param_subset(df_params: pd.DataFrame, preferred: list[str]) -> pd.Da
     if not cols:
         return df_params.head(12)
     return df_params[cols].head(12)
+
+
+def load_biogeme_numeric_df_from_parquet(path: Path) -> pd.DataFrame:
+    return (
+        read_parquet_portable(str(path))
+        .select([pl.col(c).cast(pl.Float64) for c in MODEL_NUMERIC_COLUMNS])
+        .collect()
+        .to_pandas()
+    )
+
+
+def model_partition_param_names(names: list[str]) -> list[str]:
+    return [f"{name}_{MODEL_PARTITION}" for name in names]
+
+
+SUMMARY_PARAM_NAMES_FULL = model_partition_param_names([
+    "ASC_QR_RED",
+    "ASC_QR_OTHER",
+    "B_QR_RED_ANIO_2025",
+    "B_QR_OTHER_ANIO_2025",
+    "B_QR_RED_LOG_DEMAND",
+    "B_QR_OTHER_LOG_DEMAND",
+    "B_QR_RED_LOG_BUS_STOP_DENSITY",
+    "B_QR_OTHER_LOG_BUS_STOP_DENSITY",
+    "B_QR_RED_LOG_METRO_STATION_DENSITY",
+    "B_QR_OTHER_LOG_METRO_STATION_DENSITY",
+    "B_QR_RED_LOG_BUS_LINE_COUNT",
+    "B_QR_OTHER_LOG_BUS_LINE_COUNT",
+    "B_QR_RED_LOG_METRO_LINE_COUNT",
+    "B_QR_OTHER_LOG_METRO_LINE_COUNT",
+])
+SUMMARY_PARAM_NAMES_BUS_ONLY = model_partition_param_names([
+    "ASC_QR_RED",
+    "ASC_QR_OTHER",
+    "B_QR_RED_ANIO_2025",
+    "B_QR_OTHER_ANIO_2025",
+    "B_QR_RED_LOG_DEMAND",
+    "B_QR_OTHER_LOG_DEMAND",
+    "B_QR_RED_LOG_BUS_STOP_DENSITY",
+    "B_QR_OTHER_LOG_BUS_STOP_DENSITY",
+    "B_QR_RED_LOG_BUS_LINE_COUNT",
+    "B_QR_OTHER_LOG_BUS_LINE_COUNT",
+])
+SUMMARY_PARAM_NAMES_METRO_ONLY = model_partition_param_names([
+    "ASC_QR_RED",
+    "ASC_QR_OTHER",
+    "B_QR_RED_ANIO_2025",
+    "B_QR_OTHER_ANIO_2025",
+    "B_QR_RED_LOG_DEMAND",
+    "B_QR_OTHER_LOG_DEMAND",
+    "B_QR_RED_LOG_METRO_STATION_DENSITY",
+    "B_QR_OTHER_LOG_METRO_STATION_DENSITY",
+    "B_QR_RED_LOG_METRO_LINE_COUNT",
+    "B_QR_OTHER_LOG_METRO_LINE_COUNT",
+])
+SUMMARY_PARAM_NAMES_BUS_PLUS_METRO_STATION = model_partition_param_names([
+    "ASC_QR_RED",
+    "ASC_QR_OTHER",
+    "B_QR_RED_ANIO_2025",
+    "B_QR_OTHER_ANIO_2025",
+    "B_QR_RED_LOG_DEMAND",
+    "B_QR_OTHER_LOG_DEMAND",
+    "B_QR_RED_LOG_BUS_STOP_DENSITY",
+    "B_QR_OTHER_LOG_BUS_STOP_DENSITY",
+    "B_QR_RED_LOG_BUS_LINE_COUNT",
+    "B_QR_OTHER_LOG_BUS_LINE_COUNT",
+    "B_QR_RED_LOG_METRO_STATION_DENSITY",
+    "B_QR_OTHER_LOG_METRO_STATION_DENSITY",
+])
+SUMMARY_PARAM_NAMES_BUS_PLUS_METRO_LINE = model_partition_param_names([
+    "ASC_QR_RED",
+    "ASC_QR_OTHER",
+    "B_QR_RED_ANIO_2025",
+    "B_QR_OTHER_ANIO_2025",
+    "B_QR_RED_LOG_DEMAND",
+    "B_QR_OTHER_LOG_DEMAND",
+    "B_QR_RED_LOG_BUS_STOP_DENSITY",
+    "B_QR_OTHER_LOG_BUS_STOP_DENSITY",
+    "B_QR_RED_LOG_BUS_LINE_COUNT",
+    "B_QR_OTHER_LOG_BUS_LINE_COUNT",
+    "B_QR_RED_LOG_METRO_LINE_COUNT",
+    "B_QR_OTHER_LOG_METRO_LINE_COUNT",
+])
+SUMMARY_PARAM_NAMES_DENSITY_ONLY = model_partition_param_names([
+    "ASC_QR_RED",
+    "ASC_QR_OTHER",
+    "B_QR_RED_ANIO_2025",
+    "B_QR_OTHER_ANIO_2025",
+    "B_QR_RED_LOG_DEMAND",
+    "B_QR_OTHER_LOG_DEMAND",
+    "B_QR_RED_LOG_BUS_STOP_DENSITY",
+    "B_QR_OTHER_LOG_BUS_STOP_DENSITY",
+    "B_QR_RED_LOG_METRO_STATION_DENSITY",
+    "B_QR_OTHER_LOG_METRO_STATION_DENSITY",
+])
+
+
+def biogeme_stats_to_frame(stats: dict) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "metric": key,
+                "value": val[0] if isinstance(val, tuple) else val,
+            }
+            for key, val in stats.items()
+        ]
+    )
+
+
+def write_biogeme_result_csvs(
+    *,
+    params_df: pd.DataFrame,
+    stats: dict,
+    params_path: Path,
+    stats_path: Path,
+) -> None:
+    params_df.to_csv(params_path, index=False)
+    biogeme_stats_to_frame(stats).to_csv(stats_path, index=False)
+
+
+def load_biogeme_result_csvs(
+    *,
+    params_path: Path,
+    stats_path: Path,
+) -> tuple[dict | None, pd.DataFrame | None]:
+    if not (params_path.exists() and stats_path.exists()):
+        return None, None
+    params_df = pd.read_csv(params_path)
+    stats_df = pd.read_csv(stats_path)
+    stats = dict(zip(stats_df["metric"], stats_df["value"]))
+    return stats, params_df
 ```
 
-## 4) Construcción pooled 2024 + 2025
+## 4) Crosswalk bus por zona modal
+
+```{python}
+#| label: build-bus-zona-modal-crosswalk
+print("label: build-bus-zona-modal-crosswalk")
+df_bus_crosswalk, df_bus_crosswalk_summary = build_stop_zona_modal_crosswalk(
+    partitions=PARTITIONS,
+    valid_transport_types={"1", "3"},
+    ambiguity_threshold=0.80,
+)
+
+df_bus_crosswalk.write_parquet(OUT_BUS_STOP_ZONA_CROSSWALK)
+df_bus_crosswalk.filter(~pl.col("is_ambiguous_for_offer")).write_parquet(OUT_BUS_STOP_ZONA_CROSSWALK_OFFER_READY)
+print(f"✅ Crosswalk bus_stop -> zona_modal escrito en: {OUT_BUS_STOP_ZONA_CROSSWALK}")
+print(f"✅ Crosswalk bus_stop -> zona_modal offer-ready escrito en: {OUT_BUS_STOP_ZONA_CROSSWALK_OFFER_READY}")
+display(df_bus_crosswalk_summary)
+display(df_bus_crosswalk.filter(pl.col("is_ambiguous_for_offer")).head(10))
+```
+
+## 5) Crosswalk metro por zona modal
+
+```{python}
+#| label: build-metro-zona-modal-crosswalk
+print("label: build-metro-zona-modal-crosswalk")
+df_metro_crosswalk, df_metro_crosswalk_summary = build_stop_zona_modal_crosswalk(
+    partitions=PARTITIONS,
+    valid_transport_types={"2"},
+    ambiguity_threshold=0.80,
+)
+
+df_metro_crosswalk.write_parquet(OUT_METRO_STATION_ZONA_CROSSWALK)
+print(f"✅ Crosswalk metro_station -> zona_modal escrito en: {OUT_METRO_STATION_ZONA_CROSSWALK}")
+display(df_metro_crosswalk_summary)
+```
+
+## 6) Areas de ZONA777
+
+```{python}
+#| label: build-zona777-area
+print("label: build-zona777-area")
+df_zona_area = build_zona777_area_table(ZONAS777_SHP)
+df_zona_area.write_parquet(OUT_ZONA_AREA)
+print(f"✅ Área de ZONA777 escrita en: {OUT_ZONA_AREA}")
+display(df_zona_area.head())
+```
+
+## 7) Densidad de paraderos bus por zona
+
+```{python}
+#| label: build-bus-infra-context
+print("label: build-bus-infra-context")
+df_bus_infra = build_bus_stop_density_by_zone(
+    zona_area=df_zona_area,
+    bus_crosswalk_offer_ready=df_bus_crosswalk.filter(~pl.col("is_ambiguous_for_offer")),
+)
+df_bus_infra.write_parquet(OUT_BUS_INFRA_CONTEXT)
+print(f"✅ Densidad bus por zona escrita en: {OUT_BUS_INFRA_CONTEXT}")
+display(df_bus_infra.select(["N_BUS_STOPS", "BUS_STOP_DENSITY", "LOG_BUS_STOP_DENSITY"]).describe())
+```
+
+## 8) Densidad de estaciones Metro por zona
+
+```{python}
+#| label: build-metro-infra-context
+print("label: build-metro-infra-context")
+df_metro_infra = build_metro_station_density_by_zone(
+    zona_area=df_zona_area,
+    metro_crosswalk_offer_ready=df_metro_crosswalk,
+)
+df_metro_infra.write_parquet(OUT_METRO_INFRA_CONTEXT)
+print(f"✅ Densidad metro por zona escrita en: {OUT_METRO_INFRA_CONTEXT}")
+display(df_metro_infra.select(["N_METRO_STATIONS", "METRO_STATION_DENSITY", "LOG_METRO_STATION_DENSITY"]).describe())
+```
+
+## 9) Conteo de líneas bus por zona y franja
+
+```{python}
+#| label: build-bus-line-count-context
+print("label: build-bus-line-count-context")
+bus_line_frames = []
+for partition in PARTITIONS:
+    df_bus_line_partition = build_bus_line_count_by_zone_franja(
+        partition=partition,
+        bus_crosswalk_offer_ready=df_bus_crosswalk.filter(~pl.col("is_ambiguous_for_offer")),
+        valid_zonas=df_zona_area.select(["zona_inicio_viaje"]),
+    )
+    bus_line_frames.append(df_bus_line_partition)
+
+df_bus_line_count_pooled = pl.concat(bus_line_frames, how="diagonal_relaxed")
+df_bus_line_count_pooled.write_parquet(OUT_BUS_LINE_COUNT_CONTEXT)
+
+print(f"✅ BUS_LINE_COUNT pooled escrito en: {OUT_BUS_LINE_COUNT_CONTEXT}")
+display(
+    df_bus_line_count_pooled.group_by(["partition", "franja_v2"]).agg(
+        pl.len().alias("n_zona_franja_cells"),
+        pl.col("BUS_LINE_COUNT").mean().alias("bus_line_count_mean"),
+        pl.col("LOG_BUS_LINE_COUNT").mean().alias("log_bus_line_count_mean"),
+    ).sort(["partition", "franja_v2"])
+)
+```
+
+## 10) Conteo de líneas Metro por zona y franja
+
+```{python}
+#| label: build-metro-line-count-context
+print("label: build-metro-line-count-context")
+metro_line_frames = []
+for partition in PARTITIONS:
+    df_metro_line_partition = build_metro_line_count_by_zone_franja(
+        partition=partition,
+        metro_crosswalk_offer_ready=df_metro_crosswalk,
+        valid_zonas=df_zona_area.select(["zona_inicio_viaje"]),
+    )
+    metro_line_frames.append(df_metro_line_partition)
+
+df_metro_line_count_pooled = pl.concat(metro_line_frames, how="diagonal_relaxed")
+df_metro_line_count_pooled.write_parquet(OUT_METRO_LINE_COUNT_CONTEXT)
+
+print(f"✅ METRO_LINE_COUNT pooled escrito en: {OUT_METRO_LINE_COUNT_CONTEXT}")
+display(
+    df_metro_line_count_pooled.group_by(["partition", "franja_v2"]).agg(
+        pl.len().alias("n_zona_franja_cells"),
+        pl.col("METRO_LINE_COUNT").mean().alias("metro_line_count_mean"),
+        pl.col("LOG_METRO_LINE_COUNT").mean().alias("log_metro_line_count_mean"),
+    ).sort(["partition", "franja_v2"])
+)
+```
+
+## 11) Construcción pooled 2024 + 2025
 
 ```{python}
 #| label: build-pooled-context
 print("label: build-pooled-context")
 od_frames = []
 trip_frames = []
+demand_frames = []
 
 for partition in PARTITIONS:
-    df_od_alt, df_trips = build_partition_trip_context(partition)
+    df_od_alt, df_trips, df_demand_base = build_partition_trip_context(partition)
     od_frames.append(df_od_alt.with_columns(pl.lit(partition).alias("partition")))
     trip_frames.append(df_trips)
+    demand_frames.append(df_demand_base)
     gc.collect()
 
 df_od_pooled = pl.concat(od_frames, how="diagonal_relaxed")
 df_trips_pooled = pl.concat(trip_frames, how="diagonal_relaxed")
-df_trips_pooled, df_demand_pooled = add_origin_demand_controls(df_trips_pooled)
+df_demand_base_pooled = pl.concat(demand_frames, how="diagonal_relaxed")
+valid_origin_zonas = df_zona_area.select(["zona_inicio_viaje"])
+df_trips_pooled, trips_zone_filter_diag = filter_to_valid_origin_zones(
+    df_trips_pooled,
+    valid_origin_zonas,
+    "df_trips_pooled",
+)
+df_demand_base_pooled, demand_zone_filter_diag = filter_to_valid_origin_zones(
+    df_demand_base_pooled,
+    valid_origin_zonas,
+    "df_demand_base_pooled",
+)
+print(f"   filtro zonas trips  : {trips_zone_filter_diag}")
+print(f"   filtro zonas demand : {demand_zone_filter_diag}")
+df_trips_pooled, df_demand_pooled = add_origin_demand_controls(df_trips_pooled, df_demand_base_pooled)
+df_trips_pooled = add_origin_offer_controls(
+    df_trips_pooled,
+    df_bus_infra,
+    df_metro_infra,
+    df_bus_line_count_pooled,
+    df_metro_line_count_pooled,
+)
 
 df_od_pooled.write_parquet(OUT_OD_CONTEXT)
 df_trips_pooled.write_parquet(OUT_TRIPS_CONTEXT)
@@ -432,7 +1637,7 @@ print(f"   trip rows : {df_trips_pooled.height:,}")
 print(f"   demand cells : {df_demand_pooled.height:,}")
 ```
 
-## 5) Checks rápidos del dataset pooled
+## 9) Checks rápidos del dataset pooled
 
 ```{python}
 #| label: pooled-checks
@@ -454,6 +1659,11 @@ display(
             pl.len().alias("rows"),
             pl.col("DUMMY_ANIO_2025").mean().alias("dummy_anio_2025_mean"),
             pl.col("LOG_N_VIAJES_ZONA_INICIO_FRANJA").mean().alias("log_n_viajes_zona_inicio_franja_mean"),
+            pl.col("LOG_BUS_STOP_DENSITY").mean().alias("log_bus_stop_density_mean"),
+            pl.col("LOG_METRO_STATION_DENSITY").mean().alias("log_metro_station_density_mean"),
+            pl.col("LOG_BUS_LINE_COUNT").mean().alias("log_bus_line_count_mean"),
+            pl.col("LOG_METRO_LINE_COUNT").mean().alias("log_metro_line_count_mean"),
+            (pl.col("METRO_LINE_COUNT") == 0).mean().alias("metro_line_count_zero_share"),
             pl.col("N_BIP").mean().alias("N_BIP_mean"),
             pl.col("N_QR_RED").mean().alias("N_QR_RED_mean"),
             pl.col("N_QR_OTHER").mean().alias("N_QR_OTHER_mean"),
@@ -471,9 +1681,20 @@ display(
         ]
     ).sort(["partition", "franja_v2"])
 )
+
+display(
+    df_trips_pooled.group_by(["partition", "franja_v2"]).agg(
+        [
+            pl.len().alias("rows"),
+            pl.col("LOG_BUS_LINE_COUNT").mean().alias("log_bus_line_count_mean"),
+            pl.col("LOG_METRO_LINE_COUNT").mean().alias("log_metro_line_count_mean"),
+            (pl.col("METRO_LINE_COUNT") == 0).mean().alias("metro_line_count_zero_share"),
+        ]
+    ).sort(["partition", "franja_v2"])
+)
 ```
 
-## 6) Muestra de estimación Biogeme
+## 10) Muestra de estimación Biogeme
 
 ```{python}
 #| label: estimation-sample
@@ -486,6 +1707,9 @@ df_trips_est = stratified_sample_partition_choice(
     seed=42,
 )
 
+df_trips_est.write_parquet(OUT_ESTIMATION_SAMPLE)
+print(f"✅ Muestra de estimación escrita en: {OUT_ESTIMATION_SAMPLE}")
+
 display(
     df_trips_est.group_by(["partition", "choice_nested"]).agg(pl.len().alias("rows")).sort(["partition", "choice_nested"])
 )
@@ -497,31 +1721,32 @@ display(
 
 ## 7) Estimación nested interanual
 
+
 ```{python}
-#| label: nested-smoke
-print("label: nested-smoke")
-df_smoke = (
-    df_trips_est
-    .sample(fraction=0.02, seed=42)
-)
-df_smoke_pd = to_biogeme_numeric_df(df_smoke)
-
-smoke_stats, smoke_params = estimate_nested_option1_alt_specific_enriched(
-    df_smoke_pd,
-    partition=MODEL_PARTITION,
-    model_name=MODEL_NAME_SMOKE,
-    clean_run_no_iter=True,
-    project_root=PROJECT_ROOT,
-    quick=True,
-)
-
-display(display_param_subset(smoke_params, ["Name", "Value", "Rob. p-value", "Rob. p-value", "p-value", "Rob. t-test"]))
+#| label: release-estimation-memory
+print("label: release-estimation-memory")
+for name in [
+    "df_smoke",
+    "df_smoke_pd",
+    "df_trips_est",
+    "df_od_pooled",
+    "df_trips_pooled",
+    "df_demand_base_pooled",
+    "df_demand_pooled",
+    "od_frames",
+    "trip_frames",
+    "demand_frames",
+]:
+    if name in globals():
+        del globals()[name]
+gc.collect()
+print("✅ Memoria liberada antes de la estimación full; los modelos cargarán la muestra desde parquet.")
 ```
 
 ```{python}
 #| label: nested-full
 print("label: nested-full")
-df_model = to_biogeme_numeric_df(df_trips_est)
+df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE)
 
 stats_nested, params_nested = estimate_nested_option1_alt_specific_enriched(
     df_model,
@@ -531,8 +1756,73 @@ stats_nested, params_nested = estimate_nested_option1_alt_specific_enriched(
     project_root=PROJECT_ROOT,
     quick=False,
 )
+write_biogeme_result_csvs(
+    params_df=params_nested,
+    stats=stats_nested,
+    params_path=NESTED_PARAMS_CSV,
+    stats_path=NESTED_STATS_CSV,
+)
+print(f"✅ Nested guardado en: {BIOGEME_RESULTS_DIR}")
 
 display(display_param_subset(params_nested, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model
+gc.collect()
+```
+
+```{python}
+#| label: nested-bus-only-full
+print("label: nested-bus-only-full")
+df_model_nested_bus_only = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE)
+
+stats_nested_bus_only, params_nested_bus_only = estimate_nested_option1_alt_specific_enriched(
+    df_model_nested_bus_only,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_NESTED_BUS_ONLY,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+    quick=False,
+    include_bus_offer=True,
+    include_metro_offer=False,
+)
+write_biogeme_result_csvs(
+    params_df=params_nested_bus_only,
+    stats=stats_nested_bus_only,
+    params_path=NESTED_BUS_ONLY_PARAMS_CSV,
+    stats_path=NESTED_BUS_ONLY_STATS_CSV,
+)
+print(f"✅ Nested bus_only guardado en: {BIOGEME_RESULTS_DIR}")
+
+display(display_param_subset(params_nested_bus_only, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_nested_bus_only
+gc.collect()
+```
+
+```{python}
+#| label: nested-metro-only-full
+print("label: nested-metro-only-full")
+df_model_nested_metro_only = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE)
+
+stats_nested_metro_only, params_nested_metro_only = estimate_nested_option1_alt_specific_enriched(
+    df_model_nested_metro_only,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_NESTED_METRO_ONLY,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+    quick=False,
+    include_bus_offer=False,
+    include_metro_offer=True,
+)
+write_biogeme_result_csvs(
+    params_df=params_nested_metro_only,
+    stats=stats_nested_metro_only,
+    params_path=NESTED_METRO_ONLY_PARAMS_CSV,
+    stats_path=NESTED_METRO_ONLY_STATS_CSV,
+)
+print(f"✅ Nested metro_only guardado en: {BIOGEME_RESULTS_DIR}")
+
+display(display_param_subset(params_nested_metro_only, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_nested_metro_only
+gc.collect()
 ```
 
 ```{python}
@@ -557,18 +1847,630 @@ display(
     params_nested[
         params_nested["Name"].isin([
             "MU_QR_" + MODEL_PARTITION,
-            "ASC_QR_RED_" + MODEL_PARTITION,
-            "ASC_QR_OTHER_" + MODEL_PARTITION,
-            "B_QR_RED_ANIO_2025_" + MODEL_PARTITION,
-            "B_QR_OTHER_ANIO_2025_" + MODEL_PARTITION,
-            "B_QR_RED_LOG_DEMAND_" + MODEL_PARTITION,
-            "B_QR_OTHER_LOG_DEMAND_" + MODEL_PARTITION,
+            *SUMMARY_PARAM_NAMES_FULL,
         ])
     ][[c for c in ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"] if c in params_nested.columns]]
 )
 ```
 
+```{python}
+#| label: nested-bus-only-summary
+print("label: nested-bus-only-summary")
+summary_keys_nested_bus_only = [
+    "Final log likelihood",
+    "Rho-square for the init. model",
+    "Rho-square-bar for the init. model",
+    "Akaike Information Criterion",
+    "Bayesian Information Criterion",
+]
+summary_rows_nested_bus_only = []
+for key in summary_keys_nested_bus_only:
+    val = stats_nested_bus_only.get(key)
+    if val is None:
+        continue
+    summary_rows_nested_bus_only.append({"metric": key, "value": val[0] if isinstance(val, tuple) else val})
+
+display(pl.DataFrame(summary_rows_nested_bus_only))
+display(
+    params_nested_bus_only[
+        params_nested_bus_only["Name"].isin([
+            "MU_QR_" + MODEL_PARTITION,
+            *SUMMARY_PARAM_NAMES_BUS_ONLY,
+        ])
+    ][[c for c in ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"] if c in params_nested_bus_only.columns]]
+)
+```
+
+```{python}
+#| label: nested-metro-only-summary
+print("label: nested-metro-only-summary")
+summary_keys_nested_metro_only = [
+    "Final log likelihood",
+    "Rho-square for the init. model",
+    "Rho-square-bar for the init. model",
+    "Akaike Information Criterion",
+    "Bayesian Information Criterion",
+]
+summary_rows_nested_metro_only = []
+for key in summary_keys_nested_metro_only:
+    val = stats_nested_metro_only.get(key)
+    if val is None:
+        continue
+    summary_rows_nested_metro_only.append({"metric": key, "value": val[0] if isinstance(val, tuple) else val})
+
+display(pl.DataFrame(summary_rows_nested_metro_only))
+display(
+    params_nested_metro_only[
+        params_nested_metro_only["Name"].isin([
+            "MU_QR_" + MODEL_PARTITION,
+            *SUMMARY_PARAM_NAMES_METRO_ONLY,
+        ])
+    ][[c for c in ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"] if c in params_nested_metro_only.columns]]
+)
+```
+
+```{python}
+#| label: nested-full-results
+print("label: nested-full-results")
+display(pd.DataFrame([
+    {
+        "metric": key,
+        "value": val[0] if isinstance(val, tuple) else val,
+    }
+    for key, val in stats_nested.items()
+]))
+display(params_nested)
+```
+
+```{python}
+#| label: nested-bus-only-full-results
+print("label: nested-bus-only-full-results")
+display(pd.DataFrame([
+    {
+        "metric": key,
+        "value": val[0] if isinstance(val, tuple) else val,
+    }
+    for key, val in stats_nested_bus_only.items()
+]))
+display(params_nested_bus_only)
+```
+
+```{python}
+#| label: nested-metro-only-full-results
+print("label: nested-metro-only-full-results")
+display(pd.DataFrame([
+    {
+        "metric": key,
+        "value": val[0] if isinstance(val, tuple) else val,
+    }
+    for key, val in stats_nested_metro_only.items()
+]))
+display(params_nested_metro_only)
+```
+
 ## 8) Próximo bloque: controles de demanda y oferta
+
+```{python}
+#| label: mnl-full
+print("label: mnl-full")
+df_model_mnl = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE)
+
+stats_mnl, params_mnl = estimate_mnl_option1_alt_specific_enriched(
+    df_model_mnl,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_FULL,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl,
+    stats=stats_mnl,
+    params_path=MNL_PARAMS_CSV,
+    stats_path=MNL_STATS_CSV,
+)
+print(f"✅ MNL guardado en: {BIOGEME_RESULTS_DIR}")
+
+display(display_param_subset(params_mnl, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_mnl
+gc.collect()
+```
+
+```{python}
+#| label: mnl-bus-only-full
+print("label: mnl-bus-only-full")
+df_model_mnl_bus_only = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE)
+
+stats_mnl_bus_only, params_mnl_bus_only = estimate_mnl_option1_alt_specific_enriched(
+    df_model_mnl_bus_only,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_BUS_ONLY,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+    include_bus_offer=True,
+    include_metro_offer=False,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_bus_only,
+    stats=stats_mnl_bus_only,
+    params_path=MNL_BUS_ONLY_PARAMS_CSV,
+    stats_path=MNL_BUS_ONLY_STATS_CSV,
+)
+print(f"✅ MNL bus_only guardado en: {BIOGEME_RESULTS_DIR}")
+
+display(display_param_subset(params_mnl_bus_only, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_mnl_bus_only
+gc.collect()
+```
+
+```{python}
+#| label: mnl-metro-only-full
+print("label: mnl-metro-only-full")
+df_model_mnl_metro_only = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE)
+
+stats_mnl_metro_only, params_mnl_metro_only = estimate_mnl_option1_alt_specific_enriched(
+    df_model_mnl_metro_only,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_METRO_ONLY,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+    include_bus_offer=False,
+    include_metro_offer=True,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_metro_only,
+    stats=stats_mnl_metro_only,
+    params_path=MNL_METRO_ONLY_PARAMS_CSV,
+    stats_path=MNL_METRO_ONLY_STATS_CSV,
+)
+print(f"✅ MNL metro_only guardado en: {BIOGEME_RESULTS_DIR}")
+
+display(display_param_subset(params_mnl_metro_only, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_mnl_metro_only
+gc.collect()
+```
+
+```{python}
+#| label: mnl-bus-plus-metro-station-full
+print("label: mnl-bus-plus-metro-station-full")
+df_model_mnl_bus_plus_metro_station = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE)
+
+stats_mnl_bus_plus_metro_station, params_mnl_bus_plus_metro_station = estimate_mnl_option1_alt_specific_enriched(
+    df_model_mnl_bus_plus_metro_station,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_BUS_PLUS_METRO_STATION,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+    include_bus_stop_density=True,
+    include_bus_line_count=True,
+    include_metro_station_density=True,
+    include_metro_line_count=False,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_bus_plus_metro_station,
+    stats=stats_mnl_bus_plus_metro_station,
+    params_path=MNL_BUS_PLUS_METRO_STATION_PARAMS_CSV,
+    stats_path=MNL_BUS_PLUS_METRO_STATION_STATS_CSV,
+)
+print(f"✅ MNL bus+metro_station guardado en: {BIOGEME_RESULTS_DIR}")
+
+display(display_param_subset(params_mnl_bus_plus_metro_station, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_mnl_bus_plus_metro_station
+gc.collect()
+```
+
+```{python}
+#| label: mnl-bus-plus-metro-line-full
+print("label: mnl-bus-plus-metro-line-full")
+df_model_mnl_bus_plus_metro_line = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE)
+
+stats_mnl_bus_plus_metro_line, params_mnl_bus_plus_metro_line = estimate_mnl_option1_alt_specific_enriched(
+    df_model_mnl_bus_plus_metro_line,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_BUS_PLUS_METRO_LINE,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+    include_bus_stop_density=True,
+    include_bus_line_count=True,
+    include_metro_station_density=False,
+    include_metro_line_count=True,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_bus_plus_metro_line,
+    stats=stats_mnl_bus_plus_metro_line,
+    params_path=MNL_BUS_PLUS_METRO_LINE_PARAMS_CSV,
+    stats_path=MNL_BUS_PLUS_METRO_LINE_STATS_CSV,
+)
+print(f"✅ MNL bus+metro_line guardado en: {BIOGEME_RESULTS_DIR}")
+
+display(display_param_subset(params_mnl_bus_plus_metro_line, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_mnl_bus_plus_metro_line
+gc.collect()
+```
+
+```{python}
+#| label: mnl-density-only-full
+print("label: mnl-density-only-full")
+df_model_mnl_density_only = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE)
+
+stats_mnl_density_only, params_mnl_density_only = estimate_mnl_option1_alt_specific_enriched(
+    df_model_mnl_density_only,
+    partition=MODEL_PARTITION,
+    model_name=MODEL_NAME_MNL_DENSITY_ONLY,
+    clean_run_no_iter=True,
+    project_root=PROJECT_ROOT,
+    include_bus_stop_density=True,
+    include_bus_line_count=False,
+    include_metro_station_density=True,
+    include_metro_line_count=False,
+)
+write_biogeme_result_csvs(
+    params_df=params_mnl_density_only,
+    stats=stats_mnl_density_only,
+    params_path=MNL_DENSITY_ONLY_PARAMS_CSV,
+    stats_path=MNL_DENSITY_ONLY_STATS_CSV,
+)
+print(f"✅ MNL density_only guardado en: {BIOGEME_RESULTS_DIR}")
+
+display(display_param_subset(params_mnl_density_only, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+del df_model_mnl_density_only
+gc.collect()
+```
+
+```{python}
+#| label: load-results
+print("label: load-results")
+
+stats_nested_loaded, params_nested_loaded = load_biogeme_result_csvs(
+    params_path=NESTED_PARAMS_CSV,
+    stats_path=NESTED_STATS_CSV,
+)
+stats_nested_bus_only_loaded, params_nested_bus_only_loaded = load_biogeme_result_csvs(
+    params_path=NESTED_BUS_ONLY_PARAMS_CSV,
+    stats_path=NESTED_BUS_ONLY_STATS_CSV,
+)
+stats_nested_metro_only_loaded, params_nested_metro_only_loaded = load_biogeme_result_csvs(
+    params_path=NESTED_METRO_ONLY_PARAMS_CSV,
+    stats_path=NESTED_METRO_ONLY_STATS_CSV,
+)
+stats_mnl_loaded, params_mnl_loaded = load_biogeme_result_csvs(
+    params_path=MNL_PARAMS_CSV,
+    stats_path=MNL_STATS_CSV,
+)
+stats_mnl_bus_only_loaded, params_mnl_bus_only_loaded = load_biogeme_result_csvs(
+    params_path=MNL_BUS_ONLY_PARAMS_CSV,
+    stats_path=MNL_BUS_ONLY_STATS_CSV,
+)
+stats_mnl_metro_only_loaded, params_mnl_metro_only_loaded = load_biogeme_result_csvs(
+    params_path=MNL_METRO_ONLY_PARAMS_CSV,
+    stats_path=MNL_METRO_ONLY_STATS_CSV,
+)
+stats_mnl_bus_plus_metro_station_loaded, params_mnl_bus_plus_metro_station_loaded = load_biogeme_result_csvs(
+    params_path=MNL_BUS_PLUS_METRO_STATION_PARAMS_CSV,
+    stats_path=MNL_BUS_PLUS_METRO_STATION_STATS_CSV,
+)
+stats_mnl_bus_plus_metro_line_loaded, params_mnl_bus_plus_metro_line_loaded = load_biogeme_result_csvs(
+    params_path=MNL_BUS_PLUS_METRO_LINE_PARAMS_CSV,
+    stats_path=MNL_BUS_PLUS_METRO_LINE_STATS_CSV,
+)
+stats_mnl_density_only_loaded, params_mnl_density_only_loaded = load_biogeme_result_csvs(
+    params_path=MNL_DENSITY_ONLY_PARAMS_CSV,
+    stats_path=MNL_DENSITY_ONLY_STATS_CSV,
+)
+
+if stats_nested_loaded is not None and params_nested_loaded is not None:
+    stats_nested = stats_nested_loaded
+    params_nested = params_nested_loaded
+    print(f"✅ Nested cargado desde: {BIOGEME_RESULTS_DIR}")
+else:
+    print(f"⚠️ Nested no encontrado en: {BIOGEME_RESULTS_DIR}")
+
+if stats_nested_bus_only_loaded is not None and params_nested_bus_only_loaded is not None:
+    stats_nested_bus_only = stats_nested_bus_only_loaded
+    params_nested_bus_only = params_nested_bus_only_loaded
+    print(f"✅ Nested bus_only cargado desde: {BIOGEME_RESULTS_DIR}")
+else:
+    print(f"⚠️ Nested bus_only no encontrado en: {BIOGEME_RESULTS_DIR}")
+
+if stats_nested_metro_only_loaded is not None and params_nested_metro_only_loaded is not None:
+    stats_nested_metro_only = stats_nested_metro_only_loaded
+    params_nested_metro_only = params_nested_metro_only_loaded
+    print(f"✅ Nested metro_only cargado desde: {BIOGEME_RESULTS_DIR}")
+else:
+    print(f"⚠️ Nested metro_only no encontrado en: {BIOGEME_RESULTS_DIR}")
+
+if stats_mnl_loaded is not None and params_mnl_loaded is not None:
+    stats_mnl = stats_mnl_loaded
+    params_mnl = params_mnl_loaded
+    print(f"✅ MNL cargado desde: {BIOGEME_RESULTS_DIR}")
+else:
+    print(f"⚠️ MNL no encontrado en: {BIOGEME_RESULTS_DIR}")
+
+if stats_mnl_bus_only_loaded is not None and params_mnl_bus_only_loaded is not None:
+    stats_mnl_bus_only = stats_mnl_bus_only_loaded
+    params_mnl_bus_only = params_mnl_bus_only_loaded
+    print(f"✅ MNL bus_only cargado desde: {BIOGEME_RESULTS_DIR}")
+else:
+    print(f"⚠️ MNL bus_only no encontrado en: {BIOGEME_RESULTS_DIR}")
+
+if stats_mnl_metro_only_loaded is not None and params_mnl_metro_only_loaded is not None:
+    stats_mnl_metro_only = stats_mnl_metro_only_loaded
+    params_mnl_metro_only = params_mnl_metro_only_loaded
+    print(f"✅ MNL metro_only cargado desde: {BIOGEME_RESULTS_DIR}")
+else:
+    print(f"⚠️ MNL metro_only no encontrado en: {BIOGEME_RESULTS_DIR}")
+
+if stats_mnl_bus_plus_metro_station_loaded is not None and params_mnl_bus_plus_metro_station_loaded is not None:
+    stats_mnl_bus_plus_metro_station = stats_mnl_bus_plus_metro_station_loaded
+    params_mnl_bus_plus_metro_station = params_mnl_bus_plus_metro_station_loaded
+    print(f"✅ MNL bus+metro_station cargado desde: {BIOGEME_RESULTS_DIR}")
+else:
+    print(f"⚠️ MNL bus+metro_station no encontrado en: {BIOGEME_RESULTS_DIR}")
+
+if stats_mnl_bus_plus_metro_line_loaded is not None and params_mnl_bus_plus_metro_line_loaded is not None:
+    stats_mnl_bus_plus_metro_line = stats_mnl_bus_plus_metro_line_loaded
+    params_mnl_bus_plus_metro_line = params_mnl_bus_plus_metro_line_loaded
+    print(f"✅ MNL bus+metro_line cargado desde: {BIOGEME_RESULTS_DIR}")
+else:
+    print(f"⚠️ MNL bus+metro_line no encontrado en: {BIOGEME_RESULTS_DIR}")
+
+if stats_mnl_density_only_loaded is not None and params_mnl_density_only_loaded is not None:
+    stats_mnl_density_only = stats_mnl_density_only_loaded
+    params_mnl_density_only = params_mnl_density_only_loaded
+    print(f"✅ MNL density_only cargado desde: {BIOGEME_RESULTS_DIR}")
+else:
+    print(f"⚠️ MNL density_only no encontrado en: {BIOGEME_RESULTS_DIR}")
+```
+
+```{python}
+#| label: mnl-summary
+print("label: mnl-summary")
+summary_keys = [
+    "Final log likelihood",
+    "Rho-square for the init. model",
+    "Rho-square-bar for the init. model",
+    "Akaike Information Criterion",
+    "Bayesian Information Criterion",
+]
+summary_rows_mnl = []
+for key in summary_keys:
+    val = stats_mnl.get(key)
+    if val is None:
+        continue
+    summary_rows_mnl.append({"metric": key, "value": val[0] if isinstance(val, tuple) else val})
+
+display(pl.DataFrame(summary_rows_mnl))
+display(
+    params_mnl[
+        params_mnl["Name"].isin(SUMMARY_PARAM_NAMES_FULL)
+    ][[c for c in ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"] if c in params_mnl.columns]]
+)
+```
+
+```{python}
+#| label: mnl-bus-only-summary
+print("label: mnl-bus-only-summary")
+summary_keys_bus_only = [
+    "Final log likelihood",
+    "Rho-square for the init. model",
+    "Rho-square-bar for the init. model",
+    "Akaike Information Criterion",
+    "Bayesian Information Criterion",
+]
+summary_rows_mnl_bus_only = []
+for key in summary_keys_bus_only:
+    val = stats_mnl_bus_only.get(key)
+    if val is None:
+        continue
+    summary_rows_mnl_bus_only.append({"metric": key, "value": val[0] if isinstance(val, tuple) else val})
+
+display(pl.DataFrame(summary_rows_mnl_bus_only))
+display(
+    params_mnl_bus_only[
+        params_mnl_bus_only["Name"].isin(SUMMARY_PARAM_NAMES_BUS_ONLY)
+    ][[c for c in ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"] if c in params_mnl_bus_only.columns]]
+)
+```
+
+```{python}
+#| label: mnl-metro-only-summary
+print("label: mnl-metro-only-summary")
+summary_keys_metro_only = [
+    "Final log likelihood",
+    "Rho-square for the init. model",
+    "Rho-square-bar for the init. model",
+    "Akaike Information Criterion",
+    "Bayesian Information Criterion",
+]
+summary_rows_mnl_metro_only = []
+for key in summary_keys_metro_only:
+    val = stats_mnl_metro_only.get(key)
+    if val is None:
+        continue
+    summary_rows_mnl_metro_only.append({"metric": key, "value": val[0] if isinstance(val, tuple) else val})
+
+display(pl.DataFrame(summary_rows_mnl_metro_only))
+display(
+    params_mnl_metro_only[
+        params_mnl_metro_only["Name"].isin(SUMMARY_PARAM_NAMES_METRO_ONLY)
+    ][[c for c in ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"] if c in params_mnl_metro_only.columns]]
+)
+```
+
+```{python}
+#| label: mnl-bus-plus-metro-station-summary
+print("label: mnl-bus-plus-metro-station-summary")
+summary_keys_bus_plus_metro_station = [
+    "Final log likelihood",
+    "Rho-square for the init. model",
+    "Rho-square-bar for the init. model",
+    "Akaike Information Criterion",
+    "Bayesian Information Criterion",
+]
+summary_rows_mnl_bus_plus_metro_station = []
+for key in summary_keys_bus_plus_metro_station:
+    val = stats_mnl_bus_plus_metro_station.get(key)
+    if val is None:
+        continue
+    summary_rows_mnl_bus_plus_metro_station.append({"metric": key, "value": val[0] if isinstance(val, tuple) else val})
+
+display(pl.DataFrame(summary_rows_mnl_bus_plus_metro_station))
+display(
+    params_mnl_bus_plus_metro_station[
+        params_mnl_bus_plus_metro_station["Name"].isin(SUMMARY_PARAM_NAMES_BUS_PLUS_METRO_STATION)
+    ][[c for c in ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"] if c in params_mnl_bus_plus_metro_station.columns]]
+)
+```
+
+```{python}
+#| label: mnl-bus-plus-metro-line-summary
+print("label: mnl-bus-plus-metro-line-summary")
+summary_keys_bus_plus_metro_line = [
+    "Final log likelihood",
+    "Rho-square for the init. model",
+    "Rho-square-bar for the init. model",
+    "Akaike Information Criterion",
+    "Bayesian Information Criterion",
+]
+summary_rows_mnl_bus_plus_metro_line = []
+for key in summary_keys_bus_plus_metro_line:
+    val = stats_mnl_bus_plus_metro_line.get(key)
+    if val is None:
+        continue
+    summary_rows_mnl_bus_plus_metro_line.append({"metric": key, "value": val[0] if isinstance(val, tuple) else val})
+
+display(pl.DataFrame(summary_rows_mnl_bus_plus_metro_line))
+display(
+    params_mnl_bus_plus_metro_line[
+        params_mnl_bus_plus_metro_line["Name"].isin(SUMMARY_PARAM_NAMES_BUS_PLUS_METRO_LINE)
+    ][[c for c in ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"] if c in params_mnl_bus_plus_metro_line.columns]]
+)
+```
+
+```{python}
+#| label: mnl-density-only-summary
+print("label: mnl-density-only-summary")
+summary_keys_density_only = [
+    "Final log likelihood",
+    "Rho-square for the init. model",
+    "Rho-square-bar for the init. model",
+    "Akaike Information Criterion",
+    "Bayesian Information Criterion",
+]
+summary_rows_mnl_density_only = []
+for key in summary_keys_density_only:
+    val = stats_mnl_density_only.get(key)
+    if val is None:
+        continue
+    summary_rows_mnl_density_only.append({"metric": key, "value": val[0] if isinstance(val, tuple) else val})
+
+display(pl.DataFrame(summary_rows_mnl_density_only))
+display(
+    params_mnl_density_only[
+        params_mnl_density_only["Name"].isin(SUMMARY_PARAM_NAMES_DENSITY_ONLY)
+    ][[c for c in ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"] if c in params_mnl_density_only.columns]]
+)
+```
+
+```{python}
+#| label: mnl-full-results
+print("label: mnl-full-results")
+display(pd.DataFrame([
+    {
+        "metric": key,
+        "value": val[0] if isinstance(val, tuple) else val,
+    }
+    for key, val in stats_mnl.items()
+]))
+display(params_mnl)
+```
+
+```{python}
+#| label: mnl-bus-only-full-results
+print("label: mnl-bus-only-full-results")
+display(pd.DataFrame([
+    {
+        "metric": key,
+        "value": val[0] if isinstance(val, tuple) else val,
+    }
+    for key, val in stats_mnl_bus_only.items()
+]))
+display(params_mnl_bus_only)
+```
+
+```{python}
+#| label: mnl-metro-only-full-results
+print("label: mnl-metro-only-full-results")
+display(pd.DataFrame([
+    {
+        "metric": key,
+        "value": val[0] if isinstance(val, tuple) else val,
+    }
+    for key, val in stats_mnl_metro_only.items()
+]))
+display(params_mnl_metro_only)
+```
+
+```{python}
+#| label: mnl-bus-plus-metro-station-full-results
+print("label: mnl-bus-plus-metro-station-full-results")
+display(pd.DataFrame([
+    {
+        "metric": key,
+        "value": val[0] if isinstance(val, tuple) else val,
+    }
+    for key, val in stats_mnl_bus_plus_metro_station.items()
+]))
+display(params_mnl_bus_plus_metro_station)
+```
+
+```{python}
+#| label: mnl-bus-plus-metro-line-full-results
+print("label: mnl-bus-plus-metro-line-full-results")
+display(pd.DataFrame([
+    {
+        "metric": key,
+        "value": val[0] if isinstance(val, tuple) else val,
+    }
+    for key, val in stats_mnl_bus_plus_metro_line.items()
+]))
+display(params_mnl_bus_plus_metro_line)
+```
+
+```{python}
+#| label: mnl-density-only-full-results
+print("label: mnl-density-only-full-results")
+display(pd.DataFrame([
+    {
+        "metric": key,
+        "value": val[0] if isinstance(val, tuple) else val,
+    }
+    for key, val in stats_mnl_density_only.items()
+]))
+display(params_mnl_density_only)
+```
+
+```{python}
+#| label: compare-nested-vs-mnl
+print("label: compare-nested-vs-mnl")
+compare_rows = []
+for model_label, stats_obj in [
+    ("nested", stats_nested),
+    ("mnl", stats_mnl),
+]:
+    row = {"model": model_label}
+    for key in [
+        "Final log likelihood",
+        "Rho-square for the init. model",
+        "Rho-square-bar for the init. model",
+        "Akaike Information Criterion",
+        "Bayesian Information Criterion",
+    ]:
+        val = stats_obj.get(key)
+        row[key] = val[0] if isinstance(val, tuple) else val
+    compare_rows.append(row)
+
+display(pl.DataFrame(compare_rows))
+```
 
 ```{python}
 #| label: demand-supply-placeholder

@@ -71,21 +71,27 @@ print("Larch version:", lx.__version__)
 ```{python}
 #| label: config
 
-POOLED_PATH = PROJECT_ROOT / "03_models" / "tmp" / "nested_enriched_interannual" / "trips_context_pooled_2024_2025.parquet"
+INTERANNUAL_ARTIFACTS_DIR = PROJECT_ROOT / "03_models" / "artifacts" / "interannual_enriched"
+INTERANNUAL_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+LARCH_RESULTS_ROOT = PROJECT_ROOT / "03_models" / "larch_logit" / "results" / "07_interannual_enriched"
+LARCH_RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
+
+POOLED_PATH = INTERANNUAL_ARTIFACTS_DIR / "trips_context_pooled_2024_2025.parquet"
 MODEL_PARTITION = "pooled_2024_2025"
-SAMPLE_FRACTION_ESTIMATION = 0.25
+SAMPLE_FRACTION_ESTIMATION = 0.15
 SEED = 42
 LARCH_METHOD = "slsqp"
 LARCH_MAX_CAP = 20.0
 
 OUTPUT_DIR = (
-    PROJECT_ROOT
-    / "03_models"
-    / "larch_logit"
-    / "model_outputs_nl_larch"
+    LARCH_RESULTS_ROOT
     / f"{MODEL_PARTITION}-nested-enriched-interannual-{format_sample_tag(SAMPLE_FRACTION_ESTIMATION)}"
 )
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+LARCH_NESTED_STATS_CSV = OUTPUT_DIR / f"stats_nested_enriched_interannual_larch_{MODEL_PARTITION}.csv"
+LARCH_NESTED_PARAMS_CSV = OUTPUT_DIR / f"params_nested_enriched_interannual_larch_{MODEL_PARTITION}.csv"
+LARCH_MNL_STATS_CSV = OUTPUT_DIR / f"stats_mnl_enriched_interannual_larch_{MODEL_PARTITION}.csv"
+LARCH_MNL_PARAMS_CSV = OUTPUT_DIR / f"params_mnl_enriched_interannual_larch_{MODEL_PARTITION}.csv"
 
 print("Pooled path:", POOLED_PATH)
 print("Sample fraction:", SAMPLE_FRACTION_ESTIMATION)
@@ -123,6 +129,10 @@ LARCH_NUMERIC_COLUMNS = [
     "DUMMY_NO_LAB",
     "DUMMY_ANIO_2025",
     "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_METRO_STATION_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
     "TVH_BIP",
     "TVH_QR_RED",
     "TVH_QR_OTHER",
@@ -218,6 +228,16 @@ def build_larch_params_frame(model: lx.Model) -> pd.DataFrame:
     ].rename(columns={"minimum": "Lower bound", "maximum": "Upper bound"})
 
 
+def load_larch_result_csvs(
+    *,
+    stats_path: Path,
+    params_path: Path,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    if not (stats_path.exists() and params_path.exists()):
+        return None, None
+    return pd.read_csv(stats_path), pd.read_csv(params_path)
+
+
 def build_larch_enriched_model(
     pandas_df: pd.DataFrame,
     *,
@@ -248,6 +268,10 @@ def build_larch_enriched_model(
         + P.B_QR_RED_NO_LAB * X.DUMMY_NO_LAB
         + P.B_QR_RED_ANIO_2025 * X.DUMMY_ANIO_2025
         + P.B_QR_RED_LOG_DEMAND * X.LOG_N_VIAJES_ZONA_INICIO_FRANJA
+        + P.B_QR_RED_LOG_BUS_STOP_DENSITY * X.LOG_BUS_STOP_DENSITY
+        + P.B_QR_RED_LOG_METRO_STATION_DENSITY * X.LOG_METRO_STATION_DENSITY
+        + P.B_QR_RED_LOG_BUS_LINE_COUNT * X.LOG_BUS_LINE_COUNT
+        + P.B_QR_RED_LOG_METRO_LINE_COUNT * X.LOG_METRO_LINE_COUNT
         + P.B_QR_RED_T_VEH * X.TVH_QR_RED
         + P.B_QR_RED_T_ESPERA_INI * X.TEI_QR_RED
         + P.B_QR_RED_T_ESPERA_TRASB * X.TET_QR_RED
@@ -261,6 +285,10 @@ def build_larch_enriched_model(
         + P.B_QR_OTHER_NO_LAB * X.DUMMY_NO_LAB
         + P.B_QR_OTHER_ANIO_2025 * X.DUMMY_ANIO_2025
         + P.B_QR_OTHER_LOG_DEMAND * X.LOG_N_VIAJES_ZONA_INICIO_FRANJA
+        + P.B_QR_OTHER_LOG_BUS_STOP_DENSITY * X.LOG_BUS_STOP_DENSITY
+        + P.B_QR_OTHER_LOG_METRO_STATION_DENSITY * X.LOG_METRO_STATION_DENSITY
+        + P.B_QR_OTHER_LOG_BUS_LINE_COUNT * X.LOG_BUS_LINE_COUNT
+        + P.B_QR_OTHER_LOG_METRO_LINE_COUNT * X.LOG_METRO_LINE_COUNT
         + P.B_QR_OTHER_T_VEH * X.TVH_QR_OTHER
         + P.B_QR_OTHER_T_ESPERA_INI * X.TEI_QR_OTHER
         + P.B_QR_OTHER_T_ESPERA_TRASB * X.TET_QR_OTHER
@@ -274,6 +302,7 @@ def build_larch_enriched_model(
             ("Time Dummies", "B_QR_.*_(LAB_PM|LAB_PT|NO_LAB)"),
             ("Interannual", "B_QR_.*_ANIO_2025"),
             ("Demand", "B_QR_.*_LOG_DEMAND"),
+            ("Offer", "B_QR_.*_LOG_(BUS_STOP_DENSITY|METRO_STATION_DENSITY|BUS_LINE_COUNT|METRO_LINE_COUNT)"),
             ("LOS", "B_.*_(T_VEH|T_ESPERA_INI|T_ESPERA_TRASB|N_TRASB)"),
             ("LogSums", "Mu:.*"),
         ]
@@ -284,6 +313,7 @@ def build_larch_enriched_model(
             ("Time Dummies", "B_QR_.*_(LAB_PM|LAB_PT|NO_LAB)"),
             ("Interannual", "B_QR_.*_ANIO_2025"),
             ("Demand", "B_QR_.*_LOG_DEMAND"),
+            ("Offer", "B_QR_.*_LOG_(BUS_STOP_DENSITY|METRO_STATION_DENSITY|BUS_LINE_COUNT|METRO_LINE_COUNT)"),
             ("LOS", "B_.*_(T_VEH|T_ESPERA_INI|T_ESPERA_TRASB|N_TRASB)"),
         ]
 
@@ -341,7 +371,7 @@ print("rows estimation:", len(pdf_larch))
 #| label: smoke-test-larch
 
 smoke_n = min(50_000, len(pdf_larch))
-pdf_smoke = pdf_larch.head(smoke_n).copy()
+pdf_smoke = pdf_larch.sample(n=smoke_n, random_state=SEED).copy()
 
 model_smoke_nested, stats_smoke_nested, params_smoke_nested = estimate_larch_enriched(
     pdf_smoke,
@@ -381,14 +411,12 @@ model_larch_nested, stats_larch_nested, params_larch_nested = estimate_larch_enr
     max_cap=LARCH_MAX_CAP,
 )
 
-stats_path_nested = OUTPUT_DIR / f"stats_nested_enriched_interannual_larch_{MODEL_PARTITION}.csv"
-params_path_nested = OUTPUT_DIR / f"params_nested_enriched_interannual_larch_{MODEL_PARTITION}.csv"
-stats_larch_nested.to_csv(stats_path_nested, index=False)
-params_larch_nested.to_csv(params_path_nested, index=False)
+stats_larch_nested.to_csv(LARCH_NESTED_STATS_CSV, index=False)
+params_larch_nested.to_csv(LARCH_NESTED_PARAMS_CSV, index=False)
 
 print("✅ Nested guardado en:", OUTPUT_DIR)
-print("  -", stats_path_nested.name)
-print("  -", params_path_nested.name)
+print("  -", LARCH_NESTED_STATS_CSV.name)
+print("  -", LARCH_NESTED_PARAMS_CSV.name)
 display(stats_larch_nested)
 display(
     params_larch_nested[
@@ -419,12 +447,61 @@ model_larch_mnl, stats_larch_mnl, params_larch_mnl = estimate_larch_enriched(
     max_cap=LARCH_MAX_CAP,
 )
 
-stats_path_mnl = OUTPUT_DIR / f"stats_mnl_enriched_interannual_larch_{MODEL_PARTITION}.csv"
-params_path_mnl = OUTPUT_DIR / f"params_mnl_enriched_interannual_larch_{MODEL_PARTITION}.csv"
-stats_larch_mnl.to_csv(stats_path_mnl, index=False)
-params_larch_mnl.to_csv(params_path_mnl, index=False)
+stats_larch_mnl.to_csv(LARCH_MNL_STATS_CSV, index=False)
+params_larch_mnl.to_csv(LARCH_MNL_PARAMS_CSV, index=False)
 
 print("✅ MNL guardado en:", OUTPUT_DIR)
 display(stats_larch_mnl)
 display(params_larch_mnl.head(12))
+```
+
+```{python}
+#| label: load-results
+
+print("label: load-results")
+
+stats_larch_nested_loaded, params_larch_nested_loaded = load_larch_result_csvs(
+    stats_path=LARCH_NESTED_STATS_CSV,
+    params_path=LARCH_NESTED_PARAMS_CSV,
+)
+stats_larch_mnl_loaded, params_larch_mnl_loaded = load_larch_result_csvs(
+    stats_path=LARCH_MNL_STATS_CSV,
+    params_path=LARCH_MNL_PARAMS_CSV,
+)
+
+if stats_larch_nested_loaded is not None and params_larch_nested_loaded is not None:
+    stats_larch_nested = stats_larch_nested_loaded
+    params_larch_nested = params_larch_nested_loaded
+    print(f"✅ Nested cargado desde: {OUTPUT_DIR}")
+else:
+    print(f"⚠️ Nested no encontrado en: {OUTPUT_DIR}")
+
+if stats_larch_mnl_loaded is not None and params_larch_mnl_loaded is not None:
+    stats_larch_mnl = stats_larch_mnl_loaded
+    params_larch_mnl = params_larch_mnl_loaded
+    print(f"✅ MNL cargado desde: {OUTPUT_DIR}")
+else:
+    print(f"⚠️ MNL no encontrado en: {OUTPUT_DIR}")
+```
+
+## 8) Resumen nested
+
+```{python}
+#| label: summarize-larch-nested
+#| eval: false
+
+print("label: summarize-larch-nested")
+display(stats_larch_nested)
+display(params_larch_nested)
+```
+
+## 9) Resumen MNL
+
+```{python}
+#| label: summarize-larch-mnl
+#| eval: false
+
+print("label: summarize-larch-mnl")
+display(stats_larch_mnl)
+display(params_larch_mnl)
 ```

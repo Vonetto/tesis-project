@@ -1,0 +1,1246 @@
+---
+TITLE: "Tesis — 10 | Interanual Enriquecido + OSM Origen"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: true
+---
+
+# Objetivo
+
+Construir una nueva versión del modelo interanual enriquecido, ahora incorporando una
+primera ronda corta de variables `OSM` de **origen** sobre la misma baseline de transporte
+ya cerrada:
+
+- `LOG_BUS_STOP_DENSITY`
+- `LOG_BUS_LINE_COUNT`
+- `LOG_METRO_LINE_COUNT`
+
+La lógica de este notebook replica el enfoque de `08`, pero para el bloque OSM:
+
+- baseline;
+- modelos univariados;
+- combinaciones de a dos seleccionadas;
+- y un `full` OSM de primera ronda.
+
+::: {.callout-note}
+## Alcance de esta versión
+- El modelo principal sigue siendo `MNL`.
+- Las variables OSM de primera ronda son:
+  - `osm_leisure_park`
+  - `osm_amenity_school`
+  - `osm_shop_supermarket`
+  - `osm_amenity_restaurant`
+  - `osm_shop_mall`
+  - `osm_amenity_university`
+  - `osm_amenity_pharmacy`
+- La segunda ronda añadida para screening univariado es:
+  - `osm_shop_convenience`
+  - `osm_leisure_playground`
+  - `osm_office_company`
+  - `osm_leisure_sports_centre`
+  - `osm_office_government`
+- La métrica usada para modelación será:
+  - `density_km2`
+  - luego estandarizada sobre zonas usadas.
+- `public_transport=*` y el resto del bloque OSM quedan fuera de esta primera ronda.
+:::
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+import gc
+import sys
+from pathlib import Path
+
+import geopandas as gpd
+import pandas as pd
+import polars as pl
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró la raíz del proyecto.")
+
+import biogeme.biogeme_logging as blog
+import biogeme.database as db
+import biogeme.biogeme as bio
+from biogeme.results_processing import pandas_output as br
+from biogeme import models
+from biogeme.expressions import Beta, Variable
+
+from lib.interannual_offer_context import assert_left_join_preserves_rows, ensure_unique_keys
+from lib.od_buffers_nested_logit import read_parquet_portable
+from lib.osm_zona777 import DEFAULT_OSM_ZONA777_SPECS, build_osm_spec_table, build_osm_zona777_outputs
+
+logger = blog.get_screen_logger(level=blog.INFO)
+```
+
+## 2) Configuración
+
+```{python}
+#| label: config
+print("label: config")
+MODEL_PARTITION = "pooled_2024_2025"
+SAMPLE_FRACTION_ESTIMATION = 0.025
+
+def estimation_sample_tag(fraction: float | None) -> str:
+    return "full" if fraction is None else f"sample{int(fraction * 100)}pct"
+
+ESTIMATION_SAMPLE_TAG = estimation_sample_tag(SAMPLE_FRACTION_ESTIMATION)
+
+MODELS_DIR = PROJECT_ROOT / "03_models"
+INTERANNUAL_ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "interannual_enriched"
+INTERANNUAL_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+BASELINE_ESTIMATION_SAMPLE_PATH = (
+    INTERANNUAL_ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}.parquet"
+)
+ZONAS777_SHP = Path("/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp")
+RAW_OSM_PARQUET = PROJECT_ROOT / "02_eda" / "tmp" / "osm_zona777" / "osm_zona777_raw.parquet"
+OSM_FEATURES_DIR = PROJECT_ROOT / "02_eda" / "tmp" / "osm_zona777_model_join"
+OSM_FEATURES_PATH = OSM_FEATURES_DIR / "osm_zona777_features.parquet"
+
+OUT_OSM_MODEL_READY = INTERANNUAL_ARTIFACTS_DIR / "osm_zona777_model_ready.parquet"
+OUT_OSM_MODEL_READY_STD = (
+    INTERANNUAL_ARTIFACTS_DIR / f"osm_zona777_model_ready_{ESTIMATION_SAMPLE_TAG}.parquet"
+)
+OUT_ESTIMATION_SAMPLE_OSM = (
+    INTERANNUAL_ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-osm.parquet"
+)
+
+OSM_VAR_SPECS = [
+    ("park", "osm_leisure_park_density_km2"),
+    ("school", "osm_amenity_school_density_km2"),
+    ("supermarket", "osm_shop_supermarket_density_km2"),
+    ("restaurant", "osm_amenity_restaurant_density_km2"),
+    ("mall", "osm_shop_mall_density_km2"),
+    ("university", "osm_amenity_university_density_km2"),
+    ("pharmacy", "osm_amenity_pharmacy_density_km2"),
+    ("convenience", "osm_shop_convenience_density_km2"),
+    ("playground", "osm_leisure_playground_density_km2"),
+    ("office_company", "osm_office_company_density_km2"),
+    ("sports_centre", "osm_leisure_sports_centre_density_km2"),
+    ("office_government", "osm_office_government_density_km2"),
+    ("transport_shelter", "osm_transport_shelter_yes_density_km2"),
+    ("transport_bench", "osm_transport_bench_yes_density_km2"),
+    ("subway_entrance", "osm_railway_subway_entrance_density_km2"),
+]
+OSM_VAR_ALIAS_TO_RAW = dict(OSM_VAR_SPECS)
+OSM_RAW_VARS = [raw for _, raw in OSM_VAR_SPECS]
+OSM_Z_VARS = [f"{raw}_z" for raw in OSM_RAW_VARS]
+OSM_ALIAS_TO_Z = {alias: f"{raw}_z" for alias, raw in OSM_VAR_SPECS}
+OSM_PARAM_TAGS = {
+    OSM_ALIAS_TO_Z["park"]: "OSM_LEISURE_PARK_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["school"]: "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["supermarket"]: "OSM_SHOP_SUPERMARKET_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["restaurant"]: "OSM_AMENITY_RESTAURANT_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["mall"]: "OSM_SHOP_MALL_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["university"]: "OSM_AMENITY_UNIVERSITY_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["pharmacy"]: "OSM_AMENITY_PHARMACY_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["convenience"]: "OSM_SHOP_CONVENIENCE_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["playground"]: "OSM_LEISURE_PLAYGROUND_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["office_company"]: "OSM_OFFICE_COMPANY_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["sports_centre"]: "OSM_LEISURE_SPORTS_CENTRE_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["office_government"]: "OSM_OFFICE_GOVERNMENT_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["transport_shelter"]: "OSM_TRANSPORT_SHELTER_YES_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["transport_bench"]: "OSM_TRANSPORT_BENCH_YES_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["subway_entrance"]: "OSM_RAILWAY_SUBWAY_ENTRANCE_DENSITY_KM2_Z",
+}
+
+MODEL_NAME_MNL_BASELINE = "mnl_interannual_osm_baseline"
+MODEL_NAME_MNL_OSM_PARK = "mnl_interannual_osm_park"
+MODEL_NAME_MNL_OSM_SCHOOL = "mnl_interannual_osm_school"
+MODEL_NAME_MNL_OSM_SUPERMARKET = "mnl_interannual_osm_supermarket"
+MODEL_NAME_MNL_OSM_RESTAURANT = "mnl_interannual_osm_restaurant"
+MODEL_NAME_MNL_OSM_MALL = "mnl_interannual_osm_mall"
+MODEL_NAME_MNL_OSM_UNIVERSITY = "mnl_interannual_osm_university"
+MODEL_NAME_MNL_OSM_PHARMACY = "mnl_interannual_osm_pharmacy"
+MODEL_NAME_MNL_OSM_CONVENIENCE = "mnl_interannual_osm_convenience"
+MODEL_NAME_MNL_OSM_PLAYGROUND = "mnl_interannual_osm_playground"
+MODEL_NAME_MNL_OSM_OFFICE_COMPANY = "mnl_interannual_osm_office_company"
+MODEL_NAME_MNL_OSM_SPORTS_CENTRE = "mnl_interannual_osm_sports_centre"
+MODEL_NAME_MNL_OSM_OFFICE_GOVERNMENT = "mnl_interannual_osm_office_government"
+MODEL_NAME_MNL_OSM_SCHOOL_SUPERMARKET = "mnl_interannual_osm_school_supermarket"
+MODEL_NAME_MNL_OSM_SCHOOL_MALL = "mnl_interannual_osm_school_mall"
+MODEL_NAME_MNL_OSM_SUPERMARKET_MALL = "mnl_interannual_osm_supermarket_mall"
+MODEL_NAME_MNL_OSM_FULL = "mnl_interannual_osm_full"
+
+BIOGEME_RESULTS_ROOT = MODELS_DIR / "biogeme-logit" / "results" / "10_interannual_osm"
+BIOGEME_RESULTS_DIR = BIOGEME_RESULTS_ROOT / f"{MODEL_PARTITION}-biogeme-{ESTIMATION_SAMPLE_TAG}"
+BIOGEME_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+RESULT_PATHS = {
+    MODEL_NAME_MNL_BASELINE: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_BASELINE}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_BASELINE}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_PARK: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_PARK}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_PARK}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_SCHOOL: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_SCHOOL}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_SCHOOL}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_SUPERMARKET: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_SUPERMARKET}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_SUPERMARKET}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_RESTAURANT: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_RESTAURANT}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_RESTAURANT}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_MALL: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_MALL}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_MALL}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_UNIVERSITY: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_UNIVERSITY}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_UNIVERSITY}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_PHARMACY: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_PHARMACY}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_PHARMACY}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_CONVENIENCE: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_CONVENIENCE}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_CONVENIENCE}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_PLAYGROUND: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_PLAYGROUND}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_PLAYGROUND}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_OFFICE_COMPANY: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_OFFICE_COMPANY}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_OFFICE_COMPANY}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_SPORTS_CENTRE: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_SPORTS_CENTRE}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_SPORTS_CENTRE}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_OFFICE_GOVERNMENT: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_OFFICE_GOVERNMENT}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_OFFICE_GOVERNMENT}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_SCHOOL_SUPERMARKET: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_SCHOOL_SUPERMARKET}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_SCHOOL_SUPERMARKET}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_SCHOOL_MALL: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_SCHOOL_MALL}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_SCHOOL_MALL}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_SUPERMARKET_MALL: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_SUPERMARKET_MALL}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_SUPERMARKET_MALL}.csv",
+    ),
+    MODEL_NAME_MNL_OSM_FULL: (
+        BIOGEME_RESULTS_DIR / f"params_{MODEL_NAME_MNL_OSM_FULL}.csv",
+        BIOGEME_RESULTS_DIR / f"stats_{MODEL_NAME_MNL_OSM_FULL}.csv",
+    ),
+}
+
+BIOGEME_LARGE_RUN_MODE = True
+BIOGEME_THREADS = 1
+BIOGEME_SECOND_DERIVATIVES = "never"
+BIOGEME_OPTIMIZATION_ALGORITHM = "simple_bounds_BFGS"
+
+print("BASELINE_ESTIMATION_SAMPLE_PATH:", BASELINE_ESTIMATION_SAMPLE_PATH)
+print("RAW_OSM_PARQUET:", RAW_OSM_PARQUET)
+print("OSM_FEATURES_PATH:", OSM_FEATURES_PATH)
+print("OUT_ESTIMATION_SAMPLE_OSM:", OUT_ESTIMATION_SAMPLE_OSM)
+print("OSM vars in notebook:", OSM_VAR_SPECS)
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+MODEL_NUMERIC_COLUMNS = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_NO_LAB",
+    "DUMMY_ANIO_2025",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+] + OSM_Z_VARS
+
+
+def remove_biogeme_iter_file(model_name: str, project_root: Path) -> None:
+    candidates = [
+        project_root / f"{model_name}.iter",
+        project_root / f"__{model_name}.iter",
+        Path.cwd() / f"{model_name}.iter",
+        Path.cwd() / f"__{model_name}.iter",
+    ]
+    seen = set()
+    for iter_path in candidates:
+        if iter_path in seen:
+            continue
+        seen.add(iter_path)
+        if iter_path.exists():
+            iter_path.unlink()
+            print(f"🗑️ Iter eliminado: {iter_path}")
+
+
+def biogeme_stats_to_frame(stats: dict) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"metric": key, "value": val[0] if isinstance(val, tuple) else val}
+            for key, val in stats.items()
+        ]
+    )
+
+
+def write_biogeme_result_csvs(
+    *,
+    params_df: pd.DataFrame,
+    stats: dict,
+    params_path: Path,
+    stats_path: Path,
+) -> None:
+    params_df.to_csv(params_path, index=False)
+    biogeme_stats_to_frame(stats).to_csv(stats_path, index=False)
+
+
+def load_biogeme_result_csvs(
+    *,
+    params_path: Path,
+    stats_path: Path,
+) -> tuple[dict | None, pd.DataFrame | None]:
+    if not (params_path.exists() and stats_path.exists()):
+        return None, None
+    params_df = pd.read_csv(params_path)
+    stats_df = pd.read_csv(stats_path)
+    stats = dict(zip(stats_df["metric"], stats_df["value"]))
+    return stats, params_df
+
+
+def display_param_subset(df_params: pd.DataFrame, preferred: list[str]) -> pd.DataFrame:
+    cols = [c for c in preferred if c in df_params.columns]
+    if not cols:
+        return df_params.head(12)
+    return df_params[cols].head(20)
+
+
+def load_biogeme_numeric_df_from_parquet(path: Path) -> pd.DataFrame:
+    return (
+        read_parquet_portable(str(path))
+        .select([pl.col(c).cast(pl.Float64) for c in MODEL_NUMERIC_COLUMNS])
+        .collect()
+        .to_pandas()
+    )
+
+
+def parse_sample_fraction_from_name(path: Path) -> float | None:
+    stem = path.stem
+    if "-sample" not in stem or not stem.endswith("pct"):
+        return None
+    try:
+        pct_str = stem.split("-sample", 1)[1].removesuffix("pct")
+        return int(pct_str) / 100
+    except Exception:
+        return None
+
+
+def materialize_baseline_sample_if_needed(
+    *,
+    target_path: Path,
+    target_fraction: float,
+    model_partition: str,
+    artifacts_dir: Path,
+    seed: int = 42,
+) -> Path:
+    if target_path.exists():
+        return target_path
+
+    candidates = []
+    for p in artifacts_dir.glob(f"{model_partition}-estimation-sample*pct.parquet"):
+        if "-censo" in p.stem or "-micro" in p.stem or "-osm" in p.stem:
+            continue
+        frac = parse_sample_fraction_from_name(p)
+        if frac is not None and frac > target_fraction:
+            candidates.append((frac, p))
+
+    if not candidates:
+        available_samples = sorted(
+            p.name for p in artifacts_dir.glob(f"{model_partition}-estimation-*.parquet")
+        )
+        raise FileNotFoundError(
+            "No existe muestra baseline exacta y tampoco una muestra mayor desde la cual derivarla. "
+            f"Esperada: {target_path}. Disponibles: {available_samples}"
+        )
+
+    source_fraction, source_path = sorted(candidates, key=lambda x: x[0])[0]
+    sample_ratio = target_fraction / source_fraction
+    if not (0 < sample_ratio < 1):
+        raise ValueError(
+            f"No se puede derivar muestra objetivo {target_fraction:.2%} desde {source_fraction:.2%}"
+        )
+
+    print(
+        "ℹ️ No existe sample baseline exacto. "
+        f"Derivando {target_path.name} desde {source_path.name} con ratio estratificado {sample_ratio:.6f}"
+    )
+    df_source = pd.read_parquet(source_path)
+    required = {"partition", "choice_nested"}
+    missing = sorted(required - set(df_source.columns))
+    if missing:
+        raise ValueError(f"Faltan columnas para sampleo estratificado en {source_path}: {missing}")
+
+    df_target = (
+        df_source.groupby(["partition", "choice_nested"], sort=False, group_keys=False)
+        .sample(frac=sample_ratio, random_state=seed)
+        .sort_values(["partition", "choice_nested"], kind="stable")
+        .reset_index(drop=True)
+    )
+    pl.from_pandas(df_target).write_parquet(target_path)
+    print(f"✅ Sample baseline derivado escrito en: {target_path}")
+    return target_path
+
+
+def build_osm_model_ready_table(
+    *,
+    features_path: Path,
+    raw_osm_path: Path,
+    zonas777_shp: Path,
+    out_dir: Path,
+    raw_vars: list[str],
+) -> pl.DataFrame:
+    if features_path.exists():
+        df_features = pl.read_parquet(features_path)
+        existing_cols = set(df_features.columns)
+        missing = sorted(set(["ZONA777"] + raw_vars) - existing_cols)
+        if missing:
+            print("ℹ️ El parquet OSM existente no contiene todas las columnas requeridas. Reconstruyéndolo...")
+            build_osm_zona777_outputs(
+                osm_raw_path=raw_osm_path,
+                zonas_path=zonas777_shp,
+                out_dir=out_dir,
+                specs=DEFAULT_OSM_ZONA777_SPECS,
+            )
+            df_features = pl.read_parquet(features_path)
+    else:
+        print("ℹ️ No existe parquet OSM por ZONA777. Construyéndolo ahora...")
+        build_osm_zona777_outputs(
+            osm_raw_path=raw_osm_path,
+            zonas_path=zonas777_shp,
+            out_dir=out_dir,
+            specs=DEFAULT_OSM_ZONA777_SPECS,
+        )
+        df_features = pl.read_parquet(features_path)
+
+    missing = sorted(set(["ZONA777"] + raw_vars) - set(df_features.columns))
+    if missing:
+        raise ValueError(f"Faltan columnas OSM requeridas en parquet final: {missing}")
+
+    return df_features.select(["ZONA777", "AREA_M2", "AREA_KM2"] + raw_vars).sort("ZONA777")
+
+
+def standardize_over_used_zones(
+    df_zone_model_ready: pl.DataFrame,
+    df_est_base: pl.DataFrame,
+    raw_vars: list[str],
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    df_used_zones = (
+        df_est_base
+        .select(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .drop_nulls()
+        .unique()
+        .sort("ZONA777")
+    )
+    df_used = df_zone_model_ready.join(df_used_zones, on="ZONA777", how="inner")
+    stats_rows = []
+    df_out = df_zone_model_ready
+
+    for raw_var in raw_vars:
+        mu = df_used.select(pl.col(raw_var).mean()).item()
+        sd = df_used.select(pl.col(raw_var).std()).item()
+        if mu is None:
+            raise ValueError(f"No se pudo calcular media para {raw_var} sobre zonas usadas")
+        if sd is None or sd == 0:
+            sd = 1.0
+        z_var = f"{raw_var}_z"
+        df_out = df_out.with_columns(
+            ((pl.col(raw_var) - pl.lit(float(mu))) / pl.lit(float(sd))).alias(z_var)
+        )
+        stats_rows.append(
+            {
+                "variable": raw_var,
+                "mean_used_zones": float(mu),
+                "std_used_zones": float(sd),
+                "z_variable": z_var,
+            }
+        )
+
+    return df_out, pl.DataFrame(stats_rows)
+
+
+def add_origin_osm_controls(
+    df_trips: pl.DataFrame,
+    df_osm_zone: pl.DataFrame,
+    raw_vars: list[str],
+    z_vars: list[str],
+) -> pl.DataFrame:
+    ensure_unique_keys(df_osm_zone, ["ZONA777"], "df_osm_zone")
+    before_rows = df_trips.height
+    df = (
+        df_trips
+        .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .join(df_osm_zone.select(["ZONA777"] + raw_vars + z_vars), on="ZONA777", how="left")
+        .drop("ZONA777")
+    )
+    assert_left_join_preserves_rows(before_rows, df.height, "join OSM sobre muestra de estimación")
+    missing_ratio = df.select(
+        pl.any_horizontal([pl.col(c).is_null() for c in z_vars]).mean().alias("pct_rows_any_missing_osm")
+    ).item()
+    if missing_ratio != 0:
+        raise ValueError(f"Join OSM dejó filas con variables faltantes: {missing_ratio:.6%}")
+    return df
+
+
+def estimate_mnl_transport_plus_osm(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    socio_cols: list[str] | None = None,
+    clean_run_no_iter: bool = False,
+    project_root: Path | None = None,
+):
+    database = db.Database(model_name, pandas_df)
+    socio_cols = socio_cols or []
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+
+    CHOICE = Variable("choice_nested")
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+    DUMMY_ANIO_2025 = Variable("DUMMY_ANIO_2025")
+    LOG_DEMAND = Variable("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+    LOG_BUS_STOP_DENSITY = Variable("LOG_BUS_STOP_DENSITY")
+    LOG_BUS_LINE_COUNT = Variable("LOG_BUS_LINE_COUNT")
+    LOG_METRO_LINE_COUNT = Variable("LOG_METRO_LINE_COUNT")
+
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+    TET_BIP = Variable("TET_BIP")
+    TET_QR_RED = Variable("TET_QR_RED")
+    TET_QR_OTHER = Variable("TET_QR_OTHER")
+    NTR_BIP = Variable("NTR_BIP")
+    NTR_QR_RED = Variable("NTR_QR_RED")
+    NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    ASC_QR_RED = Beta(f"ASC_QR_RED_{partition}", 0, None, None, 0)
+    ASC_QR_OTHER = Beta(f"ASC_QR_OTHER_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PM = Beta(f"B_QR_RED_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PM = Beta(f"B_QR_OTHER_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PT = Beta(f"B_QR_RED_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PT = Beta(f"B_QR_OTHER_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_RED_NO_LAB = Beta(f"B_QR_RED_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_NO_LAB = Beta(f"B_QR_OTHER_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_RED_ANIO_2025 = Beta(f"B_QR_RED_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_OTHER_ANIO_2025 = Beta(f"B_QR_OTHER_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_DEMAND = Beta(f"B_QR_RED_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_DEMAND = Beta(f"B_QR_OTHER_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_RED_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_OTHER_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_LINE_COUNT = Beta(f"B_QR_RED_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_METRO_LINE_COUNT = Beta(f"B_QR_RED_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_METRO_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+
+    B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_VEH = Beta(f"B_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_TRASB = Beta(f"B_BIP_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_TRASB = Beta(f"B_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_BIP_N_TRASB = Beta(f"B_BIP_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_N_TRASB = Beta(f"B_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_N_TRASB = Beta(f"B_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+
+    socio_var_exprs = {c: Variable(c) for c in socio_cols}
+    socio_betas_red = {
+        c: Beta(f"B_QR_RED_{OSM_PARAM_TAGS[c]}_{partition}", 0, None, None, 0)
+        for c in socio_cols
+    }
+    socio_betas_other = {
+        c: Beta(f"B_QR_OTHER_{OSM_PARAM_TAGS[c]}_{partition}", 0, None, None, 0)
+        for c in socio_cols
+    }
+
+    V_BIP = (
+        B_BIP_T_VEH * TVH_BIP
+        + B_BIP_T_ESPERA_INI * TEI_BIP
+        + B_BIP_T_ESPERA_TRASB * TET_BIP
+        + B_BIP_N_TRASB * NTR_BIP
+    )
+    V_QR_RED = (
+        ASC_QR_RED
+        + B_QR_RED_LAB_PM * LAB_PM
+        + B_QR_RED_LAB_PT * LAB_PT
+        + B_QR_RED_NO_LAB * NO_LAB
+        + B_QR_RED_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_RED_LOG_DEMAND * LOG_DEMAND
+        + B_QR_RED_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_RED_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_RED_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_RED_T_VEH * TVH_QR_RED
+        + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+        + B_QR_RED_N_TRASB * NTR_QR_RED
+    )
+    for c in socio_cols:
+        V_QR_RED += socio_betas_red[c] * socio_var_exprs[c]
+
+    V_QR_OTHER = (
+        ASC_QR_OTHER
+        + B_QR_OTHER_LAB_PM * LAB_PM
+        + B_QR_OTHER_LAB_PT * LAB_PT
+        + B_QR_OTHER_NO_LAB * NO_LAB
+        + B_QR_OTHER_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_OTHER_LOG_DEMAND * LOG_DEMAND
+        + B_QR_OTHER_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_OTHER_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_OTHER_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+        + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+    )
+    for c in socio_cols:
+        V_QR_OTHER += socio_betas_other[c] * socio_var_exprs[c]
+
+    V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+    av = {CHOICE_BIP: 1, CHOICE_QR_RED: 1, CHOICE_QR_OTHER: 1}
+    logprob = models.loglogit(V, av, CHOICE)
+
+    if clean_run_no_iter and project_root is not None:
+        remove_biogeme_iter_file(model_name, project_root)
+
+    biogeme = bio.BIOGEME(database, logprob)
+    biogeme.model_name = model_name
+    if BIOGEME_LARGE_RUN_MODE:
+        try:
+            biogeme.biogeme_parameters.set_value("generate_html", False)
+            biogeme.biogeme_parameters.set_value("generate_yaml", False)
+            biogeme.biogeme_parameters.set_value("save_iterations", False)
+            biogeme.biogeme_parameters.set_value("number_of_threads", BIOGEME_THREADS)
+            biogeme.biogeme_parameters.set_value("calculating_second_derivatives", BIOGEME_SECOND_DERIVATIVES)
+            biogeme.biogeme_parameters.set_value("optimization_algorithm", BIOGEME_OPTIMIZATION_ALGORITHM)
+        except Exception:
+            pass
+    results = biogeme.estimate()
+    return results.get_general_statistics(), br.get_pandas_estimated_parameters(results)
+
+
+def run_osm_mnl_model(
+    *,
+    model_name: str,
+    socio_cols: list[str],
+) -> None:
+    df_model = load_biogeme_numeric_df_from_parquet(OUT_ESTIMATION_SAMPLE_OSM)
+    stats, params = estimate_mnl_transport_plus_osm(
+        df_model,
+        partition=MODEL_PARTITION,
+        model_name=model_name,
+        socio_cols=socio_cols,
+        clean_run_no_iter=True,
+        project_root=PROJECT_ROOT,
+    )
+    write_biogeme_result_csvs(
+        params_df=params,
+        stats=stats,
+        params_path=RESULT_PATHS[model_name][0],
+        stats_path=RESULT_PATHS[model_name][1],
+    )
+    display(display_param_subset(params, ["Name", "Value", "Rob. p-value", "p-value", "Rob. t-test"]))
+    del df_model
+    gc.collect()
+```
+
+## 4) Construir artifact OSM model-ready
+
+```{python}
+#| label: build-osm-model-ready
+print("label: build-osm-model-ready")
+df_osm_model_ready = build_osm_model_ready_table(
+    features_path=OSM_FEATURES_PATH,
+    raw_osm_path=RAW_OSM_PARQUET,
+    zonas777_shp=ZONAS777_SHP,
+    out_dir=OSM_FEATURES_DIR,
+    raw_vars=OSM_RAW_VARS,
+)
+df_osm_model_ready.write_parquet(OUT_OSM_MODEL_READY)
+print(f"✅ OSM model-ready escrito en: {OUT_OSM_MODEL_READY}")
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(build_osm_spec_table(DEFAULT_OSM_ZONA777_SPECS).filter(pl.col("feature_name").is_in([c.replace('_density_km2', '') for c in OSM_RAW_VARS])))
+    display(df_osm_model_ready.head(5))
+```
+
+## 5) Construir muestra de estimación con OSM
+
+```{python}
+#| label: build-estimation-sample-osm
+print("label: build-estimation-sample-osm")
+baseline_sample_path = materialize_baseline_sample_if_needed(
+    target_path=BASELINE_ESTIMATION_SAMPLE_PATH,
+    target_fraction=SAMPLE_FRACTION_ESTIMATION,
+    model_partition=MODEL_PARTITION,
+    artifacts_dir=INTERANNUAL_ARTIFACTS_DIR,
+)
+df_est_base = read_parquet_portable(str(baseline_sample_path)).collect()
+print(f"rows baseline sample 07: {df_est_base.height:,}")
+
+df_osm_model_ready_std, df_osm_std_stats = standardize_over_used_zones(
+    df_osm_model_ready,
+    df_est_base,
+    OSM_RAW_VARS,
+)
+df_osm_model_ready_std.write_parquet(OUT_OSM_MODEL_READY_STD)
+print(f"✅ OSM model-ready + z escrito en: {OUT_OSM_MODEL_READY_STD}")
+display(df_osm_std_stats)
+
+df_est_osm = add_origin_osm_controls(
+    df_est_base,
+    df_osm_model_ready_std,
+    raw_vars=OSM_RAW_VARS,
+    z_vars=OSM_Z_VARS,
+)
+df_est_osm.write_parquet(OUT_ESTIMATION_SAMPLE_OSM)
+print(f"✅ Muestra de estimación + OSM escrita en: {OUT_ESTIMATION_SAMPLE_OSM}")
+display(
+    df_est_osm.select(
+        pl.len().alias("rows"),
+        *[pl.col(c).mean().alias(f"{c}_mean") for c in OSM_Z_VARS],
+        *[pl.col(c).std().alias(f"{c}_std") for c in OSM_Z_VARS],
+    )
+)
+del df_est_base, df_est_osm
+gc.collect()
+```
+
+## 6) Baseline MNL transport-only
+
+```{python}
+#| label: mnl-baseline
+print("label: mnl-baseline")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_BASELINE,
+    socio_cols=[],
+)
+```
+
+## 7) Screening OSM univariado
+
+```{python}
+#| label: mnl-osm-park
+print("label: mnl-osm-park")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_PARK,
+    socio_cols=[OSM_ALIAS_TO_Z["park"]],
+)
+```
+
+```{python}
+#| label: mnl-osm-school
+print("label: mnl-osm-school")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_SCHOOL,
+    socio_cols=[OSM_ALIAS_TO_Z["school"]],
+)
+```
+
+```{python}
+#| label: mnl-osm-supermarket
+print("label: mnl-osm-supermarket")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_SUPERMARKET,
+    socio_cols=[OSM_ALIAS_TO_Z["supermarket"]],
+)
+```
+
+```{python}
+#| label: mnl-osm-restaurant
+print("label: mnl-osm-restaurant")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_RESTAURANT,
+    socio_cols=[OSM_ALIAS_TO_Z["restaurant"]],
+)
+```
+
+```{python}
+#| label: mnl-osm-mall
+print("label: mnl-osm-mall")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_MALL,
+    socio_cols=[OSM_ALIAS_TO_Z["mall"]],
+)
+```
+
+```{python}
+#| label: mnl-osm-university
+print("label: mnl-osm-university")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_UNIVERSITY,
+    socio_cols=[OSM_ALIAS_TO_Z["university"]],
+)
+```
+
+```{python}
+#| label: mnl-osm-pharmacy
+print("label: mnl-osm-pharmacy")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_PHARMACY,
+    socio_cols=[OSM_ALIAS_TO_Z["pharmacy"]],
+)
+```
+
+```{python}
+#| label: mnl-osm-convenience
+print("label: mnl-osm-convenience")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_CONVENIENCE,
+    socio_cols=[OSM_ALIAS_TO_Z["convenience"]],
+)
+```
+
+```{python}
+#| label: mnl-osm-playground
+print("label: mnl-osm-playground")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_PLAYGROUND,
+    socio_cols=[OSM_ALIAS_TO_Z["playground"]],
+)
+```
+
+```{python}
+#| label: mnl-osm-office-company
+print("label: mnl-osm-office-company")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_OFFICE_COMPANY,
+    socio_cols=[OSM_ALIAS_TO_Z["office_company"]],
+)
+```
+
+```{python}
+#| label: mnl-osm-sports-centre
+print("label: mnl-osm-sports-centre")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_SPORTS_CENTRE,
+    socio_cols=[OSM_ALIAS_TO_Z["sports_centre"]],
+)
+```
+
+```{python}
+#| label: mnl-osm-office-government
+print("label: mnl-osm-office-government")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_OFFICE_GOVERNMENT,
+    socio_cols=[OSM_ALIAS_TO_Z["office_government"]],
+)
+```
+
+## 8) Combinaciones OSM de a dos
+
+```{python}
+#| label: mnl-osm-school-supermarket
+print("label: mnl-osm-school-supermarket")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_SCHOOL_SUPERMARKET,
+    socio_cols=[
+        OSM_ALIAS_TO_Z["school"],
+        OSM_ALIAS_TO_Z["supermarket"],
+    ],
+)
+```
+
+```{python}
+#| label: mnl-osm-school-mall
+print("label: mnl-osm-school-mall")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_SCHOOL_MALL,
+    socio_cols=[
+        OSM_ALIAS_TO_Z["school"],
+        OSM_ALIAS_TO_Z["mall"],
+    ],
+)
+```
+
+```{python}
+#| label: mnl-osm-supermarket-mall
+print("label: mnl-osm-supermarket-mall")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_SUPERMARKET_MALL,
+    socio_cols=[
+        OSM_ALIAS_TO_Z["supermarket"],
+        OSM_ALIAS_TO_Z["mall"],
+    ],
+)
+```
+
+```{python}
+#| label: mnl-osm-full
+print("label: mnl-osm-full")
+run_osm_mnl_model(
+    model_name=MODEL_NAME_MNL_OSM_FULL,
+    socio_cols=[
+        OSM_ALIAS_TO_Z["park"],
+        OSM_ALIAS_TO_Z["school"],
+        OSM_ALIAS_TO_Z["supermarket"],
+        OSM_ALIAS_TO_Z["restaurant"],
+        OSM_ALIAS_TO_Z["mall"],
+        OSM_ALIAS_TO_Z["university"],
+        OSM_ALIAS_TO_Z["pharmacy"],
+    ],
+)
+```
+
+## 9) Cargar resultados guardados
+
+```{python}
+#| label: load-results
+print("label: load-results")
+loaded_results = {}
+for model_name, (params_path, stats_path) in RESULT_PATHS.items():
+    stats_loaded, params_loaded = load_biogeme_result_csvs(
+        params_path=params_path,
+        stats_path=stats_path,
+    )
+    loaded_results[model_name] = {
+        "stats": stats_loaded,
+        "params": params_loaded,
+    }
+    print(
+        model_name,
+        "->",
+        "loaded" if (stats_loaded is not None and params_loaded is not None) else "missing",
+    )
+```
+
+## 10) Resúmenes rápidos
+
+```{python}
+#| label: mnl-baseline-results
+print("label: mnl-baseline-results")
+if loaded_results[MODEL_NAME_MNL_BASELINE]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_BASELINE]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_BASELINE]["params"])
+```
+
+```{python}
+#| label: mnl-osm-park-results
+print("label: mnl-osm-park-results")
+if loaded_results[MODEL_NAME_MNL_OSM_PARK]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_PARK]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_PARK]["params"])
+```
+
+```{python}
+#| label: mnl-osm-school-results
+print("label: mnl-osm-school-results")
+if loaded_results[MODEL_NAME_MNL_OSM_SCHOOL]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_SCHOOL]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_SCHOOL]["params"])
+```
+
+```{python}
+#| label: mnl-osm-supermarket-results
+print("label: mnl-osm-supermarket-results")
+if loaded_results[MODEL_NAME_MNL_OSM_SUPERMARKET]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_SUPERMARKET]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_SUPERMARKET]["params"])
+```
+
+```{python}
+#| label: mnl-osm-restaurant-results
+print("label: mnl-osm-restaurant-results")
+if loaded_results[MODEL_NAME_MNL_OSM_RESTAURANT]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_RESTAURANT]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_RESTAURANT]["params"])
+```
+
+```{python}
+#| label: mnl-osm-mall-results
+print("label: mnl-osm-mall-results")
+if loaded_results[MODEL_NAME_MNL_OSM_MALL]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_MALL]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_MALL]["params"])
+```
+
+```{python}
+#| label: mnl-osm-university-results
+print("label: mnl-osm-university-results")
+if loaded_results[MODEL_NAME_MNL_OSM_UNIVERSITY]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_UNIVERSITY]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_UNIVERSITY]["params"])
+```
+
+```{python}
+#| label: mnl-osm-pharmacy-results
+print("label: mnl-osm-pharmacy-results")
+if loaded_results[MODEL_NAME_MNL_OSM_PHARMACY]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_PHARMACY]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_PHARMACY]["params"])
+```
+
+```{python}
+#| label: mnl-osm-convenience-results
+print("label: mnl-osm-convenience-results")
+if loaded_results[MODEL_NAME_MNL_OSM_CONVENIENCE]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_CONVENIENCE]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_CONVENIENCE]["params"])
+```
+
+```{python}
+#| label: mnl-osm-playground-results
+print("label: mnl-osm-playground-results")
+if loaded_results[MODEL_NAME_MNL_OSM_PLAYGROUND]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_PLAYGROUND]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_PLAYGROUND]["params"])
+```
+
+```{python}
+#| label: mnl-osm-office-company-results
+print("label: mnl-osm-office-company-results")
+if loaded_results[MODEL_NAME_MNL_OSM_OFFICE_COMPANY]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_OFFICE_COMPANY]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_OFFICE_COMPANY]["params"])
+```
+
+```{python}
+#| label: mnl-osm-sports-centre-results
+print("label: mnl-osm-sports-centre-results")
+if loaded_results[MODEL_NAME_MNL_OSM_SPORTS_CENTRE]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_SPORTS_CENTRE]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_SPORTS_CENTRE]["params"])
+```
+
+```{python}
+#| label: mnl-osm-office-government-resultsesto
+print("label: mnl-osm-office-government-results")
+if loaded_results[MODEL_NAME_MNL_OSM_OFFICE_GOVERNMENT]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_OFFICE_GOVERNMENT]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_OFFICE_GOVERNMENT]["params"])
+```
+
+```{python}
+#| label: mnl-osm-school-supermarket-results
+print("label: mnl-osm-school-supermarket-results")
+if loaded_results[MODEL_NAME_MNL_OSM_SCHOOL_SUPERMARKET]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_SCHOOL_SUPERMARKET]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_SCHOOL_SUPERMARKET]["params"])
+```
+
+```{python}
+#| label: mnl-osm-school-mall-results
+print("label: mnl-osm-school-mall-results")
+if loaded_results[MODEL_NAME_MNL_OSM_SCHOOL_MALL]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_SCHOOL_MALL]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_SCHOOL_MALL]["params"])
+```
+
+```{python}
+#| label: mnl-osm-supermarket-mall-results
+print("label: mnl-osm-supermarket-mall-results")
+if loaded_results[MODEL_NAME_MNL_OSM_SUPERMARKET_MALL]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_SUPERMARKET_MALL]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_SUPERMARKET_MALL]["params"])
+```
+
+```{python}
+#| label: mnl-osm-full-results
+print("label: mnl-osm-full-results")
+if loaded_results[MODEL_NAME_MNL_OSM_FULL]["stats"] is not None:
+    display(biogeme_stats_to_frame(loaded_results[MODEL_NAME_MNL_OSM_FULL]["stats"]))
+    display(loaded_results[MODEL_NAME_MNL_OSM_FULL]["params"])
+```
+
+```{python}
+#| label: osm-model-comparison-table
+print("label: osm-model-comparison-table")
+
+OSM_CONVERGENCE_GRADIENT_THRESHOLD = 50.0
+
+
+def _osm_metric_value(stats_obj, metric_name: str):
+    if stats_obj is None:
+        return None
+    if isinstance(stats_obj, pd.DataFrame):
+        subset = stats_obj.loc[stats_obj["metric"] == metric_name, "value"]
+        return None if subset.empty else subset.iloc[0]
+    stats_df = biogeme_stats_to_frame(stats_obj)
+    subset = stats_df.loc[stats_df["metric"] == metric_name, "value"]
+    return None if subset.empty else subset.iloc[0]
+
+
+def _osm_converged_flag(stats_obj):
+    gradient = _osm_metric_value(stats_obj, "Final gradient norm")
+    if gradient is None:
+        return None
+    return "si" if float(gradient) <= OSM_CONVERGENCE_GRADIENT_THRESHOLD else "no"
+
+
+osm_summary_specs = [
+    {
+        "modelo": "Park",
+        "tipo": "univariado",
+        "variables": "park",
+        "model_name": MODEL_NAME_MNL_OSM_PARK,
+    },
+    {
+        "modelo": "School",
+        "tipo": "univariado",
+        "variables": "school",
+        "model_name": MODEL_NAME_MNL_OSM_SCHOOL,
+    },
+    {
+        "modelo": "Supermarket",
+        "tipo": "univariado",
+        "variables": "supermarket",
+        "model_name": MODEL_NAME_MNL_OSM_SUPERMARKET,
+    },
+    {
+        "modelo": "Restaurant",
+        "tipo": "univariado",
+        "variables": "restaurant",
+        "model_name": MODEL_NAME_MNL_OSM_RESTAURANT,
+    },
+    {
+        "modelo": "Mall",
+        "tipo": "univariado",
+        "variables": "mall",
+        "model_name": MODEL_NAME_MNL_OSM_MALL,
+    },
+    {
+        "modelo": "University",
+        "tipo": "univariado",
+        "variables": "university",
+        "model_name": MODEL_NAME_MNL_OSM_UNIVERSITY,
+    },
+    {
+        "modelo": "Pharmacy",
+        "tipo": "univariado",
+        "variables": "pharmacy",
+        "model_name": MODEL_NAME_MNL_OSM_PHARMACY,
+    },
+    {
+        "modelo": "Convenience",
+        "tipo": "univariado",
+        "variables": "convenience",
+        "model_name": MODEL_NAME_MNL_OSM_CONVENIENCE,
+    },
+    {
+        "modelo": "Playground",
+        "tipo": "univariado",
+        "variables": "playground",
+        "model_name": MODEL_NAME_MNL_OSM_PLAYGROUND,
+    },
+    {
+        "modelo": "Office Company",
+        "tipo": "univariado",
+        "variables": "office_company",
+        "model_name": MODEL_NAME_MNL_OSM_OFFICE_COMPANY,
+    },
+    {
+        "modelo": "Sports Centre",
+        "tipo": "univariado",
+        "variables": "sports_centre",
+        "model_name": MODEL_NAME_MNL_OSM_SPORTS_CENTRE,
+    },
+    {
+        "modelo": "Office Government",
+        "tipo": "univariado",
+        "variables": "office_government",
+        "model_name": MODEL_NAME_MNL_OSM_OFFICE_GOVERNMENT,
+    },
+    {
+        "modelo": "School + Supermarket",
+        "tipo": "dupla",
+        "variables": "school + supermarket",
+        "model_name": MODEL_NAME_MNL_OSM_SCHOOL_SUPERMARKET,
+    },
+    {
+        "modelo": "School + Mall",
+        "tipo": "dupla",
+        "variables": "school + mall",
+        "model_name": MODEL_NAME_MNL_OSM_SCHOOL_MALL,
+    },
+    {
+        "modelo": "Supermarket + Mall",
+        "tipo": "dupla",
+        "variables": "supermarket + mall",
+        "model_name": MODEL_NAME_MNL_OSM_SUPERMARKET_MALL,
+    },
+]
+
+osm_summary_rows = []
+for spec in osm_summary_specs:
+    result = loaded_results.get(spec["model_name"], {})
+    stats_obj = result.get("stats")
+    osm_summary_rows.append(
+        {
+            "modelo": spec["modelo"],
+            "tipo": spec["tipo"],
+            "variables": spec["variables"],
+            "ll": _osm_metric_value(stats_obj, "Final log likelihood"),
+            "aic": _osm_metric_value(stats_obj, "Akaike Information Criterion"),
+            "gradient": _osm_metric_value(stats_obj, "Final gradient norm"),
+            "converge": _osm_converged_flag(stats_obj),
+        }
+    )
+
+df_osm_model_comparison = (
+    pl.DataFrame(osm_summary_rows)
+    .with_columns(
+        pl.col("ll").cast(pl.Float64, strict=False).round(1),
+        pl.col("aic").cast(pl.Float64, strict=False).round(1),
+        pl.col("gradient").cast(pl.Float64, strict=False).round(1),
+    )
+    .sort(["tipo", "aic"])
+)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1000):
+    display(df_osm_model_comparison)
+print(
+    f"Nota: `converge` se codifica como `si/no` usando `Final gradient norm <= {OSM_CONVERGENCE_GRADIENT_THRESHOLD:.0f}` como regla practica."
+)
+```

@@ -1,0 +1,1107 @@
+---
+title: "Tesis — 13 | Mini experimento de optimizacion Biogeme"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: false
+---
+
+# Objetivo
+
+Este notebook aísla un punto metodológico concreto:
+
+- mantener fija la especificación actual del `MNL`;
+- variar solo la configuración del optimizador de `Biogeme`;
+- y comparar diagnósticos reales de convergencia para modelos univariados y multivariados.
+
+Este experimento **no** corrige todavía el problema de `BIP`. La idea es no mezclar dos cambios a la vez.
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+import gc
+import sys
+import traceback
+from pathlib import Path
+
+import pandas as pd
+import polars as pl
+import yaml
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró la raíz del proyecto.")
+
+import biogeme.biogeme_logging as blog
+import biogeme.database as db
+import biogeme.biogeme as bio
+from biogeme import models, nests
+from biogeme.expressions import Beta, Variable
+from biogeme.results_processing import pandas_output as br
+
+from lib.od_buffers_nested_logit import read_parquet_portable
+
+logger = blog.get_screen_logger(level=blog.INFO)
+```
+
+## 2) Configuración
+
+```{python}
+#| label: config
+print("label: config")
+MODEL_PARTITION = "pooled_2024_2025"
+RUN_EXPERIMENT = False
+RUN_NESTED_EXTENSION = True
+
+MODELS_DIR = PROJECT_ROOT / "03_models"
+ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "interannual_enriched"
+RESULTS_DIR = MODELS_DIR / "biogeme-logit" / "results" / "13_optimizer_experiment"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+CENSO_SAMPLE_PATH = ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-sample2pct-censo4-micro.parquet"
+CENSO_SAMPLE5_PATH = ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-sample5pct-censo4-micro.parquet"
+OSM_SAMPLE_PATH = ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-sample2pct-osm.parquet"
+
+BASE_MODEL_COLUMNS = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_NO_LAB",
+    "DUMMY_ANIO_2025",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+]
+
+CENSO_PARAM_TAGS = {
+    "prom_edad_z": "PROM_EDAD_Z",
+    "prom_escolaridad18_z": "PROM_ESCOLARIDAD18_Z",
+    "share_inmigrantes_z": "SHARE_INMIGRANTES_Z",
+    "share_hacinamiento_z": "SHARE_HACINAMIENTO_Z",
+    "share_internet_z": "SHARE_INTERNET_Z",
+    "share_serv_compu_z": "SHARE_SERV_COMPU_Z",
+    "share_serv_tel_movil_z": "SHARE_SERV_TEL_MOVIL_Z",
+    "share_discapacidad_z": "SHARE_DISCAPACIDAD_Z",
+    "share_analfabet_z": "SHARE_ANALFABET_Z",
+    "share_cine18_universitaria_micro_z": "SHARE_CINE18_UNIVERSITARIA_MICRO_Z",
+    "share_cine18_universitaria_o_mas_micro_z": "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z",
+    "share_cine18_terciaria_corta_micro_z": "SHARE_CINE18_TERCIARIA_CORTA_MICRO_Z",
+    "share_cine18_postgrado_micro_z": "SHARE_CINE18_POSTGRADO_MICRO_Z",
+    "share_independiente_micro_z": "SHARE_INDEPENDIENTE_MICRO_Z",
+}
+
+OSM_ALIAS_TO_Z = {
+    "park": "osm_leisure_park_density_km2_z",
+    "school": "osm_amenity_school_density_km2_z",
+    "supermarket": "osm_shop_supermarket_density_km2_z",
+    "restaurant": "osm_amenity_restaurant_density_km2_z",
+    "mall": "osm_shop_mall_density_km2_z",
+    "university": "osm_amenity_university_density_km2_z",
+    "pharmacy": "osm_amenity_pharmacy_density_km2_z",
+    "convenience": "osm_shop_convenience_density_km2_z",
+    "playground": "osm_leisure_playground_density_km2_z",
+    "office_company": "osm_office_company_density_km2_z",
+    "sports_centre": "osm_leisure_sports_centre_density_km2_z",
+    "office_government": "osm_office_government_density_km2_z",
+}
+
+OSM_PARAM_TAGS = {
+    OSM_ALIAS_TO_Z["park"]: "OSM_LEISURE_PARK_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["school"]: "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["supermarket"]: "OSM_SHOP_SUPERMARKET_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["restaurant"]: "OSM_AMENITY_RESTAURANT_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["mall"]: "OSM_SHOP_MALL_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["university"]: "OSM_AMENITY_UNIVERSITY_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["pharmacy"]: "OSM_AMENITY_PHARMACY_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["convenience"]: "OSM_SHOP_CONVENIENCE_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["playground"]: "OSM_LEISURE_PLAYGROUND_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["office_company"]: "OSM_OFFICE_COMPANY_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["sports_centre"]: "OSM_LEISURE_SPORTS_CENTRE_DENSITY_KM2_Z",
+    OSM_ALIAS_TO_Z["office_government"]: "OSM_OFFICE_GOVERNMENT_DENSITY_KM2_Z",
+}
+
+MODEL_SPECS = [
+    {
+        "block": "censo",
+        "label": "censo_uni_universitaria_o_mas",
+        "sample": "sample2pct-censo4-micro",
+        "sample_path": CENSO_SAMPLE_PATH,
+        "extra_cols": ["share_cine18_universitaria_o_mas_micro_z"],
+        "param_tags": CENSO_PARAM_TAGS,
+    },
+    {
+        "block": "censo",
+        "label": "censo_multi_parsimonioso",
+        "sample": "sample2pct-censo4-micro",
+        "sample_path": CENSO_SAMPLE_PATH,
+        "extra_cols": [
+            "share_cine18_universitaria_o_mas_micro_z",
+            "share_hacinamiento_z",
+            "share_discapacidad_z",
+            "share_inmigrantes_z",
+        ],
+        "param_tags": CENSO_PARAM_TAGS,
+    },
+    {
+        "block": "osm",
+        "label": "osm_uni_school",
+        "sample": "sample2pct-osm",
+        "sample_path": OSM_SAMPLE_PATH,
+        "extra_cols": [OSM_ALIAS_TO_Z["school"]],
+        "param_tags": OSM_PARAM_TAGS,
+    },
+    {
+        "block": "osm",
+        "label": "osm_multi_school_supermarket",
+        "sample": "sample2pct-osm",
+        "sample_path": OSM_SAMPLE_PATH,
+        "extra_cols": [
+            OSM_ALIAS_TO_Z["school"],
+            OSM_ALIAS_TO_Z["supermarket"],
+        ],
+        "param_tags": OSM_PARAM_TAGS,
+    },
+    {
+        "block": "osm",
+        "label": "osm_multi_full_r1",
+        "sample": "sample2pct-osm",
+        "sample_path": OSM_SAMPLE_PATH,
+        "extra_cols": [
+            OSM_ALIAS_TO_Z["park"],
+            OSM_ALIAS_TO_Z["school"],
+            OSM_ALIAS_TO_Z["supermarket"],
+            OSM_ALIAS_TO_Z["restaurant"],
+            OSM_ALIAS_TO_Z["mall"],
+            OSM_ALIAS_TO_Z["university"],
+            OSM_ALIAS_TO_Z["pharmacy"],
+        ],
+        "param_tags": OSM_PARAM_TAGS,
+    },
+]
+
+OPTIMIZER_SPECS = [
+    {
+        "label": "current_bfgs_never",
+        "optimization_algorithm": "simple_bounds_BFGS",
+        "calculating_second_derivatives": "never",
+        "second_derivatives": 0.0,
+    },
+    {
+        "label": "simple_bounds_no_hessian",
+        "optimization_algorithm": "simple_bounds",
+        "calculating_second_derivatives": "never",
+        "second_derivatives": 0.0,
+    },
+    {
+        "label": "simple_bounds_analytical",
+        "optimization_algorithm": "simple_bounds",
+        "calculating_second_derivatives": "analytical",
+        "second_derivatives": 1.0,
+    },
+    {
+        "label": "automatic_default",
+        "optimization_algorithm": "automatic",
+        "calculating_second_derivatives": "analytical",
+        "second_derivatives": None,
+    },
+]
+
+NESTED_EXTENSION_MODEL_SPECS = [
+    {
+        "block": "censo",
+        "label": "nested_baseline_sample5",
+        "sample": "sample5pct-censo4-micro",
+        "sample_path": CENSO_SAMPLE5_PATH,
+        "extra_cols": [],
+        "param_tags": CENSO_PARAM_TAGS,
+    },
+    {
+        "block": "censo",
+        "label": "nested_uni_universitaria_o_mas_sample5",
+        "sample": "sample5pct-censo4-micro",
+        "sample_path": CENSO_SAMPLE5_PATH,
+        "extra_cols": ["share_cine18_universitaria_o_mas_micro_z"],
+        "param_tags": CENSO_PARAM_TAGS,
+    },
+    {
+        "block": "censo",
+        "label": "nested_uni_prom_escolaridad18_sample5",
+        "sample": "sample5pct-censo4-micro",
+        "sample_path": CENSO_SAMPLE5_PATH,
+        "extra_cols": ["prom_escolaridad18_z"],
+        "param_tags": CENSO_PARAM_TAGS,
+    },
+    {
+        "block": "censo",
+        "label": "nested_uni_share_internet_sample5",
+        "sample": "sample5pct-censo4-micro",
+        "sample_path": CENSO_SAMPLE5_PATH,
+        "extra_cols": ["share_internet_z"],
+        "param_tags": CENSO_PARAM_TAGS,
+    },
+]
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+def remove_biogeme_iter_file(model_name: str, project_root: Path) -> None:
+    candidates = [
+        project_root / f"{model_name}.iter",
+        project_root / f"__{model_name}.iter",
+        Path.cwd() / f"{model_name}.iter",
+        Path.cwd() / f"__{model_name}.iter",
+    ]
+    seen = set()
+    for iter_path in candidates:
+        if iter_path in seen:
+            continue
+        seen.add(iter_path)
+        if iter_path.exists():
+            iter_path.unlink()
+
+
+def existing_cols(df: pl.DataFrame, cols: list[str]) -> list[str]:
+    return [c for c in cols if c in df.columns]
+
+
+def load_biogeme_numeric_df_from_parquet(path: Path, extra_cols: list[str]) -> pd.DataFrame:
+    cols = BASE_MODEL_COLUMNS + extra_cols
+    lazy_df = read_parquet_portable(str(path))
+    present_cols = [c for c in cols if c in lazy_df.collect_schema().names()]
+    missing = sorted(set(cols) - set(present_cols))
+    if missing:
+        raise ValueError(f"Faltan columnas requeridas en {path.name}: {missing}")
+    return (
+        lazy_df
+        .select([pl.col(c).cast(pl.Float64) for c in present_cols])
+        .collect()
+        .to_pandas()
+    )
+
+
+def stats_to_frame(stats: dict) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"metric": key, "value": val[0] if isinstance(val, tuple) else val}
+            for key, val in stats.items()
+        ]
+    )
+
+
+def metric_value(stats: dict, metric: str):
+    value = stats.get(metric)
+    if isinstance(value, tuple):
+        return value[0]
+    return value
+
+
+def param_value(params_df: pd.DataFrame, name: str, candidates: list[str]):
+    for col in candidates:
+        if col in params_df.columns:
+            subset = params_df.loc[params_df["Name"] == name, col]
+            if not subset.empty:
+                return subset.iloc[0]
+    return None
+
+
+def result_artifact_dir(spec: dict, optimizer: dict) -> Path:
+    out_dir = RESULTS_DIR / spec["label"] / optimizer["label"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def parse_yaml_diagnostics(yaml_path: Path) -> dict:
+    if not yaml_path.exists():
+        return {}
+    with yaml_path.open("r", encoding="utf-8") as fh:
+        payload = yaml.safe_load(fh) or {}
+    opt = payload.get("optimization_messages", {}) or {}
+    return {
+        "yaml_convergence": payload.get("convergence"),
+        "yaml_relative_gradient": opt.get("Relative gradient"),
+        "yaml_cause_of_termination": opt.get("Cause of termination"),
+        "yaml_algorithm": opt.get("Algorithm"),
+        "yaml_n_iterations": opt.get("Number of iterations"),
+        "yaml_n_grad_evals": opt.get("Number of gradient evaluations"),
+        "yaml_n_hessian_evals": opt.get("Number of hessian evaluations"),
+    }
+
+
+def configure_biogeme_run(biogeme_model: bio.BIOGEME, optimizer: dict) -> None:
+    biogeme_model.biogeme_parameters.set_value("generate_html", False)
+    biogeme_model.biogeme_parameters.set_value("generate_yaml", False)
+    biogeme_model.biogeme_parameters.set_value("save_iterations", False)
+    biogeme_model.biogeme_parameters.set_value("number_of_threads", 1)
+    biogeme_model.biogeme_parameters.set_value(
+        "calculating_second_derivatives",
+        optimizer["calculating_second_derivatives"],
+    )
+    biogeme_model.biogeme_parameters.set_value(
+        "optimization_algorithm",
+        optimizer["optimization_algorithm"],
+    )
+    if optimizer["second_derivatives"] is not None:
+        biogeme_model.biogeme_parameters.set_value(
+            "second_derivatives",
+            optimizer["second_derivatives"],
+        )
+
+
+def estimate_mnl_transport_plus_extras(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    extra_cols: list[str],
+    param_tags: dict[str, str],
+    optimizer: dict,
+):
+    database = db.Database(model_name, pandas_df)
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+
+    CHOICE = Variable("choice_nested")
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+    DUMMY_ANIO_2025 = Variable("DUMMY_ANIO_2025")
+    LOG_DEMAND = Variable("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+    LOG_BUS_STOP_DENSITY = Variable("LOG_BUS_STOP_DENSITY")
+    LOG_BUS_LINE_COUNT = Variable("LOG_BUS_LINE_COUNT")
+    LOG_METRO_LINE_COUNT = Variable("LOG_METRO_LINE_COUNT")
+
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+    TET_BIP = Variable("TET_BIP")
+    TET_QR_RED = Variable("TET_QR_RED")
+    TET_QR_OTHER = Variable("TET_QR_OTHER")
+    NTR_BIP = Variable("NTR_BIP")
+    NTR_QR_RED = Variable("NTR_QR_RED")
+    NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    ASC_QR_RED = Beta(f"ASC_QR_RED_{partition}", 0, None, None, 0)
+    ASC_QR_OTHER = Beta(f"ASC_QR_OTHER_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PM = Beta(f"B_QR_RED_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PM = Beta(f"B_QR_OTHER_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PT = Beta(f"B_QR_RED_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PT = Beta(f"B_QR_OTHER_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_RED_NO_LAB = Beta(f"B_QR_RED_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_NO_LAB = Beta(f"B_QR_OTHER_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_RED_ANIO_2025 = Beta(f"B_QR_RED_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_OTHER_ANIO_2025 = Beta(f"B_QR_OTHER_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_DEMAND = Beta(f"B_QR_RED_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_DEMAND = Beta(f"B_QR_OTHER_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_RED_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_OTHER_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_LINE_COUNT = Beta(f"B_QR_RED_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_METRO_LINE_COUNT = Beta(f"B_QR_RED_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_METRO_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+
+    B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_VEH = Beta(f"B_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_TRASB = Beta(f"B_BIP_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_TRASB = Beta(f"B_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_BIP_N_TRASB = Beta(f"B_BIP_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_N_TRASB = Beta(f"B_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_N_TRASB = Beta(f"B_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+
+    extra_var_exprs = {c: Variable(c) for c in extra_cols}
+    extra_betas_red = {
+        c: Beta(f"B_QR_RED_{param_tags[c]}_{partition}", 0, None, None, 0)
+        for c in extra_cols
+    }
+    extra_betas_other = {
+        c: Beta(f"B_QR_OTHER_{param_tags[c]}_{partition}", 0, None, None, 0)
+        for c in extra_cols
+    }
+
+    V_BIP = (
+        B_BIP_T_VEH * TVH_BIP
+        + B_BIP_T_ESPERA_INI * TEI_BIP
+        + B_BIP_T_ESPERA_TRASB * TET_BIP
+        + B_BIP_N_TRASB * NTR_BIP
+    )
+    V_QR_RED = (
+        ASC_QR_RED
+        + B_QR_RED_LAB_PM * LAB_PM
+        + B_QR_RED_LAB_PT * LAB_PT
+        + B_QR_RED_NO_LAB * NO_LAB
+        + B_QR_RED_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_RED_LOG_DEMAND * LOG_DEMAND
+        + B_QR_RED_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_RED_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_RED_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_RED_T_VEH * TVH_QR_RED
+        + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+        + B_QR_RED_N_TRASB * NTR_QR_RED
+    )
+    for c in extra_cols:
+        V_QR_RED += extra_betas_red[c] * extra_var_exprs[c]
+
+    V_QR_OTHER = (
+        ASC_QR_OTHER
+        + B_QR_OTHER_LAB_PM * LAB_PM
+        + B_QR_OTHER_LAB_PT * LAB_PT
+        + B_QR_OTHER_NO_LAB * NO_LAB
+        + B_QR_OTHER_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_OTHER_LOG_DEMAND * LOG_DEMAND
+        + B_QR_OTHER_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_OTHER_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_OTHER_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+        + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+    )
+    for c in extra_cols:
+        V_QR_OTHER += extra_betas_other[c] * extra_var_exprs[c]
+
+    V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+    av = {CHOICE_BIP: 1, CHOICE_QR_RED: 1, CHOICE_QR_OTHER: 1}
+    logprob = models.loglogit(V, av, CHOICE)
+
+    remove_biogeme_iter_file(model_name, PROJECT_ROOT)
+    biogeme = bio.BIOGEME(database, logprob)
+    biogeme.model_name = model_name
+    configure_biogeme_run(biogeme, optimizer)
+
+    results = biogeme.estimate()
+    stats = results.get_general_statistics()
+    params_df = br.get_pandas_estimated_parameters(results)
+    return results, stats, params_df
+
+
+def selected_parameter_names(extra_cols: list[str], param_tags: dict[str, str]) -> list[tuple[str, str]]:
+    names = [
+        ("baseline", f"B_BIP_T_VEH_{MODEL_PARTITION}"),
+        ("baseline", f"B_BIP_T_ESPERA_INI_{MODEL_PARTITION}"),
+        ("baseline", f"B_BIP_N_TRASB_{MODEL_PARTITION}"),
+        ("baseline", f"B_QR_RED_LOG_DEMAND_{MODEL_PARTITION}"),
+        ("baseline", f"B_QR_OTHER_LOG_DEMAND_{MODEL_PARTITION}"),
+        ("baseline", f"B_QR_RED_T_ESPERA_INI_{MODEL_PARTITION}"),
+        ("baseline", f"B_QR_OTHER_T_ESPERA_INI_{MODEL_PARTITION}"),
+    ]
+    for c in extra_cols:
+        tag = param_tags[c]
+        names.append(("new", f"B_QR_RED_{tag}_{MODEL_PARTITION}"))
+        names.append(("new", f"B_QR_OTHER_{tag}_{MODEL_PARTITION}"))
+    return names
+
+
+def nested_extension_artifact_dir(spec: dict, optimizer: dict) -> Path:
+    out_dir = RESULTS_DIR / "nested_extension" / spec["label"] / optimizer["label"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def estimate_nested_transport_plus_bip_extras(
+    pandas_df: pd.DataFrame,
+    *,
+    partition: str,
+    model_name: str,
+    extra_cols: list[str],
+    param_tags: dict[str, str],
+    optimizer: dict,
+):
+    database = db.Database(model_name, pandas_df)
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+
+    CHOICE = Variable("choice_nested")
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+    DUMMY_ANIO_2025 = Variable("DUMMY_ANIO_2025")
+    LOG_DEMAND = Variable("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+    LOG_BUS_STOP_DENSITY = Variable("LOG_BUS_STOP_DENSITY")
+    LOG_BUS_LINE_COUNT = Variable("LOG_BUS_LINE_COUNT")
+    LOG_METRO_LINE_COUNT = Variable("LOG_METRO_LINE_COUNT")
+
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+    TET_BIP = Variable("TET_BIP")
+    TET_QR_RED = Variable("TET_QR_RED")
+    TET_QR_OTHER = Variable("TET_QR_OTHER")
+    NTR_BIP = Variable("NTR_BIP")
+    NTR_QR_RED = Variable("NTR_QR_RED")
+    NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    MU_QR = Beta(f"MU_QR_{partition}", 1.5, 1, 100, 0)
+    nest_bip = nests.OneNestForNestedLogit(1.0, [CHOICE_BIP], name="BIP")
+    nest_qr = nests.OneNestForNestedLogit(MU_QR, [CHOICE_QR_RED, CHOICE_QR_OTHER], name="QR")
+    NESTS = nests.NestsForNestedLogit(
+        choice_set=[CHOICE_BIP, CHOICE_QR_RED, CHOICE_QR_OTHER],
+        tuple_of_nests=(nest_bip, nest_qr),
+    )
+
+    ASC_QR_RED = Beta(f"ASC_QR_RED_{partition}", 0, None, None, 0)
+    ASC_QR_OTHER = Beta(f"ASC_QR_OTHER_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PM = Beta(f"B_QR_RED_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PM = Beta(f"B_QR_OTHER_LAB_PM_{partition}", 0, None, None, 0)
+    B_QR_RED_LAB_PT = Beta(f"B_QR_RED_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LAB_PT = Beta(f"B_QR_OTHER_LAB_PT_{partition}", 0, None, None, 0)
+    B_QR_RED_NO_LAB = Beta(f"B_QR_RED_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_NO_LAB = Beta(f"B_QR_OTHER_NO_LAB_{partition}", 0, None, None, 0)
+    B_QR_RED_ANIO_2025 = Beta(f"B_QR_RED_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_OTHER_ANIO_2025 = Beta(f"B_QR_OTHER_ANIO_2025_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_DEMAND = Beta(f"B_QR_RED_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_DEMAND = Beta(f"B_QR_OTHER_LOG_DEMAND_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_RED_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_STOP_DENSITY = Beta(f"B_QR_OTHER_LOG_BUS_STOP_DENSITY_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_BUS_LINE_COUNT = Beta(f"B_QR_RED_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_BUS_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_BUS_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_RED_LOG_METRO_LINE_COUNT = Beta(f"B_QR_RED_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+    B_QR_OTHER_LOG_METRO_LINE_COUNT = Beta(f"B_QR_OTHER_LOG_METRO_LINE_COUNT_{partition}", 0, None, None, 0)
+
+    B_BIP_T_VEH = Beta(f"B_BIP_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_RED_T_VEH = Beta(f"B_QR_RED_T_VEH_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_VEH = Beta(f"B_QR_OTHER_T_VEH_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_INI = Beta(f"B_BIP_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_INI = Beta(f"B_QR_RED_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_INI = Beta(f"B_QR_OTHER_T_ESPERA_INI_{partition}", 0, None, None, 0)
+    B_BIP_T_ESPERA_TRASB = Beta(f"B_BIP_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_T_ESPERA_TRASB = Beta(f"B_QR_RED_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_T_ESPERA_TRASB = Beta(f"B_QR_OTHER_T_ESPERA_TRASB_{partition}", 0, None, None, 0)
+    B_BIP_N_TRASB = Beta(f"B_BIP_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_RED_N_TRASB = Beta(f"B_QR_RED_N_TRASB_{partition}", 0, None, None, 0)
+    B_QR_OTHER_N_TRASB = Beta(f"B_QR_OTHER_N_TRASB_{partition}", 0, None, None, 0)
+
+    extra_var_exprs = {c: Variable(c) for c in extra_cols}
+    extra_betas_bip = {
+        c: Beta(f"B_BIP_{param_tags[c]}_{partition}", 0, None, None, 0)
+        for c in extra_cols
+    }
+    extra_betas_red = {
+        c: Beta(f"B_QR_RED_{param_tags[c]}_{partition}", 0, None, None, 0)
+        for c in extra_cols
+    }
+    extra_betas_other = {
+        c: Beta(f"B_QR_OTHER_{param_tags[c]}_{partition}", 0, None, None, 0)
+        for c in extra_cols
+    }
+
+    V_BIP = (
+        B_BIP_T_VEH * TVH_BIP
+        + B_BIP_T_ESPERA_INI * TEI_BIP
+        + B_BIP_T_ESPERA_TRASB * TET_BIP
+        + B_BIP_N_TRASB * NTR_BIP
+    )
+    for c in extra_cols:
+        V_BIP += extra_betas_bip[c] * extra_var_exprs[c]
+
+    V_QR_RED = (
+        ASC_QR_RED
+        + B_QR_RED_LAB_PM * LAB_PM
+        + B_QR_RED_LAB_PT * LAB_PT
+        + B_QR_RED_NO_LAB * NO_LAB
+        + B_QR_RED_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_RED_LOG_DEMAND * LOG_DEMAND
+        + B_QR_RED_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_RED_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_RED_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_RED_T_VEH * TVH_QR_RED
+        + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+        + B_QR_RED_N_TRASB * NTR_QR_RED
+    )
+    for c in extra_cols:
+        V_QR_RED += extra_betas_red[c] * extra_var_exprs[c]
+
+    V_QR_OTHER = (
+        ASC_QR_OTHER
+        + B_QR_OTHER_LAB_PM * LAB_PM
+        + B_QR_OTHER_LAB_PT * LAB_PT
+        + B_QR_OTHER_NO_LAB * NO_LAB
+        + B_QR_OTHER_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_OTHER_LOG_DEMAND * LOG_DEMAND
+        + B_QR_OTHER_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_OTHER_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_OTHER_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+        + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+    )
+    for c in extra_cols:
+        V_QR_OTHER += extra_betas_other[c] * extra_var_exprs[c]
+
+    V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+    logprob = models.lognested(V, None, NESTS, CHOICE)
+
+    remove_biogeme_iter_file(model_name, PROJECT_ROOT)
+    biogeme = bio.BIOGEME(database, logprob)
+    biogeme.model_name = model_name
+    configure_biogeme_run(biogeme, optimizer)
+
+    results = biogeme.estimate()
+    stats = results.get_general_statistics()
+    params_df = br.get_pandas_estimated_parameters(results)
+    return results, stats, params_df
+
+
+def selected_nested_extension_parameter_names(extra_cols: list[str], param_tags: dict[str, str]) -> list[tuple[str, str]]:
+    names = [
+        ("baseline", f"MU_QR_{MODEL_PARTITION}"),
+        ("baseline", f"B_BIP_T_VEH_{MODEL_PARTITION}"),
+        ("baseline", f"B_BIP_T_ESPERA_INI_{MODEL_PARTITION}"),
+        ("baseline", f"B_BIP_N_TRASB_{MODEL_PARTITION}"),
+        ("baseline", f"B_QR_RED_LOG_DEMAND_{MODEL_PARTITION}"),
+        ("baseline", f"B_QR_OTHER_LOG_DEMAND_{MODEL_PARTITION}"),
+    ]
+    for c in extra_cols:
+        tag = param_tags[c]
+        names.append(("new", f"B_BIP_{tag}_{MODEL_PARTITION}"))
+        names.append(("new", f"B_QR_RED_{tag}_{MODEL_PARTITION}"))
+        names.append(("new", f"B_QR_OTHER_{tag}_{MODEL_PARTITION}"))
+    return names
+```
+
+## 4) Muestras y diseño experimental
+
+```{python}
+#| label: experiment-design
+print("label: experiment-design")
+display(
+    pl.DataFrame(
+        [
+            {
+                "block": spec["block"],
+                "model": spec["label"],
+                "sample": spec["sample"],
+                "n_extra_vars": len(spec["extra_cols"]),
+                "extra_vars": ", ".join(spec["extra_cols"]),
+            }
+            for spec in MODEL_SPECS
+        ]
+    )
+)
+
+display(pl.DataFrame(OPTIMIZER_SPECS))
+
+print("RUN_EXPERIMENT =", RUN_EXPERIMENT)
+```
+
+## 5) Ejecutar mini experimento
+
+```{python}
+#| label: run-experiment
+print("label: run-experiment")
+sample_cache = {}
+summary_rows = []
+param_rows = []
+
+if RUN_EXPERIMENT:
+    for spec in MODEL_SPECS:
+        sample_key = (str(spec["sample_path"]), tuple(spec["extra_cols"]))
+        if sample_key not in sample_cache:
+            sample_cache[sample_key] = load_biogeme_numeric_df_from_parquet(
+                spec["sample_path"],
+                spec["extra_cols"],
+            )
+        pandas_df = sample_cache[sample_key]
+
+        for optimizer in OPTIMIZER_SPECS:
+            run_name = f"{spec['label']}__{optimizer['label']}"
+            out_dir = result_artifact_dir(spec, optimizer)
+            params_path = out_dir / f"params_{run_name}.csv"
+            stats_path = out_dir / f"stats_{run_name}.csv"
+            yaml_path = out_dir / f"{run_name}.yaml"
+
+            print(f"Estimando: {run_name}")
+            try:
+                results, stats, params_df = estimate_mnl_transport_plus_extras(
+                    pandas_df,
+                    partition=MODEL_PARTITION,
+                    model_name=run_name,
+                    extra_cols=spec["extra_cols"],
+                    param_tags=spec["param_tags"],
+                    optimizer=optimizer,
+                )
+
+                params_df.to_csv(params_path, index=False)
+                stats_to_frame(stats).to_csv(stats_path, index=False)
+                results.dump_yaml_file(str(yaml_path))
+                yaml_diag = parse_yaml_diagnostics(yaml_path)
+
+                summary_rows.append(
+                    {
+                        "block": spec["block"],
+                        "model": spec["label"],
+                        "sample": spec["sample"],
+                        "optimizer_label": optimizer["label"],
+                        "optimization_algorithm": optimizer["optimization_algorithm"],
+                        "calculating_second_derivatives": optimizer["calculating_second_derivatives"],
+                        "second_derivatives": optimizer["second_derivatives"],
+                        "n_extra_vars": len(spec["extra_cols"]),
+                        "n_params": metric_value(stats, "Number of estimated parameters"),
+                        "sample_size": metric_value(stats, "Sample size"),
+                        "ll_init": metric_value(stats, "Init log likelihood"),
+                        "ll_final": metric_value(stats, "Final log likelihood"),
+                        "aic": metric_value(stats, "Akaike Information Criterion"),
+                        "gradient_norm": metric_value(stats, "Final gradient norm"),
+                        "status": "ok",
+                        "error_type": None,
+                        "error_message": None,
+                        **yaml_diag,
+                    }
+                )
+
+                for role, param_name in selected_parameter_names(spec["extra_cols"], spec["param_tags"]):
+                    param_rows.append(
+                        {
+                            "block": spec["block"],
+                            "model": spec["label"],
+                            "optimizer_label": optimizer["label"],
+                            "role": role,
+                            "parameter": param_name,
+                            "value": param_value(params_df, param_name, ["Value"]),
+                            "robust_t": param_value(
+                                params_df,
+                                param_name,
+                                ["Robust t-stat.", "Rob. t-test", "t-test"],
+                            ),
+                            "robust_p": param_value(
+                                params_df,
+                                param_name,
+                                ["Robust p-value", "Rob. p-value", "p-value"],
+                            ),
+                            "status": "ok",
+                        }
+                    )
+            except Exception as exc:
+                print(f"ERROR en {run_name}: {type(exc).__name__}: {exc}")
+                summary_rows.append(
+                    {
+                        "block": spec["block"],
+                        "model": spec["label"],
+                        "sample": spec["sample"],
+                        "optimizer_label": optimizer["label"],
+                        "optimization_algorithm": optimizer["optimization_algorithm"],
+                        "calculating_second_derivatives": optimizer["calculating_second_derivatives"],
+                        "second_derivatives": optimizer["second_derivatives"],
+                        "n_extra_vars": len(spec["extra_cols"]),
+                        "n_params": None,
+                        "sample_size": len(pandas_df),
+                        "ll_init": None,
+                        "ll_final": None,
+                        "aic": None,
+                        "gradient_norm": None,
+                        "status": "error",
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                        "yaml_convergence": None,
+                        "yaml_relative_gradient": None,
+                        "yaml_cause_of_termination": None,
+                        "yaml_algorithm": None,
+                        "yaml_n_iterations": None,
+                        "yaml_n_grad_evals": None,
+                        "yaml_n_hessian_evals": None,
+                    }
+                )
+                (out_dir / f"{run_name}.error.txt").write_text(
+                    "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                    encoding="utf-8",
+                )
+            gc.collect()
+else:
+    print("RUN_EXPERIMENT = False. No se ejecutaron estimaciones.")
+```
+
+## 6) Resumen de convergencia y terminación
+
+```{python}
+#| label: convergence-summary
+print("label: convergence-summary")
+if summary_rows:
+    df_summary = (
+        pl.DataFrame(summary_rows)
+        .with_columns(
+            pl.col("ll_init").cast(pl.Float64, strict=False).round(1),
+            pl.col("ll_final").cast(pl.Float64, strict=False).round(1),
+            pl.col("aic").cast(pl.Float64, strict=False).round(1),
+            pl.col("gradient_norm").cast(pl.Float64, strict=False),
+            pl.col("yaml_relative_gradient").cast(pl.Float64, strict=False),
+        )
+        .sort(["block", "model", "optimizer_label"])
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1400):
+        display(df_summary)
+else:
+    print("No hay resultados en memoria. Activa RUN_EXPERIMENT para ejecutar el barrido.")
+```
+
+## 7) Comparación de parámetros
+
+```{python}
+#| label: parameter-comparison
+print("label: parameter-comparison")
+if param_rows:
+    df_params_compare = (
+        pl.DataFrame(param_rows)
+        .with_columns(
+            pl.col("value").cast(pl.Float64, strict=False).round(4),
+            pl.col("robust_t").cast(pl.Float64, strict=False).round(3),
+            pl.col("robust_p").cast(pl.Float64, strict=False),
+        )
+        .sort(["block", "model", "role", "parameter", "optimizer_label"])
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1400):
+        display(df_params_compare)
+else:
+    print("No hay parámetros en memoria. Activa RUN_EXPERIMENT para ejecutar el barrido.")
+```
+
+## 8) Lectura esperada
+
+- Si cambia mucho `gradient_norm` pero la `yaml_cause_of_termination` sigue indicando `Relative gradient <= tol`, entonces estábamos sobreinterpretando mal el `Final gradient norm`.
+- Si `automatic` o `simple_bounds_analytical` mejoran fuerte la `yaml_convergence` frente a `current_bfgs_never`, el problema es parcialmente de configuración del optimizador.
+- Si incluso con `simple_bounds_analytical` persisten causas como `Maximum number of iterations reached` o `Trust region is too small`, el problema es más estructural en la especificación/datos.
+- Este notebook mantiene fija la especificación actual donde las variables nuevas entran solo en `QR_RED` y `QR_OTHER`, para no mezclar este experimento con el rediseño posterior que incorporará `BIP`.
+
+## 9) Extensión acotada para `Nested`
+
+Esta extensión responde una duda distinta al experimento `MNL` de arriba:
+
+- usar la especificación `Nested` que hoy estamos probando en el notebook `14`;
+- mantener el barrido pequeño;
+- y revisar si el problema en `Nested` es del optimizador o si `MU_QR` simplemente no agrega valor.
+
+```{python}
+#| label: nested-extension-design
+print("label: nested-extension-design")
+display(
+    pl.DataFrame(
+        [
+            {
+                "block": spec["block"],
+                "model": spec["label"],
+                "sample": spec["sample"],
+                "n_extra_vars": len(spec["extra_cols"]),
+                "extra_vars": ", ".join(spec["extra_cols"]),
+            }
+            for spec in NESTED_EXTENSION_MODEL_SPECS
+        ]
+    )
+)
+
+print("RUN_NESTED_EXTENSION =", RUN_NESTED_EXTENSION)
+```
+
+```{python}
+#| label: run-nested-extension
+print("label: run-nested-extension")
+nested_extension_summary_rows = []
+nested_extension_param_rows = []
+nested_extension_sample_cache = {}
+
+if RUN_NESTED_EXTENSION:
+    for spec in NESTED_EXTENSION_MODEL_SPECS:
+        sample_key = (str(spec["sample_path"]), tuple(spec["extra_cols"]))
+        if sample_key not in nested_extension_sample_cache:
+            nested_extension_sample_cache[sample_key] = load_biogeme_numeric_df_from_parquet(
+                spec["sample_path"],
+                spec["extra_cols"],
+            )
+        pandas_df = nested_extension_sample_cache[sample_key]
+
+        for optimizer in OPTIMIZER_SPECS:
+            run_name = f"{spec['label']}__{optimizer['label']}"
+            out_dir = nested_extension_artifact_dir(spec, optimizer)
+            params_path = out_dir / f"params_{run_name}.csv"
+            stats_path = out_dir / f"stats_{run_name}.csv"
+            yaml_path = out_dir / f"{run_name}.yaml"
+
+            print(f"Estimando Nested extension: {run_name}")
+            try:
+                results, stats, params_df = estimate_nested_transport_plus_bip_extras(
+                    pandas_df,
+                    partition=MODEL_PARTITION,
+                    model_name=run_name,
+                    extra_cols=spec["extra_cols"],
+                    param_tags=spec["param_tags"],
+                    optimizer=optimizer,
+                )
+
+                params_df.to_csv(params_path, index=False)
+                stats_to_frame(stats).to_csv(stats_path, index=False)
+                results.dump_yaml_file(str(yaml_path))
+                yaml_diag = parse_yaml_diagnostics(yaml_path)
+
+                nested_extension_summary_rows.append(
+                    {
+                        "family": "nested",
+                        "block": spec["block"],
+                        "model": spec["label"],
+                        "sample": spec["sample"],
+                        "optimizer_label": optimizer["label"],
+                        "optimization_algorithm": optimizer["optimization_algorithm"],
+                        "calculating_second_derivatives": optimizer["calculating_second_derivatives"],
+                        "second_derivatives": optimizer["second_derivatives"],
+                        "n_extra_vars": len(spec["extra_cols"]),
+                        "n_params": metric_value(stats, "Number of estimated parameters"),
+                        "sample_size": metric_value(stats, "Sample size"),
+                        "ll_init": metric_value(stats, "Init log likelihood"),
+                        "ll_final": metric_value(stats, "Final log likelihood"),
+                        "aic": metric_value(stats, "Akaike Information Criterion"),
+                        "gradient_norm": metric_value(stats, "Final gradient norm"),
+                        "status": "ok",
+                        "error_type": None,
+                        "error_message": None,
+                        **yaml_diag,
+                    }
+                )
+
+                for role, param_name in selected_nested_extension_parameter_names(spec["extra_cols"], spec["param_tags"]):
+                    nested_extension_param_rows.append(
+                        {
+                            "family": "nested",
+                            "block": spec["block"],
+                            "model": spec["label"],
+                            "optimizer_label": optimizer["label"],
+                            "role": role,
+                            "parameter": param_name,
+                            "value": param_value(params_df, param_name, ["Value"]),
+                            "robust_t": param_value(
+                                params_df,
+                                param_name,
+                                ["Robust t-stat.", "Rob. t-test", "t-test"],
+                            ),
+                            "robust_p": param_value(
+                                params_df,
+                                param_name,
+                                ["Robust p-value", "Rob. p-value", "p-value"],
+                            ),
+                            "status": "ok",
+                        }
+                    )
+            except Exception as exc:
+                print(f"ERROR en {run_name}: {type(exc).__name__}: {exc}")
+                nested_extension_summary_rows.append(
+                    {
+                        "family": "nested",
+                        "block": spec["block"],
+                        "model": spec["label"],
+                        "sample": spec["sample"],
+                        "optimizer_label": optimizer["label"],
+                        "optimization_algorithm": optimizer["optimization_algorithm"],
+                        "calculating_second_derivatives": optimizer["calculating_second_derivatives"],
+                        "second_derivatives": optimizer["second_derivatives"],
+                        "n_extra_vars": len(spec["extra_cols"]),
+                        "n_params": None,
+                        "sample_size": len(pandas_df),
+                        "ll_init": None,
+                        "ll_final": None,
+                        "aic": None,
+                        "gradient_norm": None,
+                        "status": "error",
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                        "yaml_convergence": None,
+                        "yaml_relative_gradient": None,
+                        "yaml_cause_of_termination": None,
+                        "yaml_algorithm": None,
+                        "yaml_n_iterations": None,
+                        "yaml_n_grad_evals": None,
+                        "yaml_n_hessian_evals": None,
+                    }
+                )
+                (out_dir / f"{run_name}.error.txt").write_text(
+                    "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                    encoding="utf-8",
+                )
+            gc.collect()
+else:
+    print("RUN_NESTED_EXTENSION = False. No se ejecutó la extensión Nested.")
+```
+
+```{python}
+#| label: nested-extension-convergence-summary
+print("label: nested-extension-convergence-summary")
+if nested_extension_summary_rows:
+    df_nested_extension_summary = (
+        pl.DataFrame(nested_extension_summary_rows)
+        .with_columns(
+            pl.col("ll_init").cast(pl.Float64, strict=False).round(1),
+            pl.col("ll_final").cast(pl.Float64, strict=False).round(1),
+            pl.col("aic").cast(pl.Float64, strict=False).round(1),
+            pl.col("gradient_norm").cast(pl.Float64, strict=False),
+            pl.col("yaml_relative_gradient").cast(pl.Float64, strict=False),
+        )
+        .sort(["model", "optimizer_label"])
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1400):
+        display(df_nested_extension_summary)
+else:
+    print("No hay resultados Nested extension en memoria. Activa RUN_NESTED_EXTENSION para ejecutar el barrido.")
+```
+
+```{python}
+#| label: nested-extension-parameter-comparison
+print("label: nested-extension-parameter-comparison")
+if nested_extension_param_rows:
+    df_nested_extension_params = (
+        pl.DataFrame(nested_extension_param_rows)
+        .with_columns(
+            pl.col("value").cast(pl.Float64, strict=False).round(4),
+            pl.col("robust_t").cast(pl.Float64, strict=False).round(3),
+            pl.col("robust_p").cast(pl.Float64, strict=False),
+        )
+        .sort(["model", "role", "parameter", "optimizer_label"])
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1400):
+        display(df_nested_extension_params)
+else:
+    print("No hay parámetros Nested extension en memoria. Activa RUN_NESTED_EXTENSION para ejecutar el barrido.")
+```
+
+## 10) Lectura esperada para `Nested`
+
+- Si `simple_bounds_analytical` o `automatic_default` cambian de forma importante `yaml_convergence` frente a `BFGS`, entonces el cuello de botella sigue siendo configuración del optimizador.
+- Si `MU_QR` queda muy cerca de `1` o no mejora el `LL`, entonces el nido no está agregando valor sustantivo aunque converja.
+- Si la convergencia mejora pero `AIC` no mejora, el mensaje práctico sigue siendo que `MNL` basta para esta familia de modelos.
