@@ -259,3 +259,26 @@ Este umbral reduce ruido de credenciales con actividad muy baja, pero conserva l
 ### Siguiente paso
 
 Crear un notebook de clustering base con `k-means` sobre la muestra principal `min_trips >= 5`, estandarizando features y comparando valores de `k` entre 3 y 8. Luego describir los clusters usando variables no formadoras, especialmente composición QR/no QR y contrato.
+
+## 2026-05-01 - Notebook de clustering base preparado
+
+Se creó el notebook:
+
+- `03_models/user_segmentation/04_credential_clustering_baselines.qmd`
+
+El notebook implementa una primera comparación de `k-means` usando `MiniBatchKMeans`, por el tamaño de la muestra principal (`1,878,549` credenciales para `min_trips >= 5`). La configuración base es:
+
+- `MAIN_MIN_TRIPS = 5`
+- `K_VALUES = 3..8`
+- `SELECTED_K = 5` como solución candidata solo para perfilar, no como decisión final.
+- `SAMPLE_METRICS_N = 5,000` para calcular silhouette sobre una submuestra.
+- variables de pago excluidas de la formación de clusters.
+
+El notebook reporta:
+
+- métricas por `k`: inertia, Davies-Bouldin, Calinski-Harabasz, silhouette en muestra, share mínimo y máximo de cluster;
+- perfil del `SELECTED_K`: tamaño, intensidad de uso, temporalidad, diversidad de paraderos, tiempos, transbordos, uso de Metro y composición QR;
+- contratos dominantes por cluster;
+- centroides desestandarizados en escala transformada.
+
+Se hizo una prueba reducida exitosa con `min_trips >= 20`, `k=3`, `SAMPLE_METRICS_N=1000` y sin guardar artefactos. Falta ejecutar el notebook completo con la configuración principal y analizar los resultados.
