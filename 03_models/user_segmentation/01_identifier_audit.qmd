@@ -1,0 +1,313 @@
+---
+title: "Tesis - Segmentacion 01 | Auditoria de identificadores"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: false
+---
+
+# Objetivo
+
+Este notebook abre el frente de segmentacion/clustering revisando primero la unidad de analisis.
+
+La pregunta no es todavia que algoritmo de clustering usar, sino que identificador permite agrupar viajes de forma metodologicamente defendible. En particular, no se debe asumir que `id_tarjeta` identifica usuarios/personas: puede identificar una credencial o medio de pago, y un mismo usuario podria aparecer con una tarjeta BIP fisica y con una credencial QR distinta.
+
+El objetivo operativo es auditar:
+
+- `pk_viaje`: llave primaria de viaje;
+- `id_tarjeta`: identificador de credencial/tarjeta observado en viajes;
+- `id_viaje`: correlativo de viaje dentro de tarjeta;
+- `contrato` / `id_contrato`: contrato de transaccion, usado para identificar QR;
+- `is_qr`: flag generado desde contratos QR;
+- posibles columnas adicionales que puedan aproximar una llave de usuario.
+
+## Lectura esperada
+
+Si no existe una llave de usuario real, el frente de clustering debe formularse como segmentacion de credenciales o perfiles de uso observados, no como segmentacion de personas.
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+import polars as pl
+
+
+def resolve_project_root(start: Path | None = None) -> Path:
+    current = (start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / "config").exists() and (candidate / "lib").exists():
+            return candidate
+    raise RuntimeError("No se pudo resolver PROJECT_ROOT desde el notebook actual.")
+
+
+PROJECT_ROOT = resolve_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+print("PROJECT_ROOT:", PROJECT_ROOT)
+```
+
+## 2) Configuracion
+
+Los parquets pesados no estan versionados. Si el worktree de segmentacion no los tiene materializados, el notebook usa como fallback el worktree principal `tesis-project`, donde quedaron los artefactos generados.
+
+```{python}
+#| label: config
+print("label: config")
+
+MODEL_PARTITIONS = ["2024-W17", "2025-W17"]
+
+PRIMARY_DATA_ROOT = PROJECT_ROOT
+FALLBACK_DATA_ROOT = PROJECT_ROOT.parent / "tesis-project"
+
+
+def first_existing_path(*paths: Path) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    raise FileNotFoundError("No existe ninguna ruta candidata:\n" + "\n".join(str(p) for p in paths))
+
+
+TRIP_PARQUET_BY_PARTITION = {
+    partition: first_existing_path(
+        PRIMARY_DATA_ROOT / "tmp" / f"viajes_con_te_calculado_{partition}.parquet",
+        FALLBACK_DATA_ROOT / "tmp" / f"viajes_con_te_calculado_{partition}.parquet",
+    )
+    for partition in MODEL_PARTITIONS
+}
+
+CONTEXT_PATH = first_existing_path(
+    PRIMARY_DATA_ROOT / "03_models" / "artifacts" / "interannual_enriched" / "trips_context_pooled_2024_2025.parquet",
+    FALLBACK_DATA_ROOT / "03_models" / "artifacts" / "interannual_enriched" / "trips_context_pooled_2024_2025.parquet",
+)
+
+for partition, path in TRIP_PARQUET_BY_PARTITION.items():
+    print(partition, "->", path)
+print("CONTEXT_PATH:", CONTEXT_PATH)
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+
+IDENTIFIER_PATTERNS = [
+    "pk",
+    "tarjeta",
+    "viaje",
+    "contrato",
+    "usuario",
+    "user",
+    "hash",
+    "choice",
+    "qr",
+    "tipo_app",
+    "partition",
+]
+
+
+def collect_schema_table(path: Path, label: str) -> pl.DataFrame:
+    lf = pl.scan_parquet(str(path))
+    schema = lf.collect_schema()
+    rows = []
+    for name in schema.names():
+        if any(pattern.lower() in name.lower() for pattern in IDENTIFIER_PATTERNS):
+            rows.append(
+                {
+                    "source": label,
+                    "column": name,
+                    "dtype": str(schema[name]),
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+def require_columns(lf: pl.LazyFrame, columns: list[str], source_name: str) -> None:
+    available = set(lf.collect_schema().names())
+    missing = sorted(set(columns) - available)
+    if missing:
+        raise ValueError(f"{source_name} no contiene columnas requeridas: {missing}")
+```
+
+## 4) Esquemas relevantes
+
+Esta celda identifica columnas candidatas a llaves o a variables de pago. Sirve para confirmar si existen columnas adicionales que no estemos considerando.
+
+```{python}
+#| label: identifier-schema-audit
+print("label: identifier-schema-audit")
+
+schema_tables = [
+    collect_schema_table(path, partition)
+    for partition, path in TRIP_PARQUET_BY_PARTITION.items()
+]
+schema_tables.append(collect_schema_table(CONTEXT_PATH, "trips_context_pooled_2024_2025"))
+
+df_identifier_schema = pl.concat(schema_tables)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    print(df_identifier_schema)
+```
+
+## 5) Auditoria por particion
+
+Esta tabla revisa unicidad de `pk_viaje`, cobertura de `id_tarjeta`, presencia de contratos y si una misma `id_tarjeta` mezcla viajes QR y no QR dentro de cada particion.
+
+```{python}
+#| label: per-partition-identifier-summary
+print("label: per-partition-identifier-summary")
+
+partition_summaries = []
+
+for partition, path in TRIP_PARQUET_BY_PARTITION.items():
+    lf = pl.scan_parquet(str(path))
+    require_columns(lf, ["pk_viaje", "id_tarjeta", "id_viaje", "contrato", "is_qr"], partition)
+    lf = lf.select(["pk_viaje", "id_tarjeta", "id_viaje", "contrato", "is_qr", "tiempo_inicio_viaje"])
+
+    base_summary = lf.select(
+        [
+            pl.len().alias("n_rows"),
+            pl.col("pk_viaje").n_unique().alias("n_pk_viaje"),
+            pl.col("id_tarjeta").n_unique().alias("n_id_tarjeta"),
+            pl.col("contrato").n_unique().alias("n_contrato"),
+            pl.col("is_qr").sum().alias("n_qr_rows"),
+            pl.col("is_qr").mean().alias("share_qr_rows"),
+            pl.col("pk_viaje").is_null().sum().alias("null_pk_viaje"),
+            pl.col("id_tarjeta").is_null().sum().alias("null_id_tarjeta"),
+            pl.col("contrato").is_null().sum().alias("null_contrato"),
+        ]
+    ).collect()
+
+    per_card = lf.group_by("id_tarjeta").agg(
+        [
+            pl.len().alias("n_rows_card"),
+            pl.col("contrato").n_unique().alias("n_contracts_card"),
+            pl.col("is_qr").n_unique().alias("n_is_qr_card"),
+            pl.col("is_qr").any().alias("has_qr"),
+            (~pl.col("is_qr")).any().alias("has_bip"),
+        ]
+    )
+
+    card_summary = per_card.select(
+        [
+            pl.len().alias("n_cards"),
+            (pl.col("n_contracts_card") > 1).sum().alias("n_cards_multi_contract"),
+            (pl.col("n_is_qr_card") > 1).sum().alias("n_cards_mixed_qr_flag"),
+            (pl.col("has_qr") & pl.col("has_bip")).sum().alias("n_cards_has_qr_and_bip"),
+            pl.col("n_rows_card").median().alias("median_rows_per_card"),
+            pl.col("n_rows_card").quantile(0.90).alias("p90_rows_per_card"),
+            pl.col("n_rows_card").quantile(0.99).alias("p99_rows_per_card"),
+        ]
+    ).collect()
+
+    partition_summaries.append(
+        pl.concat([base_summary, card_summary], how="horizontal")
+        .with_columns(pl.lit(partition).alias("partition"))
+        .select(["partition", pl.all().exclude("partition")])
+    )
+
+df_partition_identifier_summary = pl.concat(partition_summaries)
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    print(df_partition_identifier_summary)
+```
+
+## 6) Distribucion de contratos
+
+```{python}
+#| label: contract-distribution
+print("label: contract-distribution")
+
+contract_tables = []
+
+for partition, path in TRIP_PARQUET_BY_PARTITION.items():
+    df_contract = (
+        pl.scan_parquet(str(path))
+        .select(["contrato", "is_qr"])
+        .group_by(["contrato", "is_qr"])
+        .agg(pl.len().alias("n"))
+        .with_columns(pl.lit(partition).alias("partition"))
+        .sort(["partition", "n"], descending=[False, True])
+        .collect()
+    )
+    contract_tables.append(df_contract)
+
+df_contract_distribution = pl.concat(contract_tables).select(["partition", "contrato", "is_qr", "n"])
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    print(df_contract_distribution)
+```
+
+## 7) Auditoria interanual de `id_tarjeta`
+
+Esta celda revisa si una misma `id_tarjeta` aparece en ambas particiones y si cambia de estado QR/no QR entre anos. Si no cambia, refuerza que `id_tarjeta` es una credencial asociada a un medio de pago, no una unidad persona que permita observar migracion BIP -> QR.
+
+```{python}
+#| label: interannual-card-audit
+print("label: interannual-card-audit")
+
+lf_cards_all = pl.concat(
+    [
+        pl.scan_parquet(str(path))
+        .select(["id_tarjeta", "contrato", "is_qr"])
+        .with_columns(pl.lit(partition).alias("partition"))
+        for partition, path in TRIP_PARQUET_BY_PARTITION.items()
+    ]
+)
+
+per_card_all = lf_cards_all.group_by("id_tarjeta").agg(
+    [
+        pl.col("partition").n_unique().alias("n_partitions"),
+        pl.col("contrato").n_unique().alias("n_contracts_all"),
+        pl.col("is_qr").n_unique().alias("n_is_qr_all"),
+        pl.col("is_qr").any().alias("has_qr"),
+        (~pl.col("is_qr")).any().alias("has_bip"),
+        pl.len().alias("n_rows_all"),
+    ]
+)
+
+df_interannual_card_summary = per_card_all.select(
+    [
+        pl.len().alias("n_cards_all"),
+        (pl.col("n_partitions") == 2).sum().alias("n_cards_in_both_partitions"),
+        (pl.col("n_contracts_all") > 1).sum().alias("n_cards_multi_contract_all"),
+        (pl.col("n_is_qr_all") > 1).sum().alias("n_cards_mixed_qr_flag_all"),
+        (pl.col("has_qr") & pl.col("has_bip")).sum().alias("n_cards_has_qr_and_bip_all"),
+        pl.col("n_rows_all").median().alias("median_rows_all"),
+        pl.col("n_rows_all").quantile(0.90).alias("p90_rows_all"),
+        pl.col("n_rows_all").quantile(0.99).alias("p99_rows_all"),
+    ]
+).collect()
+
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
+    print(df_interannual_card_summary)
+```
+
+## 8) Decision preliminar
+
+```{python}
+#| label: preliminary-decision
+print("label: preliminary-decision")
+
+print(
+    """
+Lectura preliminar esperada:
+
+1. pk_viaje debe tratarse como llave de viaje, no como unidad de clustering.
+2. id_tarjeta permite agrupar viajes por credencial, pero no identifica necesariamente personas.
+3. is_qr se deriva desde contrato/id_contrato; contratos 171 y 102 identifican pagos QR.
+4. Si id_tarjeta no mezcla QR y BIP, no se debe interpretar share QR por id_tarjeta como adopcion individual.
+5. Si no aparece una llave de usuario real, el siguiente notebook debe hablar de perfiles de credenciales o perfiles de uso observados, no de usuarios/personas.
+"""
+)
+```

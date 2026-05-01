@@ -84,3 +84,47 @@ Luego hacer EDA antes de aplicar clustering.
 - Crear clusters dominados solo por intensidad de uso.
 - Incluir adopción QR en el clustering y luego interpretar mecánicamente que los clusters explican adopción QR.
 - Forzar demasiados clusters sin estabilidad ni interpretación clara.
+
+## 2026-05-01 - Auditoría preliminar de identificadores
+
+Se creó el notebook:
+
+- `03_models/user_segmentation/01_identifier_audit.qmd`
+
+El notebook parte desde los parquets finales con tiempos de espera recalculados:
+
+- `tmp/viajes_con_te_calculado_2024-W17.parquet`
+- `tmp/viajes_con_te_calculado_2025-W17.parquet`
+
+Como esos parquets no están versionados, el notebook usa el worktree principal `tesis-project` como fallback cuando se ejecuta desde `tesis-project-segmentation`.
+
+### Hallazgos preliminares
+
+Auditoría rápida ejecutada con el Python de `larch-env`:
+
+- `2024-W17`:
+  - `n_rows = 11,931,489`
+  - `n_pk_viaje = 11,931,489`
+  - `n_id_tarjeta = 2,422,283`
+  - `n_qr_rows = 1,544,389`
+  - `share_qr_rows = 0.1294`
+  - `n_cards_has_qr_and_bip = 0`
+- `2025-W17`:
+  - `n_rows = 12,131,426`
+  - `n_pk_viaje = 12,131,426`
+  - `n_id_tarjeta = 2,451,340`
+  - `n_qr_rows = 2,020,511`
+  - `share_qr_rows = 0.1666`
+  - `n_cards_has_qr_and_bip = 0`
+- Interanual:
+  - `n_cards_all = 4,031,185`
+  - `n_cards_in_both_partitions = 842,438`
+  - `n_cards_has_qr_and_bip_all = 0`
+
+### Lectura metodológica
+
+- `pk_viaje` funciona como llave de viaje: es único por fila en ambas particiones.
+- `id_tarjeta` permite agrupar viajes por credencial, pero no debe interpretarse como usuario/persona.
+- Ningún `id_tarjeta` mezcla viajes QR y no QR, ni dentro de cada semana ni al juntar 2024-W17 con 2025-W17.
+- Esto confirma que no corresponde medir adopción QR como proporción QR por `id_tarjeta`.
+- Si no se encuentra una llave persona-equivalente adicional, el framing debe cambiar desde "segmentación de usuarios" hacia "segmentación de credenciales/perfiles de uso observados".
