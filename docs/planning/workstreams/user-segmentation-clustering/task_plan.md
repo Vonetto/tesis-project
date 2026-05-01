@@ -14,7 +14,7 @@ La idea no es reemplazar el modelo logit territorial, sino construir una capa co
 
 ## Scope
 
-- Unidad principal tentativa: usuario/tarjeta anonimizada, no viaje individual.
+- Unidad principal por definir: no asumir que `id_tarjeta` identifica usuarios.
 - Insumos: viajes 2024-2025, variables de uso del sistema, adopción QR, fricciones de viaje, patrones temporales y contexto territorial ya construido.
 - Output esperado: segmentos interpretables y reproducibles, con validación descriptiva y uso posterior en modelos MNL o sensibilidades.
 
@@ -22,8 +22,9 @@ La idea no es reemplazar el modelo logit territorial, sino construir una capa co
 
 - [x] Crear rama y worktree separado para aislar el frente de segmentación.
 - [x] Registrar decisiones iniciales y plan de trabajo.
-- [ ] Definir unidad de análisis exacta y criterios de inclusión de usuarios.
-- [ ] Diseñar tabla usuario-nivel con features de comportamiento.
+- [ ] Auditar identificadores disponibles (`pk_viaje`, `id_tarjeta`, `id_contrato`/`contrato`, y posibles llaves de usuario) y documentar qué unidad identifican realmente.
+- [ ] Definir unidad de análisis exacta y criterios de inclusión.
+- [ ] Diseñar tabla de comportamiento agregada según la unidad elegida.
 - [ ] Separar features candidatas por familia: intensidad de uso, temporalidad, multimodalidad, fricciones, adopción QR y contexto territorial.
 - [ ] Hacer EDA de features usuario-nivel antes de clusterizar.
 - [ ] Probar enfoques de segmentación simples e interpretables (`k-means`, clustering jerárquico, posiblemente GMM o LCA si aporta).
@@ -34,6 +35,7 @@ La idea no es reemplazar el modelo logit territorial, sino construir una capa co
 ## Guardrails
 
 - No empezar con algoritmos complejos antes de definir bien la unidad de análisis.
+- No llamar "usuario" a una unidad que solo identifica tarjeta, contrato, credencial o viaje.
 - No usar variables post-tratamiento que hagan circular la interpretación de adopción QR, salvo que se usen explícitamente para describir adopción.
 - Priorizar interpretabilidad sobre performance predictiva.
 - Mantener separados los objetivos: segmentar comportamiento de usuarios no es lo mismo que estimar causalidad.

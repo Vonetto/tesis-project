@@ -23,13 +23,22 @@ El trabajo reciente avanzó fuertemente en la especificación MNL territorial e 
 
 ### Decisión metodológica inicial
 
-La segmentación debe pensarse principalmente a nivel de usuario/tarjeta anonimizada, no a nivel de viaje individual.
+La segmentación no debe partir asumiendo que `id_tarjeta` identifica usuarios.
 
-Razón:
+Razones:
 
-- el modelo logit actual explica elección en viajes;
-- la segmentación busca describir perfiles de comportamiento persistente;
-- por lo tanto, necesita features agregadas por usuario en una ventana temporal.
+- `pk_viaje` es una llave primaria de viaje, generada a partir de `id_tarjeta`, `id_viaje` y el timestamp normalizado de inicio;
+- `id_tarjeta` identifica una credencial/medio de pago, no necesariamente una persona;
+- un mismo usuario podría viajar con tarjeta BIP física y luego con QR, apareciendo como identificadores distintos;
+- `is_qr` se deriva operativamente desde `id_contrato`/`contrato`, con contratos `171` y `102` marcados como QR;
+- ya existe una advertencia metodológica en `02_eda/eda_trips_overview.qmd`: cada `id_tarjeta` puede ser BIP o QR, por lo que el share QR por `id_tarjeta` no debe interpretarse como adopción gradual de una misma persona.
+
+Por lo tanto, el primer paso del workstream es auditar identificadores y decidir si la segmentación será:
+
+- por credencial/medio de pago;
+- por viaje agrupado a nivel de tarjeta;
+- por usuario real, solo si existe una llave que permita vincular BIP y QR para la misma persona;
+- o por perfiles de uso agregados sin afirmar identidad individual.
 
 ### Rol respecto al modelo MNL
 
@@ -43,16 +52,18 @@ No se asume de entrada que el modelo MNL final deba reemplazarse por un modelo s
 
 ### Preguntas iniciales
 
-- ¿Cuál es la unidad de usuario disponible y estable entre 2024 y 2025?
+- ¿Existe una llave de usuario real que vincule BIP y QR para una misma persona?
+- ¿Qué representa exactamente `id_contrato` y si permite distinguir canales QR sin identificar personas?
+- ¿Cuál es la unidad disponible y estable entre 2024 y 2025?
 - ¿Qué ventana temporal usar para construir perfiles?
 - ¿Se segmenta usando solo comportamiento de viaje o también contexto territorial?
 - ¿La adopción QR debe ser una variable usada para formar segmentos o una variable usada para describir segmentos?
-- ¿Conviene separar primero usuarios frecuentes de usuarios esporádicos?
-- ¿Qué hacemos con usuarios observados en solo un año?
+- ¿Conviene separar primero credenciales frecuentes de credenciales esporádicas?
+- ¿Qué hacemos con identificadores observados en solo un año?
 
 ### Primer enfoque recomendado
 
-Partir con una tabla usuario-nivel simple:
+Partir con una auditoría de identificadores y luego, si corresponde, una tabla agregada por la unidad elegida:
 
 - número de viajes observados;
 - share de viajes por medio de pago;
