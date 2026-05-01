@@ -24,11 +24,11 @@ La idea no es reemplazar el modelo logit territorial, sino construir una capa co
 - [x] Registrar decisiones iniciales y plan de trabajo.
 - [x] Crear notebook inicial de auditoría de identificadores (`03_models/user_segmentation/01_identifier_audit.qmd`).
 - [x] Crear notebook de tabla de features por credencial (`03_models/user_segmentation/02_credential_feature_table.qmd`).
-- [ ] Auditar identificadores disponibles (`pk_viaje`, `id_tarjeta`, `id_contrato`/`contrato`, y posibles llaves de usuario) y documentar qué unidad identifican realmente.
-- [ ] Definir unidad de análisis exacta y criterios de inclusión.
-- [ ] Diseñar tabla de comportamiento agregada según la unidad elegida.
-- [ ] Separar features candidatas por familia: intensidad de uso, temporalidad, multimodalidad, fricciones, adopción QR y contexto territorial.
-- [ ] Hacer EDA de features usuario-nivel antes de clusterizar.
+- [x] Auditar identificadores disponibles (`pk_viaje`, `id_tarjeta`, `id_contrato`/`contrato`, y posibles llaves de usuario) y documentar qué unidad identifican realmente.
+- [x] Definir unidad de análisis exacta y criterios de inclusión.
+- [x] Diseñar tabla de comportamiento agregada según la unidad elegida.
+- [x] Separar features candidatas por familia: intensidad de uso, temporalidad, multimodalidad, fricciones, adopción QR y contexto territorial.
+- [x] Hacer EDA de features por credencial antes de clusterizar.
 - [ ] Probar enfoques de segmentación simples e interpretables (`k-means`, clustering jerárquico, posiblemente GMM o LCA si aporta).
 - [ ] Validar estabilidad y sentido sustantivo de los segmentos.
 - [ ] Evaluar cómo conectar segmentos con modelos de elección: interacciones, modelos por segmento o comparación descriptiva de adopción.

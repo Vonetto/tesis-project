@@ -196,3 +196,66 @@ El siguiente paso debe ser un EDA de esta tabla para decidir:
 - variables altamente correlacionadas;
 - outliers que podrían dominar `k-means`;
 - si conviene clusterizar todas las credenciales elegibles juntas o separar primero por baja/alta frecuencia.
+
+## 2026-05-01 - EDA de features por credencial
+
+Se creó el notebook:
+
+- `03_models/user_segmentation/03_credential_feature_eda.qmd`
+
+El notebook carga la tabla de features por credencial y evalúa umbrales de actividad, transformaciones, distribuciones, missingness, outliers y correlaciones antes de correr clustering.
+
+### Umbral principal
+
+La decisión preliminar es usar `min_trips >= 5` como muestra principal:
+
+- `1,878,549` credenciales observadas.
+- `46.6%` de las credenciales.
+- `78.8%` de los viajes.
+- `share_qr_credentials = 0.1425`.
+
+Este umbral reduce ruido de credenciales con actividad muy baja, pero conserva la mayoría de los viajes observados. Como sensibilidad, conviene comparar luego con `min_trips >= 3` y `min_trips >= 10`.
+
+### Transformaciones
+
+- Conteos e intensidad: `log1p`.
+- Tiempos: conversión de segundos a minutos.
+- Shares: escala original `[0, 1]`.
+- Variables de pago: se excluyen del clustering inicial y se reservan para caracterizar clusters ex post.
+
+### Variables recomendadas para el primer clustering
+
+- `log1p_n_trips`
+- `log1p_n_active_days`
+- `log1p_trips_per_active_day`
+- `n_partitions`
+- `share_lab_pm`
+- `share_lab_pt`
+- `share_no_lab`
+- `log1p_n_origin_stops`
+- `log1p_n_destination_stops`
+- `median_total_time_min`
+- `mean_initial_wait_min`
+- `mean_transfer_wait_min`
+- `share_with_transfer`
+- `share_with_metro`
+
+### Variables excluidas de la primera especificación
+
+- `share_lab_valle`: queda implícita al incluir las demás shares temporales.
+- `log1p_n_origin_zones` y `log1p_n_destination_zones`: muy correlacionadas con diversidad de paraderos.
+- `mean_vehicle_time_min`: muy correlacionada con `median_total_time_min`.
+- `mean_n_transfers`: muy correlacionada con `share_with_transfer`.
+- `is_qr_credential`, `n_qr_states`, `n_contracts`, `first_observed_contract`: se reservan para descripción posterior, no para formar clusters.
+
+### Correlaciones relevantes
+
+- `log1p_n_origin_zones` vs. `log1p_n_origin_stops`: `0.951`.
+- `log1p_n_destination_zones` vs. `log1p_n_destination_stops`: `0.938`.
+- `median_total_time_min` vs. `mean_vehicle_time_min`: `0.934`.
+- `mean_n_transfers` vs. `share_with_transfer`: `0.886`.
+- `log1p_n_trips` vs. `log1p_n_active_days`: `0.853`.
+
+### Siguiente paso
+
+Crear un notebook de clustering base con `k-means` sobre la muestra principal `min_trips >= 5`, estandarizando features y comparando valores de `k` entre 3 y 8. Luego describir los clusters usando variables no formadoras, especialmente composición QR/no QR y contrato.
