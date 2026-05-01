@@ -128,3 +128,71 @@ Auditoría rápida ejecutada con el Python de `larch-env`:
 - Ningún `id_tarjeta` mezcla viajes QR y no QR, ni dentro de cada semana ni al juntar 2024-W17 con 2025-W17.
 - Esto confirma que no corresponde medir adopción QR como proporción QR por `id_tarjeta`.
 - Si no se encuentra una llave persona-equivalente adicional, el framing debe cambiar desde "segmentación de usuarios" hacia "segmentación de credenciales/perfiles de uso observados".
+
+## 2026-05-01 - Tabla de features por credencial
+
+Se creó el notebook:
+
+- `03_models/user_segmentation/02_credential_feature_table.qmd`
+
+El notebook construye una tabla agregada por `id_tarjeta`, interpretada explícitamente como **credencial observada**, no como persona/usuario.
+
+### Output
+
+El notebook escribe:
+
+- `03_models/artifacts/user_segmentation/credential_features_pooled_2024_2025.parquet`
+
+Este parquet queda ignorado por git por ser artifact local.
+
+### Sanidad del output
+
+Resultados de ejecución:
+
+- `n_credentials = 4,031,185`
+- `n_trip_rows_recovered = 24,062,915`
+- `n_unique_trips_recovered = 24,062,915`
+- `n_qr_credentials = 649,026`
+- `share_qr_credentials = 0.1610`
+- `n_credentials_mixed_qr_state = 0`
+- `n_credentials_multi_contract = 38,778`
+- `median_trips = 4`
+- `p90_trips = 13`
+- `p99_trips = 24`
+
+### Umbrales de actividad evaluados
+
+- `min_trips >= 1`:
+  - `4,031,185` credenciales
+  - `100%` de viajes
+  - `share_qr_credentials = 0.1610`
+- `min_trips >= 3`:
+  - `2,657,784` credenciales
+  - `90.3%` de viajes
+  - `share_qr_credentials = 0.1493`
+- `min_trips >= 5`:
+  - `1,878,549` credenciales
+  - `78.8%` de viajes
+  - `share_qr_credentials = 0.1425`
+- `min_trips >= 10`:
+  - `818,781` credenciales
+  - `49.0%` de viajes
+  - `share_qr_credentials = 0.1363`
+
+### Decisión preliminar
+
+Para clustering inicial, no usar `is_qr_credential`, `contrato` ni derivados de pago como features formadoras.
+
+Usarlas después para describir clusters:
+
+- composición QR/no QR;
+- contratos dominantes;
+- diferencias de adopción por perfil de uso.
+
+El siguiente paso debe ser un EDA de esta tabla para decidir:
+
+- filtro mínimo de actividad;
+- transformaciones (`log1p` para conteos/intensidad);
+- variables altamente correlacionadas;
+- outliers que podrían dominar `k-means`;
+- si conviene clusterizar todas las credenciales elegibles juntas o separar primero por baja/alta frecuencia.

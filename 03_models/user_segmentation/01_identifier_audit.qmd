@@ -293,21 +293,4 @@ with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=-1):
     print(df_interannual_card_summary)
 ```
 
-## 8) Decision preliminar
 
-```{python}
-#| label: preliminary-decision
-print("label: preliminary-decision")
-
-print(
-    """
-Lectura preliminar esperada:
-
-1. pk_viaje debe tratarse como llave de viaje, no como unidad de clustering.
-2. id_tarjeta permite agrupar viajes por credencial, pero no identifica necesariamente personas.
-3. is_qr se deriva desde contrato/id_contrato; contratos 171 y 102 identifican pagos QR.
-4. Si id_tarjeta no mezcla QR y BIP, no se debe interpretar share QR por id_tarjeta como adopcion individual.
-5. Si no aparece una llave de usuario real, el siguiente notebook debe hablar de perfiles de credenciales o perfiles de uso observados, no de usuarios/personas.
-"""
-)
-```

@@ -23,6 +23,7 @@ La idea no es reemplazar el modelo logit territorial, sino construir una capa co
 - [x] Crear rama y worktree separado para aislar el frente de segmentación.
 - [x] Registrar decisiones iniciales y plan de trabajo.
 - [x] Crear notebook inicial de auditoría de identificadores (`03_models/user_segmentation/01_identifier_audit.qmd`).
+- [x] Crear notebook de tabla de features por credencial (`03_models/user_segmentation/02_credential_feature_table.qmd`).
 - [ ] Auditar identificadores disponibles (`pk_viaje`, `id_tarjeta`, `id_contrato`/`contrato`, y posibles llaves de usuario) y documentar qué unidad identifican realmente.
 - [ ] Definir unidad de análisis exacta y criterios de inclusión.
 - [ ] Diseñar tabla de comportamiento agregada según la unidad elegida.
