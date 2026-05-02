@@ -282,3 +282,42 @@ El notebook reporta:
 - centroides desestandarizados en escala transformada.
 
 Se hizo una prueba reducida exitosa con `min_trips >= 20`, `k=3`, `SAMPLE_METRICS_N=1000` y sin guardar artefactos. Falta ejecutar el notebook completo con la configuración principal y analizar los resultados.
+
+## 2026-05-01 - Resultado preliminar del clustering base
+
+El notebook `04_credential_clustering_baselines.qmd` se ejecutó con `min_trips >= 5` y `K_VALUES = 3..8`. La solución `k=4` quedó como candidato principal preliminar:
+
+- mejor `silhouette_sample` entre los valores probados: `0.138`.
+- mejor `davies_bouldin`: `1.945`.
+- clusters balanceados: entre `24.1%` y `25.6%` de las credenciales elegibles.
+- evita la fragmentación de `k >= 5`.
+
+Los perfiles interpretables para `k=4` fueron:
+
+- `cluster 0`: viajes largos multietapa con alta presencia de Metro/transbordo y menor QR.
+- `cluster 1`: credenciales más intensivas/diversas.
+- `cluster 2`: viajes cortos, alta presencia Metro y baja espera.
+- `cluster 3`: baja presencia Metro y alta espera inicial, perfil más bus-dependiente.
+
+La composición QR no define los clusters; se interpreta solo como descriptor posterior. Esto es consistente con la decisión metodológica de excluir variables de pago de la formación de clusters.
+
+## 2026-05-01 - Notebook de sensibilidad de clusters preparado
+
+Se creó el notebook:
+
+- `03_models/user_segmentation/05_credential_cluster_sensitivity_and_description.qmd`
+
+El notebook fija `k=4` y estima la misma especificación de clustering para tres umbrales de actividad:
+
+- `min_trips >= 3`
+- `min_trips >= 5`
+- `min_trips >= 10`
+
+La comparación no asume que los números de cluster sean directamente comparables entre corridas. Para facilitar la lectura se agrega una etiqueta semántica heurística a partir del perfil de cada cluster:
+
+- `long_multistage_metro`
+- `intensive_diverse`
+- `short_metro_direct`
+- `bus_high_wait`
+
+El objetivo es verificar si los perfiles sustantivos reaparecen al cambiar el filtro de actividad, antes de avanzar hacia interpretaciones fuertes o hacia integración con modelos logit.
