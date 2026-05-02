@@ -30,9 +30,11 @@ La idea no es reemplazar el modelo logit territorial, sino construir una capa co
 - [x] Separar features candidatas por familia: intensidad de uso, temporalidad, multimodalidad, fricciones, adopción QR y contexto territorial.
 - [x] Hacer EDA de features por credencial antes de clusterizar.
 - [x] Ejecutar e interpretar clustering base con `k-means` sobre la muestra principal (`min_trips >= 5`, `k=3..8`).
-- [ ] Ejecutar notebook de sensibilidad de `k=4` por umbral de actividad (`min_trips >= 3/5/10`).
-- [ ] Probar enfoques alternativos si el baseline no es estable/interpretable (clustering jerárquico, posiblemente GMM o LCA si aporta).
-- [ ] Validar estabilidad y sentido sustantivo de los segmentos.
+- [x] Ejecutar notebook de sensibilidad de `k=4` por umbral de actividad (`min_trips >= 3/5/10`).
+- [x] Validar estabilidad y sentido sustantivo preliminar de los segmentos.
+- [ ] Crear notebook de enriquecimiento de features por credencial usando más información de tiempos, esperas, transbordos, Metro y concentración espacial.
+- [ ] Re-estimar clustering con features enriquecidas y comparar con la especificación base.
+- [ ] Probar enfoques alternativos solo después de revisar el clustering enriquecido (GMM, clustering jerárquico en muestra, LCA si aporta una historia metodológica clara).
 - [ ] Evaluar cómo conectar segmentos con modelos de elección: interacciones, modelos por segmento o comparación descriptiva de adopción.
 - [ ] Documentar resultados y decisión metodológica para el informe/tesis.
 

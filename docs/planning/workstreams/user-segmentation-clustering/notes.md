@@ -321,3 +321,44 @@ La comparación no asume que los números de cluster sean directamente comparabl
 - `bus_high_wait`
 
 El objetivo es verificar si los perfiles sustantivos reaparecen al cambiar el filtro de actividad, antes de avanzar hacia interpretaciones fuertes o hacia integración con modelos logit.
+
+## 2026-05-02 - Decisión preliminar y próximos pasos
+
+La sensibilidad de `k=4` fue ejecutada para `min_trips >= 3`, `>= 5` y `>= 10`.
+
+### Resultado preliminar
+
+Se deja como especificación principal preliminar:
+
+- unidad: credencial observada (`id_tarjeta`), no persona;
+- muestra principal: `min_trips >= 5`;
+- método: `MiniBatchKMeans`;
+- número de clusters: `k=4`;
+- variables formadoras: 14 variables de comportamiento, temporalidad, diversidad de paraderos, tiempos, transbordos y Metro;
+- variables de pago: excluidas del clustering y usadas solo para descripción posterior.
+
+### Lectura de sensibilidad
+
+- `min_trips >= 3`: reaparecen los cuatro perfiles esperados, con tamaños razonables.
+- `min_trips >= 5`: queda como punto principal por balance entre cobertura de viajes, reducción de ruido e interpretabilidad.
+- `min_trips >= 10`: cambia la población hacia credenciales intensivas; tres clusters se vuelven más difíciles de etiquetar con las reglas heurísticas, por lo que se interpreta como sensibilidad de población intensiva y no como reemplazo de la especificación principal.
+
+### Perfiles preliminares
+
+- viajes largos multietapa con alta presencia de Metro/transbordo y menor QR;
+- credenciales intensivas/diversas;
+- viajes cortos con alta presencia de Metro y baja espera;
+- viajes de baja presencia Metro y alta espera inicial, más bus-dependientes.
+
+### Próxima fase
+
+Antes de probar otros modelos de clustering, se prioriza mejorar la tabla de features por credencial. Variables candidatas:
+
+- proporción de viajes con espera inicial alta (`te0_calculado > 10 min`);
+- proporción de viajes con dos o más transbordos;
+- percentiles altos o dispersión de tiempo total (`p75`, `p90`, IQR);
+- proporción de viajes con Metro y transbordo simultáneamente;
+- concentración espacial de origen/destino, por ejemplo share del origen dominante o entropía simple;
+- diferencias de fricción por franja horaria si son fáciles de construir.
+
+Después de enriquecer features, se re-estima `k-means` con el mismo diseño (`min_trips >= 5`, `k=3..8`, sensibilidad `3/10`). Solo después se evaluarán alternativas como GMM, clustering jerárquico o LCA.
