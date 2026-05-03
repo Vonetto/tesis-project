@@ -362,3 +362,28 @@ Antes de probar otros modelos de clustering, se prioriza mejorar la tabla de fea
 - diferencias de fricción por franja horaria si son fáciles de construir.
 
 Después de enriquecer features, se re-estima `k-means` con el mismo diseño (`min_trips >= 5`, `k=3..8`, sensibilidad `3/10`). Solo después se evaluarán alternativas como GMM, clustering jerárquico o LCA.
+
+## 2026-05-03 - Notebook de enriquecimiento de features preparado
+
+Se creó el notebook:
+
+- `03_models/user_segmentation/06_credential_feature_enrichment.qmd`
+
+La decisión metodológica fue evitar umbrales absolutos definidos manualmente para esperas y duraciones. En su lugar, el notebook calcula percentiles globales de la distribución de viajes observados y construye shares por credencial respecto de esos umbrales empíricos.
+
+Variables nuevas principales:
+
+- shares de espera inicial sobre p75/p90 global;
+- shares de duración total sobre p75/p90 global;
+- p75/p90 internos por credencial de espera inicial, duración total y espera de transbordo;
+- share de viajes con dos o más transbordos;
+- share de viajes Metro con transbordo, Metro sin transbordo y transbordo sin Metro;
+- concentración/entropía de paradero y zona de origen/destino;
+- concentración temporal (`dominant_time_share`) y entropía temporal;
+- persistencia interanual (`is_observed_both_years`, `share_2025_trips`).
+
+El output esperado es:
+
+- `03_models/artifacts/user_segmentation/credential_features_pooled_2024_2025_enriched.parquet`
+
+El siguiente paso es ejecutar el notebook, revisar calidad/correlaciones de las variables nuevas y elegir un subconjunto acotado para re-estimar clustering.
