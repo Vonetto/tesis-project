@@ -1,13 +1,13 @@
 \section{Resultados de parámetros en formato wide}
 
-\subsection{Opción A: \texttt{BIP} como referencia para variables comunes}
+\subsection{Parámetros estimados}
 
-La Tabla~\ref{tab:parametros_opcion_a} presenta los parámetros del modelo bajo la primera
-normalización considerada. En esta especificación, \texttt{BIP} se mantiene como alternativa de
-referencia para las variables comunes al conjunto de alternativas. Por lo tanto, para variables como
-año, franja horaria, demanda, oferta, Censo y OSM, el coeficiente de \texttt{BIP} se fija en cero y
-los coeficientes de \texttt{QR\_OTHER} y \texttt{QR\_RED} se interpretan respecto de esa alternativa
-base.
+Las Tablas~\ref{tab:parametros_modelo_continuo} y~\ref{tab:parametros_modelo_dummy} presentan los
+parámetros de las dos especificaciones candidatas. En ambas, \texttt{BIP} se mantiene como
+alternativa de referencia para las variables comunes al conjunto de alternativas. Por lo tanto, para
+variables como año, franja horaria, demanda, oferta, Censo, OSM y EOD, el coeficiente de
+\texttt{BIP} se fija en cero y los coeficientes de \texttt{QR\_OTHER} y \texttt{QR\_RED} se
+interpretan respecto de esa alternativa base.
 
 Esta normalización no implica que dichas variables no estén asociadas a la elección de
 \texttt{BIP}. Más bien, implica que el efecto se expresa en términos relativos: un coeficiente
@@ -17,16 +17,27 @@ variables que sí varían entre alternativas dentro de un mismo viaje, como tiem
 también se estima directamente un coeficiente para \texttt{BIP}.
 
 Se presentan los coeficientes estimados y sus estadísticos \emph{t-ratio} robustos. Una versión
-extendida de la tabla, que incluye errores estándar robustos, se deja en el
+extendida de las tablas, que incluye errores estándar robustos, se deja en el
 Anexo~\ref{sec:anexo_parametros_completos}. Los ceros reportados para \texttt{BIP} en variables
 comunes corresponden a restricciones de normalización y no a parámetros estimados.
 
+Además, para facilitar la interpretación de magnitudes, el Anexo~\ref{sec:anexo_odds_ratios}
+presenta los \emph{odds ratios} asociados a ambas especificaciones. Estos se calculan como
+\(\exp(\beta)\) o, en el caso de variables de tiempo medidas en segundos, como \(\exp(60\beta)\)
+para reportar el cambio asociado a un minuto adicional.
+
+\subsubsection{Modelo con proxy EOD continuo}
+
+La Tabla~\ref{tab:parametros_modelo_continuo} presenta la especificación que incorpora la composición
+histórica de ingreso EOD mediante proporciones continuas de hogares en los tramos
+\texttt{ABC1\_proxy} y \texttt{D+E\_proxy}.
+
 \begin{landscape}
 \small
 \setlength{\tabcolsep}{3pt}
 \begin{longtable}{p{0.27\linewidth}rrrrrr}
-\caption{Parámetros del modelo principal territorial. Opción A: \texttt{BIP} como referencia para variables comunes}
-\label{tab:parametros_opcion_a}\\
+\caption{Parámetros del modelo con proxy EOD continuo}
+\label{tab:parametros_modelo_continuo}\\
 \toprule
 Variable &
 \texttt{BIP} Est. & \texttt{BIP} t &
@@ -46,69 +57,50 @@ Variable &
 \bottomrule
 \endfoot
 
-\texttt{ASC} & -- & -- & -1.9472 & -24.08 & -3.5994 & -21.41 \\
-\texttt{ANIO\_2025} & 0 & -- & 0.2966 & 33.34 & 0.2335 & 12.73 \\
-\texttt{LAB\_PM} & 0 & -- & 0.1002 & 6.95 & 0.4568 & 15.19 \\
-\texttt{LAB\_PT} & 0 & -- & 0.1590 & 9.07 & 0.2309 & 6.68 \\
-\texttt{NO\_LAB} & 0 & -- & 0.1653 & 9.46 & 0.0413 & 1.10 \\
-\texttt{LOG\_DEMAND} & 0 & -- & -0.0330 & -4.22 & -0.0725 & -4.64 \\
-\texttt{LOG\_BUS\_STOP\_DENSITY} & 0 & -- & 0.0070 & 0.52 & -0.0707 & -2.37 \\
-\texttt{LOG\_BUS\_LINE\_COUNT} & 0 & -- & 0.0171 & 1.18 & 0.0925 & 3.00 \\
-\texttt{LOG\_METRO\_LINE\_COUNT} & 0 & -- & 0.0542 & 2.66 & 0.1233 & 3.15 \\
-\texttt{T\_VEH} & 0.000019 & 0.62 & 0.000069 & 2.33 & -0.000007 & -0.23 \\
-\texttt{T\_ESPERA\_INI} & -0.001700 & -29.18 & -0.001726 & -29.40 & -0.001410 & -20.11 \\
-\texttt{T\_ESPERA\_TRASB} & -0.000277 & -3.57 & -0.000442 & -5.57 & 0.000042 & 0.56 \\
-\texttt{N\_TRASB} & -0.0614 & -1.55 & -0.1276 & -3.23 & -0.1557 & -3.83 \\
-\texttt{Educación univ. 18+} & 0 & -- & 0.0701 & 8.98 & 0.3405 & 20.96 \\
-\texttt{Hacinamiento} & 0 & -- & -0.0577 & -5.21 & -0.0344 & -1.31 \\
-\texttt{Discapacidad} & 0 & -- & 0.0191 & 1.82 & -0.1226 & -4.96 \\
-\texttt{Inmigrantes} & 0 & -- & 0.1022 & 11.23 & 0.0450 & 2.19 \\
-\texttt{Centros deportivos OSM} & 0 & -- & -0.0107 & -2.44 & 0.0096 & 1.12 \\
-\texttt{Convenience OSM} & 0 & -- & 0.0111 & 2.59 & 0.0344 & 4.05 \\
-\texttt{Playgrounds OSM} & 0 & -- & 0.0297 & 6.05 & 0.0735 & 7.34 \\
-\texttt{Escuelas OSM} & 0 & -- & 0.0015 & 0.29 & -0.0199 & -1.83 \\
-\texttt{Universidades OSM} & 0 & -- & -0.0199 & -9.36 & -0.0268 & -5.95 \\
-\texttt{Refugios transporte OSM} & 0 & -- & -0.0271 & -4.22 & 0.0297 & 2.10 \\
-\texttt{Accesos Metro OSM} & 0 & -- & -0.0126 & -3.77 & -0.0372 & -5.43 \\
+\texttt{ASC} & -- & -- & -1.9172 & -23.32 & -3.5839 & -20.81 \\
+\texttt{ANIO\_2025} & 0 & -- & 0.2965 & 33.32 & 0.2332 & 12.72 \\
+\texttt{LAB\_PM} & 0 & -- & 0.0976 & 6.76 & 0.4604 & 15.25 \\
+\texttt{LAB\_PT} & 0 & -- & 0.1571 & 8.87 & 0.2396 & 6.89 \\
+\texttt{NO\_LAB} & 0 & -- & 0.1624 & 9.23 & 0.0510 & 1.35 \\
+\texttt{LOG\_DEMAND} & 0 & -- & -0.0344 & -4.31 & -0.0671 & -4.24 \\
+\texttt{LOG\_BUS\_STOP\_DENSITY} & 0 & -- & 0.0008 & 0.06 & -0.0910 & -2.92 \\
+\texttt{LOG\_BUS\_LINE\_COUNT} & 0 & -- & 0.0164 & 1.13 & 0.0901 & 2.91 \\
+\texttt{LOG\_METRO\_LINE\_COUNT} & 0 & -- & 0.0488 & 2.39 & 0.1235 & 3.14 \\
+\texttt{T\_VEH} & 0.000020 & 0.66 & 0.000071 & 2.39 & -0.000006 & -0.19 \\
+\texttt{T\_ESPERA\_INI} & -0.0017 & -29.21 & -0.0017 & -29.39 & -0.0014 & -20.08 \\
+\texttt{T\_ESPERA\_TRASB} & -0.0003 & -3.59 & -0.0004 & -5.60 & 0.000045 & 0.60 \\
+\texttt{N\_TRASB} & -0.0597 & -1.50 & -0.1248 & -3.15 & -0.1556 & -3.83 \\
+\texttt{Educación univ. 18+} & 0 & -- & 0.0815 & 8.93 & 0.3073 & 16.47 \\
+\texttt{Hacinamiento} & 0 & -- & -0.0652 & -5.66 & -0.0492 & -1.79 \\
+\texttt{Discapacidad} & 0 & -- & 0.0028 & 0.24 & -0.0988 & -3.67 \\
+\texttt{Inmigrantes} & 0 & -- & 0.1007 & 9.91 & 0.0865 & 3.68 \\
+\texttt{Mujeres} & 0 & -- & -0.0002 & -0.06 & 0.0212 & 2.37 \\
+\texttt{Asistencia parvularia} & 0 & -- & 0.0053 & 0.76 & 0.0487 & 3.11 \\
+\texttt{Centros deportivos OSM} & 0 & -- & -0.0092 & -2.10 & 0.0078 & 0.89 \\
+\texttt{Convenience OSM} & 0 & -- & 0.0135 & 3.07 & 0.0414 & 4.69 \\
+\texttt{Playgrounds OSM} & 0 & -- & 0.0283 & 5.65 & 0.0662 & 6.44 \\
+\texttt{Escuelas OSM} & 0 & -- & -0.0001 & -0.03 & -0.0284 & -2.54 \\
+\texttt{Universidades OSM} & 0 & -- & -0.0197 & -9.15 & -0.0244 & -5.35 \\
+\texttt{Refugios transporte OSM} & 0 & -- & -0.0306 & -4.65 & 0.0375 & 2.62 \\
+\texttt{Accesos Metro OSM} & 0 & -- & -0.0096 & -2.83 & -0.0370 & -5.27 \\
+\texttt{ABC1\_proxy EOD} & 0 & -- & -0.0154 & -1.87 & -0.0053 & -0.34 \\
+\texttt{D+E\_proxy EOD} & 0 & -- & 0.0369 & 4.53 & -0.0123 & -0.67 \\
 
 \end{longtable}
 \end{landscape}
 
-\subsection{Opción B: coeficientes reportables bajo suma cero}
+\subsubsection{Modelo con proxy EOD dummy}
 
-La Tabla~\ref{tab:parametros_opcion_b} presenta los parámetros del modelo bajo la segunda
-normalización considerada. A diferencia de la Opción A, esta parametrización permite reportar
-coeficientes para \texttt{BIP}, \texttt{QR\_OTHER} y \texttt{QR\_RED} también en variables comunes al
-conjunto de alternativas. Esta forma de presentar los resultados puede ser más informativa cuando el
-interés es comparar directamente el signo y magnitud de cada variable entre las tres alternativas.
-
-En esta parametrización, los coeficientes de variables comunes se identifican mediante una
-restricción de suma cero entre alternativas. Es decir, para cada variable común $x_k$ se impone que
-\[
-\beta_{\texttt{BIP},k}
-+ \beta_{\texttt{QR\_OTHER},k}
-+ \beta_{\texttt{QR\_RED},k}
-= 0.
-\]
-Por lo tanto, el coeficiente de \texttt{BIP} no se estima como un tercer parámetro libre, sino que se
-recupera como
-\[
-\beta_{\texttt{BIP},k}
-= -\left(\beta_{\texttt{QR\_OTHER},k}+\beta_{\texttt{QR\_RED},k}\right).
-\]
-Esto permite reportar coeficientes para las tres alternativas, manteniendo identificada la utilidad.
-Sin embargo, para los coeficientes de \texttt{BIP} derivados por suma cero no se reportan errores
-estándar ni estadísticos \emph{t-ratio}, ya que estos requerirían calcularse explícitamente mediante
-el método delta usando la matriz de varianzas y covarianzas. Por esta razón, en la tabla principal y
-en la tabla extendida del anexo, el \emph{t-ratio} de \texttt{BIP} aparece solo para las variables
-alternativa-específicas estimadas directamente.
+La Tabla~\ref{tab:parametros_modelo_dummy} presenta la especificación que incorpora la composición
+histórica de ingreso EOD mediante indicadores de alta concentración de hogares en los tramos
+\texttt{ABC1\_proxy} y \texttt{D+E\_proxy}.
 
 \begin{landscape}
 \small
 \setlength{\tabcolsep}{3pt}
 \begin{longtable}{p{0.27\linewidth}rrrrrr}
-\caption{Parámetros del modelo principal territorial. Opción B: coeficientes reportables bajo suma cero}
-\label{tab:parametros_opcion_b}\\
+\caption{Parámetros del modelo con proxy EOD dummy}
+\label{tab:parametros_modelo_dummy}\\
 \toprule
 Variable &
 \texttt{BIP} Est. & \texttt{BIP} t &
@@ -128,30 +120,54 @@ Variable &
 \bottomrule
 \endfoot
 
-\texttt{ASC} & -- & -- & -1.9473 & -24.08 & -3.5979 & -21.40 \\
-\texttt{ANIO\_2025} & -0.1767 & -- & 0.1199 & 14.56 & 0.0568 & 4.58 \\
-\texttt{LAB\_PM} & -0.1857 & -- & -0.0854 & -6.38 & 0.2711 & 13.36 \\
-\texttt{LAB\_PT} & -0.1300 & -- & 0.0291 & 1.85 & 0.1009 & 4.32 \\
-\texttt{NO\_LAB} & -0.0689 & -- & 0.0965 & 5.85 & -0.0276 & -1.09 \\
-\texttt{LOG\_DEMAND} & 0.0352 & -- & 0.0022 & 0.32 & -0.0374 & -3.55 \\
-\texttt{BUS stops} & 0.0213 & -- & 0.0283 & 2.18 & -0.0496 & -2.46 \\
-\texttt{Bus lines} & -0.0364 & -- & -0.0195 & -1.43 & 0.0559 & 2.69 \\
-\texttt{Metro lines} & -0.0593 & -- & -0.0049 & -0.27 & 0.0642 & 2.43 \\
-\texttt{T\_VEH} & 0.000019 & 0.62 & 0.000069 & 2.33 & -0.000007 & -0.23 \\
-\texttt{T\_ESPERA\_INI} & -0.001700 & -29.18 & -0.001726 & -29.40 & -0.001410 & -20.11 \\
-\texttt{T\_ESPERA\_TRASB} & -0.000277 & -3.57 & -0.000442 & -5.57 & 0.000042 & 0.56 \\
-\texttt{N\_TRASB} & -0.0614 & -1.54 & -0.1277 & -3.23 & -0.1557 & -3.83 \\
-\texttt{Educación univ. 18+} & -0.1369 & -- & -0.0668 & -9.19 & 0.2036 & 18.56 \\
-\texttt{Hacinamiento} & 0.0307 & -- & -0.0270 & -2.43 & -0.0037 & -0.21 \\
-\texttt{Discapacidad} & 0.0345 & -- & 0.0536 & 5.10 & -0.0880 & -5.29 \\
-\texttt{Inmigrantes} & -0.0491 & -- & 0.0531 & 5.99 & -0.0041 & -0.29 \\
-\texttt{Centros deportivos OSM} & 0.0003 & -- & -0.0103 & -2.61 & 0.0100 & 1.71 \\
-\texttt{Convenience OSM} & -0.0152 & -- & -0.0041 & -1.05 & 0.0193 & 3.36 \\
-\texttt{Playgrounds OSM} & -0.0344 & -- & -0.0047 & -1.04 & 0.0391 & 5.77 \\
-\texttt{Escuelas OSM} & 0.0062 & -- & 0.0076 & 1.60 & -0.0138 & -1.88 \\
-\texttt{Universidades OSM} & 0.0155 & -- & -0.0043 & -2.16 & -0.0112 & -3.69 \\
-\texttt{Refugios transporte OSM} & -0.0009 & -- & -0.0280 & -4.53 & 0.0288 & 3.02 \\
-\texttt{Accesos Metro OSM} & 0.0166 & -- & 0.0040 & 1.29 & -0.0206 & -4.45 \\
+\texttt{ASC} & -- & -- & -1.9081 & -23.16 & -3.5086 & -20.47 \\
+\texttt{ANIO\_2025} & 0 & -- & 0.2963 & 33.30 & 0.2329 & 12.70 \\
+\texttt{LAB\_PM} & 0 & -- & 0.0955 & 6.60 & 0.4529 & 14.97 \\
+\texttt{LAB\_PT} & 0 & -- & 0.1522 & 8.60 & 0.2305 & 6.62 \\
+\texttt{NO\_LAB} & 0 & -- & 0.1603 & 9.11 & 0.0447 & 1.18 \\
+\texttt{LOG\_DEMAND} & 0 & -- & -0.0370 & -4.65 & -0.0722 & -4.56 \\
+\texttt{LOG\_BUS\_STOP\_DENSITY} & 0 & -- & -0.0022 & -0.16 & -0.1134 & -3.60 \\
+\texttt{LOG\_BUS\_LINE\_COUNT} & 0 & -- & 0.0251 & 1.72 & 0.1023 & 3.29 \\
+\texttt{LOG\_METRO\_LINE\_COUNT} & 0 & -- & 0.0571 & 2.80 & 0.1251 & 3.19 \\
+\texttt{T\_VEH} & 0.000020 & 0.67 & 0.000069 & 2.32 & -0.000008 & -0.25 \\
+\texttt{T\_ESPERA\_INI} & -0.0017 & -29.34 & -0.0017 & -29.43 & -0.0014 & -20.04 \\
+\texttt{T\_ESPERA\_TRASB} & -0.0003 & -3.58 & -0.0004 & -5.58 & 0.000046 & 0.61 \\
+\texttt{N\_TRASB} & -0.0644 & -1.62 & -0.1285 & -3.24 & -0.1572 & -3.86 \\
+\texttt{Educación univ. 18+} & 0 & -- & 0.0784 & 8.63 & 0.3194 & 17.16 \\
+\texttt{Hacinamiento} & 0 & -- & -0.0556 & -4.84 & -0.0520 & -1.88 \\
+\texttt{Discapacidad} & 0 & -- & 0.0123 & 1.09 & -0.1057 & -4.02 \\
+\texttt{Inmigrantes} & 0 & -- & 0.1033 & 10.24 & 0.0962 & 4.09 \\
+\texttt{Mujeres} & 0 & -- & 0.0005 & 0.15 & 0.0241 & 2.68 \\
+\texttt{Asistencia parvularia} & 0 & -- & 0.0094 & 1.33 & 0.0672 & 4.17 \\
+\texttt{Centros deportivos OSM} & 0 & -- & -0.0086 & -1.94 & 0.0113 & 1.29 \\
+\texttt{Convenience OSM} & 0 & -- & 0.0119 & 2.74 & 0.0429 & 4.94 \\
+\texttt{Playgrounds OSM} & 0 & -- & 0.0283 & 5.63 & 0.0644 & 6.26 \\
+\texttt{Escuelas OSM} & 0 & -- & 0.0020 & 0.39 & -0.0262 & -2.35 \\
+\texttt{Universidades OSM} & 0 & -- & -0.0178 & -8.03 & -0.0211 & -4.47 \\
+\texttt{Refugios transporte OSM} & 0 & -- & -0.0304 & -4.58 & 0.0328 & 2.28 \\
+\texttt{Accesos Metro OSM} & 0 & -- & -0.0104 & -3.06 & -0.0340 & -4.90 \\
+\texttt{Alta concentración ABC1\_proxy} & 0 & -- & -0.0264 & -4.38 & -0.0421 & -3.44 \\
+\texttt{Alta concentración D+E\_proxy} & 0 & -- & -0.0026 & -0.37 & -0.0110 & -0.65 \\
 
 \end{longtable}
 \end{landscape}
+
+\subsection{Comparación general entre especificaciones}
+
+Los parámetros de las variables base, temporales, de viaje, Censo y OSM son estables entre ambas
+especificaciones. En particular, se mantienen los signos principales asociados a año, franjas
+horarias, demanda local, tiempos de espera, educación universitaria, hacinamiento, inmigración,
+refugios de transporte y accesos a Metro. Esto sugiere que la forma de representar el proxy EOD no
+altera de manera sustantiva la estructura central del modelo.
+
+La diferencia principal aparece en la lectura del bloque EOD. En la especificación continua,
+\texttt{D+E\_proxy} presenta una asociación positiva y significativa con \texttt{QR\_OTHER}, mientras
+que \texttt{ABC1\_proxy} muestra una señal negativa solo marginal. En la especificación dummy, la
+alta concentración \texttt{ABC1\_proxy} presenta coeficientes negativos y significativos tanto para
+\texttt{QR\_OTHER} como para \texttt{QR\_RED}, mientras que la alta concentración
+\texttt{D+E\_proxy} no presenta una señal estadísticamente robusta.
+
+La interpretación sustantiva de estos patrones se desarrolla en la sección siguiente. En esta sección
+solo se deja establecido que ambas especificaciones son comparables, convergen correctamente y
+conservan patrones centrales similares, pero capturan de forma distinta la dimensión histórica de
+ingreso territorial proveniente de la EOD 2012.

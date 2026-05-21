@@ -8,7 +8,7 @@ Las variables utilizadas en la especificación se pueden agrupar en tres grandes
 
 El segundo bloque corresponde a variables temporales, de demanda y de oferta operacional. Estas variables describen el contexto en que ocurre el viaje, por ejemplo el año de observación, la franja horaria, el nivel de demanda local y la disponibilidad de infraestructura u oferta de transporte en la zona de origen. En general, estas variables son comunes a las tres alternativas dentro de una misma observación.
 
-El tercer bloque corresponde a variables territoriales construidas a partir de fuentes externas, principalmente Censo 2024 y OpenStreetMap. Estas variables caracterizan el entorno socioeconómico, urbano y de infraestructura de la zona de origen del viaje. Para integrarlas al modelo, cada viaje se asocia a una zona territorial \texttt{ZONA777}, y las variables zonales se incorporan según la zona de inicio del viaje.
+El tercer bloque corresponde a variables territoriales construidas a partir de fuentes externas, principalmente Censo 2024, OpenStreetMap y la Encuesta Origen Destino de Santiago 2012. Estas variables caracterizan el entorno socioeconómico, urbano, de infraestructura y de composición histórica de la zona de origen del viaje. Para integrarlas al modelo, cada viaje se asocia a una zona territorial \texttt{ZONA777}, y las variables zonales se incorporan según la zona de inicio del viaje.
 
 En términos de escala, las variables con prefijo \texttt{LOG\_} corresponden a transformaciones logarítmicas del tipo \(\log(1+x)\). Esta transformación se utiliza para reducir la asimetría de variables de conteo o densidad operacional y para permitir una interpretación asociada a cambios proporcionales. Por otra parte, las variables con sufijo \texttt{\_z} corresponden a variables estandarizadas, es decir, transformadas restando su media y dividiendo por su desviación estándar. En estos casos, el coeficiente se interpreta como el cambio en utilidad asociado a un aumento de una desviación estándar en la variable.
 
@@ -81,7 +81,9 @@ se implementa el procedimiento completo de refinamiento espacial, por lo que las
 microespacializadas deben interpretarse como aproximaciones territoriales consistentes con los
 agregados disponibles, no como ubicaciones observadas de los hogares.
 
-El bloque censal finalmente incorporado al modelo principal contiene cuatro variables. La primera es \path{share_cine18_universitaria_o_mas_micro_z}, que mide la proporción espacializada de población de 18 años o más con educación universitaria o superior. Esta variable proviene de los microdatos espacializados y actúa como proxy de capital educativo o nivel socioeconómico del entorno de origen. La segunda es \path{share_hacinamiento_z}, definida como la proporción de viviendas particulares ocupadas clasificadas como hacinadas. La tercera es \path{share_discapacidad_z}, que corresponde a la proporción de personas con discapacidad. La cuarta es \path{share_inmigrantes_z}, definida como la proporción de población inmigrante. Todas estas variables se estandarizan, por lo que sus coeficientes se interpretan como cambios en utilidad asociados a un aumento de una desviación estándar en la característica territorial.
+El bloque censal incorporado en las especificaciones candidatas contiene seis variables. La primera es \path{share_cine18_universitaria_o_mas_micro_z}, que mide la proporción espacializada de población de 18 años o más con educación universitaria o superior. Esta variable proviene de los microdatos espacializados y actúa como proxy de capital educativo o nivel socioeconómico del entorno de origen. La segunda es \path{share_hacinamiento_z}, definida como la proporción de viviendas particulares ocupadas clasificadas como hacinadas. La tercera es \path{share_discapacidad_z}, que corresponde a la proporción de personas con discapacidad. La cuarta es \path{share_inmigrantes_z}, definida como la proporción de población inmigrante.
+
+Adicionalmente, se incorporan dos controles sociodemográficos territoriales. La variable \path{share_mujeres_z} mide la proporción de mujeres en la zona de origen. La variable \path{share_asistencia_parv_z} mide la proporción de población en edad preescolar que asiste a educación parvularia. Esta última no debe interpretarse como una medida exacta de asistencia a sala cuna, sino como una proxy censal más amplia de asistencia a educación parvularia. Todas estas variables se estandarizan, por lo que sus coeficientes se interpretan como cambios en utilidad asociados a un aumento de una desviación estándar en la característica territorial.
 
 Durante el proceso de especificación también se evaluaron otras variables censales que no fueron incluidas en el bloque principal. Entre ellas se encuentran:
 
@@ -90,7 +92,7 @@ Durante el proceso de especificación también se evaluaron otras variables cens
     \item \path{share_cine18_universitaria_micro_z}, \path{share_cine18_terciaria_corta_micro_z}, \path{share_cine18_postgrado_micro_z} y \path{share_independiente_micro_z}.
 \end{itemize}
 
-Estas variables se dejaron fuera por una combinación de menor aporte incremental, señales menos robustas o significativas, redundancia con variables ya seleccionadas, o una interpretación sustantiva menos directa para el objetivo del modelo. En particular, el bloque final privilegia una especificación más parsimoniosa y defendible: educación superior como proxy socioeconómica, hacinamiento como vulnerabilidad habitacional, discapacidad como dimensión de accesibilidad social, e inmigración como composición territorial.
+Estas variables se dejaron fuera por una combinación de menor aporte incremental, señales menos robustas o significativas, redundancia con variables ya seleccionadas, o una interpretación sustantiva menos directa para el objetivo del modelo. En particular, el bloque final privilegia una especificación parsimoniosa y defendible: educación superior como proxy socioeconómica, hacinamiento como vulnerabilidad habitacional, discapacidad como dimensión de accesibilidad social, inmigración como composición territorial, y controles adicionales de composición por sexo y asistencia parvularia.
 
 Estas variables deben interpretarse como atributos del entorno de origen del viaje, no como características individuales necesariamente observadas para cada persona que viaja. Por ejemplo, un coeficiente asociado a \texttt{share\_inmigrantes\_z} no indica que una persona inmigrante tenga mayor o menor propensión a usar cierta alternativa de pago, sino que los viajes iniciados en zonas con mayor presencia relativa de población inmigrante presentan diferencias sistemáticas en la utilidad relativa de las alternativas.
 
@@ -116,14 +118,29 @@ Durante el proceso de exploración también se evaluaron otras variables OSM que
 
 La interpretación de las variables OSM requiere una cautela adicional. OpenStreetMap es una fuente colaborativa y su cobertura puede variar espacialmente según el nivel de mapeo de cada zona. Por ello, estas variables no deben entenderse como mediciones administrativas exhaustivas, sino como proxies observables del entorno construido y de la infraestructura mapeada. Aun así, su valor para este modelo está en capturar diferencias territoriales que no aparecen en las variables operacionales tradicionales, especialmente en dimensiones de equipamiento urbano y experiencia de acceso al transporte.
 
+\subsection{Variables de la Encuesta Origen Destino 2012}
+
+Además de las fuentes contemporáneas, se evalúan variables provenientes de la Encuesta Origen Destino de Santiago 2012 (EOD 2012). Esta encuesta contiene información de hogares, personas y viajes, incluyendo variables de ingreso de hogar, tenencia de vehículos y patrones de movilidad. En este reporte la EOD no se utiliza como medición contemporánea directa del período 2024--2025, sino como una fuente histórica para construir proxies territoriales relativamente persistentes.
+
+Para compatibilizar la EOD 2012 con la base de modelación, las variables se agregan primero a la zonificación original de la encuesta y luego se transfieren a \texttt{ZONA777} mediante un cruce espacial por intersección de áreas. En los casos en que una zona \texttt{ZONA777} intersecta varias zonas EOD, las variables se calculan como promedios ponderados por la proporción de área intersectada. De este modo, cada viaje recibe el valor EOD asociado a su zona de origen \texttt{ZONA777}.
+
+La dimensión EOD evaluada en las especificaciones candidatas corresponde a composición histórica de ingreso del hogar. Para construirla, los hogares de la EOD 2012 se clasifican según percentiles ponderados de ingreso, usando el factor de expansión muestral de la encuesta. Este factor indica cuántos hogares de la población representa cada hogar encuestado, por lo que permite calcular distribuciones más consistentes con el diseño muestral de la EOD. A partir de esta clasificación se definen dos grupos operativos: \texttt{ABC1\_proxy}, correspondiente al tramo superior de ingreso, y \texttt{D+E\_proxy}, correspondiente a los tramos bajos. Estas etiquetas no corresponden a una clasificación socioeconómica oficial, sino a proxies históricos construidos exclusivamente a partir del ingreso declarado en la EOD 2012.
+
+Se reportan dos formas alternativas de incorporar esta información. La primera utiliza variables continuas: \path{eod2012_share_hogares_abc1_income_proxy_z} y \path{eod2012_share_hogares_de_income_proxy_z}, que miden la proporción zonal de hogares en el tramo superior y en los tramos bajos de ingreso, respectivamente. En términos simples, estas variables mantienen la intensidad de la composición de ingreso: una zona puede tener 5\%, 20\% o 60\% de hogares en un determinado tramo, y esa diferencia gradual se conserva en el modelo.
+
+La segunda forma utiliza variables binarias de alta concentración: \path{eod2012_dummy_high_abc1_income_proxy_z} y \path{eod2012_dummy_high_de_income_proxy_z}. Estas variables no distinguen todos los niveles posibles de la proporción zonal, sino que separan las zonas con concentración especialmente alta del resto. En particular, toman valor uno cuando la zona se ubica en el 25\% superior de la distribución zonal de la proporción correspondiente, y cero en caso contrario. Por lo tanto, la versión continua captura variación gradual en composición de ingreso, mientras que la versión dummy captura pertenencia a un grupo de zonas de alta concentración relativa.
+
+Estas variables deben interpretarse con cautela. Primero, provienen de una encuesta de 2012, por lo que no capturan cambios recientes en composición socioeconómica, patrones residenciales o adopción tecnológica. Segundo, se incorporan como atributos agregados de la zona de origen, no como información individual del usuario que realiza el viaje. Tercero, al estar construidas a partir de ingreso histórico, pueden estar correlacionadas con otras dimensiones territoriales, como educación, hacinamiento, motorización o centralidad urbana. Su rol en el reporte es evaluar si una señal histórica de composición socioeconómica territorial agrega información interpretable al modelo, no reemplazar mediciones contemporáneas del Censo 2024.
+
 \subsection{Resumen de variables utilizadas}
 
-La Tabla~\ref{tab:variables_resumen} resume las variables incluidas en la especificación principal del modelo. La columna de tratamiento indica si la variable es alternativa-específica o común al viaje, y resume la transformación aplicada antes de la estimación.
+La Tabla~\ref{tab:variables_resumen} resume las variables incluidas en las especificaciones candidatas reportadas. La columna de tratamiento indica si la variable es alternativa-específica o común al viaje, y resume la transformación aplicada antes de la estimación.
 
+\begin{landscape}
 \begingroup
-\small
+\scriptsize
 \setlength{\tabcolsep}{3pt}
-\begin{longtable}{p{0.17\textwidth} p{0.12\textwidth} p{0.33\textwidth} p{0.18\textwidth} p{0.16\textwidth}}
+\begin{longtable}{p{0.16\linewidth} p{0.10\linewidth} p{0.35\linewidth} p{0.18\linewidth} p{0.16\linewidth}}
 \caption{Resumen de variables utilizadas en el modelo}
 \label{tab:variables_resumen}\\
 \toprule
@@ -158,6 +175,8 @@ Educación univ. 18+ & Censo & Proporción espacializada de población 18+ con e
 Hacinamiento & Censo & Proporción de viviendas particulares ocupadas con hacinamiento. & Censo 2024 manzana-entidad & Común; estandarizada \\
 Discapacidad & Censo & Proporción de personas con discapacidad. & Censo 2024 manzana-entidad & Común; estandarizada \\
 Inmigrantes & Censo & Proporción de población inmigrante. & Censo 2024 manzana-entidad & Común; estandarizada \\
+Mujeres & Censo & Proporción de mujeres en la zona de origen. & Censo 2024 manzana-entidad & Común; estandarizada \\
+Asistencia parvularia & Censo & Proporción de población en edad preescolar que asiste a educación parvularia. & Censo 2024 manzana-entidad & Común; estandarizada \\
 
 Escuelas OSM & OSM & Densidad de objetos \texttt{amenity=school}. & OpenStreetMap & Común; densidad/km\(^2\), est. \\
 Universidades OSM & OSM & Densidad de objetos \texttt{amenity=university}. & OpenStreetMap & Común; densidad/km\(^2\), est. \\
@@ -167,8 +186,14 @@ Convenience OSM & OSM & Densidad de comercio de conveniencia. & OpenStreetMap & 
 Refugios transporte OSM & OSM & Densidad de objetos de transporte con \texttt{shelter=yes}. & OpenStreetMap & Común; densidad/km\(^2\), est. \\
 Accesos Metro OSM & OSM & Densidad de accesos físicos a Metro. & OpenStreetMap & Común; densidad/km\(^2\), est. \\
 
+\texttt{ABC1\_proxy} EOD & EOD 2012 & Proporción histórica de hogares en el tramo superior de ingreso EOD. & EOD Santiago 2012 & Común; estandarizada \\
+\texttt{D+E\_proxy} EOD & EOD 2012 & Proporción histórica de hogares en tramos bajos de ingreso EOD. & EOD Santiago 2012 & Común; estandarizada \\
+Alta concentración \texttt{ABC1\_proxy} & EOD 2012 & Indicador de zona en el 25\% superior de concentración del tramo alto de ingreso. & EOD Santiago 2012 & Común; dummy est. \\
+Alta concentración \texttt{D+E\_proxy} & EOD 2012 & Indicador de zona en el 25\% superior de concentración de tramos bajos de ingreso. & EOD Santiago 2012 & Común; dummy est. \\
+
 \end{longtable}
 \endgroup
+\end{landscape}
 
 \noindent
-La categoría temporal omitida es \texttt{LAB\_VALLE}. Para las variables comunes al viaje, la forma de reportar coeficientes por alternativa depende de la parametrización adoptada: en la opción A se normaliza \texttt{BIP} a cero para variables comunes, mientras que en la opción B se reporta un coeficiente para \texttt{BIP} mediante la restricción de suma cero.
+La categoría temporal omitida es \texttt{LAB\_VALLE}. Para las variables comunes al viaje, \texttt{BIP} se utiliza como alternativa de referencia; por lo tanto, los coeficientes reportados para \texttt{QR\_OTHER} y \texttt{QR\_RED} se interpretan respecto de \texttt{BIP}.

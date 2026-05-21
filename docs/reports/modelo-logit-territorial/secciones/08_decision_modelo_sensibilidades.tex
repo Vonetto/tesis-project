@@ -1,61 +1,66 @@
 \section{Decisión de modelo principal y sensibilidades}
 
-A partir de los resultados anteriores, el modelo principal propuesto corresponde al modelo territorial
-que incorpora variables de viaje, variables temporales, demanda y oferta operacional, variables
-sociodemográficas del Censo 2024 y variables OSM, incluyendo infraestructura de acceso al sistema.
-En particular, se mantiene la especificación con refugios de transporte y accesos a Metro, ya que
-ambas variables aportan una lectura sustantiva relevante sobre condiciones del entorno de acceso y
-presentan señales estadísticamente informativas.
+A partir de los resultados anteriores, la especificación territorial de trabajo corresponde a un
+modelo MNL con \texttt{BIP} como alternativa de referencia para variables comunes, que incorpora
+atributos del viaje, variables temporales, demanda y oferta operacional, variables
+sociodemográficas del Censo 2024, variables OSM de entorno urbano e infraestructura de acceso, y
+proxies históricos de ingreso provenientes de la EOD 2012. Esta estructura permite analizar la
+elección entre \texttt{BIP}, \texttt{QR\_OTHER} y \texttt{QR\_RED} combinando atributos
+operacionales del viaje con características territoriales del origen.
 
-La decisión de mantener esta especificación no se basa únicamente en la mejora de ajuste global, sino
-también en su interpretabilidad. La inclusión de
-\path{osm_transport_shelter_yes_density_km2_z} permite incorporar una dimensión de infraestructura
-de parada que no estaba representada por las variables operacionales tradicionales. Por su parte,
+Dentro de esta estructura se mantienen dos especificaciones candidatas. La primera representa la
+dimensión de ingreso EOD mediante proporciones continuas de hogares en los tramos
+\texttt{ABC1\_proxy} y \texttt{D+E\_proxy}. La segunda utiliza indicadores de alta concentración
+zonal de esos mismos grupos. Ambas especificaciones comparten el resto de variables del modelo y
+mantienen patrones sustantivos similares en los bloques de viaje, temporalidad, Censo y OSM.
+
+La decisión entre ambas representaciones no debe basarse únicamente en AIC, BIC o
+log-verosimilitud. En modelos con variables territoriales correlacionadas, una variable puede aportar
+valor interpretativo aun cuando la mejora incremental de ajuste sea moderada. Por esto, la elección
+del modelo de reporte debe combinar tres criterios: estabilidad de signos, coherencia sustantiva e
+interpretabilidad para política pública. Bajo ese criterio, la especificación continua permite leer
+gradientes territoriales de composición de ingreso, mientras que la especificación dummy permite
+identificar zonas con alta concentración relativa de ciertos grupos.
+
+Respecto del bloque OSM, se mantiene la inclusión de refugios de transporte y accesos a Metro. La
+variable \path{osm_transport_shelter_yes_density_km2_z} aporta una dimensión de infraestructura de
+parada que no está representada por las variables operacionales tradicionales. Por su parte,
 \path{osm_railway_subway_entrance_density_km2_z} agrega información sobre accesibilidad física a la
-red de Metro, complementando la variable de número de líneas de Metro disponibles en la zona.
+red de Metro, complementando la variable de número de líneas de Metro disponibles en la zona. Aunque
+estas variables no deben interpretarse causalmente, sí entregan una lectura territorial relevante
+sobre el entorno de acceso al sistema.
 
-En términos de ajuste, el modelo presenta una mejora respecto de especificaciones más simples y
-mantiene convergencia satisfactoria. Sin embargo, la evaluación no debe reducirse exclusivamente a
-AIC, BIC o log-verosimilitud. En modelos con variables territoriales altamente correlacionadas, una
-variable puede aportar valor sustantivo aun cuando la mejora incremental en ajuste sea moderada. Por
-esto, la decisión final combina tres criterios: desempeño estadístico, estabilidad de signos y valor
-interpretativo para política pública.
+Respecto del bloque censal, la especificación conserva variables de composición educacional,
+vulnerabilidad habitacional, discapacidad, inmigración, composición por sexo y asistencia a educación
+parvularia. Estas variables no describen necesariamente al individuo que realiza el viaje, sino el
+contexto territorial de la zona de origen. Su valor está en permitir que el modelo distinga patrones
+de adopción de medios de pago asociados a la composición sociodemográfica del territorio.
 
-Respecto de la parametrización, se reportan dos rutas en paralelo. La Opción A trata a \texttt{BIP}
-como referencia para variables comunes, lo que corresponde a una especificación más convencional y
-directa de leer en términos de contrastes contra \texttt{BIP}. La Opción B impone una restricción de
-suma cero para variables comunes, permitiendo reportar coeficientes para las tres alternativas. Esta
-segunda ruta facilita una lectura más simétrica entre \texttt{BIP}, \texttt{QR\_OTHER} y
-\texttt{QR\_RED}, pero requiere recordar que los coeficientes de variables comunes se interpretan
-como desviaciones relativas respecto del promedio de alternativas.
-
-Dado que ambas rutas producen el mismo ajuste global, la diferencia entre ellas no corresponde a una
-diferencia de capacidad predictiva, sino a una decisión de identificación y presentación. Por ello,
-la elección entre Opción A y Opción B se deja explícitamente como una decisión metodológica a discutir.
-Para efectos de interpretación, la Opción B resulta útil porque permite observar la dirección relativa
-asociada a \texttt{BIP}; para efectos de estimación convencional, la Opción A sigue siendo una
-referencia válida y transparente.
+Como sensibilidad adicional, se evaluó la variable \path{eod2012_numveh_mean_z}, que mide el número
+promedio histórico de vehículos por hogar en la zona. Esta variable presentó una señal
+estadísticamente informativa, especialmente para \texttt{QR\_OTHER}. Sin embargo, no se incorpora en
+las especificaciones candidatas junto con los proxies de ingreso, porque representa una dimensión
+conceptualmente muy cercana al nivel socioeconómico y presenta alta colinealidad empírica con las
+variables EOD de ingreso. En consecuencia, se considera una sensibilidad útil para diagnóstico, pero
+no una variable central del modelo de reporte.
 
 Como sensibilidad computacional y de robustez, también se estimaron modelos equivalentes en Larch con
 muestras mayores. En particular, se probaron muestras de 5\% y 10\%, aprovechando que Larch permitió
-trabajar con mayor volumen de datos sin los problemas de memoria observados previamente. Los resultados
-mantuvieron métricas de ajuste y patrones generales consistentes con la estimación en Biogeme al 2\%.
-Esto entrega una confirmación adicional de que las señales principales no dependen únicamente del
-submuestreo inicial.
+trabajar con mayor volumen de datos sin los problemas de memoria observados previamente. Los
+resultados mantuvieron métricas de ajuste y patrones generales consistentes con la estimación en
+Biogeme al 2\%. Esto entrega una confirmación adicional de que las señales principales no dependen
+únicamente del submuestreo inicial.
 
-En síntesis, se propone mantener como especificación principal el modelo territorial con Censo, OSM,
-refugios de transporte y accesos a Metro. Esta especificación conserva buen desempeño estadístico,
-agrega variables interpretables desde una perspectiva de autoridad de transporte y permite discutir
-cómo el entorno territorial de origen se asocia con la elección entre \texttt{BIP}, \texttt{QR\_OTHER}
-y \texttt{QR\_RED}. Sin embargo, esta especificación no debe entenderse necesariamente como el modelo
-definitivo de la investigación, sino como el modelo principal desarrollado hasta esta etapa del
-análisis.
+En síntesis, el modelo territorial de trabajo queda definido por una estructura común con variables
+de viaje, temporalidad, Censo, OSM y EOD 2012. La decisión metodológica pendiente es seleccionar qué
+representación del bloque EOD resulta más adecuada para la tesis: una lectura continua de gradientes
+territoriales de ingreso o una lectura discreta basada en zonas de alta concentración relativa. En
+ambos casos, la especificación debe entenderse como un modelo principal de trabajo, no como el cierre
+definitivo de la investigación.
 
-Aún queda pendiente evaluar nuevas familias de variables que podrían complementar la lectura
+Aún queda pendiente evaluar otras familias de variables que podrían complementar la lectura
 territorial, especialmente aquellas vinculadas con calidad de infraestructura de paraderos y
 estaciones, accesibilidad peatonal, seguridad del entorno, disponibilidad de puntos de carga o pago,
-y medidas operacionales de confiabilidad, regularidad y ocupación. Estas variables podrían mejorar la
-capacidad explicativa del modelo y, sobre todo, aumentar su valor interpretativo para una autoridad
-de transporte. La decisión metodológica pendiente es si reportar como especificación principal la
-Opción A, con \texttt{BIP} como referencia para variables comunes, o la Opción B, con coeficientes
-reportables para las tres alternativas mediante suma cero.
+y medidas operacionales de confiabilidad, regularidad y ocupación. Estas variables podrían mejorar
+la capacidad explicativa del modelo y, sobre todo, aumentar su valor interpretativo para una
+autoridad de transporte.

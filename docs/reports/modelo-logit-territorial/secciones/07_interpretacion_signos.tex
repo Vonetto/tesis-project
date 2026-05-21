@@ -2,37 +2,39 @@
 
 \subsection{Consideraciones de interpretación}
 
-La interpretación de los resultados se realiza principalmente a partir de la Opción B, ya que esta
-permite reportar coeficientes para \texttt{BIP}, \texttt{QR\_OTHER} y \texttt{QR\_RED} también en
-variables comunes al conjunto de alternativas. Bajo esta parametrización, los coeficientes de
-variables comunes se leen como desviaciones respecto del promedio de las tres alternativas, debido a
-la restricción de suma cero. Por lo tanto, un coeficiente positivo indica que, condicional al resto
-de variables del modelo, esa característica se asocia con una mayor utilidad relativa de la
-alternativa respecto del promedio de alternativas.
+La interpretación de los resultados se realiza usando \texttt{BIP} como alternativa de referencia
+para las variables comunes al viaje o a la zona. Por lo tanto, para variables como año, franja
+horaria, demanda, oferta, Censo, OSM y EOD, un coeficiente positivo de \texttt{QR\_RED} o
+\texttt{QR\_OTHER} indica una mayor utilidad relativa de esa alternativa respecto de \texttt{BIP},
+manteniendo constantes las demás variables del modelo. Un coeficiente negativo indica una menor
+utilidad relativa respecto de \texttt{BIP}.
 
 En el caso de variables alternativa-específicas, como tiempos de viaje, esperas y transbordos, los
-coeficientes se interpretan directamente para cada alternativa. En cambio, para variables comunes
-como Censo, OSM, demanda u oferta, la interpretación debe entenderse como una asociación relativa:
-estas variables no cambian entre alternativas para un mismo viaje, pero sí permiten que el contexto
-territorial modifique la utilidad relativa de cada medio de pago.
+coeficientes se interpretan directamente para cada alternativa. Estas variables pueden tomar valores
+distintos para \texttt{BIP}, \texttt{QR\_RED} y \texttt{QR\_OTHER} dentro de una misma observación,
+por lo que sus coeficientes son identificables para las tres alternativas.
 
 Finalmente, los resultados deben interpretarse como asociaciones condicionales del modelo, no como
 efectos causales. En particular, las variables territoriales pueden capturar diferencias de
 composición socioespacial, intensidad de uso del sistema, disponibilidad de infraestructura y otros
-factores no observados que coexisten en una misma zona.
+factores no observados que coexisten en una misma zona. Esta cautela es especialmente relevante para
+las variables EOD 2012, que se incorporan como proxies históricos de composición territorial y no
+como mediciones contemporáneas directas del período 2024--2025.
 
 \subsection{Variables de viaje}
 
-Las variables de espera presentan los patrones más estables del modelo. El tiempo de espera inicial
-(\texttt{T\_ESPERA\_INI}) tiene coeficientes negativos, de magnitud similar y altamente
-significativos para las tres alternativas. Esto es consistente con la teoría de elección discreta:
-mayores tiempos de espera reducen la utilidad de la alternativa considerada.
+Las variables de espera presentan los patrones más estables en ambas especificaciones candidatas. El
+tiempo de espera inicial (\texttt{T\_ESPERA\_INI}) tiene coeficientes negativos, de magnitud similar
+y altamente significativos para las tres alternativas. Esto es consistente con la teoría de elección
+discreta: mayores tiempos de espera reducen la utilidad de la alternativa considerada.
 
 El tiempo de espera asociado a transbordos (\texttt{T\_ESPERA\_TRASB}) también presenta coeficientes
 negativos para \texttt{BIP} y \texttt{QR\_OTHER}, ambos estadísticamente significativos. En
-\texttt{QR\_RED}, en cambio, el coeficiente es cercano a cero y no significativo. Esto sugiere que el
-componente de espera por transbordo está capturando una penalización más clara para viajes asociados
-a \texttt{BIP} y \texttt{QR\_OTHER}, mientras que para \texttt{QR\_RED} la señal no es robusta.
+\texttt{QR\_RED}, en cambio, el coeficiente es cercano a cero y no significativo en ambas
+especificaciones. Una lectura sustantiva posible es que los viajes asociados a \texttt{QR\_RED}
+presentan menor penalización por espera en transbordo, posiblemente porque el uso de la app entrega
+información que permite anticipar la espera o decidir cómo utilizar ese tiempo. Esta hipótesis debe
+tratarse como interpretación exploratoria y no como evidencia causal directa.
 
 El número de transbordos (\texttt{N\_TRASB}) tiene signo negativo para las tres alternativas, aunque
 su significancia es mayor para \texttt{QR\_OTHER} y \texttt{QR\_RED}. Esto indica que, manteniendo
@@ -41,37 +43,32 @@ las alternativas de pago, especialmente en las alternativas QR.
 
 Por su parte, el tiempo en vehículo (\texttt{T\_VEH}) presenta coeficientes de magnitud muy pequeña.
 El único coeficiente estadísticamente significativo aparece en \texttt{QR\_OTHER}, con signo
-positivo. Esta señal debe interpretarse con cautela: descriptivamente, los viajes observados con
-\texttt{QR\_OTHER} presentan tiempos en vehículo algo mayores que \texttt{BIP}, aunque la diferencia
-es pequeña y \texttt{QR\_RED} muestra una media similar o mayor. Por lo tanto, más que interpretarse
-como una preferencia por viajes más largos, este resultado probablemente refleja diferencias de
-composición entre tipos de viaje, zonas y alternativas disponibles.
+positivo. Esta señal debe interpretarse con cautela: más que indicar una preferencia por viajes más
+largos, probablemente refleja diferencias de composición entre tipos de viaje, zonas de origen,
+distancias recorridas y alternativas disponibles.
 
 \subsection{Variables temporales, demanda y oferta}
 
 La variable \texttt{ANIO\_2025} muestra una asociación positiva con \texttt{QR\_OTHER} y
-\texttt{QR\_RED}, y negativa con \texttt{BIP} bajo la parametrización de suma cero. Esto sugiere que,
-en la muestra analizada, el año 2025 se asocia con una mayor utilidad relativa de las alternativas
-QR respecto de \texttt{BIP}. Esta señal es consistente con una posible expansión o consolidación del
-uso de medios de pago QR entre 2024 y 2025.
+\texttt{QR\_RED} respecto de \texttt{BIP}. Esto sugiere que, en la muestra analizada, el año 2025 se
+asocia con una mayor utilidad relativa de las alternativas QR. Esta señal es consistente con una
+posible expansión o consolidación del uso de medios de pago QR entre 2024 y 2025.
 
 Las variables de franja muestran diferencias relevantes entre alternativas. \texttt{LAB\_PM} se
-asocia fuertemente con \texttt{QR\_RED}, mientras que presenta coeficientes negativos para
-\texttt{BIP} y \texttt{QR\_OTHER}. Esto indica que los viajes en día laboral y punta mañana están
-particularmente asociados a \texttt{QR\_RED}. \texttt{LAB\_PT} muestra una señal similar, aunque de
-menor magnitud. En contraste, \texttt{NO\_LAB} se asocia positivamente con \texttt{QR\_OTHER}, lo
-que sugiere que esta alternativa adquiere mayor utilidad relativa en días no laborales.
+asocia fuertemente con \texttt{QR\_RED} respecto de \texttt{BIP}, mientras que también presenta una
+asociación positiva, aunque menor, con \texttt{QR\_OTHER}. \texttt{LAB\_PT} muestra una señal
+similar, aunque de menor magnitud. En contraste, \texttt{NO\_LAB} se asocia positivamente con
+\texttt{QR\_OTHER}, mientras que la señal para \texttt{QR\_RED} no es estadísticamente robusta.
 
-La variable \texttt{LOG\_DEMAND} presenta un coeficiente negativo y significativo para
-\texttt{QR\_RED}, mientras que su coeficiente en \texttt{QR\_OTHER} es pequeño y no significativo.
-Bajo suma cero, \texttt{BIP} queda con un coeficiente positivo derivado. Esto sugiere que zonas y
-franjas con mayor intensidad local de viajes tienden a estar relativamente menos asociadas a
-\texttt{QR\_RED}. Sin embargo, esta variable debe interpretarse con cautela, porque puede reflejar
-tanto intensidad de uso del sistema como composición territorial de la demanda.
+La variable \texttt{LOG\_DEMAND} presenta coeficientes negativos y significativos para
+\texttt{QR\_OTHER} y \texttt{QR\_RED} respecto de \texttt{BIP}. Esto sugiere que zonas y franjas con
+mayor intensidad local de viajes tienden a estar relativamente menos asociadas a alternativas QR. Sin
+embargo, esta variable debe interpretarse con cautela, porque puede reflejar tanto intensidad de uso
+del sistema como composición territorial de la demanda.
 
-En cuanto a oferta, la densidad de paraderos se asocia positivamente con \texttt{QR\_OTHER} y
-negativamente con \texttt{QR\_RED}. El número de líneas de bus y de metro muestra el patrón opuesto:
-coeficientes positivos para \texttt{QR\_RED} y no significativos o negativos para
+En cuanto a oferta, la densidad de paraderos se asocia negativamente con \texttt{QR\_RED} y no
+presenta una señal robusta para \texttt{QR\_OTHER}. El número de líneas de bus y de Metro muestra
+coeficientes positivos para \texttt{QR\_RED}, y el número de líneas de Metro también es positivo para
 \texttt{QR\_OTHER}. Estos resultados sugieren que la relación entre infraestructura operacional y
 medio de pago no es homogénea entre alternativas QR, y probablemente captura diferencias entre tipos
 de viaje, zonas de origen y estructura de la red.
@@ -79,72 +76,118 @@ de viaje, zonas de origen y estructura de la red.
 \subsection{Variables censales}
 
 La proporción de población de 18 años o más con educación universitaria o superior muestra uno de los
-patrones más claros del modelo. Bajo la Opción B, el coeficiente es positivo y altamente
-significativo para \texttt{QR\_RED}, negativo y significativo para \texttt{QR\_OTHER}, y negativo
-para \texttt{BIP} por suma cero. En términos relativos, esto indica que las zonas con mayor presencia
-de población universitaria se asocian con una mayor utilidad relativa de \texttt{QR\_RED}.
+patrones más claros de ambos modelos. El coeficiente es positivo y altamente significativo para
+\texttt{QR\_RED} respecto de \texttt{BIP}, y también positivo para \texttt{QR\_OTHER}, aunque de
+menor magnitud. En términos relativos, esto indica que las zonas con mayor presencia de población
+universitaria se asocian con una mayor utilidad relativa de alternativas QR, especialmente
+\texttt{QR\_RED}. Este resultado es coherente con la hipótesis de que mayor nivel educacional puede
+relacionarse con mayor adopción de herramientas digitales de pago o información.
 
 El hacinamiento presenta coeficientes negativos para las alternativas QR, especialmente para
-\texttt{QR\_OTHER}, mientras que \texttt{BIP} queda con coeficiente positivo derivado. Este patrón
-sugiere que zonas con mayor hacinamiento se asocian relativamente menos con alternativas QR,
-particularmente con \texttt{QR\_OTHER}. Esta variable puede estar capturando condiciones
-socioeconómicas y de acceso digital que afectan la adopción de medios de pago.
+\texttt{QR\_OTHER}. En \texttt{QR\_RED} la señal también es negativa, aunque menos robusta. Este
+patrón sugiere que zonas con mayor hacinamiento se asocian relativamente menos con alternativas QR,
+lo que puede reflejar condiciones socioeconómicas y diferencias de acceso o adopción digital.
 
-La proporción de personas con discapacidad muestra una asociación positiva con \texttt{QR\_OTHER} y
-negativa con \texttt{QR\_RED}, ambas significativas. Esto indica que el efecto territorial de esta
-variable no es uniforme entre alternativas QR. En este caso, la interpretación debe ser cuidadosa,
-porque la variable describe el contexto territorial de origen y no necesariamente una característica
-individual del usuario que realiza el viaje.
+La proporción de personas con discapacidad muestra una asociación negativa y significativa con
+\texttt{QR\_RED}, mientras que la señal para \texttt{QR\_OTHER} no es robusta en las especificaciones
+actuales. En este caso, la interpretación debe ser cuidadosa, porque la variable describe el contexto
+territorial de origen y no necesariamente una característica individual del usuario que realiza el
+viaje.
 
-La proporción de población inmigrante se asocia positivamente con \texttt{QR\_OTHER}, mientras que
-\texttt{QR\_RED} no presenta una señal significativa. Bajo suma cero, \texttt{BIP} aparece con un
-coeficiente negativo derivado. Esto sugiere que zonas con mayor proporción de población inmigrante
-están relativamente más asociadas a \texttt{QR\_OTHER} que a las otras alternativas.
+La proporción de población inmigrante se asocia positivamente con \texttt{QR\_OTHER} y también con
+\texttt{QR\_RED}. La magnitud es mayor para \texttt{QR\_OTHER}, aunque ambas señales se mantienen
+positivas en los dos modelos. Esto sugiere que zonas con mayor proporción de población inmigrante
+están relativamente más asociadas a alternativas QR respecto de \texttt{BIP}.
+
+Las variables censales de composición sociodemográfica agregan dos lecturas complementarias. La proporción de mujeres en la
+zona de origen no presenta una señal robusta para \texttt{QR\_OTHER}, pero sí una asociación positiva
+y significativa con \texttt{QR\_RED}. Por su parte, la asistencia a educación parvularia muestra una
+señal positiva y significativa para \texttt{QR\_RED}, mientras que su asociación con
+\texttt{QR\_OTHER} es débil o no robusta. Dado que estas variables son territoriales, no deben
+interpretarse como características individuales del usuario, sino como indicadores de composición
+sociodemográfica y ciclo de vida de las zonas de origen.
 
 \subsection{Variables OSM e infraestructura}
 
 La densidad de universidades OSM presenta coeficientes negativos y significativos para
-\texttt{QR\_OTHER} y \texttt{QR\_RED}, mientras que \texttt{BIP} queda con un coeficiente positivo
-derivado. Este resultado no contradice necesariamente el efecto positivo de la educación
-universitaria residencial sobre \texttt{QR\_RED}. Ambas variables capturan dimensiones distintas: la
-variable censal de educación universitaria describe la composición educacional de la población
-residente, mientras que \path{osm_amenity_university_density_km2_z} identifica la presencia
-territorial de equipamientos universitarios. En Santiago, estos equipamientos están
-fuertemente concentrados en pocas comunas centrales, especialmente Santiago y Providencia, por lo
-que esta variable también puede estar capturando centralidad urbana, concentración de destinos
-educacionales y zonas con alta presencia de Metro o viajes asociados a \texttt{BIP}.
+\texttt{QR\_OTHER} y \texttt{QR\_RED} respecto de \texttt{BIP}. Este resultado no contradice
+necesariamente el efecto positivo de la educación universitaria residencial sobre \texttt{QR\_RED}.
+Ambas variables capturan dimensiones distintas: la variable censal de educación universitaria
+describe la composición educacional de la población residente, mientras que
+\path{osm_amenity_university_density_km2_z} identifica la presencia territorial de equipamientos
+universitarios. En Santiago, estos equipamientos están fuertemente concentrados en pocas comunas
+centrales, por lo que esta variable también puede estar capturando centralidad urbana, concentración
+de destinos educacionales y zonas con alta presencia de Metro o viajes asociados a \texttt{BIP}.
 
-La densidad de juegos infantiles y comercio de conveniencia muestra asociaciones positivas con
-\texttt{QR\_RED}. En ambos casos, los coeficientes de \texttt{QR\_RED} son positivos y
-estadísticamente significativos, mientras que las señales para \texttt{QR\_OTHER} son débiles o no
-significativas. Esto sugiere que ciertos entornos urbanos de escala barrial pueden estar más
-asociados con el uso de \texttt{QR\_RED}.
+La densidad de juegos infantiles y comercio de conveniencia muestra asociaciones positivas con ambas
+alternativas QR, especialmente con \texttt{QR\_RED}. Esto sugiere que ciertos entornos urbanos de
+escala barrial se asocian con una mayor utilidad relativa de alternativas QR. La densidad de centros
+deportivos presenta una señal menos clara: tiende a ser negativa para \texttt{QR\_OTHER} y no robusta
+para \texttt{QR\_RED}.
 
 La variable de refugios de transporte en OSM
 (\path{osm_transport_shelter_yes_density_km2_z}) presenta una señal particularmente interesante:
-el coeficiente es negativo y significativo para \texttt{QR\_OTHER}, positivo y
-significativo para \texttt{QR\_RED}, y cercano a cero para \texttt{BIP}. Esto indica que la presencia
-de objetos de transporte con \texttt{shelter=yes} no se asocia de forma homogénea con el uso de QR.
-Más que interpretarse como un efecto causal de tener refugio, esta variable debe leerse como un
-indicador territorial de infraestructura de parada o entorno de acceso al sistema.
+el coeficiente es negativo y significativo para \texttt{QR\_OTHER}, pero positivo y significativo
+para \texttt{QR\_RED}. Esto indica que la presencia de objetos de transporte con
+\texttt{shelter=yes} no se asocia de forma homogénea con el uso de QR. Más que interpretarse como un
+efecto causal de tener refugio, esta variable debe leerse como un indicador territorial de
+infraestructura de parada o entorno de acceso al sistema.
 
 La densidad de accesos a Metro
-(\texttt{osm\_railway\_subway\_entrance\_density\_km2\_z}) presenta un coeficiente negativo y
-significativo para \texttt{QR\_RED}, mientras que \texttt{QR\_OTHER} no es significativo y
-\texttt{BIP} queda con coeficiente positivo derivado. Esto sugiere que zonas con mayor presencia de
-accesos físicos a Metro se asocian relativamente menos con \texttt{QR\_RED} y más con
-\texttt{BIP}, una vez controladas las demás variables del modelo.
+(\path{osm_railway_subway_entrance_density_km2_z}) presenta coeficientes negativos y significativos
+para \texttt{QR\_OTHER} y \texttt{QR\_RED} respecto de \texttt{BIP}. Esto sugiere que zonas con
+mayor presencia de accesos físicos a Metro se asocian relativamente menos con alternativas QR una vez
+controladas las demás variables del modelo. La densidad de colegios también tiende a presentar una
+señal negativa para \texttt{QR\_RED}, mientras que su asociación con \texttt{QR\_OTHER} no es
+robusta.
+
+\subsection{Variables EOD 2012}
+
+Las variables de ingreso construidas desde la EOD 2012 se evalúan en dos formas alternativas. La
+primera usa proporciones continuas de hogares en tramos históricos de ingreso; la segunda usa
+indicadores de alta concentración zonal. Estas dos formas no responden exactamente la misma pregunta:
+la especificación continua mide cambios graduales en la composición de ingreso de la zona, mientras
+que la especificación dummy identifica zonas ubicadas en el cuartil superior de concentración de un
+grupo específico.
+
+En la especificación continua, la proporción histórica de hogares en los tramos bajos de ingreso
+(\texttt{D+E\_proxy}) presenta una asociación positiva y significativa con \texttt{QR\_OTHER}, pero
+no muestra una señal robusta para \texttt{QR\_RED}. En cambio, la proporción histórica de hogares en
+el tramo superior de ingreso (\texttt{ABC1\_proxy}) presenta una señal negativa solo marginal para
+\texttt{QR\_OTHER} y no robusta para \texttt{QR\_RED}. Esta lectura sugiere que el gradiente
+continuo de ingreso bajo se relaciona principalmente con \texttt{QR\_OTHER}.
+
+En la especificación dummy, la alta concentración de hogares \texttt{ABC1\_proxy} muestra
+coeficientes negativos y significativos para \texttt{QR\_OTHER} y \texttt{QR\_RED}. En cambio, la
+alta concentración de hogares \texttt{D+E\_proxy} no presenta una señal estadísticamente robusta.
+Esto sugiere que, cuando el ingreso histórico se representa como una condición de alta concentración,
+la señal más clara aparece en zonas de mayor ingreso relativo, que se asocian con menor utilidad
+relativa de alternativas QR respecto de \texttt{BIP}.
+
+Ambas lecturas son complementarias más que contradictorias. El modelo continuo permite observar una
+relación gradual asociada a la presencia de hogares de ingresos bajos, especialmente para
+\texttt{QR\_OTHER}; el modelo dummy, en cambio, resalta el comportamiento de zonas con concentración
+alta de hogares de mayores ingresos. En cualquier caso, estas variables deben tratarse como proxies
+históricos y territoriales, no como clasificación socioeconómica oficial ni como ingreso individual
+del usuario.
 
 \subsection{Síntesis}
 
 En conjunto, los resultados muestran que la elección entre \texttt{BIP}, \texttt{QR\_OTHER} y
-\texttt{QR\_RED} no solo depende de atributos operacionales del viaje, sino también de características
-temporales y territoriales del origen. Las variables de espera y transbordo mantienen los signos
-esperados, mientras que las variables censales y OSM permiten distinguir patrones territoriales entre
-las alternativas QR.
+\texttt{QR\_RED} no solo depende de atributos operacionales del viaje, sino también de
+características temporales y territoriales del origen. Las variables de espera y transbordo mantienen
+los signos esperados en la mayoría de los casos, con una excepción sustantivamente interesante en
+\texttt{QR\_RED}: la espera por transbordo no presenta una penalización estadísticamente robusta.
 
-Los resultados más robustos aparecen en la asociación de \texttt{QR\_RED} con educación
-universitaria, puntas laborales y ciertos entornos OSM, y en la asociación de \texttt{QR\_OTHER} con
-días no laborales, población inmigrante y menor presencia relativa de refugios de transporte. Estas
-lecturas refuerzan la utilidad del bloque territorial del modelo, aunque deben entenderse como
-asociaciones condicionales y no como evidencia causal directa.
+Los resultados más robustos para \texttt{QR\_RED} aparecen en la asociación positiva con educación
+universitaria, puntas laborales, asistencia parvularia, proporción de mujeres y ciertos entornos OSM
+de escala barrial. Para \texttt{QR\_OTHER}, destacan la asociación positiva con población inmigrante
+y con el proxy continuo de hogares en tramos bajos de ingreso, junto con señales negativas asociadas
+a hacinamiento, demanda local y refugios de transporte.
+
+La comparación entre los modelos continuo y dummy muestra que la incorporación de la EOD 2012 no
+altera los patrones principales del modelo, pero sí permite explorar dos formas distintas de
+representar la dimensión socioeconómica histórica del territorio. Por lo tanto, la decisión entre
+ambas especificaciones debería basarse principalmente en la interpretación sustantiva que se quiera
+privilegiar: gradientes territoriales continuos de ingreso o identificación de zonas con alta
+concentración relativa de ciertos grupos.
