@@ -24,7 +24,9 @@ DEFAULT_VARS = [
     "n_per",
     "n_hombres",
     "n_mujeres",
+    "n_edad_0_5",
     "prom_edad",
+    "n_asistencia_parv",
     "n_inmigrantes",
     "n_pueblos_orig",
     "n_afrodescendencia",
@@ -61,6 +63,8 @@ COUNT_VARS = [
     "n_per",
     "n_hombres",
     "n_mujeres",
+    "n_edad_0_5",
+    "n_asistencia_parv",
     "n_inmigrantes",
     "n_pueblos_orig",
     "n_afrodescendencia",
@@ -92,6 +96,8 @@ WEIGHTED_MEANS = {
 
 # Shares derived after aggregation
 SHARES = {
+    "share_mujeres": ("n_mujeres", "n_per"),
+    "share_asistencia_parv": ("n_asistencia_parv", "n_edad_0_5"),
     "share_inmigrantes": ("n_inmigrantes", "n_per"),
     "share_pueblos_orig": ("n_pueblos_orig", "n_per"),
     "share_afrodescendencia": ("n_afrodescendencia", "n_per"),
