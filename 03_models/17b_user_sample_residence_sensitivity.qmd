@@ -1,0 +1,726 @@
+---
+title: "Tesis — 17b | Sensibilidad MNL con muestreo por usuario"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: false
+---
+
+# Objetivo
+
+Este notebook prueba una sensibilidad de diseño muestral: seleccionar usuarios
+(`id_tarjeta`) y luego incluir todos sus viajes observados en la muestra fuente.
+
+La especificación sustantiva se mantiene fija respecto del modelo residencial C:
+
+- muestra final: usuarios seleccionados con residencia de confianza `alta`;
+- variables sociodemográficas e ingreso proxy: `res_*`, medidas en `zona_hogar`;
+- oferta, demanda, OSM, macrozonas y atributos de viaje: origen/contexto del viaje;
+- `BIP` se mantiene como alternativa base.
+
+El objetivo no es reemplazar el notebook 17, sino evaluar si los resultados son
+sensibles a muestrear viajes en vez de usuarios.
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+import gc
+import sys
+import traceback
+from pathlib import Path
+
+import pandas as pd
+import polars as pl
+import yaml
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontró la raíz del proyecto.")
+
+import biogeme.biogeme_logging as blog
+import biogeme.database as db
+import biogeme.biogeme as bio
+from biogeme import models
+from biogeme.expressions import Beta, Variable
+from biogeme.results_processing import pandas_output as br
+
+logger = blog.get_screen_logger(level=blog.INFO)
+```
+
+## 2) Configuración
+
+```{python}
+#| label: config
+print("label: config")
+MODEL_PARTITION = "pooled_2024_2025"
+USER_SAMPLE_TAG = "user20pct"
+SOURCE_SAMPLE_TAG = "sample10pct"
+RUN_ESTIMATION = True
+
+MODELS_DIR = PROJECT_ROOT / "03_models"
+ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "interannual_enriched"
+RESULTS_ROOT = MODELS_DIR / "biogeme-logit" / "results" / "17b_user_sample_residence_sensitivity"
+RESULTS_DIR = RESULTS_ROOT / f"{MODEL_PARTITION}-biogeme-{USER_SAMPLE_TAG}-from-{SOURCE_SAMPLE_TAG}"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+USER_SAMPLE_PATH = (
+    ARTIFACTS_DIR
+    / f"{MODEL_PARTITION}-estimation-{USER_SAMPLE_TAG}-from-{SOURCE_SAMPLE_TAG}-residence-censo4-micro-osm-eod2012.parquet"
+)
+USER_HOME_ALTA_SAMPLE_PATH = (
+    ARTIFACTS_DIR
+    / f"{MODEL_PARTITION}-estimation-{USER_SAMPLE_TAG}-from-{SOURCE_SAMPLE_TAG}-residence-home-alta-censo4-micro-osm-eod2012.parquet"
+)
+TRIP_SAMPLE_HOME_ALTA_RESULTS_DIR = (
+    MODELS_DIR
+    / "biogeme-logit"
+    / "results"
+    / "17_residence_socio_mnl_sensitivity"
+    / f"{MODEL_PARTITION}-biogeme-sample2pct"
+)
+TRIP_SAMPLE_C_MODEL = "mnl_residence_home_alta_parsimonious"
+
+BASE_MODEL_COLUMNS = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_NO_LAB",
+    "DUMMY_ANIO_2025",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+]
+
+TRIP_ALT_ATTR_COLS = [
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+]
+
+RESIDENCE_SOCIO_COLS = [
+    "res_share_cine18_universitaria_o_mas_micro_z",
+    "res_share_discapacidad_z",
+    "res_share_inmigrantes_z",
+    "res_share_mujeres_z",
+    "res_share_asistencia_parv_z",
+    "res_prom_edad_z",
+    "res_eod2012_share_hogares_de_income_proxy_z",
+]
+
+OSM_ORIGIN_PARSIMONIOUS_COLS = [
+    "osm_leisure_playground_density_km2_z",
+    "osm_amenity_school_density_km2_z",
+    "osm_amenity_university_density_km2_z",
+    "osm_transport_shelter_yes_density_km2_z",
+    "osm_railway_subway_entrance_density_km2_z",
+]
+
+MACROZONA_ORIGIN_COLS = [
+    "macro_norte",
+    "macro_poniente",
+    "macro_oriente",
+    "macro_sur",
+    "macro_suroriente",
+    "macro_externa_especial",
+]
+
+MODEL_EXTRA_COLS = RESIDENCE_SOCIO_COLS + OSM_ORIGIN_PARSIMONIOUS_COLS + MACROZONA_ORIGIN_COLS
+
+PARAM_TAGS = {
+    "res_share_cine18_universitaria_o_mas_micro_z": "RES_SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z",
+    "res_share_discapacidad_z": "RES_SHARE_DISCAPACIDAD_Z",
+    "res_share_inmigrantes_z": "RES_SHARE_INMIGRANTES_Z",
+    "res_share_mujeres_z": "RES_SHARE_MUJERES_Z",
+    "res_share_asistencia_parv_z": "RES_SHARE_ASISTENCIA_PARV_Z",
+    "res_prom_edad_z": "RES_PROM_EDAD_Z",
+    "res_eod2012_share_hogares_de_income_proxy_z": "RES_EOD2012_SHARE_HOGARES_DE_INCOME_PROXY_Z",
+    "osm_leisure_playground_density_km2_z": "OSM_LEISURE_PLAYGROUND_DENSITY_KM2_Z",
+    "osm_amenity_school_density_km2_z": "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z",
+    "osm_amenity_university_density_km2_z": "OSM_AMENITY_UNIVERSITY_DENSITY_KM2_Z",
+    "osm_transport_shelter_yes_density_km2_z": "OSM_TRANSPORT_SHELTER_YES_DENSITY_KM2_Z",
+    "osm_railway_subway_entrance_density_km2_z": "OSM_RAILWAY_SUBWAY_ENTRANCE_DENSITY_KM2_Z",
+    "macro_norte": "MACRO_NORTE",
+    "macro_poniente": "MACRO_PONIENTE",
+    "macro_oriente": "MACRO_ORIENTE",
+    "macro_sur": "MACRO_SUR",
+    "macro_suroriente": "MACRO_SURORIENTE",
+    "macro_externa_especial": "MACRO_EXTERNA_ESPECIAL",
+}
+
+MODEL_LABEL = f"mnl_residence_home_alta_{USER_SAMPLE_TAG}_from_{SOURCE_SAMPLE_TAG}_parsimonious"
+
+BIOGEME_OPTIMIZER = {
+    "optimization_algorithm": "automatic",
+    "calculating_second_derivatives": "analytical",
+    "save_iterations": True,
+    "clean_iter_before_run": True,
+}
+
+print("RUN_ESTIMATION =", RUN_ESTIMATION)
+print("USER_HOME_ALTA_SAMPLE_PATH:", USER_HOME_ALTA_SAMPLE_PATH)
+print("RESULTS_DIR:", RESULTS_DIR)
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+def unique_ordered(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
+
+
+def result_artifact_dir(model_label: str) -> Path:
+    out_dir = RESULTS_DIR / model_label
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def biogeme_iter_candidates(model_name: str, project_root: Path) -> list[Path]:
+    return [
+        project_root / f"{model_name}.iter",
+        project_root / f"__{model_name}.iter",
+        Path.cwd() / f"{model_name}.iter",
+        Path.cwd() / f"__{model_name}.iter",
+    ]
+
+
+def remove_biogeme_iter_file(model_name: str, project_root: Path) -> None:
+    seen = set()
+    for iter_path in biogeme_iter_candidates(model_name, project_root):
+        if iter_path in seen:
+            continue
+        seen.add(iter_path)
+        if iter_path.exists():
+            iter_path.unlink()
+
+
+def stats_to_frame(stats: dict) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"metric": key, "value": val[0] if isinstance(val, tuple) else val}
+            for key, val in stats.items()
+        ]
+    )
+
+
+def metric_value(stats: dict, metric: str):
+    value = stats.get(metric)
+    if isinstance(value, tuple):
+        return value[0]
+    return value
+
+
+def param_value(params_df: pd.DataFrame, name: str, candidates: list[str]):
+    for col in candidates:
+        if col in params_df.columns:
+            subset = params_df.loc[params_df["Name"] == name, col]
+            if not subset.empty:
+                return subset.iloc[0]
+    return None
+
+
+def parse_yaml_diagnostics(yaml_path: Path) -> dict:
+    if not yaml_path.exists():
+        return {}
+    with yaml_path.open("r", encoding="utf-8") as fh:
+        payload = yaml.safe_load(fh) or {}
+    opt = payload.get("optimization_messages", {}) or {}
+    return {
+        "yaml_convergence": payload.get("convergence"),
+        "yaml_relative_gradient": opt.get("Relative gradient"),
+        "yaml_cause_of_termination": opt.get("Cause of termination"),
+        "yaml_algorithm": opt.get("Algorithm"),
+        "yaml_n_iterations": opt.get("Number of iterations"),
+        "yaml_n_grad_evals": opt.get("Number of gradient evaluations"),
+        "yaml_n_hessian_evals": opt.get("Number of hessian evaluations"),
+    }
+
+
+def configure_biogeme_run(biogeme_model: bio.BIOGEME) -> None:
+    biogeme_model.biogeme_parameters.set_value("generate_html", False)
+    biogeme_model.biogeme_parameters.set_value("generate_yaml", False)
+    biogeme_model.biogeme_parameters.set_value("save_iterations", BIOGEME_OPTIMIZER["save_iterations"])
+    biogeme_model.biogeme_parameters.set_value("number_of_threads", 1)
+    biogeme_model.biogeme_parameters.set_value(
+        "calculating_second_derivatives",
+        BIOGEME_OPTIMIZER["calculating_second_derivatives"],
+    )
+    biogeme_model.biogeme_parameters.set_value(
+        "optimization_algorithm",
+        BIOGEME_OPTIMIZER["optimization_algorithm"],
+    )
+
+
+def load_numeric_df(path: Path, extra_cols: list[str]) -> pd.DataFrame:
+    cols = unique_ordered(BASE_MODEL_COLUMNS + extra_cols)
+    lazy_df = pl.scan_parquet(path)
+    schema_names = lazy_df.collect_schema().names()
+    missing = sorted(set(cols) - set(schema_names))
+    if missing:
+        raise ValueError(f"Faltan columnas requeridas en {path.name}: {missing}")
+    null_summary = (
+        lazy_df
+        .select([pl.col(c).is_null().sum().alias(c) for c in cols])
+        .collect()
+        .to_dicts()[0]
+    )
+    missing_nulls = {c: n for c, n in null_summary.items() if n}
+    if missing_nulls:
+        raise ValueError(f"Columnas requeridas con nulos en {path.name}: {missing_nulls}")
+    return (
+        lazy_df
+        .select([pl.col(c).cast(pl.Float64) for c in cols])
+        .collect()
+        .to_pandas()
+    )
+```
+
+## 4) Auditoría de muestra
+
+```{python}
+#| label: sample-audit
+print("label: sample-audit")
+if not USER_HOME_ALTA_SAMPLE_PATH.exists():
+    raise FileNotFoundError(
+        "No existe la muestra por usuario. Ejecuta primero: "
+        f"`python scripts/audits/build_user_sample_model_artifact.py --user-sample-tag {USER_SAMPLE_TAG} --source-sample-tag {SOURCE_SAMPLE_TAG}`"
+    )
+
+AUDIT_DIR = PROJECT_ROOT / "tmp" / "audits" / "proposito_residence" / "user_sample" / f"{USER_SAMPLE_TAG}-from-{SOURCE_SAMPLE_TAG}"
+for name in ["sample_summary.csv", "choice_summary.csv", "home_confidence_summary.csv", "macrozone_summary.csv"]:
+    path = AUDIT_DIR / name
+    if path.exists():
+        print(name)
+        display(pl.read_csv(path))
+
+df_design = pl.DataFrame(
+    [
+        {
+            "family": "mnl",
+            "block": "residence_user_sample",
+            "model": MODEL_LABEL,
+            "sample": f"{USER_SAMPLE_TAG}_home_alta_from_{SOURCE_SAMPLE_TAG}",
+            "sample_path": USER_HOME_ALTA_SAMPLE_PATH.name,
+            "n_extra_vars": len(MODEL_EXTRA_COLS),
+            "extra_vars": ", ".join(MODEL_EXTRA_COLS),
+        }
+    ]
+)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1800):
+    display(df_design)
+```
+
+## 5) Modelo MNL
+
+```{python}
+#| label: mnl-helper
+print("label: mnl-helper")
+def estimate_mnl_with_extras(
+    pandas_df: pd.DataFrame,
+    *,
+    model_name: str,
+    extra_cols: list[str],
+    param_tags: dict[str, str],
+):
+    database = db.Database(model_name, pandas_df)
+
+    CHOICE_BIP = 0
+    CHOICE_QR_RED = 1
+    CHOICE_QR_OTHER = 2
+
+    CHOICE = Variable("choice_nested")
+    LAB_PM = Variable("DUMMY_LAB_PM")
+    LAB_PT = Variable("DUMMY_LAB_PT")
+    NO_LAB = Variable("DUMMY_NO_LAB")
+    DUMMY_ANIO_2025 = Variable("DUMMY_ANIO_2025")
+    LOG_DEMAND = Variable("LOG_N_VIAJES_ZONA_INICIO_FRANJA")
+    LOG_BUS_STOP_DENSITY = Variable("LOG_BUS_STOP_DENSITY")
+    LOG_BUS_LINE_COUNT = Variable("LOG_BUS_LINE_COUNT")
+    LOG_METRO_LINE_COUNT = Variable("LOG_METRO_LINE_COUNT")
+
+    TVH_BIP = Variable("TVH_BIP")
+    TVH_QR_RED = Variable("TVH_QR_RED")
+    TVH_QR_OTHER = Variable("TVH_QR_OTHER")
+    TEI_BIP = Variable("TEI_BIP")
+    TEI_QR_RED = Variable("TEI_QR_RED")
+    TEI_QR_OTHER = Variable("TEI_QR_OTHER")
+    TET_BIP = Variable("TET_BIP")
+    TET_QR_RED = Variable("TET_QR_RED")
+    TET_QR_OTHER = Variable("TET_QR_OTHER")
+    NTR_BIP = Variable("NTR_BIP")
+    NTR_QR_RED = Variable("NTR_QR_RED")
+    NTR_QR_OTHER = Variable("NTR_QR_OTHER")
+
+    def beta(name: str, default: float = 0.0):
+        return Beta(name, default, None, None, 0)
+
+    ASC_QR_RED = beta(f"ASC_QR_RED_{MODEL_PARTITION}")
+    ASC_QR_OTHER = beta(f"ASC_QR_OTHER_{MODEL_PARTITION}")
+    B_QR_RED_LAB_PM = beta(f"B_QR_RED_LAB_PM_{MODEL_PARTITION}")
+    B_QR_OTHER_LAB_PM = beta(f"B_QR_OTHER_LAB_PM_{MODEL_PARTITION}")
+    B_QR_RED_LAB_PT = beta(f"B_QR_RED_LAB_PT_{MODEL_PARTITION}")
+    B_QR_OTHER_LAB_PT = beta(f"B_QR_OTHER_LAB_PT_{MODEL_PARTITION}")
+    B_QR_RED_NO_LAB = beta(f"B_QR_RED_NO_LAB_{MODEL_PARTITION}")
+    B_QR_OTHER_NO_LAB = beta(f"B_QR_OTHER_NO_LAB_{MODEL_PARTITION}")
+    B_QR_RED_ANIO_2025 = beta(f"B_QR_RED_ANIO_2025_{MODEL_PARTITION}")
+    B_QR_OTHER_ANIO_2025 = beta(f"B_QR_OTHER_ANIO_2025_{MODEL_PARTITION}")
+    B_QR_RED_LOG_DEMAND = beta(f"B_QR_RED_LOG_DEMAND_{MODEL_PARTITION}")
+    B_QR_OTHER_LOG_DEMAND = beta(f"B_QR_OTHER_LOG_DEMAND_{MODEL_PARTITION}")
+    B_QR_RED_LOG_BUS_STOP_DENSITY = beta(f"B_QR_RED_LOG_BUS_STOP_DENSITY_{MODEL_PARTITION}")
+    B_QR_OTHER_LOG_BUS_STOP_DENSITY = beta(f"B_QR_OTHER_LOG_BUS_STOP_DENSITY_{MODEL_PARTITION}")
+    B_QR_RED_LOG_BUS_LINE_COUNT = beta(f"B_QR_RED_LOG_BUS_LINE_COUNT_{MODEL_PARTITION}")
+    B_QR_OTHER_LOG_BUS_LINE_COUNT = beta(f"B_QR_OTHER_LOG_BUS_LINE_COUNT_{MODEL_PARTITION}")
+    B_QR_RED_LOG_METRO_LINE_COUNT = beta(f"B_QR_RED_LOG_METRO_LINE_COUNT_{MODEL_PARTITION}")
+    B_QR_OTHER_LOG_METRO_LINE_COUNT = beta(f"B_QR_OTHER_LOG_METRO_LINE_COUNT_{MODEL_PARTITION}")
+
+    B_BIP_T_VEH = beta(f"B_BIP_T_VEH_{MODEL_PARTITION}")
+    B_QR_RED_T_VEH = beta(f"B_QR_RED_T_VEH_{MODEL_PARTITION}")
+    B_QR_OTHER_T_VEH = beta(f"B_QR_OTHER_T_VEH_{MODEL_PARTITION}")
+    B_BIP_T_ESPERA_INI = beta(f"B_BIP_T_ESPERA_INI_{MODEL_PARTITION}")
+    B_QR_RED_T_ESPERA_INI = beta(f"B_QR_RED_T_ESPERA_INI_{MODEL_PARTITION}")
+    B_QR_OTHER_T_ESPERA_INI = beta(f"B_QR_OTHER_T_ESPERA_INI_{MODEL_PARTITION}")
+    B_BIP_T_ESPERA_TRASB = beta(f"B_BIP_T_ESPERA_TRASB_{MODEL_PARTITION}")
+    B_QR_RED_T_ESPERA_TRASB = beta(f"B_QR_RED_T_ESPERA_TRASB_{MODEL_PARTITION}")
+    B_QR_OTHER_T_ESPERA_TRASB = beta(f"B_QR_OTHER_T_ESPERA_TRASB_{MODEL_PARTITION}")
+    B_BIP_N_TRASB = beta(f"B_BIP_N_TRASB_{MODEL_PARTITION}")
+    B_QR_RED_N_TRASB = beta(f"B_QR_RED_N_TRASB_{MODEL_PARTITION}")
+    B_QR_OTHER_N_TRASB = beta(f"B_QR_OTHER_N_TRASB_{MODEL_PARTITION}")
+
+    extra_var_exprs = {c: Variable(c) for c in extra_cols}
+    extra_betas_red = {c: beta(f"B_QR_RED_{param_tags[c]}_{MODEL_PARTITION}") for c in extra_cols}
+    extra_betas_other = {c: beta(f"B_QR_OTHER_{param_tags[c]}_{MODEL_PARTITION}") for c in extra_cols}
+
+    V_BIP = (
+        B_BIP_T_VEH * TVH_BIP
+        + B_BIP_T_ESPERA_INI * TEI_BIP
+        + B_BIP_T_ESPERA_TRASB * TET_BIP
+        + B_BIP_N_TRASB * NTR_BIP
+    )
+    V_QR_RED = (
+        ASC_QR_RED
+        + B_QR_RED_LAB_PM * LAB_PM
+        + B_QR_RED_LAB_PT * LAB_PT
+        + B_QR_RED_NO_LAB * NO_LAB
+        + B_QR_RED_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_RED_LOG_DEMAND * LOG_DEMAND
+        + B_QR_RED_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_RED_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_RED_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_RED_T_VEH * TVH_QR_RED
+        + B_QR_RED_T_ESPERA_INI * TEI_QR_RED
+        + B_QR_RED_T_ESPERA_TRASB * TET_QR_RED
+        + B_QR_RED_N_TRASB * NTR_QR_RED
+    )
+    V_QR_OTHER = (
+        ASC_QR_OTHER
+        + B_QR_OTHER_LAB_PM * LAB_PM
+        + B_QR_OTHER_LAB_PT * LAB_PT
+        + B_QR_OTHER_NO_LAB * NO_LAB
+        + B_QR_OTHER_ANIO_2025 * DUMMY_ANIO_2025
+        + B_QR_OTHER_LOG_DEMAND * LOG_DEMAND
+        + B_QR_OTHER_LOG_BUS_STOP_DENSITY * LOG_BUS_STOP_DENSITY
+        + B_QR_OTHER_LOG_BUS_LINE_COUNT * LOG_BUS_LINE_COUNT
+        + B_QR_OTHER_LOG_METRO_LINE_COUNT * LOG_METRO_LINE_COUNT
+        + B_QR_OTHER_T_VEH * TVH_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_INI * TEI_QR_OTHER
+        + B_QR_OTHER_T_ESPERA_TRASB * TET_QR_OTHER
+        + B_QR_OTHER_N_TRASB * NTR_QR_OTHER
+    )
+    for c in extra_cols:
+        V_QR_RED += extra_betas_red[c] * extra_var_exprs[c]
+        V_QR_OTHER += extra_betas_other[c] * extra_var_exprs[c]
+
+    V = {CHOICE_BIP: V_BIP, CHOICE_QR_RED: V_QR_RED, CHOICE_QR_OTHER: V_QR_OTHER}
+    av = {CHOICE_BIP: 1, CHOICE_QR_RED: 1, CHOICE_QR_OTHER: 1}
+    logprob = models.loglogit(V, av, CHOICE)
+
+    if BIOGEME_OPTIMIZER["clean_iter_before_run"]:
+        remove_biogeme_iter_file(model_name, PROJECT_ROOT)
+    biogeme = bio.BIOGEME(database, logprob)
+    biogeme.model_name = model_name
+    configure_biogeme_run(biogeme)
+
+    results = biogeme.estimate()
+    stats = results.get_general_statistics()
+    params_df = br.get_pandas_estimated_parameters(results)
+    return results, stats, params_df
+```
+
+## 6) Helpers de parámetros
+
+```{python}
+#| label: parameter-helpers
+print("label: parameter-helpers")
+def new_variable_parameter_rows(*, params_df: pd.DataFrame, model_label: str):
+    rows = []
+    for col in MODEL_EXTRA_COLS:
+        tag = PARAM_TAGS[col]
+        for alternative, prefix in [("BIP", "B_BIP"), ("QR_RED", "B_QR_RED"), ("QR_OTHER", "B_QR_OTHER")]:
+            param_name = f"{prefix}_{tag}_{MODEL_PARTITION}"
+            if alternative == "BIP":
+                rows.append(
+                    {
+                        "model": model_label,
+                        "family": "mnl",
+                        "block": "residence_user_sample",
+                        "variable": col,
+                        "alternative": alternative,
+                        "parameter": f"{param_name} [normalized]",
+                        "beta": 0.0,
+                        "robust_t": None,
+                        "robust_p": None,
+                    }
+                )
+                continue
+            rows.append(
+                {
+                    "model": model_label,
+                    "family": "mnl",
+                    "block": "residence_user_sample",
+                    "variable": col,
+                    "alternative": alternative,
+                    "parameter": param_name,
+                    "beta": param_value(params_df, param_name, ["Value"]),
+                    "robust_t": param_value(params_df, param_name, ["Robust t-stat.", "Rob. t-test", "t-test"]),
+                    "robust_p": param_value(params_df, param_name, ["Robust p-value", "Rob. p-value", "p-value"]),
+                }
+            )
+    return rows
+
+
+def base_model_parameter_rows(*, params_df: pd.DataFrame, model_label: str):
+    param_specs = [
+        ("ASC", "QR_RED", "ASC_QR_RED"),
+        ("ASC", "QR_OTHER", "ASC_QR_OTHER"),
+        ("LAB_PM", "QR_RED", "B_QR_RED_LAB_PM"),
+        ("LAB_PM", "QR_OTHER", "B_QR_OTHER_LAB_PM"),
+        ("LAB_PT", "QR_RED", "B_QR_RED_LAB_PT"),
+        ("LAB_PT", "QR_OTHER", "B_QR_OTHER_LAB_PT"),
+        ("NO_LAB", "QR_RED", "B_QR_RED_NO_LAB"),
+        ("NO_LAB", "QR_OTHER", "B_QR_OTHER_NO_LAB"),
+        ("ANIO_2025", "QR_RED", "B_QR_RED_ANIO_2025"),
+        ("ANIO_2025", "QR_OTHER", "B_QR_OTHER_ANIO_2025"),
+        ("LOG_DEMAND", "QR_RED", "B_QR_RED_LOG_DEMAND"),
+        ("LOG_DEMAND", "QR_OTHER", "B_QR_OTHER_LOG_DEMAND"),
+        ("LOG_BUS_STOP_DENSITY", "QR_RED", "B_QR_RED_LOG_BUS_STOP_DENSITY"),
+        ("LOG_BUS_STOP_DENSITY", "QR_OTHER", "B_QR_OTHER_LOG_BUS_STOP_DENSITY"),
+        ("LOG_BUS_LINE_COUNT", "QR_RED", "B_QR_RED_LOG_BUS_LINE_COUNT"),
+        ("LOG_BUS_LINE_COUNT", "QR_OTHER", "B_QR_OTHER_LOG_BUS_LINE_COUNT"),
+        ("LOG_METRO_LINE_COUNT", "QR_RED", "B_QR_RED_LOG_METRO_LINE_COUNT"),
+        ("LOG_METRO_LINE_COUNT", "QR_OTHER", "B_QR_OTHER_LOG_METRO_LINE_COUNT"),
+        ("T_VEH", "BIP", "B_BIP_T_VEH"),
+        ("T_VEH", "QR_RED", "B_QR_RED_T_VEH"),
+        ("T_VEH", "QR_OTHER", "B_QR_OTHER_T_VEH"),
+        ("T_ESPERA_INI", "BIP", "B_BIP_T_ESPERA_INI"),
+        ("T_ESPERA_INI", "QR_RED", "B_QR_RED_T_ESPERA_INI"),
+        ("T_ESPERA_INI", "QR_OTHER", "B_QR_OTHER_T_ESPERA_INI"),
+        ("T_ESPERA_TRASB", "BIP", "B_BIP_T_ESPERA_TRASB"),
+        ("T_ESPERA_TRASB", "QR_RED", "B_QR_RED_T_ESPERA_TRASB"),
+        ("T_ESPERA_TRASB", "QR_OTHER", "B_QR_OTHER_T_ESPERA_TRASB"),
+        ("N_TRASB", "BIP", "B_BIP_N_TRASB"),
+        ("N_TRASB", "QR_RED", "B_QR_RED_N_TRASB"),
+        ("N_TRASB", "QR_OTHER", "B_QR_OTHER_N_TRASB"),
+    ]
+    rows = []
+    for variable, alternative, param_prefix in param_specs:
+        param_name = f"{param_prefix}_{MODEL_PARTITION}"
+        rows.append(
+            {
+                "model": model_label,
+                "family": "mnl",
+                "block": "residence_user_sample",
+                "variable": variable,
+                "alternative": alternative,
+                "parameter": param_name,
+                "beta": param_value(params_df, param_name, ["Value"]),
+                "robust_t": param_value(params_df, param_name, ["Robust t-stat.", "Rob. t-test", "t-test"]),
+                "robust_p": param_value(params_df, param_name, ["Robust p-value", "Rob. p-value", "p-value"]),
+            }
+        )
+    return rows
+```
+
+## 7) Ejecutar o cargar estimación
+
+```{python}
+#| label: run-or-load-estimation
+print("label: run-or-load-estimation")
+summary_rows = []
+parameter_rows = []
+base_parameter_rows = []
+out_dir = result_artifact_dir(MODEL_LABEL)
+params_path = out_dir / f"params_{MODEL_LABEL}.csv"
+stats_path = out_dir / f"stats_{MODEL_LABEL}.csv"
+yaml_path = out_dir / f"{MODEL_LABEL}.yaml"
+
+if RUN_ESTIMATION:
+    pandas_df = load_numeric_df(USER_HOME_ALTA_SAMPLE_PATH, MODEL_EXTRA_COLS)
+    print(f"Estimando: {MODEL_LABEL} ({len(pandas_df):,} filas)")
+    try:
+        results, stats, params_df = estimate_mnl_with_extras(
+            pandas_df,
+            model_name=MODEL_LABEL,
+            extra_cols=MODEL_EXTRA_COLS,
+            param_tags=PARAM_TAGS,
+        )
+        params_df.to_csv(params_path, index=False)
+        stats_to_frame(stats).to_csv(stats_path, index=False)
+        results.dump_yaml_file(str(yaml_path))
+    finally:
+        del pandas_df
+        gc.collect()
+
+if params_path.exists() and stats_path.exists() and yaml_path.exists():
+    params_df = pd.read_csv(params_path)
+    stats_df = pd.read_csv(stats_path)
+    stats = dict(zip(stats_df["metric"], stats_df["value"]))
+    yaml_diag = parse_yaml_diagnostics(yaml_path)
+    run_converged = yaml_diag.get("yaml_convergence") is True
+    summary_rows.append(
+        {
+            "family": "mnl",
+            "block": "residence_user_sample",
+            "model": MODEL_LABEL,
+            "sample": f"{USER_SAMPLE_TAG}_home_alta_from_{SOURCE_SAMPLE_TAG}",
+            "sample_path": USER_HOME_ALTA_SAMPLE_PATH.name,
+            "n_extra_vars": len(MODEL_EXTRA_COLS),
+            "n_params": metric_value(stats, "Number of estimated parameters"),
+            "sample_size": metric_value(stats, "Sample size"),
+            "ll_init": metric_value(stats, "Init log likelihood"),
+            "ll_final": metric_value(stats, "Final log likelihood"),
+            "ll_per_obs": metric_value(stats, "Final log likelihood") / metric_value(stats, "Sample size"),
+            "aic": metric_value(stats, "Akaike Information Criterion"),
+            "bic": metric_value(stats, "Bayesian Information Criterion"),
+            "gradient_norm": metric_value(stats, "Final gradient norm"),
+            "status": "ok" if run_converged else "not_converged",
+            **yaml_diag,
+        }
+    )
+    if run_converged:
+        parameter_rows.extend(new_variable_parameter_rows(params_df=params_df, model_label=MODEL_LABEL))
+    base_parameter_rows.extend(base_model_parameter_rows(params_df=params_df, model_label=MODEL_LABEL))
+    pd.DataFrame(summary_rows).to_csv(RESULTS_DIR / "convergence_summary.csv", index=False)
+    pd.DataFrame(parameter_rows).to_csv(RESULTS_DIR / "new_variable_parameters_long.csv", index=False)
+    pd.DataFrame(base_parameter_rows).to_csv(RESULTS_DIR / "base_parameters_long.csv", index=False)
+else:
+    print("No hay estimación cargada. Cambia RUN_ESTIMATION=True para correr el modelo.")
+```
+
+## 8) Resumen de convergencia
+
+```{python}
+#| label: convergence-summary
+print("label: convergence-summary")
+if summary_rows:
+    df_summary = pl.DataFrame(summary_rows).with_columns(
+        pl.col("ll_init").cast(pl.Float64, strict=False).round(1),
+        pl.col("ll_final").cast(pl.Float64, strict=False).round(1),
+        pl.col("ll_per_obs").cast(pl.Float64, strict=False).round(6),
+        pl.col("aic").cast(pl.Float64, strict=False).round(1),
+        pl.col("bic").cast(pl.Float64, strict=False).round(1),
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1600):
+        display(df_summary)
+else:
+    print("No hay resultados cargados.")
+```
+
+## 9) Parámetros
+
+```{python}
+#| label: new-variable-parameters-wide
+print("label: new-variable-parameters-wide")
+if parameter_rows:
+    df_params_pd = pd.DataFrame(parameter_rows)
+    df_wide = df_params_pd.pivot_table(
+        index=["block", "family", "model", "variable"],
+        columns="alternative",
+        values=["beta", "robust_t", "robust_p"],
+        aggfunc="first",
+    )
+    df_wide.columns = [f"{metric}_{alt.lower()}" for metric, alt in df_wide.columns.to_flat_index()]
+    df_wide = (
+        df_wide.reset_index()
+        .rename(
+            columns={
+                "robust_t_bip": "t_bip",
+                "robust_p_bip": "p_error_bip",
+                "robust_t_qr_red": "t_qr_red",
+                "robust_p_qr_red": "p_error_qr_red",
+                "robust_t_qr_other": "t_qr_other",
+                "robust_p_qr_other": "p_error_qr_other",
+            }
+        )
+        .sort_values(["block", "family", "model", "variable"], kind="stable")
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=2200):
+        display(pl.from_pandas(df_wide))
+else:
+    print("No hay parámetros de variables nuevas.")
+```
+
+```{python}
+#| label: base-parameters-wide
+print("label: base-parameters-wide")
+if base_parameter_rows:
+    df_base_params_pd = pd.DataFrame(base_parameter_rows)
+    df_base_wide = df_base_params_pd.pivot_table(
+        index=["block", "family", "model", "variable"],
+        columns="alternative",
+        values=["beta", "robust_t", "robust_p"],
+        aggfunc="first",
+    )
+    df_base_wide.columns = [f"{metric}_{alt.lower()}" for metric, alt in df_base_wide.columns.to_flat_index()]
+    df_base_wide = (
+        df_base_wide.reset_index()
+        .rename(
+            columns={
+                "robust_t_bip": "t_bip",
+                "robust_p_bip": "p_error_bip",
+                "robust_t_qr_red": "t_qr_red",
+                "robust_p_qr_red": "p_error_qr_red",
+                "robust_t_qr_other": "t_qr_other",
+                "robust_p_qr_other": "p_error_qr_other",
+            }
+        )
+        .sort_values(["block", "family", "model", "variable"], kind="stable")
+    )
+    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=2200):
+        display(pl.from_pandas(df_base_wide))
+else:
+    print("No hay parámetros base.")
+```
