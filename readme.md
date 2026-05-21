@@ -1,8 +1,14 @@
-# Tesis — Data Lake + EDA
+# Tesis — Datos, modelos y escritura
 
-Este repositorio contiene el **setup de datos** (GCS + Parquet) y el **EDA** inicial para la tesis _“Tecnologías digitales y su impacto en la inercia del comportamiento de viaje en transporte público”_ (DCC + MDS, U. de Chile).
+Este repositorio contiene el pipeline de datos, notebooks de EDA/modelación y documentación viva para la tesis _“Tecnologías digitales y su impacto en la inercia del comportamiento de viaje en transporte público”_ (DCC + MDS, U. de Chile).
 
-El proyecto trabaja **100% contra Google Cloud Storage (GCS)**: los CSV viven en `gs://` y se convierten a **Parquet particionado** para análisis rápidos y reproducibles.
+El proyecto partió como un flujo **GCS + Parquet**, pero hoy combina:
+
+- fuentes remotas en GCS;
+- CSV raw locales de respaldo;
+- artefactos pesados locales/symlinkeados en SSD externo;
+- notebooks Quarto para EDA, modelos logit, sensibilidades y reportes;
+- documentación de planificación y escritura de tesis.
 
 ## Arquitectura del proyecto
 
@@ -11,13 +17,27 @@ tesis-project/
 ├─ 00_setup/
 │  └─ setup.qmd                # Validación de la capa Bronze
 ├─ 01_processing/
-│  └─ 01_silver_processing.qmd # Procesamiento Bronze→Silver
+│  ├─ 01_silver_processing.qmd # Procesamiento Bronze→Silver y PK de viajes
+│  └─ tmp/                     # Artefactos locales pesados (ignorado/symlink)
 ├─ 02_eda/
 │  ├─ eda_caracterizacion.qmd  # Perfil demográfico de usuarios QR
 │  ├─ eda_trips_overview.qmd   # Análisis de patrones de viaje
-│  └─ join_validation.qmd      # Validación de joins
+│  └─ *.qmd                    # Diagnósticos territoriales y de modelos
+├─ 03_models/
+│  ├─ *.qmd                    # Notebooks Biogeme/MNL/Nested
+│  ├─ larch_logit/             # Comparaciones Larch
+│  ├─ artifacts/               # Muestras model-ready pesadas (ignorado/symlink)
+│  └─ biogeme-logit/           # Resultados de estimación (ignorado)
+├─ docs/
+│  ├─ planning/                # Workstreams, bitácoras y decisiones
+│  ├─ reports/                 # Reportes LaTeX/Markdown y entregables
+│  └─ thesis/                  # Borradores, narrativa y figuras de tesis
 ├─ lib/
-│  └─ datalake.py              # Helpers (enable_adc, scan_parquet_portable)
+│  └─ *.py                     # Helpers de datos, Censo, OD buffers y modelos
+├─ scripts/
+│  ├─ audits/                  # Auditorías reproducibles y bypass residencia
+│  └─ figures/                 # Figuras para tesis/reportes
+├─ tmp/                        # Outputs locales, caches y artefactos auditables
 ├─ process_data.py             # Pipeline de ingesta RAW→Bronze
 ├─ _quarto.yml                 # Config del sitio Quarto
 ├─ GIT_WORKFLOW.md             # Guía de workflow de Git
@@ -26,6 +46,8 @@ tesis-project/
 ```
 
 > Las carpetas **`_site/`**, **`_freeze/`** y **`.quarto/`** son artefactos generados por Quarto y **no** deben versionarse.
+
+Los artefactos pesados que se usan localmente se documentan en [`docs/local_artifacts.md`](docs/local_artifacts.md). En este worktree varias rutas pesadas se mantienen como symlinks hacia `/Volumes/KINGSTON/tesis-project/local-artifacts/tesis-project/`.
 
 ### Data Lake en GCS
 
@@ -130,7 +152,24 @@ quarto render 01_processing/01_silver_processing.qmd
 
 Aplica enriquecimiento geográfico y crea primary keys. **Nota:** El join geográfico está pendiente de completarse.
 
-#### d) Análisis Exploratorio (EDA)
+#### d) Bypass local `proposito` → residencia por usuario (auditoría/modelos)
+
+Para los modelos que requieran variables sociodemográficas asociadas a residencia del usuario, existe un bypass reproducible que recupera `proposito` desde los CSV raw locales y lo enlaza con los viajes procesados.
+
+```bash
+python scripts/audits/build_proposito_pk_bridge.py --scope active
+```
+
+Este paso no reemplaza el pipeline Bronze/Silver; crea artefactos auditables en `tmp/audits/proposito_residence/pk_bridge/` para:
+
+- enlazar viajes procesados con `proposito`;
+- inferir `zona_hogar` por `id_tarjeta`;
+- clasificar confianza residencial (`alta`, `media`, `baja`);
+- documentar diferencias entre zonas raw y zonas procesadas.
+
+Detalles del script y outputs: [`scripts/audits/README.md`](scripts/audits/README.md).
+
+#### e) Análisis Exploratorio (EDA)
 
 ```bash
 # Análisis demográfico de usuarios QR
@@ -209,5 +248,3 @@ Este es un proyecto de tesis. Para dudas o colaboraciones, contactar a Juan Vice
 ## Licencia
 
 Por definir
-
-
