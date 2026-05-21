@@ -1,5 +1,74 @@
 # Notes — Nested Logit con Buffers OD (Option1 alt-specific)
 
+## 2026-05-13 — Reuniones con profesores: reordenamiento metodológico y próximos frentes
+- Se registran dos reuniones docentes con énfasis complementarios:
+  - la profesora guía enfocó la discusión en la validez y depuración del modelo de elección discreta;
+  - el profesor codirector enfatizó comparación predictiva flexible, visualizaciones y síntesis comunicable de resultados.
+
+### Directrices metodológicas de la profesora
+- Revisar la especificación actual de tiempos y transbordos:
+  - sacar promedios zonales de variables como tiempos de viaje, esperas y número de transbordos cuando corresponda;
+  - estimar MNL y Nested Logit usando valores observados a nivel de viaje;
+  - mantener `BIP` como alternativa base para variables comunes.
+- Agregar controles de macrozona como variables dummy:
+  - ejemplos: sector oriente, poniente, sur y norte;
+  - definir explícitamente una macrozona base;
+  - evaluar cómo cambian los coeficientes territoriales después de controlar por macrozona.
+- Depurar variables potencialmente redundantes o menos interpretables:
+  - `shelter` podría competir con densidad de paraderos;
+  - `convenience` puede ser difícil de interpretar sustantivamente;
+  - `hacinamiento` puede competir con los proxies EOD de ingreso;
+  - la depuración debe hacerse después de observar la estabilidad de signos al controlar por macrozona.
+- Explorar segmentación y clases latentes:
+  - revisar el paper de inercia de la profesora como referencia metodológica;
+  - revisar el paper local:
+    - `/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/papers/1-s2.0-S2214367X23000716-main.pdf`;
+  - considerar indicadores `DSI`, `LSI` y `TSI` como base para segmentación;
+  - usar segmentos para correr modelos separados o, si es factible, avanzar hacia clases latentes.
+
+### Directrices metodológicas del profesor codirector
+- Estimar un modelo `XGBoost` con función de pérdida logit como benchmark flexible:
+  - motivación: los modelos de elección discreta tradicionales imponen supuestos y requisitos que los datos pueden no cumplir;
+  - los modelos basados en árboles relajan varios de esos supuestos y pueden mejorar flexibilidad/accuracy;
+  - la pérdida de interpretabilidad puede compensarse parcialmente con `SHAP`.
+- Preparar un resumen de una página con:
+  - resultados experimentales ya listos;
+  - experimentos faltantes;
+  - ejemplo: qué modelos logit ya se estimaron, qué modelos quedan por contrastar y qué análisis predictivos faltan.
+- Incorporar visualizaciones de datos y resultados:
+  - mapas de variables territoriales;
+  - mapas de patrones observados de uso de `BIP`, `QR_OTHER` y `QR_RED`;
+  - distribuciones de tiempos, esperas y transbordos por alternativa;
+  - visualizaciones de resultados espaciales y, eventualmente, `SHAP`.
+- Avanzar en escritura:
+  - redactar un abstract preliminar con potenciales conclusiones;
+  - comenzar a bosquejar discusión y conclusiones si los resultados centrales ya permiten una narrativa defendible.
+
+### Lectura integrada y priorización
+- Las directrices no son contradictorias, pero sí deben ordenarse para evitar dispersión.
+- Prioridad metodológica inmediata:
+  - estabilizar el modelo econométrico base con valores observados a nivel de viaje;
+  - agregar macrozonas como controles territoriales amplios;
+  - comparar MNL vs Nested bajo esta especificación;
+  - recién después depurar variables redundantes.
+- Prioridad comparativa:
+  - usar `XGBoost + SHAP` como benchmark predictivo flexible, no como reemplazo inmediato del logit;
+  - presentar la comparación como contraste entre interpretación estructural y flexibilidad predictiva.
+- Prioridad exploratoria:
+  - dejar segmentación/clases latentes como segunda fase, después de estabilizar el modelo base;
+  - comenzar por indicadores descriptivos de inercia/regularidad (`DSI`, `LSI`, `TSI`) antes de saltar a clases latentes completas.
+- Prioridad comunicacional:
+  - producir visualizaciones espaciales y de distribución;
+  - preparar resumen ejecutivo de una página;
+  - redactar abstract preliminar y posibles conclusiones.
+
+### Decisiones provisionales
+- La especificación territorial con Censo, OSM y EOD sigue siendo útil como línea de trabajo, pero debe contrastarse contra una versión con atributos observados de viaje y macrozonas.
+- Los proxies EOD de ingreso quedan activos como variables candidatas, no como cierre definitivo.
+- `eod2012_numveh_mean_z` queda como sensibilidad diagnóstica, no como variable central junto con ingreso por colinealidad conceptual y empírica.
+- El frente `XGBoost + SHAP` se tratará como benchmark externo de robustez/predicción.
+- La segmentación por inercia/clases latentes queda priorizada después de cerrar una especificación MNL/Nested más limpia.
+
 ## 2026-04-29 — Decisión editorial para reporte informal del modelo logit territorial
 - Se decidió preparar un reporte LaTeX independiente e informal, separado del manuscrito principal de tesis.
 - Ubicación acordada dentro de este repo:
@@ -3491,3 +3560,461 @@ Implication:
   - recibir feedback de profesoras/profesores;
   - decidir entre Opción A y Opción B para la especificación principal;
   - evaluar nuevas variables de infraestructura/acceso, seguridad, puntos de carga/pago y confiabilidad operacional para futuras iteraciones.
+
+## 2026-05-05 - Feedback docente post-reporte y reordenamiento de próximos pasos
+
+- La reunión posterior al envío del reporte aclaró la duda metodológica sobre variables comunes:
+  - la profesora cuestionó la motivación de la parametrización con restricción de suma cero;
+  - para variables alternativa-específicas, como tiempos y transbordos, los coeficientes por alternativa son identificables porque los atributos se calculan para cada método de pago;
+  - para variables comunes al viaje o a la zona, como `ANIO_2025`, demanda/oferta zonal, Censo u OSM, corresponde fijar una alternativa base y estimar las otras alternativas respecto de esa base;
+  - lectura operacional: la **Opción A** (`BIP` como referencia para variables comunes) queda como especificación principal provisional.
+- Decisión metodológica provisional:
+  - modelo principal: `MNL` con observación a nivel de viaje individual;
+  - variables comunes: `BIP` se mantiene como alternativa base, y se estiman coeficientes para `QR_OTHER` y `QR_RED` respecto de `BIP`;
+  - variables alternativa-específicas: tiempos y transbordos mantienen coeficientes estimados por alternativa cuando son identificables;
+  - la Opción B con suma cero queda como ejercicio metodológico no principal, útil solo para mostrar equivalencia de ajuste si se requiere.
+- Interpretación sustantiva destacada por la profesora:
+  - el resultado de `T_ESPERA_TRASB` para `QR_RED`, cercano a cero y no significativo, puede ser informativo;
+  - hipótesis sugerida: usuarios de app Red podrían presentar menor desutilidad por espera en transbordo porque la información disponible les permite anticipar la espera o usar ese tiempo en otra actividad;
+  - este punto requiere una discusión cuidadosa, no tratarse simplemente como ausencia de efecto.
+- Nuevos requerimientos para el reporte/modelo:
+  - agregar `odds ratios` para mejorar la interpretación de coeficientes logit;
+  - buscar literatura sobre educación, adopción digital, herramientas de pago/app y brecha digital en transporte público;
+  - en particular, respaldar el resultado asociado a `share_cine18_universitaria_o_mas_micro_z` y su relación con mayor probabilidad de usar herramientas digitales como app Red;
+  - evaluar nuevas variables censales o proxies territoriales: ingreso/bajo ingreso, porcentaje de mujeres, niños en sala cuna y estudiantes escolares.
+- Sobre la sensibilidad "sin `ZONA777`":
+  - se discutió probar una versión del modelo sin la agregación por `ZONA777`;
+  - al revisar la factibilidad, se concluye que no debe correrse por ahora con la especificación final, porque Censo, OSM, demanda y oferta final dependen de la zona de origen;
+  - omitir `ZONA777` implicaría omitir precisamente las variables territoriales finales o construir un pipeline distinto basado en buffers/coordenadas;
+  - decisión actual: dejar esta sensibilidad en pausa hasta definir si vale la pena desarrollar un pipeline no zonal específico.
+- Próximos pasos inmediatos:
+  - corregir el reporte para dejar la Opción A como especificación principal;
+  - generar tabla de odds ratios para el modelo principal;
+  - iniciar búsqueda bibliográfica sobre educación/adopción digital/mobile ticketing/app de transporte;
+  - auditar disponibilidad y construcción de nuevas variables censales candidatas antes de integrarlas al modelo.
+
+## 2026-05-05 - Literatura efectivamente analizada sobre adopción digital y transporte
+
+- Se creó un memo de revisión bibliográfica en:
+  - `docs/reports/modelo-logit-territorial/literatura_adopcion_digital.md`
+- Se creó un memo de análisis profundo en:
+  - `docs/reports/modelo-logit-territorial/literatura_adopcion_digital_analisis_profundo.md`
+- Estos documentos registran los papers revisados y considerados más útiles para interpretar los resultados actuales, pero **no constituyen una selección definitiva ni exhaustiva de literatura**. Otros papers identificados o futuras búsquedas pueden seguir siendo útiles para el marco teórico, discusión de resultados o anexos.
+- Rama educación, nivel socioeconómico y brecha digital:
+  - Durand et al. (2021), `Access denied? Digital inequality in transport services`.
+  - Boyko y Schaefer (2026), `Smartphone apps for mobility access from a social inequality perspective`.
+  - Brakewood y Kocur (2013), `Unbanked Transit Riders and Open Payment Fare Collection`.
+- Rama mobile ticketing y pago digital en transporte público:
+  - Owusu-Agyemang et al. (2024), `Transit made Easy: Examining the adoption and impact of mobile fare payment technology among bus riders`.
+  - Brakewood et al. (2020), `An evaluation of the benefits of mobile fare payment technology from the user and operator perspectives`.
+  - Wani et al. (2025), `Digital payment adoption in public transportation: Mediating role of mode choice segments in developing cities`.
+- Rama apps, información en tiempo real y valor de la espera:
+  - Watkins et al. (2011), `Where Is My Bus? Impact of mobile real-time information on the perceived and actual wait time of transit riders`.
+  - Brakewood y Watkins (2019), `A literature review of the passenger benefits of real-time transit information`.
+  - Kaplan et al. (2017), `The role of information systems in non-routine transit use of university students: Evidence from Brazil and Denmark`.
+- Lectura sustantiva provisional:
+  - `share_cine18_universitaria_o_mas_micro_z` puede discutirse como proxy territorial de capital educativo/digital, acceso financiero y capacidad de adopción de herramientas digitales, sin interpretarlo causalmente a nivel individual.
+  - `QR_RED` debe tratarse como alternativa tecnológicamente mediada: combina pago, app oficial, posible acceso a información, familiaridad digital y menor fricción de uso.
+  - El resultado de `T_ESPERA_TRASB` para `QR_RED` puede presentarse como compatible con literatura sobre información en tiempo real y menor espera percibida, pero solo como hipótesis interpretativa porque el modelo no observa directamente uso efectivo de información en tiempo real.
+
+## 2026-05-06 - Sensibilidades sociodemográficas: mujeres y asistencia parvularia
+
+- Se evaluaron nuevas variables censales sugeridas en reunión docente, manteniendo la especificación principal provisional:
+  - `MNL` con observación a nivel de viaje individual;
+  - `BIP` como referencia para variables comunes (`bip_only_alt_specific`);
+  - modelo base actual entendido como `Censo main 4 + OSM main + shelter + subway_entrance`.
+- Variables evaluadas:
+  - `share_mujeres_z`: proporción de mujeres en la zona, estandarizada;
+  - `share_asistencia_parv_z`: proporción de población de 0 a 5 años que asiste a educación parvularia en la zona, estandarizada.
+- Para poder evaluar `share_asistencia_parv_z` se regeneró el agregado Censo final desde el Kingston:
+  - cartografía: `/Volumes/KINGSTON/tesis-project/raw/censo2024/cartografia_parquet/Cartografia_censo2024_Pais_Manzanas.parquet`;
+  - zonas: `/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp`;
+  - salida final: `02_eda/tmp/censo2024_zona777/censo2024_zona777_agg_final.parquet`;
+  - el agregado regenerado contiene `share_asistencia_parv`, `n_asistencia_parv` y `n_edad_0_5`.
+- Resultados de ajuste global frente al main actual sin estas dos variables:
+  - main actual: `LL = -232257.1`, `AIC = 464618.2`, `BIC = 465193.0`, `n_params = 52`;
+  - `main + share_mujeres_z`: `LL = -232253.4`, `AIC = 464614.8`, `BIC = 465211.7`, `n_params = 54`;
+  - `main + share_asistencia_parv_z`: `LL = -232250.6`, `AIC = 464609.3`, `BIC = 465206.2`, `n_params = 54`;
+  - `main + share_mujeres_z + share_asistencia_parv_z`: `LL = -232247.7`, `AIC = 464607.5`, `BIC = 465226.5`, `n_params = 56`.
+- Lectura de ajuste:
+  - las extensiones mejoran `LL` y `AIC`;
+  - `BIC` sube por la penalización adicional de parámetros, especialmente en el modelo combinado;
+  - el tradeoff queda documentado: mejora incremental e interpretabilidad versus parsimonia.
+- Resultados sustantivos para `share_mujeres_z`:
+  - modelo `main + mujeres`: `QR_RED = 0.024475`, `t = 2.649`, `p = 0.0081`; `QR_OTHER` no significativo;
+  - modelo combinado: `QR_RED = 0.021419`, `t = 2.403`, `p = 0.0162`; `QR_OTHER` no significativo;
+  - interpretación provisional: zonas con mayor proporción de mujeres se asocian con mayor utilidad relativa de `QR_RED` frente a `BIP`, pero no con `QR_OTHER`.
+- Resultados sustantivos para `share_asistencia_parv_z`:
+  - modelo `main + asistencia_parv`: `QR_RED = 0.051579`, `t = 3.456`, `p = 0.00055`; `QR_OTHER` no significativo;
+  - modelo combinado: `QR_RED = 0.048482`, `t = 3.223`, `p = 0.00127`; `QR_OTHER` no significativo;
+  - interpretación provisional: zonas con mayor asistencia parvularia relativa se asocian con mayor utilidad relativa de `QR_RED` frente a `BIP`, y la señal se mantiene incluso controlando por `share_mujeres_z`.
+- Decisión de trabajo:
+  - integrar ambas variables como extensión sociodemográfica candidata, porque aportan interpretación y ambas sobreviven en el modelo combinado;
+  - `share_asistencia_parv_z` es la señal más robusta;
+  - `share_mujeres_z` aporta una señal secundaria pero consistente para `QR_RED`;
+  - reportar explícitamente que el modelo combinado mejora `LL/AIC` pero empeora `BIC`, para no ocultar el costo de parsimonia.
+- Riesgo interpretativo:
+  - ambas variables son características territoriales de origen y no atributos individuales observados;
+  - deben interpretarse como asociaciones contextuales con la elección de medio de pago, no como efectos causales individuales.
+
+## 2026-05-07 - EOD Santiago 2012 como fuente externa potencial
+
+- Se revisaron archivos locales de la Encuesta Origen Destino Santiago 2012:
+  - informes: `/Users/vicenteonetto/Downloads/Informe_EOD-2012_Santiago`;
+  - zonificación: `/Users/vicenteonetto/Downloads/Zonificacion_EOD-2012_Santiago`;
+  - base Access: `/Users/vicenteonetto/Downloads/base_datos_eodStgo_2012.accdb`.
+- Hallazgos preliminares:
+  - la zonificación EOD 2012 es un shapefile con 866 zonas, 45 comunas y CRS `EPSG:32719`;
+  - la base `.accdb` contiene señales claras de tablas/campos `Hogar`, `Persona`, `Viaje`, `Etapa`, `IngresoHogar`, `Sexo`, `Estudios`, `Actividad`, `Numveh` y `Factor`;
+  - los informes documentan imputación de ingresos individuales y agregación a ingreso total del hogar;
+  - el informe define estratos de ingreso de hogar:
+    - bajo: hasta `$400.000`;
+    - medio: `$400.001` a `$1.600.000`;
+    - alto: más de `$1.600.000`;
+  - el ingreso de hogar imputado aparece prácticamente completo en el informe (`99,82%` de hogares con ingreso completo).
+- Variables potencialmente útiles si se habilita lectura de la base:
+  - `share_hogares_ingreso_bajo_eod2012`;
+  - `ingreso_medio_hogar_eod2012`;
+  - `share_sin_auto_eod2012` o tasa de motorización;
+  - composición por edad, sexo, estudios, actividad o estudiantes, agregadas territorialmente.
+- Limitaciones metodológicas:
+  - la EOD 2012 es muy anterior al período de modelación 2024-2025;
+  - no puede interpretarse como condición socioeconómica contemporánea sin cautela;
+  - podría servir como proxy territorial histórico/persistente o como validación externa, no como variable principal sin justificación adicional;
+  - para usarla en el modelo actual se requeriría un cruce espacial entre zonas EOD 2012 y `ZONA777`, probablemente por intersección/área;
+  - el entorno actual no tiene `mdbtools`, `LibreOffice`, `ODBC` ni `pyodbc`, por lo que todavía no se pudo exportar/inventariar la base `.accdb` completa.
+- Decisión actual:
+  - dejar la EOD 2012 en pausa como camino potencial;
+  - no integrarla todavía al modelo;
+  - retomarla solo si se decide construir una variable de ingreso/bajo ingreso territorial y se resuelve la lectura/exportación de la base Access.
+
+## 2026-05-11 - EOD 2012 retomada como sensibilidad territorial histórica
+
+- Se decidió explorar la EOD Santiago 2012 como fuente de variables territoriales históricas/persistentes, no como indicador contemporáneo directo.
+- Motivación:
+  - aunque la encuesta está desactualizada para 2024-2025, algunas señales podrían ser relativamente persistentes a escala territorial;
+  - especialmente ranking/percentil de ingresos por zona, motorización, estructura horaria de viajes al trabajo/estudio y composición socioeconómica.
+- Se instaló `mdbtools` vía Homebrew para poder leer/exportar la base Access:
+  - input: `/Users/vicenteonetto/Downloads/base_datos_eodStgo_2012.accdb`;
+  - tablas exportadas a CSV en `data/external/eod2012/raw_csv/`;
+  - tablas principales exportadas: `Hogar`, `Persona`, `Viaje`;
+  - lookups exportados: `TramoIngreso`, `JornadaTrabajo`, `Sexo`, `Estudios`, `Actividad`, `Ocupación`, `Periodo`, `Proposito`, `PropositoAgregado`, `Modo`, `ModoPriPub`, `ModoMotor`.
+- Se creó el script reproducible:
+  - `scripts/build_eod2012_zone_features.py`.
+- Salidas creadas:
+  - `data/processed/eod2012/eod2012_zone_features_eodzone.parquet`;
+  - `data/processed/eod2012/eod2012_zone_features_eodzone.csv`;
+  - `data/processed/eod2012/eod2012_zone_features_summary.csv`.
+- Cobertura base:
+  - zonificación EOD: 866 zonas, CRS `EPSG:32719`;
+  - `Hogar`: 18.264 registros;
+  - `Persona`: 60.054 registros;
+  - `Viaje`: 113.591 registros;
+  - dataset zonal EOD generado: 866 zonas y 41 variables `eod2012_*`.
+- Variables candidatas generadas:
+  - ingreso de hogar medio/mediano 2012 y sus percentiles zonales (`*_pct_rank`) para evitar lectura nominal afectada por inflación;
+  - proporción de hogares de ingreso bajo/medio/alto según tramos absolutos 2012;
+  - proporción de hogares sin auto y vehículos promedio;
+  - composición de personas por sexo, educación superior/universitaria, trabajo y estudio;
+  - jornada laboral completa/parcial entre personas trabajadoras;
+  - proporción de viajes laborales en transporte público;
+  - distribución horaria de viajes, incluyendo `al trabajo` y `al estudio` en punta mañana;
+  - hora media de inicio para viajes `al trabajo` y `al estudio`.
+- Ajuste importante:
+  - `Persona.Actividad` no usa códigos numéricos sino letras multiselección (`A`, `B`, `A;B`, etc.);
+  - se interpretó `A = trabaja` y `B = estudia`, consistente con presencia de `JornadaTrabajo` y `Ocupacion`;
+  - el script usa esa codificación para las variables laborales/estudiantiles.
+- Diagnóstico preliminar de variables:
+  - `eod2012_ingreso_hogar_mean` tiene cobertura en 790 de 866 zonas;
+  - `eod2012_ingreso_hogar_mean_pct_rank` es preferible a pesos nominales para modelación;
+  - `eod2012_share_hogares_sin_auto` tiene señal territorial interpretable;
+  - `eod2012_share_viajes_al_trabajo_punta_manana` tiene cobertura en 767 zonas, media `0,615`;
+  - `eod2012_hora_inicio_al_trabajo_mean` tiene cobertura en 767 zonas, media `9,15` y mediana `8,84`;
+  - `eod2012_share_viajes_transporte_publico` tiene cobertura en 846 zonas.
+- Decisión metodológica provisional:
+  - usar EOD 2012 solo como sensibilidad histórica/contextual;
+  - priorizar variables relativas o estructurales, no valores monetarios absolutos;
+  - no integrarla al modelo principal hasta cruzarla correctamente con `ZONA777` y revisar correlación con Censo/OSM actuales.
+- Siguiente paso:
+  - construir crosswalk espacial `EOD2012 zona -> ZONA777` por intersección/área cuando esté disponible el shapefile ZONA777 local;
+  - luego transferir features EOD a ZONA777 y evaluar correlaciones/cobertura sobre la muestra de estimación.
+
+## 2026-05-11 - EOD 2012 transferida a ZONA777 por intersección espacial
+
+- Se montó Kingston y se encontró el shapefile ZONA777 usado por el proyecto:
+  - `/Volumes/KINGSTON/tesis-project/raw/zonas777/Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp`.
+- Diagnóstico de insumos espaciales:
+  - `ZONA777`: 804 geometrías, 803 códigos `ZONA777` únicos, CRS no declarado pero coordenadas lon/lat;
+  - `EOD 2012`: 866 zonas, CRS `EPSG:32719`;
+  - el campo `Z_EOD` en ZONA777 existe, pero no se usó como llave principal porque contiene códigos compuestos y zonas externas; se prefirió cruce espacial por área.
+- Se creó el script:
+  - `scripts/build_eod2012_zona777_features.py`.
+- Decisiones técnicas del script:
+  - asigna `EPSG:4326` al shapefile ZONA777 y reproyecta a `EPSG:32719`;
+  - corrige geometrías inválidas con `make_valid`;
+  - disuelve el duplicado de `ZONA777 = 493`;
+  - calcula intersecciones EOD2012 x ZONA777;
+  - normaliza pesos por área intersectada dentro de cada ZONA777;
+  - transfiere variables `eod2012_*` como promedios ponderados por área.
+- Salidas creadas:
+  - `data/processed/eod2012/eod2012_to_zona777_area_crosswalk.csv`;
+  - `data/processed/eod2012/eod2012_zone_features_zona777.parquet`;
+  - `data/processed/eod2012/eod2012_zone_features_zona777.csv`;
+  - `data/processed/eod2012/eod2012_zone_features_zona777_summary.csv`.
+- Cobertura espacial:
+  - 803 zonas ZONA777 generadas;
+  - cobertura media de área: `0,999741`;
+  - cobertura mínima: `0,970190`;
+  - ninguna ZONA777 quedó sin intersección EOD;
+  - cada ZONA777 intersecta en promedio `4,93` zonas EOD.
+- Cobertura en muestra de estimación `sample2pct`:
+  - la muestra usa 772 zonas de origen;
+  - solo `ZONA777 = 831` queda sin variables EOD de hogar/persona;
+  - esto afecta aproximadamente `0,0334%` de filas;
+  - la misma zona sí tiene variables EOD de viajes.
+- Variables candidatas con buena cobertura ya disponibles en ZONA777:
+  - `eod2012_ingreso_hogar_mean_pct_rank`;
+  - `eod2012_ingreso_hogar_median_pct_rank`;
+  - `eod2012_share_hogares_sin_auto`;
+  - `eod2012_share_viajes_al_trabajo_punta_manana`;
+  - `eod2012_hora_inicio_al_trabajo_mean`;
+  - `eod2012_share_viajes_transporte_publico`;
+  - `eod2012_share_educ_superior`.
+- Decisión metodológica provisional:
+  - la EOD 2012 queda técnicamente lista para análisis exploratorio y sensibilidad histórica;
+  - antes de integrarla a modelos, falta revisar correlaciones con variables Censo/OSM actuales y decidir una estrategia de imputación para el caso `ZONA777 = 831`.
+
+## 2026-05-11 - Proxy de grupo de ingreso EOD 2012 por percentiles ponderados
+
+- Se decidió construir un proxy de grupos de ingreso usando solo `IngresoHogar` de la EOD 2012.
+- No se debe presentar como clasificación socioeconómica oficial `ABC1/C2/C3/D/E`, porque esa clasificación incorpora más dimensiones que ingreso.
+- Nombre conceptual recomendado:
+  - `income_proxy`;
+  - `ABC1_proxy` solo como etiqueta operativa para el tramo superior de ingreso.
+- Construcción:
+  - se clasifican hogares EOD según percentiles de `IngresoHogar`;
+  - los percentiles se calculan ponderados por `Factor`, es decir, usando el peso de expansión muestral de cada hogar;
+  - luego se agregan a zona como proporción ponderada de hogares en cada grupo.
+- Cortes ponderados obtenidos en pesos 2012:
+  - `E`: percentil 0-10, hasta `$158.533`;
+  - `D`: percentil 10-45, hasta `$470.000`;
+  - `C3`: percentil 45-70, hasta `$800.000`;
+  - `C2`: percentil 70-90, hasta `$1.456.668`;
+  - `ABC1_proxy`: percentil 90-100.
+- Variables agregadas al pipeline:
+  - `eod2012_share_hogares_e_income_proxy`;
+  - `eod2012_share_hogares_d_income_proxy`;
+  - `eod2012_share_hogares_c3_income_proxy`;
+  - `eod2012_share_hogares_c2_income_proxy`;
+  - `eod2012_share_hogares_abc1_income_proxy`;
+  - `eod2012_share_hogares_de_income_proxy`.
+- Scripts actualizados:
+  - `scripts/build_eod2012_zone_features.py`;
+  - `scripts/build_eod2012_zona777_features.py` no requirió cambios lógicos, pero se regeneraron sus salidas.
+- Salidas nuevas/relevantes:
+  - `data/processed/eod2012/eod2012_income_proxy_cutpoints.csv`;
+  - `data/processed/eod2012/eod2012_income_proxy_validation.csv`;
+  - `data/processed/eod2012/eod2012_zone_features_eodzone.parquet`;
+  - `data/processed/eod2012/eod2012_zone_features_zona777.parquet`.
+- Validación contra Censo 2024 y consistencia interna:
+  - `ABC1_proxy` vs `share_cine18_universitaria_o_mas_micro`: Pearson `0,701`, Spearman `0,600`;
+  - `D+E proxy` vs `share_hacinamiento`: Pearson `0,528`, Spearman `0,566`;
+  - `ABC1_proxy` vs `share_hogares_sin_auto`: Pearson `-0,698`, Spearman `-0,518`;
+  - `D+E proxy` vs `share_cine18_universitaria_o_mas_micro`: Pearson `-0,650`, Spearman `-0,616`;
+  - `ABC1_proxy` vs `share_hacinamiento`: Pearson `-0,471`, Spearman `-0,544`.
+- Interpretación:
+  - el proxy por percentiles tiene validez convergente razonable: zonas con mayor `ABC1_proxy` se asocian con mayor educación universitaria y menor hacinamiento/sin-auto;
+  - zonas con mayor `D+E proxy` se asocian con mayor hacinamiento y menor educación universitaria;
+  - por lo tanto, el proxy parece defendible como sensibilidad histórica de composición socioeconómica territorial, no como indicador socioeconómico contemporáneo oficial.
+
+## 2026-05-11 - Notebook EOD income proxy stepwise
+
+- Se creó un notebook separado para testear variables EOD 2012 sin contaminar el flujo principal:
+  - `03_models/16_eod2012_income_proxy_stepwise.qmd`.
+- Base del modelo:
+  - MNL;
+  - Censo main 4;
+  - OSM main;
+  - `osm_transport_shelter_yes_density_km2_z`;
+  - `osm_railway_subway_entrance_density_km2_z`;
+  - `share_mujeres_z`;
+  - `share_asistencia_parv_z`.
+- Parametrización:
+  - `BIP` queda normalizado a cero para variables comunes;
+  - tiempos y transbordos mantienen coeficientes por alternativa.
+- Preset activo:
+  - `joint_mnl_censo_osm_eod_income_proxy_stepwise`.
+- Modelos activos:
+  - `mnl_joint_current_main_mujeres_parv_plus_eod_abc1_income_proxy`;
+  - `mnl_joint_current_main_mujeres_parv_plus_eod_de_income_proxy`;
+  - `mnl_joint_current_main_mujeres_parv_plus_eod_abc1_de_income_proxy`;
+  - `mnl_joint_current_main_mujeres_parv_plus_eod_dummy_high_abc1_de_income_proxy`.
+- Variante dummy agregada:
+  - `eod2012_dummy_high_abc1_income_proxy`;
+  - `eod2012_dummy_high_de_income_proxy`;
+  - ambas se definen como 1 si la zona está en el top 25% de la distribución ZONA777 de la proporción correspondiente;
+  - umbrales observados:
+    - `ABC1_proxy` P75: `0,1163`;
+    - `D+E_proxy` P75: `0,6001`.
+- Artefactos materializados en prueba liviana:
+  - `03_models/artifacts/interannual_enriched/eod2012_zona777_model_ready_sample2pct.parquet`;
+  - `03_models/artifacts/interannual_enriched/pooled_2024_2025-estimation-sample2pct-eod2012.parquet`;
+  - `03_models/artifacts/interannual_enriched/pooled_2024_2025-estimation-sample2pct-censo4-micro-osm-eod2012.parquet`.
+- Imputación aplicada:
+  - solo `ZONA777 = 831` no tenía variables EOD de hogar/persona;
+  - se imputó con mediana EOD/ZONA777 para `eod2012_share_hogares_abc1_income_proxy` y `eod2012_share_hogares_de_income_proxy`;
+  - el caso afecta aproximadamente `0,0334%` de filas de la muestra.
+- Estado:
+  - el notebook compila estáticamente;
+  - se ejecutó hasta `estimation-design` sin entrar a estimación;
+  - el diseño activo contiene 4 modelos MNL;
+  - listo para correr la celda `run-screening`.
+
+## 2026-05-12 - Resultados EOD income proxy: variables continuas y dummies
+
+- Se corrieron modelos MNL usando como base el modelo territorial actual:
+  - Censo main 4;
+  - OSM main;
+  - `osm_transport_shelter_yes_density_km2_z`;
+  - `osm_railway_subway_entrance_density_km2_z`;
+  - `share_mujeres_z`;
+  - `share_asistencia_parv_z`.
+- Explicación simple de las variables EOD:
+  - primero se clasifican los hogares de la EOD 2012 según su ingreso relativo dentro de la encuesta, usando percentiles ponderados por el factor de expansión muestral;
+  - luego, para cada zona, se calcula qué proporción de hogares cae en el tramo alto de ingreso (`ABC1_proxy`) y qué proporción cae en los tramos bajos (`D+E_proxy`);
+  - por lo tanto, una variable como `eod2012_share_hogares_abc1_income_proxy_z` no dice que la zona sea oficialmente ABC1, sino que históricamente tenía una mayor proporción relativa de hogares en el tramo superior de ingreso de la EOD 2012;
+  - las dummies resumen esta misma idea de forma más discreta: valen 1 para zonas con alta concentración relativa de ese grupo y 0 para el resto;
+  - en particular, `eod2012_dummy_high_abc1_income_proxy` identifica zonas en el 25% superior de concentración `ABC1_proxy`, y `eod2012_dummy_high_de_income_proxy` identifica zonas en el 25% superior de concentración `D+E_proxy`.
+- Umbrales usados para las dummies:
+  - `high_ABC1_proxy = 1` si `share_hogares_abc1_income_proxy >= 0,1163`;
+  - `high_D+E_proxy = 1` si `share_hogares_de_income_proxy >= 0,6001`.
+- Modelo con proporciones continuas `ABC1_proxy` y `D+E_proxy`:
+  - `eod2012_share_hogares_abc1_income_proxy_z`: `QR_OTHER` negativo y marginal (`beta = -0,0154`, `t = -1,87`, `p = 0,062`); `QR_RED` cercano a cero y no significativo (`beta = -0,0053`, `t = -0,34`);
+  - `eod2012_share_hogares_de_income_proxy_z`: `QR_OTHER` positivo y significativo (`beta = 0,0369`, `t = 4,53`, `p < 0,001`); `QR_RED` negativo pero no significativo (`beta = -0,0123`, `t = -0,67`).
+- Modelos continuos por separado:
+  - solo `ABC1_proxy`: `QR_OTHER` negativo y significativo (`beta = -0,0281`, `t = -3,61`), `QR_RED` no significativo;
+  - solo `D+E_proxy`: `QR_OTHER` positivo y significativo (`beta = 0,0421`, `t = 5,49`), `QR_RED` no significativo.
+- Modelo con dummies de alta concentración:
+  - `eod2012_dummy_high_abc1_income_proxy_z`: negativo y significativo para `QR_OTHER` (`beta = -0,0264`, `t = -4,38`) y para `QR_RED` (`beta = -0,0421`, `t = -3,44`);
+  - `eod2012_dummy_high_de_income_proxy_z`: no significativo para `QR_OTHER` ni para `QR_RED`.
+- Lectura interpretativa provisional:
+  - la señal más consistente aparece en `QR_OTHER`: zonas históricamente con mayor proporción de hogares `D+E_proxy` se asocian con mayor utilidad relativa de `QR_OTHER`, mientras que zonas con mayor proporción `ABC1_proxy` tienden a asociarse con menor utilidad relativa de `QR_OTHER`;
+  - `QR_RED` no presenta una señal robusta en las variables continuas de ingreso EOD, pero sí aparece una penalización en zonas de alta concentración `ABC1_proxy` cuando se usa la especificación dummy;
+  - esto no respalda una lectura simple de "mayor ingreso implica mayor uso QR"; más bien sugiere que el gradiente territorial histórico de ingreso puede estar capturando diferencias de contexto urbano, acceso, composición de usuarios o patrones de adopción que deben interpretarse con cautela.
+- Estabilidad de parámetros antiguos:
+  - los parámetros base de año, horario, tiempos de espera, transbordos y demanda/oferta mantienen signos e interpretación general;
+  - la historia de `T_ESPERA_TRASB` se mantiene: `BIP` y `QR_OTHER` presentan desutilidad significativa, mientras que `QR_RED` sigue cercano a cero y no significativo;
+  - las mayores variaciones aparecen en variables de oferta/demanda, especialmente en la especificación dummy, pero no se observa una ruptura estructural de los resultados principales.
+- Decisión metodológica pendiente:
+  - estas variables EOD quedan como candidatas interpretativamente útiles para discutir con la profesora;
+  - antes de fijar una especificación final, hay que cotejar si conviene usar la versión continua, la versión dummy, o una selección más parsimoniosa;
+  - por ahora se mantienen como sensibilidad histórica de ingreso territorial basada en EOD 2012, con la advertencia explícita de que no corresponden a una clasificación socioeconómica oficial ni contemporánea.
+
+## 2026-05-12 - Sensibilidad EOD con motorización histórica (`numveh_mean`)
+
+- Se analizó `eod2012_numveh_mean`, definido como el promedio histórico de vehículos por hogar en cada zona EOD 2012, transferido a `ZONA777` por intersección espacial.
+- Diagnóstico descriptivo:
+  - media zonal: `0,592` vehículos/hogar;
+  - mediana zonal: `0,443`;
+  - P75: `0,686`;
+  - P90: `1,238`;
+  - la distribución es asimétrica, con una cola alta de zonas muy motorizadas.
+- Correlaciones relevantes:
+  - con `eod2012_share_hogares_sin_auto`: `-0,915`;
+  - con `eod2012_share_hogares_abc1_income_proxy`: `0,815`;
+  - con `eod2012_share_hogares_de_income_proxy`: `-0,723`.
+- Se probaron dos sensibilidades adicionales en `03_models/16_eod2012_income_proxy_stepwise.qmd`:
+  - ingresos continuos (`ABC1_proxy + D+E_proxy`) + `eod2012_numveh_mean_z`;
+  - dummies de alta concentración (`high_ABC1_proxy + high_D+E_proxy`) + `eod2012_numveh_mean_z`.
+- Resultado principal:
+  - `eod2012_numveh_mean_z` resulta negativo y significativo para `QR_OTHER`;
+  - en el modelo continuo: `beta_QR_OTHER = -0,0324`, `t = -3,32`;
+  - en el modelo dummy: `beta_QR_OTHER = -0,0388`, `t = -4,51`;
+  - para `QR_RED` no aparece una señal robusta.
+- Efecto sobre proxies de ingreso:
+  - en el modelo continuo, al incluir `numveh_mean`, `ABC1_proxy` pierde señal (`t_QR_OTHER = -0,29`), mientras `D+E_proxy` permanece positivo y significativo para `QR_OTHER` (`beta = 0,0301`, `t = 3,57`);
+  - en el modelo dummy, `high_ABC1_proxy` sigue negativo y significativo para ambas alternativas QR, mientras `high_D+E_proxy` sigue sin señal.
+- Decisión metodológica provisional:
+  - `numveh_mean` se considera una sensibilidad útil y sustantivamente interpretable como motorización histórica territorial;
+  - sin embargo, no conviene incorporarla simultáneamente con los proxies de ingreso como especificación principal, porque presenta alta colinealidad conceptual y empírica con ellos;
+  - la lectura defendible es que `numveh_mean` confirma que parte de la señal EOD de ingreso alto está asociada a mayor disponibilidad de vehículo, no que el proxy de ingreso deba reemplazarse automáticamente;
+  - por ahora queda registrada como diagnóstico/sensibilidad para discutir con la profesora antes de fijar la especificación final.
+
+## 2026-05-13 - Candidato econométrico actual: especificación `parsimonious`
+
+- Se probó una batería de cuatro modelos MNL con macrozonas en `03_models/16_eod2012_income_proxy_stepwise.qmd`, partiendo desde cero para cada estimación:
+  - `socio_clean`: elimina `share_hacinamiento_z` y `eod2012_share_hogares_abc1_income_proxy_z`;
+  - `osm_local_clean`: elimina `osm_leisure_sports_centre_density_km2_z` y `osm_shop_convenience_density_km2_z`;
+  - `no_shelter`: elimina `osm_transport_shelter_yes_density_km2_z`;
+  - `parsimonious`: elimina simultáneamente `share_hacinamiento_z`, `eod2012_share_hogares_abc1_income_proxy_z`, `osm_leisure_sports_centre_density_km2_z` y `osm_shop_convenience_density_km2_z`.
+- Las cuatro especificaciones convergieron correctamente (`yaml_convergence = true`).
+- Comparación de ajuste:
+  - modelo macro completo previo: `LL = -232189,9`, `AIC = 464523,8`, `BIC = 465319,6`;
+  - `socio_clean`: `LL = -232204,8`, `AIC = 464545,5`, `BIC = 465297,2`;
+  - `osm_local_clean`: `LL = -232200,6`, `AIC = 464537,2`, `BIC = 465288,8`;
+  - `no_shelter`: `LL = -232204,3`, `AIC = 464548,6`, `BIC = 465322,3`;
+  - `parsimonious`: `LL = -232214,2`, `AIC = 464556,5`, `BIC = 465263,9`.
+- Lectura:
+  - por AIC, el modelo macro completo sigue siendo el mejor;
+  - por BIC, `parsimonious` es el mejor candidato, seguido por `osm_local_clean`;
+  - sacar `shelter` no parece conveniente, porque empeora BIC frente al completo y además `shelter` mantiene señal estable en los modelos donde se conserva.
+- Estabilidad de parámetros:
+  - los parámetros de viaje (`T_ESPERA_INI`, `T_ESPERA_TRASB`, `N_TRASB`, `T_VEH`) se mantienen estables;
+  - `share_cine18_universitaria_o_mas_micro_z` sigue siendo la señal sociodemográfica dominante, especialmente para `QR_RED`;
+  - `share_mujeres_z` y `share_asistencia_parv_z` se mantienen positivos y significativos para `QR_RED`;
+  - `eod2012_share_hogares_de_income_proxy_z` se mantiene positivo y significativo para `QR_OTHER`, no para `QR_RED`;
+  - `ABC1_proxy` no era significativo y al retirarlo no desestabiliza `D+E_proxy`;
+  - `sports_centre` y `convenience` tienen interpretación sustantiva débil frente a su aporte incremental.
+- Decisión provisional:
+  - `parsimonious` queda como candidato econométrico principal actual;
+  - el modelo macro completo queda como sensibilidad de mayor ajuste;
+  - `osm_local_clean` queda como sensibilidad alternativa si se quiere retener `hacinamiento` y `ABC1` pero limpiar OSM local.
+- Advertencia interpretativa:
+  - al retirar `hacinamiento` y `ABC1_proxy`, parte de la heterogeneidad socio-territorial se concentra más en `share_cine18_universitaria_o_mas_micro_z` y en macrozonas;
+  - esto se considera aceptable bajo el criterio de parsimonia, pero debe reportarse como decisión metodológica y no como prueba de causalidad.
+
+## 2026-05-14 - Verificación de atributos OD-alternativa de viaje
+
+- Se verificó la duda metodológica levantada en reunión docente: si tiempos y transbordos estaban siendo tratados como promedios zonales o como atributos por alternativa.
+- Corrección importante de interpretación:
+  - las columnas `TVH_*`, `TEI_*`, `TET_*` y `NTR_*` **no son atributos individuales puros observados para las tres alternativas de cada viaje**;
+  - se construyen en `lib/od_buffers_nested_logit.py` como promedios observados por par origen-destino (`zona_inicio_viaje`, `zona_fin_viaje`) y `tipo_pago`;
+  - para la alternativa efectivamente elegida se aplica lógica `leave-one-out` cuando hay más de una observación de esa alternativa en el OD, evitando que el propio viaje determine completamente su atributo promedio;
+  - para alternativas no elegidas se usa el promedio observado de los viajes de ese OD realizados con ese `tipo_pago`;
+  - por lo tanto, son atributos de contexto **OD × alternativa de pago**, no promedios simples por zona de origen.
+- En `03_models/16_eod2012_income_proxy_stepwise.qmd`, la función de utilidad usa columnas alternativa-específicas:
+  - tiempos en vehículo: `TVH_BIP`, `TVH_QR_RED`, `TVH_QR_OTHER`;
+  - espera inicial: `TEI_BIP`, `TEI_QR_RED`, `TEI_QR_OTHER`;
+  - espera en transbordo: `TET_BIP`, `TET_QR_RED`, `TET_QR_OTHER`;
+  - número de transbordos: `NTR_BIP`, `NTR_QR_RED`, `NTR_QR_OTHER`.
+- Diagnóstico empírico sobre `pooled_2024_2025-estimation-sample2pct-censo4-micro-osm-eod2012.parquet`:
+  - `TVH_BIP` tiene `235.413` valores únicos en `466.639` observaciones;
+  - `TVH_QR_RED` tiene `46.478` valores únicos;
+  - `TVH_QR_OTHER` tiene `90.685` valores únicos;
+  - `TEI_BIP` tiene `182.297` valores únicos;
+  - `TET_BIP` tiene `120.459` valores únicos;
+  - `NTR_BIP` tiene `35.373` valores únicos;
+  - dentro de grupos `zona_inicio_viaje × franja_v2` con al menos 10 observaciones, la proporción de grupos con variación interna es `1,0` para las columnas revisadas principales.
+- Decisión:
+  - no se requiere crear una nueva especificación para "sacar promedios zonales", porque los atributos no son promedios zonales sino promedios OD × alternativa con leave-one-out para la alternativa elegida;
+  - si la profesora exige usar atributos puramente observados del viaje individual para la alternativa elegida, hay que aclarar que para alternativas no elegidas no existe un contrafactual individual observado; habría que definir otra estrategia de imputación/choice set;
+  - lo que sí queda documentado es que las variables territoriales, demanda/oferta, Censo, OSM, EOD y macrozonas siguen siendo controles comunes por zona/origen, como corresponde a su definición.
+- Cambio reproducible:
+  - se agregó una celda `check-od-alt-trip-attrs` al notebook `03_models/16_eod2012_income_proxy_stepwise.qmd` para validar automáticamente existencia y variación de estas columnas antes de la estimación.
+
+## 2026-05-14 - Sensibilidad pedida por profesora: atributos observados por viaje
+
+- La profesora pidió probar explícitamente cómo cambia el modelo si, en vez de usar los atributos OD × alternativa (`TVH_*`, `TEI_*`, `TET_*`, `NTR_*`), se usan los valores efectivamente observados en cada viaje.
+- Decisión metodológica:
+  - no se reemplaza el modelo principal OD × alternativa;
+  - se agrega una sensibilidad separada, porque los valores observados del viaje son comunes a las tres alternativas para una misma observación y por lo tanto solo son identificables como interacciones con alternativas respecto de una base;
+  - bajo esta sensibilidad, `BIP` queda como alternativa base para estos atributos comunes observados;
+  - se estiman coeficientes para `QR_OTHER` y `QR_RED` sobre `OBS_TVH`, `OBS_TEI`, `OBS_TET` y `OBS_NTR`.
+- Interpretación esperada:
+  - estos coeficientes no deben leerse como desutilidad genérica de tiempo/transbordos para cada alternativa;
+  - deben leerse como asociación entre las características realizadas del viaje y la probabilidad relativa de elegir `QR_OTHER` o `QR_RED` frente a `BIP`.
+- Cambio reproducible:
+  - `lib/od_buffers_nested_logit.py` ahora permite exportar métricas realizadas con `include_realized_metrics=True`;
+  - `03_models/16_eod2012_income_proxy_stepwise.qmd` incorpora el preset `joint_mnl_censo_osm_eod_parsimonious_observed_trip_attrs`;
+  - ese preset activa dos modelos sobre el candidato parsimonioso: `MNL` y `Nested`, ambos con `trip_attr_mode = observed_common`;
+  - el notebook construye una muestra `*-observed-trip-attrs.parquet`, verifica que replique exactamente las filas del baseline sample y luego genera la muestra conjunta Censo + OSM + EOD + macrozonas con columnas `OBS_*`.

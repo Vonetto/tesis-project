@@ -13,40 +13,96 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
 - Incorporar nuevos controles primero sobre el benchmark MNL y reevaluar nested solo despues.
 - Si una decisión nace en el worktree `tesis-project-ml`, su detalle canónico queda allá; este repo solo registra la síntesis puente y su impacto sobre la línea principal.
 
-## Current Focus — Reporte informal del modelo logit territorial
-- [ ] Crear un reporte LaTeX independiente, informal y separado del manuscrito principal de tesis:
-  - ubicación acordada: `docs/reports/modelo-logit-territorial/reporte_modelo_logit.tex`;
-  - no usar la carpeta externa de Seminario Tesis;
-  - no incluir portada ni índice.
-- [ ] Escribir sección 1: descripción del problema y alternativas:
-  - `BIP`;
-  - `QR_RED`;
-  - `QR_OTHER`.
-- [ ] Escribir sección 2: especificación MNL y función de utilidad:
-  - normalización de alternativa base;
-  - variables comunes/base;
-  - variables territoriales con coeficientes alternativo-específicos.
-- [ ] Escribir sección 3: variables base, Censo, OSM y microinfraestructura:
-  - definición operacional;
-  - fuente;
-  - transformación/estandarización cuando corresponda.
-- [ ] Escribir sección 4: estrategia de estimación y muestra:
-  - `pooled_2024_2025`;
-  - `sample2pct`;
-  - muestra conjunta `censo4-micro-osm`;
-  - estimación en Biogeme y criterio YAML de convergencia.
-- [ ] Generar sección 5: tabla de ajuste/convergencia del modelo elegido:
-  - modelo principal `mnl_joint_censo_main_4_plus_osm_main_plus_subway_entrance`;
-  - sensibilidad `mnl_joint_censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance`.
-- [ ] Generar sección 6: tabla wide de parámetros:
-  - columnas por alternativa (`BIP`, `QR_RED`, `QR_OTHER`);
-  - incluir `beta`, `t` robusto y `p_error` robusto.
-- [ ] Escribir sección 7: interpretación de signos/significancia por alternativa.
-- [ ] Escribir sección 8: decisión de modelo principal y sensibilidades:
-  - modelo principal: `main + subway_entrance`;
-  - sensibilidad de política pública: `main + shelter + subway_entrance`;
-  - `transport_bench` excluido del modelo principal.
-- [ ] Compilar el PDF del reporte y revisar formato de tablas largas.
+## Current Focus — Post-reunión profesores: modelo, benchmark y comunicación
+- [x] Cerrar el reporte LaTeX informal inicial:
+  - `docs/reports/modelo-logit-territorial/reporte_modelo_logit.tex`;
+  - `docs/reports/modelo-logit-territorial/reporte_modelo_logit.pdf`;
+  - estado: enviado para feedback docente.
+- [x] Revisar el reporte post-reunión para dejar la **Opción A** como especificación principal:
+  - `BIP` como referencia para variables comunes al viaje/zona;
+  - coeficientes estimados para `QR_OTHER` y `QR_RED` respecto de `BIP`;
+  - Opción B con suma cero solo como nota metodológica o sensibilidad no principal.
+- [x] Generar `odds ratios` del modelo principal:
+  - para variables comunes, interpretar `exp(beta)` como odds relativos de `QR_OTHER` o `QR_RED` contra `BIP`;
+  - para variables estandarizadas, interpretar por `+1` desviación estándar;
+  - para tiempos, reportar idealmente por minuto cuando corresponda.
+  - estado: celdas reproducibles agregadas en `03_models/15_mnl_common_variable_parametrization_options.qmd`; tabla wide incorporada al anexo del reporte.
+- [x] Actualizar reporte territorial con dos especificaciones candidatas EOD:
+  - especificación con proxies EOD continuos de ingreso;
+  - especificación con dummies de alta concentración EOD;
+  - anexos actualizados con tablas completas de parámetros y odds ratios para ambas especificaciones.
+- [ ] Buscar literatura sobre educación y adopción de herramientas digitales:
+  - adopción de apps de transporte público;
+  - mobile ticketing / e-payment;
+  - brecha digital y nivel educacional;
+  - evidencia sobre mayor uso de herramientas digitales en personas con mayor educación.
+- [x] Evaluar nuevas variables censales candidatas iniciales:
+  - proxy de ingreso o bajo ingreso;
+  - porcentaje de mujeres;
+  - niños en sala cuna;
+  - estudiantes escolares;
+  - revisar disponibilidad, definición y posible colinealidad antes de integrarlas.
+- [x] Integrar y documentar la extensión sociodemográfica candidata:
+  - variables con señal empírica ya estimada: `share_mujeres_z` y `share_asistencia_parv_z`;
+  - modelo combinado: `main + share_mujeres_z + share_asistencia_parv_z`;
+  - ambas variables son significativas para `QR_RED` y no para `QR_OTHER`;
+  - quedan incorporadas en las especificaciones candidatas actuales.
+- [x] Integrar y documentar proxies EOD 2012 de ingreso:
+  - `eod2012_share_hogares_abc1_income_proxy_z`;
+  - `eod2012_share_hogares_de_income_proxy_z`;
+  - `eod2012_dummy_high_abc1_income_proxy_z`;
+  - `eod2012_dummy_high_de_income_proxy_z`;
+  - decisión pendiente: elegir entre representación continua o dummy según interpretación sustantiva.
+- [ ] Seguir buscando variables censales/externas pendientes:
+  - estudiantes escolares;
+  - otras fuentes para variables socioeconómicas contemporáneas;
+  - validar si EMS/EOD u otras encuestas pueden aportar atributos útiles adicionales.
+- [ ] Reestimar MNL con atributos observados de viaje:
+  - sacar promedios zonales de tiempos, esperas y número de transbordos cuando corresponda;
+  - usar valores observados a nivel de viaje;
+  - mantener `BIP` como base para variables comunes;
+  - comparar contra la especificación territorial actual.
+- [ ] Reintentar Nested Logit sobre la especificación con atributos observados:
+  - usar la misma base de variables que el MNL comparable;
+  - evaluar si la estructura nested aporta frente al MNL;
+  - documentar si `MU_QR` vuelve a quedar cercano a 1 o si aparece mejora sustantiva.
+- [ ] Construir controles de macrozona:
+  - definir macrozonas interpretables: oriente, poniente, sur, norte y/o centro;
+  - seleccionar una macrozona base explícita;
+  - agregar dummies al MNL y revisar estabilidad de variables territoriales.
+- [ ] Depurar variables redundantes o menos interpretables después de controlar por macrozona:
+  - evaluar `shelter` frente a densidad de paraderos;
+  - evaluar `convenience` por interpretabilidad;
+  - evaluar `hacinamiento` frente a proxies EOD de ingreso;
+  - decidir especificación parsimoniosa final.
+- [ ] Diseñar benchmark `XGBoost + SHAP`:
+  - objetivo: comparar desempeño predictivo flexible contra MNL/Nested;
+  - usar función de pérdida logit/multiclase;
+  - reportar accuracy/log-loss y variables relevantes vía `SHAP`;
+  - usarlo como benchmark, no como reemplazo automático del modelo econométrico.
+- [ ] Preparar visualizaciones espaciales y descriptivas:
+  - mapas de variables territoriales clave;
+  - mapas de proporción observada por medio de pago;
+  - distribuciones de tiempos, esperas y transbordos por alternativa;
+  - visualizaciones SHAP cuando el benchmark XGBoost esté disponible.
+- [ ] Preparar resumen ejecutivo de una página:
+  - resultados experimentales listos;
+  - experimentos faltantes;
+  - decisiones metodológicas abiertas;
+  - próximos pasos concretos para reunión docente.
+- [ ] Redactar abstract preliminar y potenciales conclusiones:
+  - incluir hallazgos defendibles hasta ahora;
+  - separar resultados consolidados de hipótesis abiertas;
+  - alinear con la narrativa de adopción de medios de pago digitales.
+- [ ] Revisar segmentación por inercia y clases latentes:
+  - revisar paper de la profesora sobre inercia;
+  - revisar `papers/1-s2.0-S2214367X23000716-main.pdf`;
+  - estudiar indicadores `DSI`, `LSI`, `TSI`;
+  - partir con segmentación descriptiva antes de clases latentes completas.
+- [ ] Pausar los modelos "sin `ZONA777`" por ahora:
+  - la muestra actual ya está a nivel de viaje individual;
+  - Censo, OSM, demanda y oferta final dependen de `zona_inicio_viaje`/`ZONA777`;
+  - una versión realmente no zonal requeriría un pipeline distinto basado en buffers/coordenadas.
 
 ## Plan
 - [x] Definir dataset/particiones a usar (OD, choice, columnas finales).
@@ -535,7 +591,57 @@ Consolidar el modelo principal OD-buffers alt-specific y enriquecer su capacidad
 ### Current Focus — Cerrado
 
 - [x] Reporte informal del modelo logit territorial finalizado para envío a profesores.
-- [ ] Follow-up posterior al envío:
+- [x] Follow-up posterior al envío:
   - recoger comentarios de profesoras/profesores;
-  - decidir si el reporte usa Opción A u Opción B como especificación principal;
+  - dejar `BIP` como base para variables comunes;
+  - actualizar el reporte con especificaciones candidatas EOD;
   - evaluar nuevas familias de variables de infraestructura/acceso para una siguiente iteración del modelo.
+
+### Current Focus — EOD 2012 como sensibilidad histórica
+
+- [x] Exportar base Access EOD 2012 a CSV reproducibles.
+- [x] Construir features EOD 2012 a nivel de zona EOD.
+- [x] Montar Kingston y localizar shapefile ZONA777 operativo.
+- [x] Construir crosswalk espacial EOD2012 -> ZONA777 por intersección de áreas.
+- [x] Generar features EOD 2012 agregadas a ZONA777.
+- [x] Revisar correlaciones entre variables EOD 2012, Censo 2024 y OSM actuales.
+- [x] Definir variables EOD candidatas para sensibilidad histórica:
+  - percentil relativo de ingreso de hogar;
+  - hogares sin auto;
+  - estructura horaria laboral/estudio;
+  - dependencia histórica de transporte público.
+- [x] Definir imputación mínima para `ZONA777 = 831` si se usan variables de hogar/persona EOD.
+- [x] Decidir si se integra un bloque EOD al notebook de modelación o si se deja solo como análisis descriptivo/anexo metodológico.
+- [x] Crear notebook separado para sensibilidad EOD income proxy stepwise.
+- [x] Correr `03_models/16_eod2012_income_proxy_stepwise.qmd` completo y comparar:
+  - `ABC1_proxy`;
+  - `D+E proxy`;
+  - `ABC1_proxy + D+E proxy`;
+  - `dummy_high_ABC1_proxy + dummy_high_D+E_proxy`.
+- [x] Registrar sensibilidad con `eod2012_numveh_mean_z`:
+  - significativa para `QR_OTHER`;
+  - no incorporada junto con ingreso por alta colinealidad conceptual y empírica.
+- [x] Probar batería de limpieza con macrozonas:
+  - `socio_clean`;
+  - `osm_local_clean`;
+  - `no_shelter`;
+  - `parsimonious`.
+- [x] Definir candidato econométrico principal actual:
+  - `parsimonious`, por mejor BIC y mayor limpieza interpretativa;
+  - mantener modelo macro completo como sensibilidad de mayor ajuste;
+  - mantener `osm_local_clean` como sensibilidad alternativa.
+- [x] Verificar la construcción de tiempos y transbordos:
+  - columnas `TVH_*`, `TEI_*`, `TET_*`, `NTR_*`;
+  - son promedios observados por OD × tipo de pago, con leave-one-out para la alternativa elegida;
+  - no son promedios simples por zona de origen.
+- [x] Diseñar sensibilidad con atributos observados por viaje:
+  - `OBS_TVH`, `OBS_TEI`, `OBS_TET`, `OBS_NTR`;
+  - variables comunes interactuadas con `QR_OTHER` y `QR_RED`;
+  - `BIP` como base.
+- [ ] Ejecutar preset `joint_mnl_censo_osm_eod_parsimonious_observed_trip_attrs`:
+  - `MNL`;
+  - `Nested`.
+- [ ] Comparar sensibilidad de atributos observados contra candidato `parsimonious` OD × alternativa.
+- [ ] Generar tabla wide y odds ratios del candidato `parsimonious`.
+- [ ] Comparar `parsimonious` contra modelo macro completo en una tabla compacta para discusión con profesores.
+- [ ] Actualizar reporte/capítulos cuando se confirme que `parsimonious` será el modelo principal definitivo.
