@@ -66,6 +66,10 @@ secrets*/
 
 # --- Temporales ---
 tmp/
+01_processing/tmp
+01_processing/tmp/
+03_models/artifacts
+03_models/artifacts/
 temp/
 *.tmp
 *.log
@@ -82,6 +86,8 @@ docs/agent_onboarding.md
 # --- Model outputs / legacy worktrees ---
 03_models/biogeme-logit/
 03_models/larch_logit/model_outputs_nl_larch/
+03_models/archives/pre_fix_interannual_2026-03-26
+03_models/archives/pre_fix_interannual_2026-03-26/
 
 # --- Papers (comentar si quieres versionarlos) ---
 papers/
