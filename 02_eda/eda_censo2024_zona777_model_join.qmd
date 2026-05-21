@@ -64,6 +64,8 @@ SECOND_ROUND_SOCIO_VARS = [
     "share_serv_tel_movil",
     "share_discapacidad",
     "share_analfabet",
+    "share_mujeres",
+    "share_asistencia_parv",
 ]
 DEFERRED_SOCIO_VARS = [
     "share_ocupado",
@@ -263,7 +265,29 @@ display(pl.DataFrame(rows).sort("mode"))
 #| label: final-alias-check
 print("label: final-alias-check")
 df_final = pl.read_parquet(FINAL_PATH).sort("ZONA777")
+if "share_mujeres" not in df_final.columns and {"n_mujeres", "n_per"}.issubset(df_final.columns):
+    df_final = df_final.with_columns(
+        (pl.col("n_mujeres") / pl.when(pl.col("n_per") != 0).then(pl.col("n_per"))).alias("share_mujeres")
+    )
+if "share_asistencia_parv" not in df_final.columns and {"n_asistencia_parv", "n_edad_0_5"}.issubset(df_final.columns):
+    df_final = df_final.with_columns(
+        (
+            pl.col("n_asistencia_parv")
+            / pl.when(pl.col("n_edad_0_5") != 0).then(pl.col("n_edad_0_5"))
+        ).alias("share_asistencia_parv")
+    )
 df_intersects_area = pl.read_parquet(INTERSECTS_AREA_PATH).sort("ZONA777")
+if "share_mujeres" not in df_intersects_area.columns and {"n_mujeres", "n_per"}.issubset(df_intersects_area.columns):
+    df_intersects_area = df_intersects_area.with_columns(
+        (pl.col("n_mujeres") / pl.when(pl.col("n_per") != 0).then(pl.col("n_per"))).alias("share_mujeres")
+    )
+if "share_asistencia_parv" not in df_intersects_area.columns and {"n_asistencia_parv", "n_edad_0_5"}.issubset(df_intersects_area.columns):
+    df_intersects_area = df_intersects_area.with_columns(
+        (
+            pl.col("n_asistencia_parv")
+            / pl.when(pl.col("n_edad_0_5") != 0).then(pl.col("n_edad_0_5"))
+        ).alias("share_asistencia_parv")
+    )
 same_final_alias = df_final.equals(df_intersects_area)
 
 print("final rows:", df_final.height)
@@ -1028,6 +1052,8 @@ plot_cfg_round2 = {
     "share_serv_tel_movil": {"title": "Share tel. movil", "cmap": "OrRd"},
     "share_discapacidad": {"title": "Share discapacidad", "cmap": "Greys"},
     "share_analfabet": {"title": "Share analfabetismo", "cmap": "RdPu"},
+    "share_mujeres": {"title": "Share mujeres", "cmap": "Purples"},
+    "share_asistencia_parv": {"title": "Share asistencia parvularia", "cmap": "YlOrBr"},
 }
 
 render_spatial_maps(

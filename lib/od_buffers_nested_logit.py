@@ -365,6 +365,7 @@ def build_trip_dataset_with_alt_specific_context(
     time_dummy_variant: str = "v2",
     mean_mode: str = "leave_one_out",
     drop_chosen_singletons: bool = True,
+    include_realized_metrics: bool = False,
 ) -> pl.DataFrame:
     schema_names = set(lf.collect_schema().names())
     lf, _ = derive_metrics(lf, schema_names)
@@ -410,7 +411,7 @@ def build_trip_dataset_with_alt_specific_context(
                 "n_alternatives_observed",
             ]
             + dummy_cols
-            + [c for c in df_od_alt_context.columns if c not in OD_KEY_COLS]
+            + [c for c in df_od_alt_context.columns if c not in OD_KEY_COLS + ["n_alternatives_observed"]]
         )
         .fill_null(0)
     )
@@ -445,6 +446,15 @@ def build_trip_dataset_with_alt_specific_context(
                 .alias(f"{short}_{alt}")
             )
     joined = joined.with_columns(loo_exprs)
+    if include_realized_metrics:
+        joined = joined.with_columns(
+            [
+                pl.col("t_vehiculo_total_seg_final").alias("OBS_TVH"),
+                pl.col("t_espera_inicial_seg").alias("OBS_TEI"),
+                pl.col("t_espera_trasbordo_seg").alias("OBS_TET"),
+                pl.col("n_trasbordos").alias("OBS_NTR"),
+            ]
+        )
 
     out_cols = [
         "zona_inicio_viaje",
@@ -460,6 +470,8 @@ def build_trip_dataset_with_alt_specific_context(
         for short in chosen_metric_map
         for alt in ALT_LEVELS
     ]
+    if include_realized_metrics:
+        out_cols += ["OBS_TVH", "OBS_TEI", "OBS_TET", "OBS_NTR"]
 
     return joined.select(out_cols).collect()
 

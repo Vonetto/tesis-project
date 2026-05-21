@@ -96,6 +96,9 @@ OSM_SAMPLE_PATH = ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAM
 JOINT_SAMPLE_PATH = (
     ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-censo4-micro-osm.parquet"
 )
+CENSO_AGG_FINAL_PATH = (
+    PROJECT_ROOT / "02_eda" / "tmp" / "censo2024_zona777" / "censo2024_zona777_agg_final.parquet"
+)
 
 CENSO_MODEL_READY_STD_PATH = (
     ARTIFACTS_DIR / f"censo2024_zona777_model_ready_{ESTIMATION_SAMPLE_TAG}_microdata.parquet"
@@ -141,6 +144,8 @@ CENSO_EXTRA_COLS = [
     "share_serv_tel_movil_z",
     "share_discapacidad_z",
     "share_analfabet_z",
+    "share_mujeres_z",
+    "share_asistencia_parv_z",
     "share_cine18_universitaria_micro_z",
     "share_cine18_universitaria_o_mas_micro_z",
     "share_cine18_terciaria_corta_micro_z",
@@ -178,6 +183,15 @@ CENSO_CONNECTIVITY_SENSITIVITY_SPECS = [
     ),
 ]
 
+CENSO_SOCIODEMOGRAPHIC_SENSITIVITY_SPECS = [
+    ("main_4_plus_mujeres", CENSO_STEPWISE_MAIN_COLS + ["share_mujeres_z"]),
+    ("main_4_plus_asistencia_parv", CENSO_STEPWISE_MAIN_COLS + ["share_asistencia_parv_z"]),
+    (
+        "main_4_plus_mujeres_asistencia_parv",
+        CENSO_STEPWISE_MAIN_COLS + ["share_mujeres_z", "share_asistencia_parv_z"],
+    ),
+]
+
 CENSO_PARAM_TAGS = {
     "prom_edad_z": "PROM_EDAD_Z",
     "prom_escolaridad18_z": "PROM_ESCOLARIDAD18_Z",
@@ -188,6 +202,8 @@ CENSO_PARAM_TAGS = {
     "share_serv_tel_movil_z": "SHARE_SERV_TEL_MOVIL_Z",
     "share_discapacidad_z": "SHARE_DISCAPACIDAD_Z",
     "share_analfabet_z": "SHARE_ANALFABET_Z",
+    "share_mujeres_z": "SHARE_MUJERES_Z",
+    "share_asistencia_parv_z": "SHARE_ASISTENCIA_PARV_Z",
     "share_cine18_universitaria_micro_z": "SHARE_CINE18_UNIVERSITARIA_MICRO_Z",
     "share_cine18_universitaria_o_mas_micro_z": "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z",
     "share_cine18_terciaria_corta_micro_z": "SHARE_CINE18_TERCIARIA_CORTA_MICRO_Z",
@@ -330,6 +346,12 @@ OSM_INFRA_INCREMENTAL_COLS = [
     OSM_ALIAS_TO_Z["subway_entrance"],
 ]
 
+CURRENT_MAIN_JOINT_COLS = (
+    CENSO_STEPWISE_MAIN_COLS
+    + OSM_MAIN_COLS
+    + [OSM_ALIAS_TO_Z["transport_shelter"], OSM_ALIAS_TO_Z["subway_entrance"]]
+)
+
 JOINT_CENSO_TO_OSM_ROUTE_A_SPECS = [
     ("censo_main_4", CENSO_STEPWISE_MAIN_COLS),
     ("censo_main_4_plus_sports", CENSO_STEPWISE_MAIN_COLS + [OSM_ALIAS_TO_Z["sports_centre"]]),
@@ -381,9 +403,22 @@ JOINT_CENSO_OSM_INFRA_DIRECT_CHECK_SPECS = [
     ),
     (
         "censo_main_4_plus_osm_main_plus_transport_shelter_subway_entrance",
-        CENSO_STEPWISE_MAIN_COLS
-        + OSM_MAIN_COLS
-        + [OSM_ALIAS_TO_Z["transport_shelter"], OSM_ALIAS_TO_Z["subway_entrance"]],
+        CURRENT_MAIN_JOINT_COLS,
+    ),
+]
+
+JOINT_CENSO_OSM_SOCIODEMOGRAPHIC_SENSITIVITY_SPECS = [
+    (
+        "current_main_plus_mujeres",
+        CURRENT_MAIN_JOINT_COLS + ["share_mujeres_z"],
+    ),
+    (
+        "current_main_plus_asistencia_parv",
+        CURRENT_MAIN_JOINT_COLS + ["share_asistencia_parv_z"],
+    ),
+    (
+        "current_main_plus_mujeres_asistencia_parv",
+        CURRENT_MAIN_JOINT_COLS + ["share_mujeres_z", "share_asistencia_parv_z"],
     ),
 ]
 
@@ -482,6 +517,11 @@ elif ACTIVE_PRESET == "joint_mnl_censo_osm_infra_direct_checks":
         f"mnl_joint_{label}"
         for label, _ in JOINT_CENSO_OSM_INFRA_DIRECT_CHECK_SPECS
     ]
+elif ACTIVE_PRESET == "joint_mnl_censo_osm_sociodemographic_sensitivity":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_joint_{label}"
+        for label, _ in JOINT_CENSO_OSM_SOCIODEMOGRAPHIC_SENSITIVITY_SPECS
+    ]
 elif ACTIVE_PRESET == "censo_mnl_stepwise_main":
     ACTIVE_MODEL_LABELS = ["mnl_baseline_baseline"] + [
         f"mnl_censo_stepwise_main_{i}"
@@ -520,6 +560,11 @@ elif ACTIVE_PRESET == "censo_mnl_connectivity_new_only":
     ACTIVE_MODEL_LABELS = [
         f"mnl_censo_connectivity_{label}"
         for label, _ in CENSO_CONNECTIVITY_SENSITIVITY_SPECS
+    ]
+elif ACTIVE_PRESET == "censo_mnl_sociodemographic_sensitivity":
+    ACTIVE_MODEL_LABELS = [
+        f"mnl_censo_sociodemographic_{label}"
+        for label, _ in CENSO_SOCIODEMOGRAPHIC_SENSITIVITY_SPECS
     ]
 elif ACTIVE_PRESET == "censo_mnl_connectivity_alternatives_only":
     ACTIVE_MODEL_LABELS = [
@@ -832,6 +877,38 @@ def read_zone_model_ready_sources(paths) -> pl.DataFrame:
     return df_zone
 
 
+def augment_censo_zone_sources(df_zone: pl.DataFrame, raw_vars: list[str]) -> pl.DataFrame:
+    missing = set(raw_vars) - set(df_zone.columns)
+    derived_exprs = []
+    if "share_mujeres" in missing:
+        derived_exprs.append((pl.col("n_mujeres") / pl.when(pl.col("n_per") != 0).then(pl.col("n_per"))).alias("share_mujeres"))
+    if "share_asistencia_parv" in missing:
+        derived_exprs.append(
+            (
+                pl.col("n_asistencia_parv")
+                / pl.when(pl.col("n_edad_0_5") != 0).then(pl.col("n_edad_0_5"))
+            ).alias("share_asistencia_parv")
+        )
+    if not derived_exprs:
+        return df_zone
+    if not CENSO_AGG_FINAL_PATH.exists():
+        return df_zone
+
+    df_agg = pl.read_parquet(CENSO_AGG_FINAL_PATH)
+    required = {"ZONA777"} | {dep for expr_var in missing for dep in {
+        "share_mujeres": {"n_mujeres", "n_per"},
+        "share_asistencia_parv": {"n_asistencia_parv", "n_edad_0_5"},
+    }.get(expr_var, set())}
+    if not required.issubset(df_agg.columns):
+        return df_zone
+
+    df_derived = df_agg.select(["ZONA777", *sorted(required - {"ZONA777"})]).with_columns(derived_exprs)
+    derived_cols = [c for c in ["share_mujeres", "share_asistencia_parv"] if c in df_derived.columns and c in missing]
+    if not derived_cols:
+        return df_zone
+    return df_zone.join(df_derived.select(["ZONA777"] + derived_cols), on="ZONA777", how="left")
+
+
 def ensure_sample_specific_zone_controls(
     *,
     baseline_sample_path: Path,
@@ -866,9 +943,15 @@ def ensure_sample_specific_zone_controls(
     print(f"ℹ️ Materializando artefactos {context_name} para {estimation_sample_path.name}...")
     df_est_base = read_parquet_portable(str(baseline_sample_path)).collect()
     df_zone_full = read_zone_model_ready_sources(zone_model_ready_full_path)
+    if context_name.lower().startswith("censo"):
+        df_zone_full = augment_censo_zone_sources(df_zone_full, raw_vars)
     missing_raw = sorted(set(raw_vars) - set(df_zone_full.columns))
     if missing_raw:
-        raise ValueError(f"Faltan variables raw en fuentes {context_name}: {missing_raw}")
+        raise ValueError(
+            f"Faltan variables raw en fuentes {context_name}: {missing_raw}. "
+            "Si falta share_asistencia_parv, primero hay que regenerar el agregado Censo "
+            "incluyendo n_asistencia_parv y n_edad_0_5."
+        )
     df_zone_std, _ = standardize_over_used_zones(df_zone_full, df_est_base, raw_vars)
     df_zone_std.write_parquet(zone_model_ready_std_path)
 
@@ -886,6 +969,13 @@ def ensure_sample_specific_zone_controls(
     return zone_model_ready_std_path, estimation_sample_path
 
 
+def active_zone_cols(param_tags: dict[str, str]) -> list[str]:
+    cols = []
+    for spec in MODEL_SPECS:
+        cols.extend([c for c in spec["extra_cols"] if c in param_tags])
+    return unique_ordered(cols)
+
+
 def ensure_estimation_artifacts_for_active_models() -> None:
     target_fraction = parse_sample_fraction_from_tag(ESTIMATION_SAMPLE_TAG)
     if target_fraction is not None:
@@ -899,6 +989,8 @@ def ensure_estimation_artifacts_for_active_models() -> None:
         raise FileNotFoundError(f"No existe baseline sample requerido: {BASELINE_SAMPLE_PATH}")
 
     active_blocks = {spec["block"] for spec in MODEL_SPECS}
+    active_censo_cols = active_zone_cols(CENSO_PARAM_TAGS)
+    active_osm_cols = active_zone_cols(OSM_PARAM_TAGS)
 
     if "censo" in active_blocks or "joint" in active_blocks:
         ensure_sample_specific_zone_controls(
@@ -906,7 +998,7 @@ def ensure_estimation_artifacts_for_active_models() -> None:
             zone_model_ready_full_path=[CENSO_BASE_MODEL_READY_FULL_PATH, CENSO_MODEL_READY_FULL_PATH],
             zone_model_ready_std_path=CENSO_MODEL_READY_STD_PATH,
             estimation_sample_path=CENSO_SAMPLE_PATH,
-            raw_vars=[c.removesuffix("_z") for c in CENSO_EXTRA_COLS],
+            raw_vars=[c.removesuffix("_z") for c in active_censo_cols],
             context_name="Censo micro",
         )
 
@@ -916,7 +1008,7 @@ def ensure_estimation_artifacts_for_active_models() -> None:
             zone_model_ready_full_path=OSM_MODEL_READY_FULL_PATH,
             zone_model_ready_std_path=OSM_MODEL_READY_STD_PATH,
             estimation_sample_path=OSM_SAMPLE_PATH,
-            raw_vars=[c.removesuffix("_z") for c in OSM_EXTRA_COLS],
+            raw_vars=[c.removesuffix("_z") for c in active_osm_cols],
             context_name="OSM",
         )
 
@@ -1355,6 +1447,15 @@ def build_model_specs() -> list[dict]:
                 extra_cols=cols,
                 param_tags=CENSO_PARAM_TAGS,
             )
+        for label, cols in CENSO_SOCIODEMOGRAPHIC_SENSITIVITY_SPECS:
+            add_spec(
+                family=family,
+                block="censo",
+                label_suffix=f"sociodemographic_{label}",
+                sample_path=CENSO_SAMPLE_PATH,
+                extra_cols=cols,
+                param_tags=CENSO_PARAM_TAGS,
+            )
 
         for col in OSM_EXTRA_COLS:
             add_spec(
@@ -1428,6 +1529,15 @@ def build_model_specs() -> list[dict]:
                 param_tags={**CENSO_PARAM_TAGS, **OSM_PARAM_TAGS},
             )
         for label, cols in JOINT_CENSO_OSM_INFRA_DIRECT_CHECK_SPECS:
+            add_spec(
+                family=family,
+                block="joint",
+                label_suffix=label,
+                sample_path=JOINT_SAMPLE_PATH,
+                extra_cols=cols,
+                param_tags={**CENSO_PARAM_TAGS, **OSM_PARAM_TAGS},
+            )
+        for label, cols in JOINT_CENSO_OSM_SOCIODEMOGRAPHIC_SENSITIVITY_SPECS:
             add_spec(
                 family=family,
                 block="joint",
@@ -1955,8 +2065,8 @@ if RUN_ESTIMATION and any(spec["block"] == "joint" for spec in MODEL_SPECS):
         baseline_sample_path=BASELINE_SAMPLE_PATH,
         censo_zone_std_path=CENSO_MODEL_READY_STD_PATH,
         osm_zone_std_path=OSM_MODEL_READY_STD_PATH,
-        censo_cols=CENSO_EXTRA_COLS,
-        osm_cols=OSM_EXTRA_COLS,
+        censo_cols=active_zone_cols(CENSO_PARAM_TAGS),
+        osm_cols=active_zone_cols(OSM_PARAM_TAGS),
     )
 else:
     if not RUN_ESTIMATION:

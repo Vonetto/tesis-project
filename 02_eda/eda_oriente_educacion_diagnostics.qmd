@@ -1,0 +1,580 @@
+---
+title: "Diagnóstico — Oriente, educación universitaria y el coeficiente macrozona del parsimonious"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+execute:
+  freeze: false
+---
+
+# Objetivo
+
+Este notebook responde dos preguntas diagnósticas que surgieron al interpretar el
+MNL `parsimonious` del notebook `03_models/16_eod2012_income_proxy_stepwise.qmd`:
+
+> **Pregunta sustantiva original**: el `parsimonious` muestra `share_cine18_universitaria_o_mas_micro_z = +0,446`
+> (ultra significativo) en QR_RED, pero al mismo tiempo `macro_oriente = −0,391`
+> (ultra significativo, signo opuesto al esperado). ¿Cómo se explica esta tensión?
+
+Para entenderla, se hacen dos verificaciones:
+
+**Verificación 1 — descriptiva**: ¿cuán universitaria es Oriente comparada con
+otras macrozonas? Si Oriente tiene una concentración de educación universitaria
+mucho mayor que el resto, el coeficiente `macro_oriente` negativo está midiendo
+un **residual condicional** después de descontar un efecto educativo enorme, lo
+cual es consistente con que la macrozona absorba parte del efecto. Si Oriente
+no es particularmente educada, el residual negativo sería más sorprendente.
+
+**Verificación 2 — estimación**: ¿cómo se mueven los betas centrales del MNL
+cuando se quitan las 6 dummies de macrozonas, dejando todo lo demás idéntico?
+Si el beta de educación universitaria sube apreciablemente, confirma que el
+bloque macrozona estaba absorbiendo parte del efecto educativo (colinealidad
+territorial fuerte). Si se mueve poco, sugiere que macrozonas y educación
+capturan dimensiones distintas.
+
+## Caveat metodológico
+
+El propósito de este notebook es **interpretativo**, no es estimar una nueva
+especificación candidata. La spec sin macrozonas que se estima aquí queda
+documentada como diagnóstico — el modelo principal sigue siendo el
+`parsimonious` con macrozonas del notebook 16.
+
+## Cómo usar este notebook
+
+**Paso previo (una sola vez)**: ejecutar el notebook 16 con la spec sin
+macrozonas activada. En `03_models/16_eod2012_income_proxy_stepwise.qmd`,
+cambiar:
+
+```python
+ACTIVE_PRESET = "joint_mnl_parsimonious_no_macro_for_diagnostics"
+```
+
+Correr el 16 completo (toma ~5-15 min). Esto genera el params CSV en:
+
+```
+03_models/biogeme-logit/results/16_eod2012_income_proxy_stepwise/
+  pooled_2024_2025-biogeme-sample2pct/
+    mnl_joint_current_main_mujeres_parv_plus_eod_de_income_proxy_parsimonious_no_macro/
+      params_mnl_joint_current_main_mujeres_parv_plus_eod_de_income_proxy_parsimonious_no_macro.csv
+```
+
+Después restaurar `ACTIVE_PRESET` al valor que estaba antes (no contaminar).
+
+**Este notebook**: una vez que existe el params CSV, este notebook se renderiza
+en ~1 minuto (es solo lectura de parquets + estimaciones cargadas + EDA).
+
+## Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import polars as pl
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from IPython.display import display
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontro la raiz del proyecto.")
+
+print("PROJECT_ROOT:", PROJECT_ROOT)
+```
+
+## Configuración de paths
+
+```{python}
+#| label: paths
+print("label: paths")
+
+# === Fuentes para Verificación 1 (descriptiva) ===
+
+# Shapefile ZONA777 con la columna MACROZONA (el mismo que usa el notebook 16
+# en build_macrozone_lookup).
+ZONAS777_SHP = Path(
+    "/Volumes/KINGSTON/tesis-project/raw/zonas777/"
+    "Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp"
+)
+
+# Censo zonal model-ready con share_cine18_universitaria_o_mas_micro (sin _z,
+# escala 0-1, igual que usa el notebook 16).
+CENSO_MICRODATA_ZONAL_PATH = (
+    PROJECT_ROOT / "03_models" / "artifacts" / "interannual_enriched"
+    / "censo2024_microdata_zona777_model_ready.parquet"
+)
+
+# === Fuentes para Verificación 2 (comparación de betas) ===
+
+# Params del parsimonious CON macrozonas (modelo principal del notebook 16).
+PARAMS_WITH_MACRO_PATH = (
+    PROJECT_ROOT / "03_models" / "biogeme-logit" / "results"
+    / "16_eod2012_income_proxy_stepwise"
+    / "pooled_2024_2025-biogeme-sample2pct"
+    / "mnl_joint_current_main_mujeres_parv_plus_eod_de_income_proxy_macro_parsimonious"
+    / "params_mnl_joint_current_main_mujeres_parv_plus_eod_de_income_proxy_macro_parsimonious.csv"
+)
+
+# Params del parsimonious SIN macrozonas (generado al correr el 16 con
+# ACTIVE_PRESET = "joint_mnl_parsimonious_no_macro_for_diagnostics").
+PARAMS_NO_MACRO_PATH = (
+    PROJECT_ROOT / "03_models" / "biogeme-logit" / "results"
+    / "16_eod2012_income_proxy_stepwise"
+    / "pooled_2024_2025-biogeme-sample2pct"
+    / "mnl_joint_current_main_mujeres_parv_plus_eod_de_income_proxy_parsimonious_no_macro"
+    / "params_mnl_joint_current_main_mujeres_parv_plus_eod_de_income_proxy_parsimonious_no_macro.csv"
+)
+
+# Stats (LL, AIC, BIC) de ambas specs para comparar ajuste global.
+STATS_WITH_MACRO_PATH = PARAMS_WITH_MACRO_PATH.parent / (
+    "stats_mnl_joint_current_main_mujeres_parv_plus_eod_de_income_proxy_macro_parsimonious.csv"
+)
+STATS_NO_MACRO_PATH = PARAMS_NO_MACRO_PATH.parent / (
+    "stats_mnl_joint_current_main_mujeres_parv_plus_eod_de_income_proxy_parsimonious_no_macro.csv"
+)
+
+# === Output del notebook ===
+OUTPUT_DIR = (
+    PROJECT_ROOT / "02_eda" / "tmp" / "oriente_educacion_diagnostics"
+)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+print("ZONAS777_SHP:                 ", ZONAS777_SHP, "(exists:", ZONAS777_SHP.exists(), ")")
+print("CENSO_MICRODATA_ZONAL_PATH:   ", CENSO_MICRODATA_ZONAL_PATH, "(exists:", CENSO_MICRODATA_ZONAL_PATH.exists(), ")")
+print("PARAMS_WITH_MACRO_PATH:       ", PARAMS_WITH_MACRO_PATH, "(exists:", PARAMS_WITH_MACRO_PATH.exists(), ")")
+print("PARAMS_NO_MACRO_PATH:         ", PARAMS_NO_MACRO_PATH, "(exists:", PARAMS_NO_MACRO_PATH.exists(), ")")
+print("OUTPUT_DIR:                   ", OUTPUT_DIR)
+```
+
+# Verificación 1 — ¿Cuán universitaria es Oriente?
+
+Esta sección cruza el Censo zonal con la clasificación de macrozonas oficial
+(`ZONA777` shapefile, columna `MACROZONA`) y calcula la distribución de
+`share_cine18_universitaria_o_mas_micro` por macrozona.
+
+```{python}
+#| label: load-macrozone-lookup
+print("label: load-macrozone-lookup")
+
+if not ZONAS777_SHP.exists():
+    raise FileNotFoundError(
+        f"Shapefile ZONA777 no disponible en {ZONAS777_SHP}. "
+        "Conectar el disco KINGSTON o ajustar el path."
+    )
+
+import geopandas as gpd
+
+# Réplica de build_macrozone_lookup del notebook 16, simplificada.
+gdf = gpd.read_file(ZONAS777_SHP)[["ZONA777", "NMACROZONA", "MACROZONA"]].copy()
+gdf["ZONA777"] = pd.to_numeric(gdf["ZONA777"], errors="coerce")
+gdf = gdf[gdf["ZONA777"].notna()].copy()
+gdf["ZONA777"] = gdf["ZONA777"].astype(int)
+gdf["NMACROZONA"] = pd.to_numeric(gdf["NMACROZONA"], errors="coerce").astype("Int64")
+
+# Dedup por (ZONA777) — algunas zonas aparecen partidas en el shapefile.
+attrs = gdf.drop_duplicates(["ZONA777", "NMACROZONA", "MACROZONA"]).copy()
+attrs = attrs.drop_duplicates("ZONA777")
+
+# Reclasificar NMACROZONA=7 como EXTERNA_ESPECIAL (igual al notebook 16).
+attrs["macrozone_model"] = attrs["MACROZONA"].astype(str)
+attrs.loc[attrs["NMACROZONA"].eq(7), "macrozone_model"] = "EXTERNA_ESPECIAL"
+
+macrozone_lookup = attrs[["ZONA777", "NMACROZONA", "MACROZONA", "macrozone_model"]].copy()
+print(f"macrozone_lookup: {len(macrozone_lookup):,} zonas")
+print("\nDistribución de zonas por macrozone_model:")
+display(macrozone_lookup["macrozone_model"].value_counts().to_frame(name="n_zonas"))
+```
+
+```{python}
+#| label: load-censo-zonal
+print("label: load-censo-zonal")
+
+censo = pl.read_parquet(CENSO_MICRODATA_ZONAL_PATH).to_pandas()
+print(f"censo zonal: {len(censo):,} filas, {len(censo.columns)} columnas")
+
+required_cols = ["ZONA777", "share_cine18_universitaria_o_mas_micro"]
+missing = [c for c in required_cols if c not in censo.columns]
+if missing:
+    raise ValueError(f"Faltan columnas en censo zonal: {missing}")
+
+censo_zonal = censo[required_cols].copy()
+censo_zonal["ZONA777"] = pd.to_numeric(censo_zonal["ZONA777"], errors="coerce").astype("Int64")
+censo_zonal = censo_zonal.dropna(subset=["ZONA777"]).copy()
+censo_zonal["ZONA777"] = censo_zonal["ZONA777"].astype(int)
+
+print(f"censo_zonal limpio: {len(censo_zonal):,} zonas")
+display(censo_zonal["share_cine18_universitaria_o_mas_micro"].describe().to_frame())
+```
+
+```{python}
+#| label: merge-macro-censo
+print("label: merge-macro-censo")
+
+merged = macrozone_lookup.merge(censo_zonal, on="ZONA777", how="inner")
+n_unmatched = len(macrozone_lookup) - len(merged)
+print(f"Zonas con macrozona Y educación: {len(merged):,}")
+print(f"Zonas sin match (descartadas): {n_unmatched}")
+
+if n_unmatched > 0:
+    only_macro = set(macrozone_lookup["ZONA777"]) - set(censo_zonal["ZONA777"])
+    only_censo = set(censo_zonal["ZONA777"]) - set(macrozone_lookup["ZONA777"])
+    print(f"  Solo en macrozonas (sin Censo): {len(only_macro)}")
+    print(f"  Solo en Censo (sin macrozona):  {len(only_censo)}")
+```
+
+```{python}
+#| label: educacion-por-macrozona
+print("label: educacion-por-macrozona")
+
+stats_by_macro = (
+    merged.groupby("macrozone_model")["share_cine18_universitaria_o_mas_micro"]
+    .agg(["count", "mean", "median", "std",
+          lambda s: s.quantile(0.10),
+          lambda s: s.quantile(0.25),
+          lambda s: s.quantile(0.75),
+          lambda s: s.quantile(0.90)])
+    .rename(columns={
+        "count": "n_zonas",
+        "<lambda_0>": "p10",
+        "<lambda_1>": "p25",
+        "<lambda_2>": "p75",
+        "<lambda_3>": "p90",
+    })
+    .round(4)
+    .sort_values("mean", ascending=False)
+)
+
+stats_by_macro.to_csv(OUTPUT_DIR / "educacion_universitaria_por_macrozona.csv")
+print("\nShare educación universitaria o más (residentes 18+) por macrozona:")
+display(stats_by_macro)
+```
+
+```{python}
+#| label: lectura-educacion-macrozona
+print("label: lectura-educacion-macrozona")
+
+# Comparaciones explícitas que importan para la pregunta.
+def mean_for(name):
+    return float(stats_by_macro.loc[name, "mean"]) if name in stats_by_macro.index else np.nan
+
+oriente_mean = mean_for("ORIENTE")
+centro_mean = mean_for("CENTRO")
+suroriente_mean = mean_for("SURORIENTE")
+poniente_mean = mean_for("PONIENTE")
+sur_mean = mean_for("SUR")
+norte_mean = mean_for("NORTE")
+
+print(f"Share universitaria — Oriente:    {oriente_mean:.4f}")
+print(f"Share universitaria — Centro:     {centro_mean:.4f}")
+print(f"Share universitaria — Suroriente: {suroriente_mean:.4f}")
+print(f"Share universitaria — Poniente:   {poniente_mean:.4f}")
+print(f"Share universitaria — Sur:        {sur_mean:.4f}")
+print(f"Share universitaria — Norte:      {norte_mean:.4f}")
+
+print(f"\nGap Oriente vs Centro:    {(oriente_mean - centro_mean):+.4f} ({(oriente_mean / centro_mean - 1)*100:+.1f}%)")
+print(f"Gap Oriente vs Suroriente: {(oriente_mean - suroriente_mean):+.4f} ({(oriente_mean / suroriente_mean - 1)*100:+.1f}%)")
+print(f"Gap Oriente vs Poniente:  {(oriente_mean - poniente_mean):+.4f} ({(oriente_mean / poniente_mean - 1)*100:+.1f}%)")
+print(f"Gap Oriente vs Sur:       {(oriente_mean - sur_mean):+.4f} ({(oriente_mean / sur_mean - 1)*100:+.1f}%)")
+print(f"Gap Oriente vs Norte:     {(oriente_mean - norte_mean):+.4f} ({(oriente_mean / norte_mean - 1)*100:+.1f}%)")
+
+# Interpretación cualitativa automática.
+if oriente_mean > 2.0 * centro_mean:
+    print("\n→ ORIENTE tiene MÁS DEL DOBLE de share universitario que Centro.")
+    print("  El coeficiente macro_oriente = −0,391 está descontando un efecto educativo muy grande.")
+    print("  Es esperable que quede un residual negativo después de controlar por educación.")
+elif oriente_mean > 1.5 * centro_mean:
+    print("\n→ ORIENTE tiene ~50% más share universitario que Centro.")
+    print("  Diferencia educativa apreciable; descuento residual moderado-grande es esperable.")
+elif oriente_mean > 1.2 * centro_mean:
+    print("\n→ ORIENTE tiene 20-50% más share universitario que Centro.")
+    print("  Diferencia moderada; el residual negativo de macro_oriente requiere otra explicación.")
+else:
+    print("\n→ ORIENTE NO tiene una diferencia educativa marcada con Centro.")
+    print("  El coeficiente macro_oriente = −0,391 NO se explica por absorción del efecto educativo.")
+    print("  Buscar otras hipótesis (autorrecarga BIP, inercia, transporte privado).")
+```
+
+```{python}
+#| label: boxplot-educacion-macrozona
+print("label: boxplot-educacion-macrozona")
+
+# Orden visual por mean descendente.
+macro_order = stats_by_macro.index.tolist()
+
+fig, ax = plt.subplots(figsize=(11, 5.5))
+data_for_box = [
+    merged.loc[merged["macrozone_model"] == m, "share_cine18_universitaria_o_mas_micro"].dropna()
+    for m in macro_order
+]
+bp = ax.boxplot(data_for_box, labels=macro_order, showmeans=True, meanline=True)
+ax.set_ylabel("share_cine18_universitaria_o_mas_micro")
+ax.set_xlabel("Macrozona")
+ax.set_title("Distribución de share educación universitaria (residentes 18+) por macrozona")
+ax.grid(True, axis="y", alpha=0.3)
+plt.xticks(rotation=20)
+plt.tight_layout()
+out_png = OUTPUT_DIR / "educacion_universitaria_boxplot_por_macrozona.png"
+plt.savefig(out_png, dpi=120, bbox_inches="tight")
+plt.close()
+print(f"Guardado: {out_png}")
+```
+
+# Verificación 2 — ¿Cómo se mueven los betas al quitar macrozonas?
+
+Compara los params del MNL `parsimonious` **con** macrozonas (modelo principal
+del notebook 16, ya estimado) vs **sin** macrozonas (estimado al correr el 16
+con `ACTIVE_PRESET = "joint_mnl_parsimonious_no_macro_for_diagnostics"`).
+
+```{python}
+#| label: load-params
+print("label: load-params")
+
+if not PARAMS_WITH_MACRO_PATH.exists():
+    raise FileNotFoundError(
+        f"No existe params con macrozonas en {PARAMS_WITH_MACRO_PATH}. "
+        "El notebook 16 debe haber sido corrido previamente con el parsimonious oficial."
+    )
+if not PARAMS_NO_MACRO_PATH.exists():
+    raise FileNotFoundError(
+        f"No existe params sin macrozonas en {PARAMS_NO_MACRO_PATH}.\n"
+        "PASO PREVIO REQUERIDO:\n"
+        "  1. Abrir 03_models/16_eod2012_income_proxy_stepwise.qmd\n"
+        "  2. Cambiar ACTIVE_PRESET = 'joint_mnl_parsimonious_no_macro_for_diagnostics'\n"
+        "  3. Correr el notebook 16 (toma ~5-15 min)\n"
+        "  4. Restaurar ACTIVE_PRESET a su valor original\n"
+        "  5. Re-renderizar este notebook"
+    )
+
+p_with = pd.read_csv(PARAMS_WITH_MACRO_PATH)
+p_no = pd.read_csv(PARAMS_NO_MACRO_PATH)
+p_with.columns = [c.strip() for c in p_with.columns]
+p_no.columns = [c.strip() for c in p_no.columns]
+
+print(f"params con macrozonas: {len(p_with)} parámetros")
+print(f"params sin macrozonas: {len(p_no)} parámetros")
+print(f"Diferencia: {len(p_with) - len(p_no)} (esperado: 12 = 6 dummies × 2 alts QR)")
+```
+
+```{python}
+#| label: parse-and-merge-params
+print("label: parse-and-merge-params")
+
+
+def parse_param_name(name):
+    """Devuelve (alt, feature_tag) o (None, None) para nombres no estructurales."""
+    n = name
+    if n.endswith("_pooled_2024_2025"):
+        n = n[: -len("_pooled_2024_2025")]
+    if n.startswith("ASC_"):
+        return n[4:], "ASC"
+    if n.startswith("B_QR_RED_"):
+        return "QR_RED", n[len("B_QR_RED_"):]
+    if n.startswith("B_QR_OTHER_"):
+        return "QR_OTHER", n[len("B_QR_OTHER_"):]
+    if n.startswith("B_BIP_"):
+        return "BIP", n[len("B_BIP_"):]
+    return None, None
+
+
+def annotate(df, source_label):
+    out = df.copy()
+    out[["alt", "feature_tag"]] = pd.DataFrame(
+        out["Name"].apply(parse_param_name).tolist(), index=out.index
+    )
+    out = out.rename(columns={
+        "Value": f"beta_{source_label}",
+        "Robust std err.": f"se_{source_label}",
+        "Robust t-stat.": f"t_{source_label}",
+        "Robust p-value": f"p_{source_label}",
+    })
+    return out[["Name", "alt", "feature_tag",
+                f"beta_{source_label}", f"se_{source_label}",
+                f"t_{source_label}", f"p_{source_label}"]]
+
+
+p_with_a = annotate(p_with, "with_macro")
+p_no_a = annotate(p_no, "no_macro")
+
+# Merge por (alt, feature_tag) — el nombre Name difiere si la spec cambia,
+# pero (alt, feature_tag) es estable.
+both = p_with_a.merge(
+    p_no_a, on=["alt", "feature_tag"], how="outer", suffixes=("", "_dup")
+).drop(columns=[c for c in ["Name_dup"] if c in p_with_a.columns or c in p_no_a.columns],
+       errors="ignore")
+both = both.drop(columns=[c for c in both.columns if c.endswith("_dup")])
+
+print(f"Filas comparables: {len(both)}")
+print(f"  Solo en with_macro (macrozonas):    {both['beta_no_macro'].isna().sum()}")
+print(f"  Solo en no_macro:                   {both['beta_with_macro'].isna().sum()}")
+print(f"  En ambos:                           {both[['beta_with_macro','beta_no_macro']].notna().all(axis=1).sum()}")
+```
+
+```{python}
+#| label: deltas-betas-centrales
+print("label: deltas-betas-centrales")
+
+# Betas centrales para mirar el cambio educación-EOD-OSM
+# entre las dos specs (sin/con macrozonas).
+FOCUS_TAGS = [
+    "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z",
+    "SHARE_DISCAPACIDAD_Z",
+    "SHARE_INMIGRANTES_Z",
+    "SHARE_MUJERES_Z",
+    "SHARE_ASISTENCIA_PARV_Z",
+    "EOD2012_SHARE_HOGARES_DE_INCOME_PROXY_Z",
+    "OSM_LEISURE_PLAYGROUND_DENSITY_KM2_Z",
+    "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z",
+    "OSM_AMENITY_UNIVERSITY_DENSITY_KM2_Z",
+    "OSM_TRANSPORT_SHELTER_YES_DENSITY_KM2_Z",
+    "OSM_RAILWAY_SUBWAY_ENTRANCE_DENSITY_KM2_Z",
+    "LOG_DEMAND",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+]
+
+# Construir tabla de comparación SOLO para QR_RED y QR_OTHER (las alts donde
+# las variables socio/OSM/EOD aparecen como alt-específicas).
+focus = both[
+    both["alt"].isin(["QR_RED", "QR_OTHER"])
+    & both["feature_tag"].isin(FOCUS_TAGS)
+].copy()
+
+focus["beta_delta"] = focus["beta_no_macro"] - focus["beta_with_macro"]
+focus["beta_pct_change"] = np.where(
+    focus["beta_with_macro"].abs() > 1e-10,
+    (focus["beta_no_macro"] - focus["beta_with_macro"]) / focus["beta_with_macro"].abs() * 100,
+    np.nan,
+)
+focus["t_no_macro"] = focus["t_no_macro"].round(2)
+focus["t_with_macro"] = focus["t_with_macro"].round(2)
+
+display_cols = [
+    "alt", "feature_tag",
+    "beta_with_macro", "t_with_macro",
+    "beta_no_macro", "t_no_macro",
+    "beta_delta", "beta_pct_change",
+]
+focus_display = focus[display_cols].sort_values(["alt", "feature_tag"]).reset_index(drop=True)
+focus_display.to_csv(OUTPUT_DIR / "betas_centrales_with_vs_no_macrozonas.csv", index=False)
+
+print("Comparación de betas centrales (QR_RED y QR_OTHER):")
+display(focus_display.round(4))
+```
+
+```{python}
+#| label: lectura-educacion-shift
+print("label: lectura-educacion-shift")
+
+# Foco específico: ¿cuánto se mueve el beta de educación universitaria?
+edu_rows = focus[focus["feature_tag"] == "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z"]
+for _, row in edu_rows.iterrows():
+    alt = row["alt"]
+    bw = row["beta_with_macro"]
+    bn = row["beta_no_macro"]
+    delta = bn - bw
+    pct = (bn - bw) / abs(bw) * 100 if abs(bw) > 1e-10 else np.nan
+    print(f"\n=== {alt} | share_cine18_universitaria_o_mas_micro_z ===")
+    print(f"  con macrozonas: beta = {bw:+.4f} (t={row['t_with_macro']:+.2f})")
+    print(f"  sin macrozonas: beta = {bn:+.4f} (t={row['t_no_macro']:+.2f})")
+    print(f"  delta: {delta:+.4f} ({pct:+.1f}%)")
+    if not np.isnan(pct):
+        if abs(pct) > 30:
+            print(f"  → Movimiento GRANDE: macrozonas absorbían parte material del efecto educativo.")
+        elif abs(pct) > 10:
+            print(f"  → Movimiento moderado: macrozonas absorbían algo del efecto educativo.")
+        else:
+            print(f"  → Movimiento chico: macrozonas y educación capturan dimensiones distintas.")
+```
+
+```{python}
+#| label: stats-globales
+print("label: stats-globales")
+
+# Comparar LL, AIC, BIC entre las dos specs.
+def load_stats(path):
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+
+s_with = load_stats(STATS_WITH_MACRO_PATH)
+s_no = load_stats(STATS_NO_MACRO_PATH)
+
+if s_with is None or s_no is None:
+    print("WARN: alguna estadística no se encontró; saltando comparación global.")
+else:
+    print("Stats con macrozonas:")
+    display(s_with)
+    print("\nStats sin macrozonas:")
+    display(s_no)
+
+    # Intentar comparación de LL/AIC/BIC si las columnas están.
+    try:
+        ll_with = float(s_with.loc[s_with["metric"] == "log_likelihood", "value"].iloc[0]) if "metric" in s_with.columns else None
+        ll_no = float(s_no.loc[s_no["metric"] == "log_likelihood", "value"].iloc[0]) if "metric" in s_no.columns else None
+        if ll_with is not None and ll_no is not None:
+            print(f"\nLL con macrozonas:  {ll_with:,.2f}")
+            print(f"LL sin macrozonas:  {ll_no:,.2f}")
+            print(f"Δ LL (with − no):  {ll_with - ll_no:+,.2f}")
+            print("  (positivo: con macrozonas ajusta mejor en LL)")
+    except Exception as e:
+        print(f"No se pudo extraer LL automaticamente: {e}")
+```
+
+# Lectura integrada
+
+```{python}
+#| label: lectura-integrada
+print("label: lectura-integrada")
+
+print("=" * 70)
+print("LECTURA INTEGRADA DEL DIAGNÓSTICO")
+print("=" * 70)
+
+print(f"\nVerificación 1: Oriente tiene share universitario = {oriente_mean:.4f}")
+print(f"                Centro tiene share universitario  = {centro_mean:.4f}")
+print(f"                Gap = {(oriente_mean - centro_mean):+.4f} ({(oriente_mean / centro_mean - 1)*100:+.1f}%)")
+
+# Educación shift en QR_RED es lo central
+edu_qrred = focus[
+    (focus["feature_tag"] == "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z")
+    & (focus["alt"] == "QR_RED")
+]
+if len(edu_qrred) == 1:
+    row = edu_qrred.iloc[0]
+    bw, bn = float(row["beta_with_macro"]), float(row["beta_no_macro"])
+    pct = (bn - bw) / abs(bw) * 100 if abs(bw) > 1e-10 else np.nan
+    print(f"\nVerificación 2: beta(educación universitaria → QR_RED)")
+    print(f"                con macrozonas: {bw:+.4f}")
+    print(f"                sin macrozonas: {bn:+.4f}")
+    print(f"                shift: {pct:+.1f}%")
+
+# EOD income proxy también es interesante
+eod_rows = focus[focus["feature_tag"] == "EOD2012_SHARE_HOGARES_DE_INCOME_PROXY_Z"]
+print("\nVerificación 2: beta(EOD income proxy D/E → ...)")
+for _, row in eod_rows.iterrows():
+    bw, bn = float(row["beta_with_macro"]), float(row["beta_no_macro"])
+    pct = (bn - bw) / abs(bw) * 100 if abs(bw) > 1e-10 else np.nan
+    print(f"  {row['alt']:9s} | con macro: {bw:+.4f} (t={row['t_with_macro']:+.2f}) | sin macro: {bn:+.4f} (t={row['t_no_macro']:+.2f}) | shift: {pct:+.1f}%")
+
+print("\n" + "=" * 70)
+print("Artefactos guardados en:", OUTPUT_DIR)
+for p in sorted(OUTPUT_DIR.glob("*")):
+    print(f"  {p.name}")
+```

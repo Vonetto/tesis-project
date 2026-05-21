@@ -144,6 +144,11 @@ CENSO_MAIN_COLS = [
     "share_inmigrantes_z",
 ]
 CENSO_MAIN_PLUS_COMPU_COLS = CENSO_MAIN_COLS + ["share_serv_compu_z"]
+CENSO_MAIN_PLUS_MUJERES_COLS = CENSO_MAIN_COLS + ["share_mujeres_z"]
+CENSO_MAIN_PLUS_ASISTENCIA_PARV_COLS = CENSO_MAIN_COLS + ["share_asistencia_parv_z"]
+CENSO_MAIN_PLUS_MUJERES_ASISTENCIA_PARV_COLS = (
+    CENSO_MAIN_COLS + ["share_mujeres_z", "share_asistencia_parv_z"]
+)
 
 OSM_COLS = {
     "sports_centre": "osm_leisure_sports_centre_density_km2_z",
@@ -151,6 +156,8 @@ OSM_COLS = {
     "playground": "osm_leisure_playground_density_km2_z",
     "school": "osm_amenity_school_density_km2_z",
     "university": "osm_amenity_university_density_km2_z",
+    "transport_shelter": "osm_transport_shelter_yes_density_km2_z",
+    "subway_entrance": "osm_railway_subway_entrance_density_km2_z",
 }
 
 OSM_MAIN_COLS = [
@@ -166,6 +173,11 @@ OSM_PARSIMONIOUS_COLS = [
     OSM_COLS["school"],
     OSM_COLS["university"],
 ]
+OSM_MAIN_PLUS_SHELTER_SUBWAY_COLS = OSM_MAIN_COLS + [
+    OSM_COLS["transport_shelter"],
+    OSM_COLS["subway_entrance"],
+]
+CURRENT_MAIN_JOINT_COLS = CENSO_MAIN_COLS + OSM_MAIN_PLUS_SHELTER_SUBWAY_COLS
 
 JOINT_ROUTE_A_SPECS = [
     ("censo_main_4", CENSO_MAIN_COLS),
@@ -183,6 +195,16 @@ JOINT_ROUTE_A_SPECS = [
     ("censo_main_4_plus_osm_main", CENSO_MAIN_COLS + OSM_MAIN_COLS),
     ("censo_main_4_plus_osm_parsimonious", CENSO_MAIN_COLS + OSM_PARSIMONIOUS_COLS),
     ("censo_main_4_compu_plus_osm_main", CENSO_MAIN_PLUS_COMPU_COLS + OSM_MAIN_COLS),
+    ("current_main", CURRENT_MAIN_JOINT_COLS),
+    ("current_main_plus_mujeres", CURRENT_MAIN_JOINT_COLS + ["share_mujeres_z"]),
+    (
+        "current_main_plus_asistencia_parv",
+        CURRENT_MAIN_JOINT_COLS + ["share_asistencia_parv_z"],
+    ),
+    (
+        "current_main_plus_mujeres_asistencia_parv",
+        CURRENT_MAIN_JOINT_COLS + ["share_mujeres_z", "share_asistencia_parv_z"],
+    ),
 ]
 
 FINAL_AUDIT_LABELS = [
@@ -207,11 +229,15 @@ PARAM_TAGS = {
     "share_discapacidad_z": "SHARE_DISCAPACIDAD_Z",
     "share_inmigrantes_z": "SHARE_INMIGRANTES_Z",
     "share_serv_compu_z": "SHARE_SERV_COMPU_Z",
+    "share_mujeres_z": "SHARE_MUJERES_Z",
+    "share_asistencia_parv_z": "SHARE_ASISTENCIA_PARV_Z",
     "osm_leisure_sports_centre_density_km2_z": "OSM_LEISURE_SPORTS_CENTRE_DENSITY_KM2_Z",
     "osm_shop_convenience_density_km2_z": "OSM_SHOP_CONVENIENCE_DENSITY_KM2_Z",
     "osm_leisure_playground_density_km2_z": "OSM_LEISURE_PLAYGROUND_DENSITY_KM2_Z",
     "osm_amenity_school_density_km2_z": "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z",
     "osm_amenity_university_density_km2_z": "OSM_AMENITY_UNIVERSITY_DENSITY_KM2_Z",
+    "osm_transport_shelter_yes_density_km2_z": "OSM_TRANSPORT_SHELTER_YES_DENSITY_KM2_Z",
+    "osm_railway_subway_entrance_density_km2_z": "OSM_RAILWAY_SUBWAY_ENTRANCE_DENSITY_KM2_Z",
 }
 
 MODEL_SPECS = [

@@ -1,0 +1,1248 @@
+---
+title: "EOD Income Proxy Parsimonious Comparison (Larch)"
+format: html
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  message: true
+---
+
+Este notebook estima en **Larch** las especificaciones comparables del notebook
+[`03_models/16_eod2012_income_proxy_stepwise.qmd`](/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project/03_models/16_eod2012_income_proxy_stepwise.qmd).
+
+Objetivo:
+
+- contrastar `MNL` y `Nested` fuera de Biogeme;
+- comparar atributos de viaje agregados/alternativo-específicos versus atributos observados por viaje;
+- mantener la misma muestra objetivo, variables territoriales parsimoniosas y lectura de `BIP` como referencia para variables comunes.
+
+::: {.callout-note}
+En **Larch**, el parámetro del nido se expresa como `Mu:QR` con rango `(0, 1]`.
+Para compararlo con Biogeme:
+
+`MU_biogeme ~= 1 / Mu:QR_larch`
+:::
+
+## 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+
+import gc
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp/xdg-cache")
+
+import numpy as np
+import pandas as pd
+import polars as pl
+from scipy.stats import norm
+
+if os.environ.get("LARCH_DISABLE_NUMBA_CACHE", "1") == "1":
+    import numba as nb
+
+    _original_njit = nb.njit
+    _original_guvectorize = nb.guvectorize
+
+    def _njit_without_cache(*args, **kwargs):
+        kwargs["cache"] = False
+        return _original_njit(*args, **kwargs)
+
+    def _guvectorize_without_cache(*args, **kwargs):
+        kwargs["cache"] = False
+        return _original_guvectorize(*args, **kwargs)
+
+    nb.njit = _njit_without_cache
+    nb.guvectorize = _guvectorize_without_cache
+
+import larch as lx
+if not all(hasattr(lx, attr) for attr in ["P", "X", "Model", "Dataset"]):
+    raise ImportError(
+        "Este kernel no tiene una instalación completa de Larch. "
+        f"Se importó {lx!r}, pero no expone P, X, Model ni Dataset."
+    )
+
+from larch import P, X
+
+
+def resolve_project_root(start: Path | None = None) -> Path:
+    current = (start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / "config").exists() and (candidate / "lib").exists():
+            return candidate
+    raise RuntimeError("No se pudo resolver PROJECT_ROOT desde el notebook actual.")
+
+
+PROJECT_ROOT = resolve_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lib.od_buffers_nested_logit import (  # noqa: E402
+    OdContextConfig,
+    build_od_alt_specific_context_table,
+    build_trip_dataset_with_alt_specific_context,
+    load_caracterizacion,
+    read_parquet_portable,
+    resolve_caracterizacion_path,
+)
+
+print("PROJECT_ROOT:", PROJECT_ROOT)
+print("Larch:", lx)
+```
+
+## 2) Configuración
+
+```{python}
+#| label: config
+print("label: config")
+
+RUN_ESTIMATION = os.environ.get("LARCH16_RUN_ESTIMATION", "1") == "1"
+MODEL_PARTITION = "pooled_2024_2025"
+ESTIMATION_SAMPLE_TAG = os.environ.get("LARCH16_SAMPLE_TAG", "sample5pct")
+LARCH_METHOD = os.environ.get("LARCH16_METHOD", "slsqp").lower()
+LARCH_MAXITER = int(os.environ.get("LARCH16_MAXITER", "1000"))
+LARCH_FTOL = float(os.environ.get("LARCH16_FTOL", "1e-12"))
+LARCH_OPTIONS = {"maxiter": LARCH_MAXITER, "ftol": LARCH_FTOL}
+LARCH_MAX_CAP = float(os.environ.get("LARCH16_MAX_CAP", "20"))
+
+MODELS_DIR = PROJECT_ROOT / "03_models"
+ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "interannual_enriched"
+RESULTS_ROOT = MODELS_DIR / "larch_logit" / "results" / "16_eod2012_income_proxy_larch_comparison"
+RESULTS_DIR = RESULTS_ROOT / f"{MODEL_PARTITION}-larch-{ESTIMATION_SAMPLE_TAG}"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+BASELINE_SAMPLE_PATH = ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}.parquet"
+JOINT_CENSO_OSM_SAMPLE_PATH = (
+    ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-censo4-micro-osm.parquet"
+)
+OBSERVED_TRIP_ATTRS_SAMPLE_PATH = (
+    ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-observed-trip-attrs.parquet"
+)
+FULL_TRIPS_CONTEXT_PATH = ARTIFACTS_DIR / f"trips_context_{MODEL_PARTITION}.parquet"
+AGGREGATED_SAMPLE_PATH = (
+    ARTIFACTS_DIR / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-censo4-micro-osm-eod2012.parquet"
+)
+OBSERVED_SAMPLE_PATH = (
+    ARTIFACTS_DIR
+    / f"{MODEL_PARTITION}-estimation-{ESTIMATION_SAMPLE_TAG}-censo4-micro-osm-eod2012-observed-trip-attrs.parquet"
+)
+EOD_MODEL_READY_FULL_PATH = PROJECT_ROOT / "data" / "processed" / "eod2012" / "eod2012_zone_features_zona777.parquet"
+EOD_MODEL_READY_STD_PATH = ARTIFACTS_DIR / f"eod2012_zona777_model_ready_{ESTIMATION_SAMPLE_TAG}.parquet"
+CENSO_AGG_FINAL_PATH = (
+    PROJECT_ROOT / "02_eda" / "tmp" / "censo2024_zona777" / "censo2024_zona777_agg_final.parquet"
+)
+CENSO_MODEL_READY_FULL_PATH = ARTIFACTS_DIR / "censo2024_microdata_zona777_model_ready.parquet"
+CENSO_BASE_MODEL_READY_FULL_PATH = ARTIFACTS_DIR / "censo2024_zona777_model_ready.parquet"
+CENSO_MODEL_READY_STD_PATH = (
+    ARTIFACTS_DIR / f"censo2024_zona777_model_ready_{ESTIMATION_SAMPLE_TAG}_microdata.parquet"
+)
+OSM_MODEL_READY_FULL_PATH = ARTIFACTS_DIR / "osm_zona777_model_ready.parquet"
+OSM_MODEL_READY_STD_PATH = ARTIFACTS_DIR / f"osm_zona777_model_ready_{ESTIMATION_SAMPLE_TAG}.parquet"
+ZONAS777_SHP = Path(
+    "/Volumes/KINGSTON/tesis-project/raw/zonas777/"
+    "Zonas777-04-04-2014/Shape/Zonas777_V07_04_2014.shp"
+)
+RAW_PARQUET_BY_PARTITION = {
+    "2024-W17": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2024-W17.parquet",
+    "2025-W17": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet",
+}
+
+COMMON_BASE_COLS = [
+    "choice_nested",
+    "DUMMY_LAB_PM",
+    "DUMMY_LAB_PT",
+    "DUMMY_NO_LAB",
+    "DUMMY_ANIO_2025",
+    "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+    "LOG_BUS_STOP_DENSITY",
+    "LOG_BUS_LINE_COUNT",
+    "LOG_METRO_LINE_COUNT",
+]
+
+AGGREGATED_TRIP_ATTR_COLS = [
+    "TVH_BIP",
+    "TVH_QR_RED",
+    "TVH_QR_OTHER",
+    "TEI_BIP",
+    "TEI_QR_RED",
+    "TEI_QR_OTHER",
+    "TET_BIP",
+    "TET_QR_RED",
+    "TET_QR_OTHER",
+    "NTR_BIP",
+    "NTR_QR_RED",
+    "NTR_QR_OTHER",
+]
+
+OBSERVED_TRIP_ATTR_COLS = ["OBS_TVH", "OBS_TEI", "OBS_TET", "OBS_NTR"]
+
+EXTRA_COLS = [
+    "share_cine18_universitaria_o_mas_micro_z",
+    "share_discapacidad_z",
+    "share_inmigrantes_z",
+    "share_mujeres_z",
+    "share_asistencia_parv_z",
+    "osm_leisure_playground_density_km2_z",
+    "osm_amenity_school_density_km2_z",
+    "osm_amenity_university_density_km2_z",
+    "osm_transport_shelter_yes_density_km2_z",
+    "osm_railway_subway_entrance_density_km2_z",
+    "eod2012_share_hogares_de_income_proxy_z",
+    "macro_norte",
+    "macro_poniente",
+    "macro_oriente",
+    "macro_sur",
+    "macro_suroriente",
+    "macro_externa_especial",
+]
+EOD_RAW_COLS = ["eod2012_share_hogares_de_income_proxy"]
+CENSO_COLS = [
+    "share_cine18_universitaria_o_mas_micro_z",
+    "share_discapacidad_z",
+    "share_inmigrantes_z",
+    "share_mujeres_z",
+    "share_asistencia_parv_z",
+]
+OSM_COLS = [
+    "osm_leisure_playground_density_km2_z",
+    "osm_amenity_school_density_km2_z",
+    "osm_amenity_university_density_km2_z",
+    "osm_transport_shelter_yes_density_km2_z",
+    "osm_railway_subway_entrance_density_km2_z",
+]
+CENSO_RAW_COLS = [c.removesuffix("_z") for c in CENSO_COLS]
+OSM_RAW_COLS = [c.removesuffix("_z") for c in OSM_COLS]
+EOD_COLS = ["eod2012_share_hogares_de_income_proxy_z"]
+MACROZONA_BASE = "CENTRO"
+MACROZONA_DUMMY_LEVELS = ["NORTE", "PONIENTE", "ORIENTE", "SUR", "SURORIENTE", "EXTERNA_ESPECIAL"]
+MACROZONA_COLS = [
+    "macro_norte",
+    "macro_poniente",
+    "macro_oriente",
+    "macro_sur",
+    "macro_suroriente",
+    "macro_externa_especial",
+]
+OBSERVED_TRIP_ATTR_PASSTHROUGH_COLUMNS = ["OBS_TVH", "OBS_TEI", "OBS_TET", "OBS_NTR", "franja_v2"]
+
+PARAM_TAGS = {
+    "share_cine18_universitaria_o_mas_micro_z": "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z",
+    "share_discapacidad_z": "SHARE_DISCAPACIDAD_Z",
+    "share_inmigrantes_z": "SHARE_INMIGRANTES_Z",
+    "share_mujeres_z": "SHARE_MUJERES_Z",
+    "share_asistencia_parv_z": "SHARE_ASISTENCIA_PARV_Z",
+    "osm_leisure_playground_density_km2_z": "OSM_LEISURE_PLAYGROUND_DENSITY_KM2_Z",
+    "osm_amenity_school_density_km2_z": "OSM_AMENITY_SCHOOL_DENSITY_KM2_Z",
+    "osm_amenity_university_density_km2_z": "OSM_AMENITY_UNIVERSITY_DENSITY_KM2_Z",
+    "osm_transport_shelter_yes_density_km2_z": "OSM_TRANSPORT_SHELTER_YES_DENSITY_KM2_Z",
+    "osm_railway_subway_entrance_density_km2_z": "OSM_RAILWAY_SUBWAY_ENTRANCE_DENSITY_KM2_Z",
+    "eod2012_share_hogares_de_income_proxy_z": "EOD2012_SHARE_HOGARES_DE_INCOME_PROXY_Z",
+    "macro_norte": "MACRO_NORTE",
+    "macro_poniente": "MACRO_PONIENTE",
+    "macro_oriente": "MACRO_ORIENTE",
+    "macro_sur": "MACRO_SUR",
+    "macro_suroriente": "MACRO_SURORIENTE",
+    "macro_externa_especial": "MACRO_EXTERNA_ESPECIAL",
+}
+
+ALL_MODEL_SPECS = [
+    {
+        "label": "mnl_aggregated_alt_specific",
+        "family": "mnl",
+        "trip_attr_mode": "aggregated_alt_specific",
+        "sample_path": AGGREGATED_SAMPLE_PATH,
+    },
+    {
+        "label": "nested_aggregated_alt_specific",
+        "family": "nested",
+        "trip_attr_mode": "aggregated_alt_specific",
+        "sample_path": AGGREGATED_SAMPLE_PATH,
+    },
+    {
+        "label": "mnl_observed_common",
+        "family": "mnl",
+        "trip_attr_mode": "observed_common",
+        "sample_path": OBSERVED_SAMPLE_PATH,
+    },
+    {
+        "label": "nested_observed_common",
+        "family": "nested",
+        "trip_attr_mode": "observed_common",
+        "sample_path": OBSERVED_SAMPLE_PATH,
+    },
+]
+
+ACTIVE_SPEC_LABELS = [
+    label.strip()
+    for label in os.environ.get(
+        "LARCH16_ACTIVE_SPEC_LABELS",
+        ",".join(spec["label"] for spec in ALL_MODEL_SPECS),
+    ).split(",")
+    if label.strip()
+]
+known_labels = {spec["label"] for spec in ALL_MODEL_SPECS}
+unknown_labels = sorted(set(ACTIVE_SPEC_LABELS) - known_labels)
+if unknown_labels:
+    raise ValueError(f"Especificaciones Larch desconocidas: {unknown_labels}")
+
+MODEL_SPECS = [spec for spec in ALL_MODEL_SPECS if spec["label"] in ACTIVE_SPEC_LABELS]
+
+print("RUN_ESTIMATION:", RUN_ESTIMATION)
+print("ESTIMATION_SAMPLE_TAG:", ESTIMATION_SAMPLE_TAG)
+print("AGGREGATED_SAMPLE_PATH:", AGGREGATED_SAMPLE_PATH, AGGREGATED_SAMPLE_PATH.exists())
+print("OBSERVED_SAMPLE_PATH:", OBSERVED_SAMPLE_PATH, OBSERVED_SAMPLE_PATH.exists())
+print("RESULTS_DIR:", RESULTS_DIR)
+print("LARCH_METHOD:", LARCH_METHOD, LARCH_OPTIONS)
+print("ACTIVE_SPEC_LABELS:", ACTIVE_SPEC_LABELS)
+```
+
+## 3) Helpers
+
+```{python}
+#| label: helpers
+print("label: helpers")
+
+
+def parse_sample_fraction_from_tag(sample_tag: str) -> float | None:
+    if sample_tag == "full":
+        return None
+    if not (sample_tag.startswith("sample") and sample_tag.endswith("pct")):
+        return None
+    return int(sample_tag.removeprefix("sample").removesuffix("pct")) / 100
+
+
+def ensure_unique_keys(df: pl.DataFrame, keys: list[str], context: str) -> None:
+    duplicated = df.group_by(keys).len().filter(pl.col("len") > 1)
+    if duplicated.height:
+        raise ValueError(f"{context} tiene llaves duplicadas para {keys}")
+
+
+def assert_left_join_preserves_rows(before_rows: int, after_rows: int, context: str) -> None:
+    if before_rows != after_rows:
+        raise ValueError(f"{context} cambió filas: antes={before_rows:,}, después={after_rows:,}")
+
+
+def standardize_over_used_zones(
+    df_zone_model_ready: pl.DataFrame,
+    df_est_base: pl.DataFrame,
+    raw_vars: list[str],
+) -> pl.DataFrame:
+    df_used_zones = (
+        df_est_base
+        .select(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .drop_nulls()
+        .unique()
+    )
+    df_used = df_zone_model_ready.join(df_used_zones, on="ZONA777", how="inner")
+    df_out = df_zone_model_ready
+    for raw_var in raw_vars:
+        mu = df_used.select(pl.col(raw_var).mean()).item()
+        sd = df_used.select(pl.col(raw_var).std()).item()
+        if mu is None:
+            raise ValueError(f"No se pudo calcular media para {raw_var} sobre zonas usadas")
+        if sd is None or sd == 0:
+            sd = 1.0
+        df_out = df_out.with_columns(
+            ((pl.col(raw_var) - pl.lit(float(mu))) / pl.lit(float(sd))).alias(f"{raw_var}_z")
+        )
+    return df_out
+
+
+def read_zone_model_ready_sources(paths: list[Path]) -> pl.DataFrame:
+    missing_paths = [p for p in paths if not p.exists()]
+    if missing_paths:
+        raise FileNotFoundError(f"No existen zone model-ready full requeridos: {missing_paths}")
+
+    df_zone = None
+    for path in paths:
+        df_next = pl.read_parquet(path)
+        ensure_unique_keys(df_next, ["ZONA777"], path.name)
+        if df_zone is None:
+            df_zone = df_next
+            continue
+
+        duplicate_cols = sorted((set(df_zone.columns) & set(df_next.columns)) - {"ZONA777"})
+        if duplicate_cols:
+            raise ValueError(f"Columnas duplicadas al combinar fuentes zone model-ready: {duplicate_cols}")
+        df_zone = df_zone.join(df_next, on="ZONA777", how="inner")
+
+    return df_zone
+
+
+def augment_censo_zone_sources(df_zone: pl.DataFrame, raw_vars: list[str]) -> pl.DataFrame:
+    missing = set(raw_vars) - set(df_zone.columns)
+    derived_exprs = []
+    if "share_mujeres" in missing:
+        derived_exprs.append(
+            (pl.col("n_mujeres") / pl.when(pl.col("n_per") != 0).then(pl.col("n_per"))).alias("share_mujeres")
+        )
+    if "share_asistencia_parv" in missing:
+        derived_exprs.append(
+            (
+                pl.col("n_asistencia_parv")
+                / pl.when(pl.col("n_edad_0_5") != 0).then(pl.col("n_edad_0_5"))
+            ).alias("share_asistencia_parv")
+        )
+    if not derived_exprs:
+        return df_zone
+    if not CENSO_AGG_FINAL_PATH.exists():
+        return df_zone
+
+    dependencies_by_var = {
+        "share_mujeres": {"n_mujeres", "n_per"},
+        "share_asistencia_parv": {"n_asistencia_parv", "n_edad_0_5"},
+    }
+    required = {"ZONA777"} | {
+        dep
+        for raw_var in missing
+        for dep in dependencies_by_var.get(raw_var, set())
+    }
+    df_agg = pl.read_parquet(CENSO_AGG_FINAL_PATH)
+    if not required.issubset(df_agg.columns):
+        return df_zone
+
+    df_derived = df_agg.select(["ZONA777", *sorted(required - {"ZONA777"})]).with_columns(derived_exprs)
+    derived_cols = [c for c in ["share_mujeres", "share_asistencia_parv"] if c in missing and c in df_derived.columns]
+    if not derived_cols:
+        return df_zone
+    return df_zone.join(df_derived.select(["ZONA777", *derived_cols]), on="ZONA777", how="left")
+
+
+def fill_missing_raw_with_median(df_zone: pl.DataFrame, raw_vars: list[str], context_name: str) -> pl.DataFrame:
+    exprs = []
+    for col in raw_vars:
+        if col not in df_zone.columns:
+            continue
+        median_value = df_zone.select(pl.col(col).median()).item()
+        if median_value is None:
+            continue
+        missing_count = df_zone.select(pl.col(col).is_null().sum()).item()
+        if missing_count:
+            print(
+                f"ℹ️ Imputando {missing_count} zonas sin {col} "
+                f"con mediana {context_name}/ZONA777 ({median_value:.6f})."
+            )
+        exprs.append(pl.col(col).fill_null(median_value).alias(col))
+    if not exprs:
+        return df_zone
+    return df_zone.with_columns(exprs)
+
+
+def complete_used_zones_with_medians(
+    df_zone: pl.DataFrame,
+    df_est_base: pl.DataFrame,
+    raw_vars: list[str],
+    context_name: str,
+) -> pl.DataFrame:
+    df_zone_min = df_zone.select(["ZONA777", *raw_vars])
+    df_used_zones = (
+        df_est_base
+        .select(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .drop_nulls()
+        .unique()
+    )
+    df_missing_zones = df_used_zones.join(df_zone_min.select("ZONA777"), on="ZONA777", how="anti")
+    if df_missing_zones.is_empty():
+        return df_zone_min
+
+    median_exprs = []
+    for col in raw_vars:
+        median_value = df_zone_min.select(pl.col(col).median()).item()
+        if median_value is None:
+            raise ValueError(f"No se pudo imputar {col} en {context_name}: mediana nula")
+        median_exprs.append(pl.lit(float(median_value)).alias(col))
+    print(
+        f"ℹ️ Imputando {df_missing_zones.height} zonas usadas sin fila {context_name} "
+        "con medianas zonales antes de estandarizar."
+    )
+    df_imputed = df_missing_zones.with_columns(median_exprs)
+    return pl.concat([df_zone_min, df_imputed], how="vertical")
+
+
+def zone_std_is_ready(path: Path, required_cols: set[str], context_name: str) -> bool:
+    if not path.exists():
+        return False
+    existing_cols = set(pl.scan_parquet(path).collect_schema().names())
+    missing_cols = sorted(required_cols - existing_cols)
+    if missing_cols:
+        print(f"ℹ️ Re-materializando {context_name} model-ready std: faltan {missing_cols}")
+        return False
+    if not BASELINE_SAMPLE_PATH.exists():
+        return True
+
+    df_used_zones = (
+        pl.read_parquet(BASELINE_SAMPLE_PATH)
+        .select(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .drop_nulls()
+        .unique()
+    )
+    df_zone_keys = pl.read_parquet(path, columns=["ZONA777"]).unique()
+    missing_zone_count = df_used_zones.join(df_zone_keys, on="ZONA777", how="anti").height
+    if missing_zone_count:
+        print(
+            f"ℹ️ Re-materializando {context_name} model-ready std: "
+            f"faltan {missing_zone_count} zonas usadas."
+        )
+        return False
+    value_cols = sorted(required_cols - {"ZONA777"})
+    df_zone_values = pl.read_parquet(path, columns=["ZONA777", *value_cols])
+    null_cells = (
+        df_used_zones
+        .join(df_zone_values, on="ZONA777", how="left")
+        .select(pl.sum_horizontal([pl.col(c).is_null().sum() for c in value_cols]).alias("n"))
+        .item()
+    )
+    if null_cells:
+        print(
+            f"ℹ️ Re-materializando {context_name} model-ready std: "
+            f"hay {null_cells} valores nulos en zonas usadas."
+        )
+        return False
+    return True
+
+
+def ensure_censo_model_ready_std() -> Path:
+    required_cols = {"ZONA777", *CENSO_RAW_COLS, *CENSO_COLS}
+    if zone_std_is_ready(CENSO_MODEL_READY_STD_PATH, required_cols, "Censo"):
+        return CENSO_MODEL_READY_STD_PATH
+    if CENSO_MODEL_READY_STD_PATH.exists():
+        CENSO_MODEL_READY_STD_PATH.unlink()
+
+    if not BASELINE_SAMPLE_PATH.exists():
+        raise FileNotFoundError(f"No existe baseline sample para estandarizar Censo: {BASELINE_SAMPLE_PATH}")
+    df_base = pl.read_parquet(BASELINE_SAMPLE_PATH)
+    df_censo_full = read_zone_model_ready_sources([CENSO_BASE_MODEL_READY_FULL_PATH, CENSO_MODEL_READY_FULL_PATH])
+    df_censo_full = augment_censo_zone_sources(df_censo_full, CENSO_RAW_COLS)
+    missing_raw = sorted(set(CENSO_RAW_COLS) - set(df_censo_full.columns))
+    if missing_raw:
+        raise ValueError(
+            f"Faltan variables raw Censo: {missing_raw}. "
+            "Si falta share_asistencia_parv, regenera primero "
+            "02_eda/tmp/censo2024_zona777/censo2024_zona777_agg_final.parquet."
+        )
+    df_censo_full = fill_missing_raw_with_median(df_censo_full, CENSO_RAW_COLS, "Censo")
+    df_censo_full = complete_used_zones_with_medians(df_censo_full, df_base, CENSO_RAW_COLS, "Censo")
+    df_censo_std = standardize_over_used_zones(df_censo_full, df_base, CENSO_RAW_COLS)
+    df_censo_std.write_parquet(CENSO_MODEL_READY_STD_PATH)
+    print(f"✅ Censo model-ready std escrito en: {CENSO_MODEL_READY_STD_PATH}")
+    return CENSO_MODEL_READY_STD_PATH
+
+
+def ensure_osm_model_ready_std() -> Path:
+    required_cols = {"ZONA777", *OSM_RAW_COLS, *OSM_COLS}
+    if zone_std_is_ready(OSM_MODEL_READY_STD_PATH, required_cols, "OSM"):
+        return OSM_MODEL_READY_STD_PATH
+    if OSM_MODEL_READY_STD_PATH.exists():
+        OSM_MODEL_READY_STD_PATH.unlink()
+
+    if not BASELINE_SAMPLE_PATH.exists():
+        raise FileNotFoundError(f"No existe baseline sample para estandarizar OSM: {BASELINE_SAMPLE_PATH}")
+    if not OSM_MODEL_READY_FULL_PATH.exists():
+        raise FileNotFoundError(f"No existe OSM model-ready full: {OSM_MODEL_READY_FULL_PATH}")
+
+    df_base = pl.read_parquet(BASELINE_SAMPLE_PATH)
+    df_osm_full = pl.read_parquet(OSM_MODEL_READY_FULL_PATH)
+    missing_raw = sorted(set(OSM_RAW_COLS) - set(df_osm_full.columns))
+    if missing_raw:
+        raise ValueError(f"Faltan variables raw OSM: {missing_raw}")
+    df_osm_full = fill_missing_raw_with_median(df_osm_full, OSM_RAW_COLS, "OSM")
+    df_osm_full = complete_used_zones_with_medians(df_osm_full, df_base, OSM_RAW_COLS, "OSM")
+    df_osm_std = standardize_over_used_zones(df_osm_full, df_base, OSM_RAW_COLS)
+    df_osm_std.write_parquet(OSM_MODEL_READY_STD_PATH)
+    print(f"✅ OSM model-ready std escrito en: {OSM_MODEL_READY_STD_PATH}")
+    return OSM_MODEL_READY_STD_PATH
+
+
+def ensure_eod_model_ready_std() -> Path:
+    required_cols = {"ZONA777", *EOD_RAW_COLS, *EOD_COLS}
+    if zone_std_is_ready(EOD_MODEL_READY_STD_PATH, required_cols, "EOD"):
+        return EOD_MODEL_READY_STD_PATH
+    if EOD_MODEL_READY_STD_PATH.exists():
+        EOD_MODEL_READY_STD_PATH.unlink()
+
+    if not BASELINE_SAMPLE_PATH.exists():
+        raise FileNotFoundError(f"No existe baseline sample para estandarizar EOD: {BASELINE_SAMPLE_PATH}")
+    if not EOD_MODEL_READY_FULL_PATH.exists():
+        raise FileNotFoundError(f"No existe EOD model-ready full: {EOD_MODEL_READY_FULL_PATH}")
+
+    df_base = pl.read_parquet(BASELINE_SAMPLE_PATH)
+    df_eod_full = pl.read_parquet(EOD_MODEL_READY_FULL_PATH)
+    missing_raw = sorted(set(EOD_RAW_COLS) - set(df_eod_full.columns))
+    if missing_raw:
+        raise ValueError(f"Faltan variables raw EOD: {missing_raw}")
+    df_eod_full = fill_missing_raw_with_median(df_eod_full, EOD_RAW_COLS, "EOD")
+    df_eod_full = complete_used_zones_with_medians(df_eod_full, df_base, EOD_RAW_COLS, "EOD")
+    df_eod_std = standardize_over_used_zones(df_eod_full, df_base, EOD_RAW_COLS)
+    df_eod_std.write_parquet(EOD_MODEL_READY_STD_PATH)
+    print(f"✅ EOD model-ready std escrito en: {EOD_MODEL_READY_STD_PATH}")
+    return EOD_MODEL_READY_STD_PATH
+
+
+def build_macrozone_lookup() -> pl.DataFrame:
+    if not ZONAS777_SHP.exists():
+        raise FileNotFoundError(f"No existe shapefile ZONA777 para macrozonas: {ZONAS777_SHP}")
+    import geopandas as gpd
+
+    gdf = gpd.read_file(ZONAS777_SHP)[["ZONA777", "NMACROZONA", "MACROZONA", "COMUNA"]].copy()
+    gdf["ZONA777"] = pd.to_numeric(gdf["ZONA777"], errors="coerce")
+    gdf = gdf[gdf["ZONA777"].notna()].copy()
+    gdf["ZONA777"] = gdf["ZONA777"].astype(int)
+    gdf["NMACROZONA"] = pd.to_numeric(gdf["NMACROZONA"], errors="coerce").astype("Int64")
+    attrs = gdf.drop_duplicates(["ZONA777", "NMACROZONA", "MACROZONA", "COMUNA"]).copy()
+    inconsistent = attrs.groupby("ZONA777").size()
+    inconsistent = inconsistent[inconsistent.gt(1)]
+    if not inconsistent.empty:
+        raise ValueError(f"Hay ZONA777 con macrozona inconsistente: {sorted(map(int, inconsistent.index))}")
+    attrs = attrs.drop_duplicates("ZONA777").copy()
+    attrs["macrozone_model"] = attrs["MACROZONA"].astype(str)
+    attrs.loc[attrs["NMACROZONA"].eq(7), "macrozone_model"] = "EXTERNA_ESPECIAL"
+    observed = set(attrs["macrozone_model"].dropna().unique())
+    expected = set(MACROZONA_DUMMY_LEVELS + [MACROZONA_BASE])
+    unexpected = sorted(observed - expected)
+    if unexpected:
+        raise ValueError(f"Macrozonas no esperadas en ZONA777: {unexpected}")
+    for level in MACROZONA_DUMMY_LEVELS:
+        attrs[f"macro_{level.lower()}"] = attrs["macrozone_model"].eq(level).astype(float)
+    return pl.from_pandas(attrs[["ZONA777", *MACROZONA_COLS]])
+
+
+def add_macrozone_controls(df_trips: pl.DataFrame) -> pl.DataFrame:
+    df_macro = build_macrozone_lookup()
+    ensure_unique_keys(df_macro, ["ZONA777"], "macrozone_lookup")
+    before_rows = df_trips.height
+    df = (
+        df_trips
+        .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .join(df_macro, on="ZONA777", how="left")
+        .drop("ZONA777")
+    )
+    assert_left_join_preserves_rows(before_rows, df.height, "join macrozona")
+    missing_ratio = df.select(pl.any_horizontal([pl.col(c).is_null() for c in MACROZONA_COLS]).mean()).item()
+    if missing_ratio != 0:
+        raise ValueError(f"Join macrozona dejó filas faltantes: {missing_ratio:.6%}")
+    return df
+
+
+def add_origin_controls_from_zone(
+    df_trips: pl.DataFrame,
+    zone_path: Path,
+    cols: list[str],
+    context_name: str,
+) -> pl.DataFrame:
+    if not cols:
+        return df_trips
+    if not zone_path.exists():
+        raise FileNotFoundError(f"No existe {context_name} model-ready std: {zone_path}")
+    df_zone = pl.read_parquet(zone_path).select(["ZONA777", *cols])
+    ensure_unique_keys(df_zone, ["ZONA777"], context_name)
+    before_rows = df_trips.height
+    df = (
+        df_trips
+        .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("ZONA777"))
+        .join(df_zone, on="ZONA777", how="left")
+        .drop("ZONA777")
+    )
+    assert_left_join_preserves_rows(before_rows, df.height, f"join {context_name}")
+    missing_ratio = df.select(pl.any_horizontal([pl.col(c).is_null() for c in cols]).mean()).item()
+    if missing_ratio != 0:
+        raise ValueError(f"Join {context_name} dejó filas faltantes: {missing_ratio:.6%}")
+    return df
+
+
+def build_joint_eod_sample_if_needed(target_path: Path, baseline_path: Path) -> Path:
+    required_cols = set(EXTRA_COLS)
+    if target_path.exists():
+        existing_cols = set(pl.scan_parquet(target_path).collect_schema().names())
+        if required_cols.issubset(existing_cols):
+            print(f"ℹ️ Reusando muestra Censo + OSM + EOD existente: {target_path}")
+            return target_path
+        target_path.unlink()
+
+    ensure_censo_model_ready_std()
+    ensure_osm_model_ready_std()
+    ensure_eod_model_ready_std()
+    if not baseline_path.exists():
+        raise FileNotFoundError(f"No existe baseline para muestra Censo + OSM + EOD: {baseline_path}")
+    print(f"ℹ️ Construyendo muestra Censo + OSM + EOD: {target_path.name}")
+    df = pl.read_parquet(baseline_path)
+    existing = set(df.columns)
+    if not set(CENSO_COLS).issubset(existing):
+        df = add_origin_controls_from_zone(df, CENSO_MODEL_READY_STD_PATH, CENSO_COLS, "Censo")
+    if not set(OSM_COLS).issubset(set(df.columns)):
+        df = add_origin_controls_from_zone(df, OSM_MODEL_READY_STD_PATH, OSM_COLS, "OSM")
+    if not set(EOD_COLS).issubset(set(df.columns)):
+        df = add_origin_controls_from_zone(df, EOD_MODEL_READY_STD_PATH, EOD_COLS, "EOD")
+    if not set(MACROZONA_COLS).issubset(set(df.columns)):
+        df = add_macrozone_controls(df)
+    df.write_parquet(target_path)
+    print(f"✅ Muestra Censo + OSM + EOD escrita en: {target_path}")
+    return target_path
+
+
+def stratified_sample_partition_choice(df: pl.DataFrame, *, fraction: float | None, seed: int = 42) -> pl.DataFrame:
+    if fraction is None:
+        return df
+    if not (0 < fraction <= 1):
+        raise ValueError(f"fraction debe estar en (0,1], recibido: {fraction}")
+    return (
+        df.group_by("partition", "choice_nested", maintain_order=True)
+        .map_groups(lambda g: g.sample(fraction=fraction, shuffle=True, seed=seed))
+        .sort(["partition", "choice_nested"])
+    )
+
+
+def year_from_partition(partition: str) -> int:
+    return int(partition.split("-W")[0])
+
+
+def build_observed_trip_attrs_partition(partition: str) -> pl.DataFrame:
+    parquet_path = RAW_PARQUET_BY_PARTITION[partition]
+    if not parquet_path.exists():
+        raise FileNotFoundError(f"No existe parquet raw para atributos observados {partition}: {parquet_path}")
+    od_config = OdContextConfig(
+        include_time_dummies=False,
+        time_dummy_variant="v2",
+        mean_mode="leave_one_out",
+        require_all_alternatives=True,
+    )
+    lf = read_parquet_portable(str(parquet_path))
+    df_caract = load_caracterizacion(resolve_caracterizacion_path(None, partition))
+    df_od_alt = build_od_alt_specific_context_table(lf, df_caracterizacion=df_caract, config=od_config)
+    df = build_trip_dataset_with_alt_specific_context(
+        lf,
+        df_caracterizacion=df_caract,
+        df_od_alt_context=df_od_alt,
+        time_dummy_variant=od_config.time_dummy_variant,
+        mean_mode=od_config.mean_mode,
+        drop_chosen_singletons=True,
+        include_realized_metrics=True,
+    )
+    return df.with_columns(
+        [
+            pl.lit(partition).alias("partition"),
+            pl.lit(year_from_partition(partition)).alias("year"),
+            (pl.lit(year_from_partition(partition)) == 2025).cast(pl.Int8).alias("DUMMY_ANIO_2025"),
+            pl.when(pl.col("DUMMY_LAB_PM") == 1)
+            .then(pl.lit("LAB_PM"))
+            .when(pl.col("DUMMY_LAB_PT") == 1)
+            .then(pl.lit("LAB_PT"))
+            .when(pl.col("DUMMY_LAB_VALLE") == 1)
+            .then(pl.lit("LAB_VALLE"))
+            .otherwise(pl.lit("NO_LAB"))
+            .alias("franja_v2"),
+        ]
+    )
+
+
+def build_observed_trip_attrs_sample_if_needed() -> Path:
+    required_cols = set(COMMON_BASE_COLS + AGGREGATED_TRIP_ATTR_COLS + OBSERVED_TRIP_ATTR_PASSTHROUGH_COLUMNS)
+    if OBSERVED_TRIP_ATTRS_SAMPLE_PATH.exists():
+        existing_cols = set(pl.scan_parquet(OBSERVED_TRIP_ATTRS_SAMPLE_PATH).collect_schema().names())
+        if required_cols.issubset(existing_cols):
+            print(f"ℹ️ Reusando muestra observed-trip-attrs existente: {OBSERVED_TRIP_ATTRS_SAMPLE_PATH}")
+            return OBSERVED_TRIP_ATTRS_SAMPLE_PATH
+        OBSERVED_TRIP_ATTRS_SAMPLE_PATH.unlink()
+
+    if not BASELINE_SAMPLE_PATH.exists():
+        raise FileNotFoundError(f"No existe baseline sample requerido: {BASELINE_SAMPLE_PATH}")
+    if not FULL_TRIPS_CONTEXT_PATH.exists():
+        raise FileNotFoundError(f"No existe trips context full requerido: {FULL_TRIPS_CONTEXT_PATH}")
+
+    print("ℹ️ Construyendo muestra observed-trip-attrs...")
+    df_base_sample = pl.read_parquet(BASELINE_SAMPLE_PATH)
+    lf_full_context = read_parquet_portable(str(FULL_TRIPS_CONTEXT_PATH))
+    full_context_n = lf_full_context.select(pl.len()).collect().item()
+    effective_fraction = df_base_sample.height / full_context_n
+    fraction = parse_sample_fraction_from_tag(ESTIMATION_SAMPLE_TAG)
+    replication_fraction = round(effective_fraction, 3)
+    if fraction is not None and abs(effective_fraction - fraction) > 1e-6:
+        print(
+            "ℹ️ La fracción efectiva difiere del tag: "
+            f"tag={fraction:.6%}, efectiva={effective_fraction:.6%}. "
+            f"Se usa {replication_fraction:.3%}."
+        )
+
+    valid_origins = (
+        lf_full_context.select(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False))
+        .drop_nulls()
+        .unique()
+        .collect()
+        .get_column("zona_inicio_viaje")
+        .to_list()
+    )
+    frames = []
+    for partition in RAW_PARQUET_BY_PARTITION:
+        frames.append(build_observed_trip_attrs_partition(partition))
+        gc.collect()
+    df_observed_full = (
+        pl.concat(frames, how="diagonal_relaxed")
+        .with_columns(pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False))
+        .filter(pl.col("zona_inicio_viaje").is_in(valid_origins))
+    )
+    if df_observed_full.height != full_context_n:
+        raise ValueError(
+            "La reconstrucción observed no replica trips_context full: "
+            f"full_context={full_context_n:,}, observed_full={df_observed_full.height:,}"
+        )
+
+    context_keys = ["partition", "zona_inicio_viaje", "franja_v2"]
+    context_cols = [
+        "N_VIAJES_ZONA_INICIO_FRANJA_RAW",
+        "N_VIAJES_ZONA_INICIO_FRANJA",
+        "LOG_N_VIAJES_ZONA_INICIO_FRANJA",
+        "N_BUS_STOPS",
+        "BUS_STOP_DENSITY",
+        "LOG_BUS_STOP_DENSITY",
+        "N_METRO_STATIONS",
+        "METRO_STATION_DENSITY",
+        "LOG_METRO_STATION_DENSITY",
+        "BUS_LINE_COUNT",
+        "LOG_BUS_LINE_COUNT",
+        "METRO_LINE_COUNT",
+        "LOG_METRO_LINE_COUNT",
+    ]
+    df_context_controls = lf_full_context.select(context_keys + context_cols).unique().collect()
+    ensure_unique_keys(df_context_controls, context_keys, "df_context_controls_observed")
+    before_rows = df_observed_full.height
+    df_observed_full = df_observed_full.join(df_context_controls, on=context_keys, how="left")
+    assert_left_join_preserves_rows(before_rows, df_observed_full.height, "join controles contexto observed")
+    missing_context = df_observed_full.select(
+        pl.any_horizontal([pl.col(c).is_null() for c in context_cols]).mean()
+    ).item()
+    if missing_context != 0:
+        raise ValueError(f"Join controles contexto observed dejó faltantes: {missing_context:.6%}")
+
+    df_observed_sample = stratified_sample_partition_choice(
+        df_observed_full,
+        fraction=replication_fraction,
+        seed=42,
+    )
+    row_diff = abs(df_base_sample.height - df_observed_sample.height)
+    row_diff_ratio = row_diff / df_base_sample.height
+    if row_diff_ratio > 0.0001:
+        raise ValueError(
+            "La muestra observed no replica tamaño histórico: "
+            f"baseline={df_base_sample.height:,}, observed={df_observed_sample.height:,}"
+        )
+    if row_diff:
+        print(f"⚠️ Diferencia menor a 0,01% entre baseline y observed: {row_diff} filas.")
+    df_observed_sample.write_parquet(OBSERVED_TRIP_ATTRS_SAMPLE_PATH)
+    print(f"✅ Muestra observed-trip-attrs escrita en: {OBSERVED_TRIP_ATTRS_SAMPLE_PATH}")
+    return OBSERVED_TRIP_ATTRS_SAMPLE_PATH
+
+
+def ensure_active_sample_artifacts(specs: list[dict]) -> None:
+    if any(spec["trip_attr_mode"] == "aggregated_alt_specific" for spec in specs):
+        build_joint_eod_sample_if_needed(AGGREGATED_SAMPLE_PATH, JOINT_CENSO_OSM_SAMPLE_PATH)
+    if any(spec["trip_attr_mode"] == "observed_common" for spec in specs):
+        observed_base = build_observed_trip_attrs_sample_if_needed()
+        build_joint_eod_sample_if_needed(OBSERVED_SAMPLE_PATH, observed_base)
+
+
+def assert_active_sample_paths_exist(specs: list[dict]) -> None:
+    missing_paths = sorted({spec["sample_path"] for spec in specs if not spec["sample_path"].exists()})
+    if not missing_paths:
+        return
+    message = "\n".join(f"- {path}" for path in missing_paths)
+    raise FileNotFoundError(
+        "Faltan artefactos requeridos para correr las especificaciones activas en Larch.\n"
+        f"{message}\n\n"
+        "Para sample5pct, primero materializa desde el notebook 16 los artefactos "
+        "`censo4-micro-osm-eod2012` y `censo4-micro-osm-eod2012-observed-trip-attrs`."
+    )
+
+
+def required_columns_for_spec(spec: dict) -> list[str]:
+    if spec["trip_attr_mode"] == "aggregated_alt_specific":
+        trip_cols = AGGREGATED_TRIP_ATTR_COLS
+    elif spec["trip_attr_mode"] == "observed_common":
+        trip_cols = OBSERVED_TRIP_ATTR_COLS
+    else:
+        raise ValueError(f"trip_attr_mode desconocido: {spec['trip_attr_mode']}")
+    return COMMON_BASE_COLS + trip_cols + EXTRA_COLS
+
+
+def load_larch_numeric_df(path: Path, cols: list[str]) -> pd.DataFrame:
+    schema_names = pl.scan_parquet(path).collect_schema().names()
+    missing = sorted(set(cols) - set(schema_names))
+    if missing:
+        raise ValueError(f"Faltan columnas requeridas en {path.name}: {missing}")
+    df = (
+        pl.scan_parquet(path)
+        .select(
+            [
+                pl.col(c).cast(pl.Int32).alias(c)
+                if c == "choice_nested"
+                else pl.col(c).cast(pl.Float64).alias(c)
+                for c in cols
+            ]
+        )
+        .collect()
+    )
+    null_counts = df.null_count().row(0)
+    bad_nulls = {c: n for c, n in zip(df.columns, null_counts) if n}
+    if bad_nulls:
+        raise ValueError(f"Columnas con nulls en {path.name}: {bad_nulls}")
+    return df.to_pandas()
+
+
+def prepare_larch_dataframe(pandas_df: pd.DataFrame) -> pd.DataFrame:
+    pdf = pandas_df.copy()
+    remap = {0: 1, 1: 2, 2: 3}
+    pdf["choice_larch"] = pdf["choice_nested"].replace(remap).astype("int32")
+    pdf = pdf.drop(columns=["choice_nested"])
+    for col in pdf.columns:
+        if col == "choice_larch":
+            continue
+        pdf[col] = pdf[col].astype("float64")
+    return pdf
+
+
+def build_larch_stats_frame(model: lx.Model, n_obs: int, spec: dict) -> pd.DataFrame:
+    stats_raw = model.estimation_statistics_raw(compute_loglike_null=True)
+    stats = {
+        "model": spec["label"],
+        "family": spec["family"],
+        "trip_attr_mode": spec["trip_attr_mode"],
+        "sample_path": spec["sample_path"].name,
+        "Number of estimated parameters": len(model.pf),
+        "Number of free parameters": int((model.pf["holdfast"] == 0).sum()),
+        "Sample size": int(n_obs),
+    }
+    for key, value in stats_raw.items():
+        label = " | ".join(str(k) for k in key) if isinstance(key, tuple) else str(key)
+        stats[label] = value
+    return pd.DataFrame([stats])
+
+
+def build_larch_params_frame(model: lx.Model, spec: dict) -> pd.DataFrame:
+    pf = model.pf.copy().reset_index().rename(columns={"param_name": "Param", "value": "Value"})
+    robust_std_err = np.asarray(model.parameters["robust_std_err"].values, dtype=float)
+    robust_t = np.where(
+        np.isfinite(robust_std_err) & (robust_std_err > 0),
+        pf["Value"].to_numpy(dtype=float) / robust_std_err,
+        np.nan,
+    )
+    robust_p = np.where(np.isfinite(robust_t), 2 * norm.sf(np.abs(robust_t)), np.nan)
+    lower = pf["minimum"].to_numpy(dtype=float)
+    upper = pf["maximum"].to_numpy(dtype=float)
+    value = pf["Value"].to_numpy(dtype=float)
+    active_lower = np.isfinite(lower) & (np.abs(value - lower) <= 1e-6)
+    active_upper = np.isfinite(upper) & (np.abs(value - upper) <= 1e-6)
+    pf["model"] = spec["label"]
+    pf["family"] = spec["family"]
+    pf["trip_attr_mode"] = spec["trip_attr_mode"]
+    pf["Robust std err."] = robust_std_err
+    pf["Robust t-stat."] = robust_t
+    pf["Robust p-value"] = robust_p
+    pf["Active bound"] = active_lower | active_upper
+    pf["Biogeme-comparable MU"] = np.where(
+        pf["Param"] == "Mu:QR",
+        np.where(value != 0, 1.0 / value, np.nan),
+        np.nan,
+    )
+    return pf[
+        [
+            "model",
+            "family",
+            "trip_attr_mode",
+            "Param",
+            "Value",
+            "Robust std err.",
+            "Robust t-stat.",
+            "Robust p-value",
+            "minimum",
+            "maximum",
+            "Active bound",
+            "Biogeme-comparable MU",
+        ]
+    ].rename(columns={"minimum": "Lower bound", "maximum": "Upper bound"})
+
+
+def result_paths(spec: dict) -> tuple[Path, Path]:
+    model_dir = RESULTS_DIR / spec["label"]
+    model_dir.mkdir(parents=True, exist_ok=True)
+    return (
+        model_dir / f"stats_{spec['label']}.csv",
+        model_dir / f"params_{spec['label']}.csv",
+    )
+```
+
+## 4) Especificación Larch
+
+```{python}
+#| label: model-builders
+print("label: model-builders")
+
+
+def add_common_qr_terms(v, alt: str):
+    return (
+        v
+        + getattr(P, f"B_{alt}_LAB_PM") * X.DUMMY_LAB_PM
+        + getattr(P, f"B_{alt}_LAB_PT") * X.DUMMY_LAB_PT
+        + getattr(P, f"B_{alt}_NO_LAB") * X.DUMMY_NO_LAB
+        + getattr(P, f"B_{alt}_ANIO_2025") * X.DUMMY_ANIO_2025
+        + getattr(P, f"B_{alt}_LOG_DEMAND") * X.LOG_N_VIAJES_ZONA_INICIO_FRANJA
+        + getattr(P, f"B_{alt}_LOG_BUS_STOP_DENSITY") * X.LOG_BUS_STOP_DENSITY
+        + getattr(P, f"B_{alt}_LOG_BUS_LINE_COUNT") * X.LOG_BUS_LINE_COUNT
+        + getattr(P, f"B_{alt}_LOG_METRO_LINE_COUNT") * X.LOG_METRO_LINE_COUNT
+    )
+
+
+def add_extra_terms(v, alt: str):
+    for col in EXTRA_COLS:
+        tag = PARAM_TAGS[col]
+        v = v + getattr(P, f"B_{alt}_{tag}") * getattr(X, col)
+    return v
+
+
+def add_aggregated_trip_terms(v, alt: str):
+    suffix = {"BIP": "BIP", "QR_RED": "QR_RED", "QR_OTHER": "QR_OTHER"}[alt]
+    return (
+        v
+        + getattr(P, f"B_{alt}_T_VEH") * getattr(X, f"TVH_{suffix}")
+        + getattr(P, f"B_{alt}_T_ESPERA_INI") * getattr(X, f"TEI_{suffix}")
+        + getattr(P, f"B_{alt}_T_ESPERA_TRASB") * getattr(X, f"TET_{suffix}")
+        + getattr(P, f"B_{alt}_N_TRASB") * getattr(X, f"NTR_{suffix}")
+    )
+
+
+def add_observed_trip_terms(v, alt: str):
+    return (
+        v
+        + getattr(P, f"B_{alt}_T_VEH") * X.OBS_TVH
+        + getattr(P, f"B_{alt}_T_ESPERA_INI") * X.OBS_TEI
+        + getattr(P, f"B_{alt}_T_ESPERA_TRASB") * X.OBS_TET
+        + getattr(P, f"B_{alt}_N_TRASB") * X.OBS_NTR
+    )
+
+
+def build_larch_model(pandas_df: pd.DataFrame, spec: dict) -> lx.Model:
+    pdf = prepare_larch_dataframe(pandas_df)
+    alts = {1: "BIP", 2: "QR_RED", 3: "QR_OTHER"}
+    ds = lx.Dataset.construct.from_idco(pdf, alts=alts)
+    model = lx.Model(ds)
+    model.title = spec["label"]
+    model.compute_engine = "numba"
+    model.choice_co_code = "choice_larch"
+    model.availability_co_vars = {1: 1, 2: 1, 3: 1}
+
+    if spec["trip_attr_mode"] == "aggregated_alt_specific":
+        model.utility_co[1] = add_aggregated_trip_terms(0, "BIP")
+        v_qr_red = add_aggregated_trip_terms(P.ASC_QR_RED, "QR_RED")
+        v_qr_other = add_aggregated_trip_terms(P.ASC_QR_OTHER, "QR_OTHER")
+    elif spec["trip_attr_mode"] == "observed_common":
+        model.utility_co[1] = 0
+        v_qr_red = add_observed_trip_terms(P.ASC_QR_RED, "QR_RED")
+        v_qr_other = add_observed_trip_terms(P.ASC_QR_OTHER, "QR_OTHER")
+    else:
+        raise ValueError(f"trip_attr_mode desconocido: {spec['trip_attr_mode']}")
+
+    v_qr_red = add_extra_terms(add_common_qr_terms(v_qr_red, "QR_RED"), "QR_RED")
+    v_qr_other = add_extra_terms(add_common_qr_terms(v_qr_other, "QR_OTHER"), "QR_OTHER")
+    model.utility_co[2] = v_qr_red
+    model.utility_co[3] = v_qr_other
+
+    if spec["family"] == "nested":
+        model.graph.new_node(parameter="Mu:QR", children=[2, 3], name="QR")
+    else:
+        model.initialize_graph(alternative_codes=[1, 2, 3], alternative_names=["BIP", "QR_RED", "QR_OTHER"])
+
+    model.ordering = [
+        ("ASCs", "ASC_.*"),
+        ("Time Dummies", "B_QR_.*_(LAB_PM|LAB_PT|NO_LAB)"),
+        ("Interannual", "B_QR_.*_ANIO_2025"),
+        ("Demand", "B_QR_.*_LOG_DEMAND"),
+        ("Offer", "B_QR_.*_LOG_(BUS_STOP_DENSITY|BUS_LINE_COUNT|METRO_LINE_COUNT)"),
+        ("LOS", "B_.*_(T_VEH|T_ESPERA_INI|T_ESPERA_TRASB|N_TRASB)"),
+        ("Censo", "B_QR_.*_(SHARE_.*)"),
+        ("OSM", "B_QR_.*_(OSM_.*)"),
+        ("EOD", "B_QR_.*_(EOD2012_.*)"),
+        ("Macrozonas", "B_QR_.*_(MACRO_.*)"),
+        ("LogSums", "Mu:.*"),
+    ]
+    model.set_cap(LARCH_MAX_CAP)
+    if spec["family"] == "nested" and "Mu:QR" in model.pf.index:
+        mu_idx = model.pf.index.get_loc("Mu:QR")
+        model.pf.iloc[mu_idx, model.pf.columns.get_loc("minimum")] = 0.01
+        model.pf.iloc[mu_idx, model.pf.columns.get_loc("maximum")] = 1.0
+        model.pf.iloc[mu_idx, model.pf.columns.get_loc("value")] = 0.8
+    return model
+
+
+def estimate_larch_spec(spec: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    cols = required_columns_for_spec(spec)
+    pandas_df = load_larch_numeric_df(spec["sample_path"], cols)
+    model = build_larch_model(pandas_df, spec)
+    model.maximize_loglike(method=LARCH_METHOD, quiet=False, options=LARCH_OPTIONS)
+    model.calculate_parameter_covariance(robust=True)
+    stats = build_larch_stats_frame(model, n_obs=len(pandas_df), spec=spec)
+    params = build_larch_params_frame(model, spec=spec)
+    del pandas_df, model
+    gc.collect()
+    return stats, params
+```
+
+## 5) Diseño de estimación
+
+```{python}
+#| label: estimation-design
+print("label: estimation-design")
+ensure_active_sample_artifacts(MODEL_SPECS)
+assert_active_sample_paths_exist(MODEL_SPECS)
+
+df_design = pl.DataFrame(
+    [
+        {
+            "model": spec["label"],
+            "family": spec["family"],
+            "trip_attr_mode": spec["trip_attr_mode"],
+            "sample_path": spec["sample_path"].name,
+            "n_extra_vars": len(EXTRA_COLS),
+            "n_required_cols": len(required_columns_for_spec(spec)),
+        }
+        for spec in MODEL_SPECS
+    ]
+)
+with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1400):
+    display(df_design)
+```
+
+## 6) Ejecutar modelos
+
+```{python}
+#| label: run-larch-specs
+print("label: run-larch-specs")
+
+stats_frames = []
+params_frames = []
+
+if RUN_ESTIMATION:
+    for spec in MODEL_SPECS:
+        print(f"Estimando Larch: {spec['label']}")
+        stats_path, params_path = result_paths(spec)
+        stats_df, params_df = estimate_larch_spec(spec)
+        stats_df.to_csv(stats_path, index=False)
+        params_df.to_csv(params_path, index=False)
+        stats_frames.append(stats_df)
+        params_frames.append(params_df)
+else:
+    print("RUN_ESTIMATION=False. Se cargarán resultados desde disco si existen.")
+```
+
+## 7) Cargar resultados
+
+```{python}
+#| label: load-results
+print("label: load-results")
+
+loaded_stats = []
+loaded_params = []
+for spec in MODEL_SPECS:
+    stats_path, params_path = result_paths(spec)
+    if stats_path.exists() and params_path.exists():
+        loaded_stats.append(pd.read_csv(stats_path))
+        loaded_params.append(pd.read_csv(params_path))
+        print(f"✅ {spec['label']} -> loaded")
+    else:
+        print(f"⚠️ {spec['label']} -> faltan resultados")
+
+df_stats_all = pd.concat(loaded_stats, ignore_index=True) if loaded_stats else pd.DataFrame()
+df_params_all = pd.concat(loaded_params, ignore_index=True) if loaded_params else pd.DataFrame()
+```
+
+## 8) Resumen de convergencia y ajuste
+
+```{python}
+#| label: larch-convergence-summary
+print("label: larch-convergence-summary")
+
+if df_stats_all.empty:
+    print("No hay stats cargados.")
+else:
+    with pd.option_context("display.max_columns", None, "display.max_rows", None):
+        display(df_stats_all)
+```
+
+## 9) Parámetros completos
+
+```{python}
+#| label: larch-parameters-all
+print("label: larch-parameters-all")
+
+if df_params_all.empty:
+    print("No hay parámetros cargados.")
+else:
+    with pd.option_context("display.max_columns", None, "display.max_rows", None):
+        display(df_params_all)
+```
+
+## 10) Parámetro de nido
+
+```{python}
+#| label: larch-nested-mu-summary
+print("label: larch-nested-mu-summary")
+
+if df_params_all.empty:
+    print("No hay parámetros cargados.")
+else:
+    df_mu = df_params_all[df_params_all["Param"] == "Mu:QR"].copy()
+    if df_mu.empty:
+        print("No hay especificaciones nested cargadas.")
+    else:
+        display(df_mu)
+```
+
+## 11) Tabla wide de parámetros
+
+```{python}
+#| label: larch-parameters-wide
+print("label: larch-parameters-wide")
+
+
+def parse_param_name(param: str) -> tuple[str | None, str]:
+    if param == "Mu:QR":
+        return None, "MU_QR"
+    if param == "ASC_QR_RED":
+        return "QR_RED", "ASC"
+    if param == "ASC_QR_OTHER":
+        return "QR_OTHER", "ASC"
+    for alt in ["BIP", "QR_RED", "QR_OTHER"]:
+        prefix = f"B_{alt}_"
+        if param.startswith(prefix):
+            return alt, param.removeprefix(prefix)
+    return None, param
+
+
+if df_params_all.empty:
+    print("No hay parámetros cargados.")
+else:
+    df_wide_src = df_params_all.copy()
+    parsed = df_wide_src["Param"].map(parse_param_name)
+    df_wide_src["alternative"] = [x[0] for x in parsed]
+    df_wide_src["variable"] = [x[1] for x in parsed]
+    df_wide_src = df_wide_src[df_wide_src["alternative"].notna()].copy()
+    df_wide = df_wide_src.pivot_table(
+        index=["model", "family", "trip_attr_mode", "variable"],
+        columns="alternative",
+        values=["Value", "Robust t-stat.", "Robust p-value"],
+        aggfunc="first",
+    )
+    df_wide.columns = [f"{metric}_{alt.lower()}" for metric, alt in df_wide.columns.to_flat_index()]
+    df_wide = df_wide.reset_index().sort_values(["model", "variable"], kind="stable")
+    with pd.option_context("display.max_columns", None, "display.max_rows", None):
+        display(df_wide)
+```
+
+## 12) Lectura esperada
+
+- `mnl_aggregated_alt_specific`: auditoría Larch del candidato parsimonioso anterior con atributos agregados por alternativa.
+- `nested_aggregated_alt_specific`: sensibilidad nested sobre esa misma definición.
+- `mnl_observed_common`: auditoría Larch de la sensibilidad con atributos observados por viaje.
+- `nested_observed_common`: sensibilidad nested de la especificación observada.
+- En Larch, si `Mu:QR` queda cerca de `1`, el nido QR colapsa hacia MNL; si queda interior pero no significativo o con error estándar grande, tampoco justificaría preferir `Nested`.

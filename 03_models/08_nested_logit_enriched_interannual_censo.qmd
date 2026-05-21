@@ -142,6 +142,8 @@ SOCIO_SECOND_ROUND_RAW_VARS = [
     "share_serv_tel_movil",
     "share_discapacidad",
     "share_analfabet",
+    "share_mujeres",
+    "share_asistencia_parv",
 ]
 SOCIO_ALL_RAW_VARS = SOCIO_RAW_VARS + SOCIO_SECOND_ROUND_RAW_VARS
 SOCIO_Z_VARS = [f"{c}_z" for c in SOCIO_RAW_VARS]
@@ -165,6 +167,8 @@ SOCIO_PARAM_TAGS = {
     "share_serv_tel_movil_z": "SHARE_SERV_TEL_MOVIL_Z",
     "share_discapacidad_z": "SHARE_DISCAPACIDAD_Z",
     "share_analfabet_z": "SHARE_ANALFABET_Z",
+    "share_mujeres_z": "SHARE_MUJERES_Z",
+    "share_asistencia_parv_z": "SHARE_ASISTENCIA_PARV_Z",
     "share_cine18_universitaria_micro_z": "SHARE_CINE18_UNIVERSITARIA_MICRO_Z",
     "share_cine18_universitaria_o_mas_micro_z": "SHARE_CINE18_UNIVERSITARIA_O_MAS_MICRO_Z",
     "share_cine18_terciaria_corta_micro_z": "SHARE_CINE18_TERCIARIA_CORTA_MICRO_Z",
@@ -552,6 +556,19 @@ def build_censo_model_ready_table(
     socio_vars: list[str],
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     df_final = pl.read_parquet(censo_final_path)
+    if "share_mujeres" in socio_vars and "share_mujeres" not in df_final.columns:
+        if {"n_mujeres", "n_per"}.issubset(df_final.columns):
+            df_final = df_final.with_columns(
+                (pl.col("n_mujeres") / pl.when(pl.col("n_per") != 0).then(pl.col("n_per"))).alias("share_mujeres")
+            )
+    if "share_asistencia_parv" in socio_vars and "share_asistencia_parv" not in df_final.columns:
+        if {"n_asistencia_parv", "n_edad_0_5"}.issubset(df_final.columns):
+            df_final = df_final.with_columns(
+                (
+                    pl.col("n_asistencia_parv")
+                    / pl.when(pl.col("n_edad_0_5") != 0).then(pl.col("n_edad_0_5"))
+                ).alias("share_asistencia_parv")
+            )
     missing = [c for c in ["ZONA777"] + socio_vars if c not in df_final.columns]
     if missing:
         raise ValueError(f"Faltan columnas en parquet Censo final: {missing}")
