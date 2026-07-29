@@ -44,8 +44,8 @@ from lib.datalake import read_parquet_portable
 ```{python}
 #| label: params
 print("label: params")
-YEAR_ANALISIS = 2025
-WEEK_ANALISIS = 14
+YEAR_ANALISIS = 2024
+WEEK_ANALISIS = 18
 PARTITION_LABEL = f"{YEAR_ANALISIS}-W{WEEK_ANALISIS:02d}"
 
 FREQ_PATH = PROJECT_ROOT / "tmp" / f"frecuencias_buses_{PARTITION_LABEL}.parquet"
