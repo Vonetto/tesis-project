@@ -1,0 +1,3702 @@
+---
+title: "Tesis - Modelamiento zonal del crecimiento QR 2024-2025"
+author: "Juan Vicente Onetto Romero"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: false
+---
+
+# Objetivo
+
+Este notebook inicia la etapa de modelamiento zonal del crecimiento QR entre
+2024 y 2025. El EDA previo dejo definida la pregunta descriptiva: que zonas
+crecen mas o menos que la tendencia general QR, que variables se alinean con
+esas diferencias y que zonas explican mas volumen agregado.
+
+El objetivo de este notebook no es probar causalidad. La meta es construir una
+secuencia reproducible de modelos predictivo-descriptivos que permita:
+
+1. establecer baselines simples;
+2. medir cuanto agregan las familias de variables candidatas;
+3. comparar lectura por tasa y lectura por volumen;
+4. dejar una especificacion defendible para el manuscrito.
+
+Se modelan dos geografias por separado:
+
+- `Residencia`: tarjetas QR/BIP del ano asociadas a zona hogar;
+- `Origen de viaje`: viajes iniciados en la zona.
+
+La unidad de analisis es la zona `ZONA777`. Las variables territoriales no se
+interpretan como atributos individuales de personas.
+
+# 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+
+from pathlib import Path
+import os
+import sys
+
+MPLCONFIGDIR = Path("/tmp") / "matplotlib-cache"
+MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(MPLCONFIGDIR))
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from IPython.display import display
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import ElasticNetCV, LassoCV, LinearRegression, RidgeCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import GroupKFold, KFold, cross_validate
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+
+pd.set_option("display.max_columns", 100)
+pd.set_option("display.width", 180)
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.append(str(PROJECT_ROOT))
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontro la raiz del proyecto.")
+
+print(PROJECT_ROOT)
+```
+
+# 2) Configuracion
+
+```{python}
+#| label: config
+print("label: config")
+
+SEED = 42
+BASE_MIN_SUPPORT = 250
+PRIMARY_OUTCOME = "delta_relative_pp"
+SECONDARY_OUTCOMES = [
+    "delta_pp",
+    "share_shift_qr_delta",
+    "delta_logit_qr_share_smooth",
+]
+
+GEOGRAPHIES = ["residence", "origin_trip"]
+GEOGRAPHY_LABELS = {
+    "residence": "Residencia",
+    "origin_trip": "Origen de viaje",
+}
+
+MODELS_DIR = PROJECT_ROOT / "03_models"
+ARTIFACTS_DIR = MODELS_DIR / "artifacts" / "zonal_qr_growth_2024_2025"
+RESULTS_DIR = MODELS_DIR / "results" / "18_zonal_qr_growth_modeling"
+FIGURES_DIR = RESULTS_DIR / "figures"
+
+MODEL_PANEL_PATH = ARTIFACTS_DIR / "zonal_qr_growth_model_panel.parquet"
+MODEL_FEATURES_PATH = ARTIFACTS_DIR / "zonal_qr_growth_feature_matrix.parquet"
+MODEL_RESULTS_PATH = RESULTS_DIR / "model_comparison.csv"
+
+for path in [ARTIFACTS_DIR, RESULTS_DIR, FIGURES_DIR]:
+    path.mkdir(parents=True, exist_ok=True)
+
+print(f"model panel path: {MODEL_PANEL_PATH}")
+print(f"feature matrix path: {MODEL_FEATURES_PATH}")
+print(f"results dir: {RESULTS_DIR}")
+```
+
+# 3) Contrato del dataset de modelamiento
+
+El notebook espera un panel zonal con una fila por `zone_id` y `geography_key`.
+La primera iteracion deberia persistir este panel desde
+`02_eda/eda_qr_growth_zonal_2024_2025.qmd`, para evitar recalcular todo el EDA.
+
+Columnas minimas esperadas:
+
+| Familia | Columnas esperadas |
+| --- | --- |
+| Identificacion | `zone_id`, `geography_key`, `geography`, `COMUNA`, `macrozone_group` |
+| Soporte | `n_2024`, `n_2025`, `support_min`, `n_qr_2024`, `n_qr_2025` |
+| Niveles QR | `qr_share_2024`, `qr_share_2025`, `logit_qr_share_2024_smooth` |
+| Outcomes | `delta_pp`, `delta_relative_pp`, `share_shift_qr_delta`, `qr_count_delta`, `delta_logit_qr_share_smooth` |
+| Predictores | variables residenciales, OSM, operacionales, carga BIP y macrozona |
+
+```{python}
+#| label: block0-load-model-panel
+print("label: block0-load-model-panel")
+
+if MODEL_FEATURES_PATH.exists():
+    model_df = pd.read_parquet(MODEL_FEATURES_PATH)
+    print(f"loaded feature matrix: {model_df.shape}")
+elif MODEL_PANEL_PATH.exists():
+    model_df = pd.read_parquet(MODEL_PANEL_PATH)
+    print(f"loaded model panel: {model_df.shape}")
+else:
+    model_df = pd.DataFrame()
+    print(
+        "No existe aun el panel persistido. "
+        "Primer paso operativo: exportar desde el EDA zonal o construir aqui el panel base."
+    )
+
+display(model_df.head() if not model_df.empty else model_df)
+```
+
+# 3.1) Preparacion minima para modelar
+
+Las variables de soporte y volumen se mantienen en el panel original para
+filtrar y ponderar. Para entrar como predictores lineales se crean versiones
+logaritmicas.
+
+```{python}
+#| label: block0b-prepare-model-features
+print("label: block0b-prepare-model-features")
+
+def add_modeling_transforms(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    for source_col in ["support_min", "n_2024", "n_2025"]:
+        if source_col in out.columns:
+            values = pd.to_numeric(out[source_col], errors="coerce")
+            values = values.clip(lower=0)
+            out[f"{source_col}_log"] = np.log1p(values)
+    return out
+
+
+model_df = add_modeling_transforms(model_df)
+
+prepared_cols = [
+    col
+    for col in ["support_min_log", "n_2024_log", "n_2025_log"]
+    if col in model_df.columns
+]
+
+print(f"prepared transformed columns: {prepared_cols}")
+display(model_df[prepared_cols].describe().T if prepared_cols else pd.DataFrame())
+```
+
+# 4) Definicion de outcomes y pesos
+
+Outcome principal:
+
+```text
+delta_relative_pp = delta zonal QR - delta global QR de la geografia
+```
+
+Este outcome responde la pregunta: que zonas crecieron mas o menos que la
+tendencia general QR de su propia geografia.
+
+Pesos candidatos:
+
+- zonas pesan igual: pregunta territorial promedio;
+- `support_min`: reduce ruido de zonas con bajo soporte;
+- `n_2025`: aproxima importancia operacional/volumetrica.
+
+```{python}
+#| label: block1-outcome-and-weights-contract
+print("label: block1-outcome-and-weights-contract")
+
+outcome_contract = pd.DataFrame(
+    [
+        {
+            "outcome": "delta_relative_pp",
+            "uso": "Outcome principal",
+            "lectura": "Crecimiento QR sobre/bajo la tendencia global de la geografia.",
+        },
+        {
+            "outcome": "delta_pp",
+            "uso": "Sensibilidad comunicable",
+            "lectura": "Cambio bruto del share QR zonal entre 2024 y 2025.",
+        },
+        {
+            "outcome": "share_shift_qr_delta",
+            "uso": "Complemento volumetrico",
+            "lectura": "QR equivalentes por cambio de share, fijando volumen 2025.",
+        },
+        {
+            "outcome": "delta_logit_qr_share_smooth",
+            "uso": "Sensibilidad tecnica",
+            "lectura": "Cambio en escala no acotada de proporcion QR suavizada.",
+        },
+    ]
+)
+
+weight_contract = pd.DataFrame(
+    [
+        {"weighting": "unweighted", "weight_col": None, "lectura": "Cada zona pesa igual."},
+        {"weighting": "support_min", "weight_col": "support_min", "lectura": "Mayor peso a zonas con mas soporte comparable."},
+        {"weighting": "n_2025", "weight_col": "n_2025", "lectura": "Mayor peso a zonas con mas volumen 2025."},
+    ]
+)
+
+display(outcome_contract)
+display(weight_contract)
+```
+
+# 4.1) Consideraciones antes de modelar
+
+Hay dos cuidados metodologicos que se deben mantener durante toda la
+comparacion de modelos.
+
+Primero, las variables de soporte y volumen tienen colas fuertes. En modelos
+lineales no deberian entrar crudas. La especificacion base debe usar
+transformaciones tipo `log1p(support_min)` y `log1p(n_2025)`, ademas de
+estandarizacion dentro del `Pipeline`. En modelos de arboles esto es menos
+critico para el ajuste, pero sigue siendo util para mantener una lectura
+comparable.
+
+Segundo, `n_2025` solo es defendible en modelos descriptivos del crecimiento
+observado entre 2024 y 2025. Si el objetivo se formula como prediccion estricta
+de 2025 usando informacion previa, `n_2025` debe reemplazarse por volumen
+pre-periodo, por ejemplo `n_2024` o soporte historico comparable.
+
+La validacion por macrozona tambien debe leerse con cuidado. En `KFold` normal,
+`macrozone_group` funciona como control territorial. En `GroupKFold` por
+macrozona, en cambio, una macrozona completa queda fuera del entrenamiento, por
+lo que el efecto fijo de esa macrozona no puede aprenderse ni transferirse de
+forma directa. Por eso, `GroupKFold` debe reportarse como prueba exigente de
+transferencia territorial. Si su desempeno cae mucho, la lectura no es
+automaticamente que el modelo falla, sino que parte de la senal es territorial y
+no extrapola limpiamente entre macrozonas.
+
+# 5) Familias de predictores
+
+La primera version debe mantener pocas variables, bien interpretables y
+defendibles. El objetivo no es maximizar columnas, sino construir una base para
+comparar familias.
+
+```{python}
+#| label: block2-feature-family-contract
+print("label: block2-feature-family-contract")
+
+FEATURE_FAMILIES = {
+    "base": [
+        "qr_share_2024",
+        "logit_qr_share_2024_smooth",
+        "support_min_log",
+        "n_2024_log",
+        "n_2025_log",
+        "macrozone_group",
+    ],
+    "residence_socio": [
+        "education_university_plus_z",
+        "de_concentration_z",
+        "age_mean_z",
+        "population_25_44",
+        "population_60_plus",
+    ],
+    "urban_osm": [
+        "osm_commerce_services_z",
+        "osm_health_z",
+        "osm_higher_education_z",
+        "osm_civic_z",
+        "osm_sport_z",
+    ],
+    "bip_access": [
+        "bip_charge_distance_m",
+        "bip_charge_density",
+        "bip_charge_points_count",
+    ],
+    "origin_operations": [
+        "metro_station_count",
+        "metro_line_count",
+        "bus_boardings_observed",
+        "bus_stop_hour_supply",
+        "bus_pressure_demand_supply",
+    ],
+}
+
+feature_contract = (
+    pd.DataFrame(
+        [
+            {"family": family, "feature": feature}
+            for family, features in FEATURE_FAMILIES.items()
+            for feature in features
+        ]
+    )
+)
+
+display(feature_contract)
+```
+
+# 6) Dataset analitico por geografia
+
+Esta seccion filtra soporte, separa geografias y define columnas disponibles. La
+primera ejecucion real debe revisar nombres de columnas contra el panel exportado
+desde el EDA.
+
+```{python}
+#| label: block3-build-analysis-datasets
+print("label: block3-build-analysis-datasets")
+
+def available_features(df: pd.DataFrame, candidates: list[str]) -> list[str]:
+    return [col for col in candidates if col in df.columns]
+
+
+def build_analysis_dataset(
+    df: pd.DataFrame,
+    *,
+    geography_key: str,
+    outcome: str = PRIMARY_OUTCOME,
+    min_support: int = BASE_MIN_SUPPORT,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    if df.empty:
+        return pd.DataFrame(), [], []
+
+    base = df.loc[
+        df["geography_key"].eq(geography_key)
+        & df["support_min"].ge(min_support)
+        & df[outcome].notna()
+    ].copy()
+
+    if geography_key == "residence":
+        families = ["base", "residence_socio", "urban_osm", "bip_access"]
+    elif geography_key == "origin_trip":
+        families = ["base", "origin_operations", "urban_osm", "bip_access"]
+    else:
+        raise ValueError(f"geography_key no reconocida: {geography_key}")
+
+    feature_candidates = [
+        feature
+        for family in families
+        for feature in FEATURE_FAMILIES[family]
+    ]
+    features = available_features(base, feature_candidates)
+    categorical_features = [col for col in ["macrozone_group"] if col in features]
+    numeric_features = [col for col in features if col not in categorical_features]
+    return base, numeric_features, categorical_features
+
+
+analysis_datasets = {}
+for geography_key in GEOGRAPHIES:
+    data, numeric_features, categorical_features = build_analysis_dataset(
+        model_df,
+        geography_key=geography_key,
+    )
+    analysis_datasets[geography_key] = {
+        "data": data,
+        "numeric_features": numeric_features,
+        "categorical_features": categorical_features,
+    }
+    print(
+        geography_key,
+        f"rows={len(data)}",
+        f"numeric={len(numeric_features)}",
+        f"categorical={categorical_features}",
+    )
+```
+
+# 7) Validacion
+
+Con solo 2024--2025, la validacion no es temporal pura. La primera version usara:
+
+- `KFold` por zonas para performance general;
+- sensibilidad con ponderacion por soporte;
+- posteriormente, `GroupKFold` por macrozona para evaluar transferencia
+  territorial.
+
+```{python}
+#| label: block4-validation-design
+print("label: block4-validation-design")
+
+validation_contract = pd.DataFrame(
+    [
+        {
+            "validacion": "KFold zonas",
+            "uso": "Baseline principal",
+            "lectura": "Capacidad predictiva promedio entre zonas.",
+        },
+        {
+            "validacion": "KFold ponderado por soporte",
+            "uso": "Sensibilidad operacional",
+            "lectura": "Da mas peso a zonas con mayor soporte comparable.",
+        },
+        {
+            "validacion": "GroupKFold macrozona",
+            "uso": "Sensibilidad espacial",
+            "lectura": "Evalua si el modelo transfiere entre estructuras territoriales.",
+        },
+    ]
+)
+display(validation_contract)
+```
+
+# 8) Modelos baseline
+
+Orden recomendado:
+
+- `M0`: media del outcome;
+- `M1`: `share QR 2024`;
+- `M2`: `share QR 2024 + soporte/volumen`;
+- `M3`: `share QR 2024 + soporte/volumen + macrozona`.
+
+```{python}
+#| label: block5-baseline-model-contract
+print("label: block5-baseline-model-contract")
+
+MODEL_SPECS = [
+    {
+        "model_id": "M0_mean",
+        "label": "Media del outcome",
+        "features": [],
+        "categorical": [],
+        "estimator": "DummyRegressor",
+    },
+    {
+        "model_id": "M1_initial_qr",
+        "label": "QR inicial",
+        "features": ["qr_share_2024"],
+        "categorical": [],
+        "estimator": "LinearRegression",
+    },
+    {
+        "model_id": "M2_initial_qr_support",
+        "label": "QR inicial + soporte/volumen log",
+        "features": ["qr_share_2024", "support_min_log", "n_2025_log"],
+        "categorical": [],
+        "estimator": "LinearRegression",
+    },
+    {
+        "model_id": "M3_initial_qr_support_macrozone",
+        "label": "QR inicial + soporte/volumen log + macrozona",
+        "features": ["qr_share_2024", "support_min_log", "n_2025_log", "macrozone_group"],
+        "categorical": ["macrozone_group"],
+        "estimator": "LinearRegression",
+    },
+]
+
+display(pd.DataFrame(MODEL_SPECS))
+```
+
+# 8.1) Plan de validacion para baselines
+
+La primera corrida compara los baselines con tres lecturas. `GroupKFold` se
+trata como stress test territorial y, por defecto, remueve `macrozone_group`
+como predictor para no evaluar un efecto fijo que no puede aprenderse en la
+macrozona excluida.
+
+```{python}
+#| label: block5b-baseline-validation-plan
+print("label: block5b-baseline-validation-plan")
+
+BASELINE_VALIDATION_PLAN = [
+    {
+        "validation_id": "kfold_zones",
+        "validation": "KFold zonas",
+        "weighting": "unweighted",
+        "weight_col": None,
+        "group_col": None,
+        "drop_group_predictor": False,
+        "lectura": "Validacion interna promedio entre zonas.",
+    },
+    {
+        "validation_id": "kfold_support_weighted",
+        "validation": "KFold ponderado por soporte",
+        "weighting": "support_min",
+        "weight_col": "support_min",
+        "group_col": None,
+        "drop_group_predictor": False,
+        "lectura": "Misma particion aleatoria, pero zonas con mayor soporte pesan mas.",
+    },
+    {
+        "validation_id": "groupkfold_macrozone",
+        "validation": "GroupKFold macrozona",
+        "weighting": "unweighted",
+        "weight_col": None,
+        "group_col": "macrozone_group",
+        "drop_group_predictor": True,
+        "lectura": "Stress test de transferencia territorial; macrozona se excluye como predictor.",
+    },
+]
+
+display(pd.DataFrame(BASELINE_VALIDATION_PLAN))
+```
+
+# 8.2) Helpers modulares para pipelines y validacion
+
+```{python}
+#| label: block5c-baseline-modeling-helpers
+print("label: block5c-baseline-modeling-helpers")
+
+def make_one_hot_encoder() -> OneHotEncoder:
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+
+def make_estimator(estimator_name: str):
+    if estimator_name == "DummyRegressor":
+        return DummyRegressor(strategy="mean")
+    if estimator_name == "LinearRegression":
+        return LinearRegression()
+    if estimator_name == "RidgeCV":
+        return RidgeCV(alphas=np.logspace(-3, 3, 25))
+    if estimator_name == "LassoCV":
+        return LassoCV(
+            alphas=np.logspace(-4, 1, 40),
+            cv=5,
+            random_state=SEED,
+            max_iter=10000,
+        )
+    if estimator_name == "ElasticNetCV":
+        return ElasticNetCV(
+            alphas=np.logspace(-4, 1, 40),
+            l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9],
+            cv=5,
+            random_state=SEED,
+            max_iter=10000,
+        )
+    if estimator_name == "RandomForestRegressor":
+        return RandomForestRegressor(
+            n_estimators=500,
+            max_depth=4,
+            min_samples_leaf=20,
+            max_features="sqrt",
+            random_state=SEED,
+            n_jobs=-1,
+        )
+    if estimator_name == "XGBoostRegressor":
+        try:
+            from xgboost import XGBRegressor
+        except ImportError as exc:
+            raise ImportError(
+                "xgboost no esta instalado en este entorno. "
+                "Usa RandomForestRegressor o instala xgboost antes de correr este bloque."
+            ) from exc
+        return XGBRegressor(
+            n_estimators=300,
+            max_depth=2,
+            learning_rate=0.03,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="reg:squarederror",
+            random_state=SEED,
+            n_jobs=-1,
+        )
+    raise ValueError(f"Estimador no soportado aun: {estimator_name}")
+
+
+def make_regression_pipeline(
+    *,
+    numeric_features: list[str],
+    categorical_features: list[str],
+    estimator_name: str,
+) -> Pipeline:
+    estimator = make_estimator(estimator_name)
+    if estimator_name == "DummyRegressor":
+        return Pipeline([("estimator", estimator)])
+
+    tree_estimators = {"RandomForestRegressor", "XGBoostRegressor"}
+    transformers = []
+    if numeric_features:
+        numeric_steps = [("imputer", SimpleImputer(strategy="median"))]
+        if estimator_name not in tree_estimators:
+            numeric_steps.append(("scaler", StandardScaler()))
+        transformers.append(
+            (
+                "num",
+                Pipeline(numeric_steps),
+                numeric_features,
+            )
+        )
+    if categorical_features:
+        transformers.append(
+            (
+                "cat",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("onehot", make_one_hot_encoder()),
+                    ]
+                ),
+                categorical_features,
+            )
+        )
+
+    if not transformers:
+        raise ValueError("Modelo lineal sin predictores. Usa DummyRegressor.")
+
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+    return Pipeline(
+        [
+            ("preprocessor", preprocessor),
+            ("estimator", estimator),
+        ]
+    )
+
+
+def prepare_spec_features(
+    data: pd.DataFrame,
+    spec: dict,
+    validation_plan: dict,
+) -> dict:
+    requested_features = list(spec["features"])
+    requested_categorical = list(spec.get("categorical", []))
+    dropped_for_validation = []
+
+    if validation_plan.get("drop_group_predictor"):
+        group_col = validation_plan.get("group_col")
+        requested_features = [col for col in requested_features if col != group_col]
+        requested_categorical = [col for col in requested_categorical if col != group_col]
+        if group_col in spec["features"]:
+            dropped_for_validation.append(group_col)
+
+    missing_features = [col for col in requested_features if col not in data.columns]
+    features = [col for col in requested_features if col in data.columns]
+    categorical_features = [col for col in requested_categorical if col in features]
+    numeric_features = [col for col in features if col not in categorical_features]
+
+    return {
+        "features": features,
+        "numeric_features": numeric_features,
+        "categorical_features": categorical_features,
+        "missing_features": missing_features,
+        "dropped_for_validation": dropped_for_validation,
+    }
+
+
+def normalized_sample_weight(data: pd.DataFrame, weight_col: str | None) -> np.ndarray | None:
+    if weight_col is None:
+        return None
+    if weight_col not in data.columns:
+        raise KeyError(f"No existe columna de peso: {weight_col}")
+
+    weights = pd.to_numeric(data[weight_col], errors="coerce")
+    valid = weights.replace([np.inf, -np.inf], np.nan)
+    fallback = valid.loc[valid.gt(0)].median()
+    if not np.isfinite(fallback):
+        fallback = 1.0
+    valid = valid.where(valid.gt(0), fallback).fillna(fallback)
+    mean_weight = valid.mean()
+    if not np.isfinite(mean_weight) or mean_weight <= 0:
+        mean_weight = 1.0
+    return (valid / mean_weight).to_numpy()
+
+
+def iter_validation_splits(
+    data: pd.DataFrame,
+    validation_plan: dict,
+    *,
+    n_splits: int = 5,
+):
+    if validation_plan["group_col"] is None:
+        splitter = KFold(
+            n_splits=min(n_splits, len(data)),
+            shuffle=True,
+            random_state=SEED,
+        )
+        yield from splitter.split(data)
+        return
+
+    group_col = validation_plan["group_col"]
+    if group_col not in data.columns:
+        raise KeyError(f"No existe columna de grupo: {group_col}")
+
+    groups = data[group_col].astype("string").fillna("Sin macrozona")
+    n_groups = groups.nunique()
+    if n_groups < 2:
+        raise ValueError(f"No hay suficientes grupos para GroupKFold: {n_groups}")
+
+    splitter = GroupKFold(n_splits=min(n_splits, n_groups))
+    yield from splitter.split(data, groups=groups)
+
+
+def evaluate_model_cv(
+    data: pd.DataFrame,
+    spec: dict,
+    validation_plan: dict,
+    *,
+    geography_key: str,
+    outcome: str = PRIMARY_OUTCOME,
+) -> pd.DataFrame:
+    if data.empty:
+        return pd.DataFrame()
+
+    model_data = data.loc[data[outcome].notna()].reset_index(drop=True).copy()
+    feature_info = prepare_spec_features(model_data, spec, validation_plan)
+    if feature_info["missing_features"]:
+        return pd.DataFrame(
+            [
+                {
+                    "geography_key": geography_key,
+                    "geography": GEOGRAPHY_LABELS.get(geography_key, geography_key),
+                    "model_id": spec["model_id"],
+                    "label": spec["label"],
+                    "validation_id": validation_plan["validation_id"],
+                    "validation": validation_plan["validation"],
+                    "weighting": validation_plan["weighting"],
+                    "status": "missing_features",
+                    "missing_features": ", ".join(feature_info["missing_features"]),
+                }
+            ]
+        )
+
+    y = model_data[outcome].astype(float).to_numpy()
+    X = (
+        model_data[feature_info["features"]].copy()
+        if feature_info["features"]
+        else pd.DataFrame(index=model_data.index)
+    )
+    sample_weight = normalized_sample_weight(model_data, validation_plan["weight_col"])
+    pipeline = make_regression_pipeline(
+        numeric_features=feature_info["numeric_features"],
+        categorical_features=feature_info["categorical_features"],
+        estimator_name=spec["estimator"],
+    )
+
+    rows = []
+    for fold_id, (train_idx, test_idx) in enumerate(
+        iter_validation_splits(model_data, validation_plan),
+        start=1,
+    ):
+        fitted = clone(pipeline)
+        fit_kwargs = {}
+        if sample_weight is not None:
+            fit_kwargs["estimator__sample_weight"] = sample_weight[train_idx]
+        fitted.fit(X.iloc[train_idx], y[train_idx], **fit_kwargs)
+
+        y_pred = fitted.predict(X.iloc[test_idx])
+        test_weight = sample_weight[test_idx] if sample_weight is not None else None
+
+        mse = mean_squared_error(y[test_idx], y_pred, sample_weight=test_weight)
+        rows.append(
+            {
+                "geography_key": geography_key,
+                "geography": GEOGRAPHY_LABELS.get(geography_key, geography_key),
+                "model_id": spec["model_id"],
+                "label": spec["label"],
+                "validation_id": validation_plan["validation_id"],
+                "validation": validation_plan["validation"],
+                "weighting": validation_plan["weighting"],
+                "outcome": outcome,
+                "fold": fold_id,
+                "fold_n": len(test_idx),
+                "fold_weight_sum": (
+                    float(np.sum(test_weight)) if test_weight is not None else float(len(test_idx))
+                ),
+                "r2": r2_score(y[test_idx], y_pred, sample_weight=test_weight),
+                "rmse_pp": float(np.sqrt(mse)),
+                "mae_pp": mean_absolute_error(y[test_idx], y_pred, sample_weight=test_weight),
+                "features_used": ", ".join(feature_info["features"]),
+                "categorical_used": ", ".join(feature_info["categorical_features"]),
+                "features_dropped_for_validation": ", ".join(feature_info["dropped_for_validation"]),
+                "missing_features": "",
+                "status": "ok",
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def summarize_cv_results(fold_results: pd.DataFrame) -> pd.DataFrame:
+    if fold_results.empty:
+        return fold_results.copy()
+
+    ok = fold_results.loc[fold_results["status"].eq("ok")].copy()
+    if ok.empty:
+        return fold_results.copy()
+
+    group_cols = [
+        "geography_key",
+        "geography",
+        "model_id",
+        "label",
+        "validation_id",
+        "validation",
+        "weighting",
+        "outcome",
+        "features_used",
+        "categorical_used",
+        "features_dropped_for_validation",
+    ]
+
+    summaries = []
+    for keys, part in ok.groupby(group_cols, dropna=False):
+        weights = part["fold_weight_sum"].to_numpy()
+        summaries.append(
+            {
+                **dict(zip(group_cols, keys)),
+                "n_folds": int(part["fold"].nunique()),
+                "n_zones": int(part["fold_n"].sum()),
+                "r2_mean": float(np.average(part["r2"], weights=weights)),
+                "rmse_pp": float(np.average(part["rmse_pp"], weights=weights)),
+                "mae_pp": float(np.average(part["mae_pp"], weights=weights)),
+                "status": "ok",
+            }
+        )
+
+    return pd.DataFrame(summaries)
+
+print("helpers ready")
+```
+
+# 8.3) Ejecutar baselines M0--M3
+
+```{python}
+#| label: block5d-run-baseline-models
+print("label: block5d-run-baseline-models")
+
+baseline_fold_results = []
+
+for geography_key, bundle in analysis_datasets.items():
+    data = bundle["data"]
+    if data.empty:
+        print(f"{geography_key}: sin datos; se omite.")
+        continue
+
+    for spec in MODEL_SPECS:
+        for validation_plan in BASELINE_VALIDATION_PLAN:
+            result = evaluate_model_cv(
+                data,
+                spec,
+                validation_plan,
+                geography_key=geography_key,
+            )
+            if not result.empty:
+                baseline_fold_results.append(result)
+
+baseline_fold_results = (
+    pd.concat(baseline_fold_results, ignore_index=True)
+    if baseline_fold_results
+    else pd.DataFrame()
+)
+baseline_summary = summarize_cv_results(baseline_fold_results)
+
+BASELINE_FOLD_RESULTS_PATH = RESULTS_DIR / "baseline_model_fold_results.csv"
+BASELINE_SUMMARY_PATH = RESULTS_DIR / "baseline_model_summary.csv"
+
+if not baseline_fold_results.empty:
+    baseline_fold_results.to_csv(BASELINE_FOLD_RESULTS_PATH, index=False)
+if not baseline_summary.empty:
+    baseline_summary.to_csv(BASELINE_SUMMARY_PATH, index=False)
+
+display_cols = [
+    "geography",
+    "model_id",
+    "label",
+    "validation",
+    "weighting",
+    "n_zones",
+    "n_folds",
+    "r2_mean",
+    "rmse_pp",
+    "mae_pp",
+    "features_dropped_for_validation",
+]
+
+if baseline_summary.empty:
+    display(baseline_summary)
+else:
+    baseline_display = baseline_summary[display_cols].copy()
+    for col in ["r2_mean", "rmse_pp", "mae_pp"]:
+        baseline_display[col] = baseline_display[col].round(3)
+    display(
+        baseline_display.sort_values(
+            ["geography", "validation", "model_id"],
+            ascending=[True, True, True],
+        )
+    )
+    print(f"saved: {BASELINE_SUMMARY_PATH}")
+```
+
+# 8.4) Lectura preliminar del baseline
+
+La primera corrida de baselines deja una conclusion acotada: el baseline tiene
+senal, pero todavia no alcanza como modelo final. Con zonas pesando igual, el
+mejor modelo base llega a un `R2` cercano a 0.11--0.12 en ambas geografias. Esto
+indica que QR inicial, soporte/volumen y macrozona capturan parte de la
+estructura, pero dejan mucho crecimiento relativo sin explicar.
+
+El salto mas claro del baseline aparece al agregar macrozona. En validacion
+interna por zonas, pasar de QR inicial mas soporte/volumen a esa misma
+especificacion con macrozona mejora el desempeno en residencia y origen de
+viaje. La estructura territorial gruesa no funciona solo como control
+secundario, sino como parte central de la senal descriptiva.
+
+La lectura cambia al ponderar por soporte. En origen de viaje, el modelo base
+ponderado por soporte alcanza un desempeno bastante mayor que el modelo con
+zonas pesando igual; en residencia la mejora existe, pero es menor. Esto sugiere
+que el crecimiento QR es mas predecible en zonas con mayor volumen observado y
+menos ruido muestral, especialmente cuando se modela la geografia de origen de
+viaje.
+
+El stress test `GroupKFold` por macrozona queda debil o negativo. Esta caida no
+debe interpretarse automaticamente como falla del modelo, sino como evidencia de
+que la senal no transfiere limpiamente entre macrozonas. Parte importante del
+fenomeno parece estar estructurada territorialmente.
+
+El siguiente paso queda justificado: probar si las familias candidatas agregan
+informacion sobre este baseline, en particular variables operacionales para
+origen de viaje y variables socioeconomicas/urbanas para residencia.
+
+# 9) Modelos interpretables por familias
+
+Despues de los baselines se agregan familias de variables de forma incremental.
+Esto permite responder si la senal socioeconomica, operacional, urbana o de
+carga BIP agrega informacion sobre el baseline.
+
+```{python}
+#| label: block6-family-model-contract
+print("label: block6-family-model-contract")
+
+family_model_contract = pd.DataFrame(
+    [
+        {
+            "geography_key": "residence",
+            "model_id": "R1_base",
+            "families": "base",
+            "pregunta": "Cuanto predice QR inicial, soporte y macrozona?",
+        },
+        {
+            "geography_key": "residence",
+            "model_id": "R2_base_socio",
+            "families": "base + residence_socio",
+            "pregunta": "Agrega senal el eje socioeconomico residencial?",
+        },
+        {
+            "geography_key": "residence",
+            "model_id": "R3_base_socio_osm_bip",
+            "families": "base + residence_socio + urban_osm + bip_access",
+            "pregunta": "Que queda al sumar entorno urbano y control BIP?",
+        },
+        {
+            "geography_key": "origin_trip",
+            "model_id": "O1_base",
+            "families": "base",
+            "pregunta": "Cuanto predice QR inicial, soporte y macrozona?",
+        },
+        {
+            "geography_key": "origin_trip",
+            "model_id": "O2_base_ops",
+            "families": "base + origin_operations",
+            "pregunta": "Agrega senal el contexto operacional?",
+        },
+        {
+            "geography_key": "origin_trip",
+            "model_id": "O3_base_ops_osm_bip",
+            "families": "base + origin_operations + urban_osm + bip_access",
+            "pregunta": "Que queda al sumar centralidad urbana y control BIP?",
+        },
+    ]
+)
+
+display(family_model_contract)
+```
+
+# 9.1) Construir especificaciones de modelos por familias
+
+Para que la comparacion sea limpia, el bloque `base` usado en estos modelos es
+el mismo baseline descriptivo de `M3`: QR inicial, soporte/volumen log y
+macrozona. Otras variantes de base, como usar volumen 2024 para prediccion
+estricta, quedan para sensibilidad posterior.
+
+```{python}
+#| label: block6b-build-family-model-specs
+print("label: block6b-build-family-model-specs")
+
+FAMILY_BASE_FEATURES_DESCRIPTIVE = [
+    "qr_share_2024",
+    "support_min_log",
+    "n_2025_log",
+    "macrozone_group",
+]
+
+
+def parse_family_expression(family_expression: str) -> list[str]:
+    return [
+        part.strip()
+        for part in family_expression.split("+")
+        if part.strip()
+    ]
+
+
+def dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def features_for_family_expression(family_expression: str) -> list[str]:
+    features = []
+    for family in parse_family_expression(family_expression):
+        if family == "base":
+            features.extend(FAMILY_BASE_FEATURES_DESCRIPTIVE)
+            continue
+        if family not in FEATURE_FAMILIES:
+            raise KeyError(f"Familia no reconocida: {family}")
+        features.extend(FEATURE_FAMILIES[family])
+    return dedupe_preserve_order(features)
+
+
+def build_family_model_specs(contract: pd.DataFrame) -> list[dict]:
+    specs = []
+    for _, row in contract.iterrows():
+        features = features_for_family_expression(row["families"])
+        categorical = [col for col in ["macrozone_group"] if col in features]
+        specs.append(
+            {
+                "model_id": row["model_id"],
+                "label": row["families"],
+                "geography_key": row["geography_key"],
+                "features": features,
+                "categorical": categorical,
+                "estimator": "LinearRegression",
+                "pregunta": row["pregunta"],
+            }
+        )
+    return specs
+
+
+FAMILY_MODEL_SPECS = build_family_model_specs(family_model_contract)
+
+family_model_specs_display = pd.DataFrame(
+    [
+        {
+            "geography_key": spec["geography_key"],
+            "model_id": spec["model_id"],
+            "label": spec["label"],
+            "n_features": len(spec["features"]),
+            "categorical": spec["categorical"],
+            "pregunta": spec["pregunta"],
+        }
+        for spec in FAMILY_MODEL_SPECS
+    ]
+)
+
+display(family_model_specs_display)
+```
+
+# 9.2) Ejecutar modelos por familias
+
+La lectura principal es incremental: cada modelo se compara contra `R1_base` u
+`O1_base` dentro de la misma geografia, validacion y ponderacion.
+
+```{python}
+#| label: block6c-run-family-models
+print("label: block6c-run-family-models")
+
+def add_delta_vs_base(
+    summary: pd.DataFrame,
+    *,
+    base_reference: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    if summary.empty:
+        return summary.copy()
+
+    base_model_by_geography = {
+        "residence": "R1_base",
+        "origin_trip": "O1_base",
+    }
+
+    out = summary.copy()
+    out["base_model_id"] = out["geography_key"].map(base_model_by_geography)
+    reference = out if base_reference is None else base_reference.copy()
+    reference["base_model_id"] = reference["geography_key"].map(base_model_by_geography)
+
+    base_cols = [
+        "geography_key",
+        "validation_id",
+        "weighting",
+        "outcome",
+        "model_id",
+        "r2_mean",
+        "rmse_pp",
+        "mae_pp",
+    ]
+    base = reference.loc[
+        reference["model_id"].eq(reference["base_model_id"]),
+        base_cols,
+    ].rename(
+        columns={
+            "model_id": "base_model_id",
+            "r2_mean": "base_r2_mean",
+            "rmse_pp": "base_rmse_pp",
+            "mae_pp": "base_mae_pp",
+        }
+    )
+
+    out = out.merge(
+        base,
+        on=["geography_key", "validation_id", "weighting", "outcome", "base_model_id"],
+        how="left",
+    )
+    out["delta_r2_vs_base"] = out["r2_mean"] - out["base_r2_mean"]
+    out["delta_rmse_pp_vs_base"] = out["base_rmse_pp"] - out["rmse_pp"]
+    out["delta_mae_pp_vs_base"] = out["base_mae_pp"] - out["mae_pp"]
+    return out
+
+
+family_fold_results = []
+
+for spec in FAMILY_MODEL_SPECS:
+    geography_key = spec["geography_key"]
+    data = analysis_datasets.get(geography_key, {}).get("data", pd.DataFrame())
+    if data.empty:
+        print(f"{geography_key}: sin datos; se omite {spec['model_id']}.")
+        continue
+
+    for validation_plan in BASELINE_VALIDATION_PLAN:
+        result = evaluate_model_cv(
+            data,
+            spec,
+            validation_plan,
+            geography_key=geography_key,
+        )
+        if not result.empty:
+            family_fold_results.append(result)
+
+family_fold_results = (
+    pd.concat(family_fold_results, ignore_index=True)
+    if family_fold_results
+    else pd.DataFrame()
+)
+family_summary = add_delta_vs_base(summarize_cv_results(family_fold_results))
+
+FAMILY_FOLD_RESULTS_PATH = RESULTS_DIR / "family_model_fold_results.csv"
+FAMILY_SUMMARY_PATH = RESULTS_DIR / "family_model_summary.csv"
+
+if not family_fold_results.empty:
+    family_fold_results.to_csv(FAMILY_FOLD_RESULTS_PATH, index=False)
+if not family_summary.empty:
+    family_summary.to_csv(FAMILY_SUMMARY_PATH, index=False)
+
+family_display_cols = [
+    "geography",
+    "model_id",
+    "label",
+    "validation",
+    "weighting",
+    "n_zones",
+    "n_folds",
+    "r2_mean",
+    "delta_r2_vs_base",
+    "rmse_pp",
+    "delta_rmse_pp_vs_base",
+    "mae_pp",
+    "features_dropped_for_validation",
+]
+
+if family_summary.empty:
+    display(family_summary)
+else:
+    family_display = family_summary[family_display_cols].copy()
+    for col in ["r2_mean", "delta_r2_vs_base", "rmse_pp", "delta_rmse_pp_vs_base", "mae_pp"]:
+        family_display[col] = family_display[col].round(3)
+    display(
+        family_display.sort_values(
+            ["geography", "validation", "model_id"],
+            ascending=[True, True, True],
+        )
+    )
+    print(f"saved: {FAMILY_SUMMARY_PATH}")
+```
+
+# 10) Regularizacion
+
+Se usara Ridge/Lasso/Elastic Net como sensibilidad para colinealidad. La
+interpretacion principal debe seguir viniendo de modelos parsimoniosos y
+comparacion de familias.
+
+```{python}
+#| label: block7-regularization-contract
+print("label: block7-regularization-contract")
+
+regularization_contract = pd.DataFrame(
+    [
+        {"modelo": "RidgeCV", "uso": "Manejar colinealidad sin seleccion dura de variables."},
+        {"modelo": "LassoCV", "uso": "Seleccion parsimoniosa exploratoria."},
+        {"modelo": "ElasticNetCV", "uso": "Compromiso entre Ridge y Lasso."},
+    ]
+)
+
+display(regularization_contract)
+```
+
+# 10.1) Ejecutar regularizacion sobre modelos por familias
+
+La primera lectura regularizada prioriza `RidgeCV`, porque controla
+colinealidad sin seleccionar variables de forma dura. `LassoCV` y
+`ElasticNetCV` se reportan como sensibilidad exploratoria.
+
+```{python}
+#| label: block7b-run-regularized-family-models
+print("label: block7b-run-regularized-family-models")
+
+REGULARIZED_ESTIMATORS = ["RidgeCV", "LassoCV", "ElasticNetCV"]
+
+
+def build_regularized_family_specs(
+    family_specs: list[dict],
+    estimators: list[str],
+) -> list[dict]:
+    specs = []
+    for family_spec in family_specs:
+        if family_spec["model_id"] in ["R1_base", "O1_base"]:
+            continue
+        for estimator_name in estimators:
+            spec = family_spec.copy()
+            spec["estimator"] = estimator_name
+            spec["model_id"] = f"{family_spec['model_id']}__{estimator_name}"
+            spec["label"] = f"{family_spec['label']} | {estimator_name}"
+            specs.append(spec)
+    return specs
+
+
+REGULARIZED_FAMILY_MODEL_SPECS = build_regularized_family_specs(
+    FAMILY_MODEL_SPECS,
+    REGULARIZED_ESTIMATORS,
+)
+
+regularized_specs_display = pd.DataFrame(
+    [
+        {
+            "geography_key": spec["geography_key"],
+            "model_id": spec["model_id"],
+            "estimator": spec["estimator"],
+            "n_features": len(spec["features"]),
+            "categorical": spec["categorical"],
+        }
+        for spec in REGULARIZED_FAMILY_MODEL_SPECS
+    ]
+)
+display(regularized_specs_display)
+
+regularized_fold_results = []
+
+for spec in REGULARIZED_FAMILY_MODEL_SPECS:
+    geography_key = spec["geography_key"]
+    data = analysis_datasets.get(geography_key, {}).get("data", pd.DataFrame())
+    if data.empty:
+        print(f"{geography_key}: sin datos; se omite {spec['model_id']}.")
+        continue
+
+    for validation_plan in BASELINE_VALIDATION_PLAN:
+        result = evaluate_model_cv(
+            data,
+            spec,
+            validation_plan,
+            geography_key=geography_key,
+        )
+        if not result.empty:
+            regularized_fold_results.append(result)
+
+regularized_fold_results = (
+    pd.concat(regularized_fold_results, ignore_index=True)
+    if regularized_fold_results
+    else pd.DataFrame()
+)
+regularized_summary = add_delta_vs_base(
+    summarize_cv_results(regularized_fold_results),
+    base_reference=family_summary if "family_summary" in globals() else None,
+)
+
+REGULARIZED_FOLD_RESULTS_PATH = RESULTS_DIR / "regularized_family_model_fold_results.csv"
+REGULARIZED_SUMMARY_PATH = RESULTS_DIR / "regularized_family_model_summary.csv"
+
+if not regularized_fold_results.empty:
+    regularized_fold_results.to_csv(REGULARIZED_FOLD_RESULTS_PATH, index=False)
+if not regularized_summary.empty:
+    regularized_summary.to_csv(REGULARIZED_SUMMARY_PATH, index=False)
+
+regularized_display_cols = [
+    "geography",
+    "model_id",
+    "label",
+    "validation",
+    "weighting",
+    "n_zones",
+    "n_folds",
+    "r2_mean",
+    "delta_r2_vs_base",
+    "rmse_pp",
+    "delta_rmse_pp_vs_base",
+    "mae_pp",
+    "features_dropped_for_validation",
+]
+
+if regularized_summary.empty:
+    display(regularized_summary)
+else:
+    regularized_display = regularized_summary[regularized_display_cols].copy()
+    for col in ["r2_mean", "delta_r2_vs_base", "rmse_pp", "delta_rmse_pp_vs_base", "mae_pp"]:
+        regularized_display[col] = regularized_display[col].round(3)
+    display(
+        regularized_display.sort_values(
+            ["geography", "validation", "model_id"],
+            ascending=[True, True, True],
+        )
+    )
+    print(f"saved: {REGULARIZED_SUMMARY_PATH}")
+```
+
+# 10.2) Lectura preliminar de regularizacion
+
+La regularizacion no cambia la lectura general de los modelos por familias. En
+origen de viaje, agregar variables operacionales al baseline mejora solo de
+forma marginal cuando cada zona pesa igual. En la validacion ponderada por
+soporte, que es donde el baseline era mas fuerte, las especificaciones con
+operacion quedan por debajo del modelo base. Al sumar OSM y acceso a carga BIP,
+el desempeno tambien cae o no mejora de forma consistente.
+
+En residencia aparece la senal regularizada mas clara, aunque sigue siendo
+moderada. El bloque socioeconomico con `RidgeCV` mejora el modelo base cuando se
+pondera por soporte y tambien mejora el stress test por macrozona, aunque en
+este ultimo caso el `R2` sigue siendo negativo. Con zonas pesando igual, la
+mejora socioeconomica practicamente desaparece.
+
+Agregar OSM y variables de acceso fisico a carga BIP no mejora sobre el bloque
+socioeconomico residencial. En esta especificacion, esas variables parecen
+aportar mas ruido o redundancia que informacion predictiva estable.
+
+El finding del bloque es que el bajo aporte de las familias candidatas no parece
+ser solo un problema de colinealidad de OLS. `RidgeCV`, `LassoCV` y
+`ElasticNetCV` recuperan a lo mas mejoras pequenas. Esto deja abierto un ultimo
+chequeo predictivo no lineal: evaluar si hay interacciones o umbrales que los
+modelos lineales no capturan, sin interpretar ese benchmark como evidencia
+causal.
+
+# 11) Benchmark predictivo
+
+Solo despues de baselines e interpretables. La lectura debe ser: techo
+predictivo y no explicacion causal.
+
+Modelos candidatos:
+
+- Random Forest Regressor;
+- Gradient Boosting / XGBoost si queda disponible y justificado;
+- comparacion contra Ridge/Elastic Net.
+
+```{python}
+#| label: block8-predictive-benchmark-contract
+print("label: block8-predictive-benchmark-contract")
+
+benchmark_contract = pd.DataFrame(
+    [
+        {
+            "modelo": "RandomForestRegressor",
+            "rol": "Benchmark no lineal",
+            "lectura": "Evalua si hay techo predictivo mayor con interacciones no lineales.",
+        },
+        {
+            "modelo": "XGBoostRegressor",
+            "rol": "Benchmark predictivo opcional",
+            "lectura": "Usar solo si mejora de forma estable y con validacion clara.",
+        },
+    ]
+)
+
+display(benchmark_contract)
+```
+
+# 11.1) Ejecutar benchmark no lineal
+
+El benchmark no lineal se usa como chequeo de techo predictivo. No se interpreta
+como modelo causal ni como seleccion final de mecanismos. La primera version
+corre `RandomForestRegressor` sobre las especificaciones completas de cada
+geografia. `XGBoostRegressor` se intenta solo si la libreria esta disponible.
+
+```{python}
+#| label: block8b-run-nonlinear-benchmark
+print("label: block8b-run-nonlinear-benchmark")
+
+NONLINEAR_ESTIMATORS = ["RandomForestRegressor", "XGBoostRegressor"]
+NONLINEAR_SOURCE_MODELS = {
+    "residence": "R3_base_socio_osm_bip",
+    "origin_trip": "O3_base_ops_osm_bip",
+}
+
+
+def build_nonlinear_specs(
+    family_specs: list[dict],
+    estimators: list[str],
+) -> list[dict]:
+    specs = []
+    by_id = {spec["model_id"]: spec for spec in family_specs}
+    for geography_key, source_model_id in NONLINEAR_SOURCE_MODELS.items():
+        if source_model_id not in by_id:
+            raise KeyError(f"No existe spec fuente: {source_model_id}")
+        source_spec = by_id[source_model_id]
+        for estimator_name in estimators:
+            spec = source_spec.copy()
+            spec["estimator"] = estimator_name
+            spec["model_id"] = f"{source_model_id}__{estimator_name}"
+            spec["label"] = f"{source_spec['label']} | {estimator_name}"
+            specs.append(spec)
+    return specs
+
+
+NONLINEAR_MODEL_SPECS = build_nonlinear_specs(
+    FAMILY_MODEL_SPECS,
+    NONLINEAR_ESTIMATORS,
+)
+
+nonlinear_specs_display = pd.DataFrame(
+    [
+        {
+            "geography_key": spec["geography_key"],
+            "model_id": spec["model_id"],
+            "estimator": spec["estimator"],
+            "n_features": len(spec["features"]),
+            "categorical": spec["categorical"],
+        }
+        for spec in NONLINEAR_MODEL_SPECS
+    ]
+)
+display(nonlinear_specs_display)
+
+nonlinear_fold_results = []
+nonlinear_skipped = []
+
+for spec in NONLINEAR_MODEL_SPECS:
+    geography_key = spec["geography_key"]
+    data = analysis_datasets.get(geography_key, {}).get("data", pd.DataFrame())
+    if data.empty:
+        nonlinear_skipped.append(
+            {
+                "model_id": spec["model_id"],
+                "reason": f"{geography_key}: sin datos",
+            }
+        )
+        continue
+
+    for validation_plan in BASELINE_VALIDATION_PLAN:
+        try:
+            result = evaluate_model_cv(
+                data,
+                spec,
+                validation_plan,
+                geography_key=geography_key,
+            )
+        except ImportError as exc:
+            nonlinear_skipped.append(
+                {
+                    "model_id": spec["model_id"],
+                    "validation": validation_plan["validation_id"],
+                    "reason": str(exc),
+                }
+            )
+            continue
+        if not result.empty:
+            nonlinear_fold_results.append(result)
+
+nonlinear_fold_results = (
+    pd.concat(nonlinear_fold_results, ignore_index=True)
+    if nonlinear_fold_results
+    else pd.DataFrame()
+)
+nonlinear_summary = add_delta_vs_base(
+    summarize_cv_results(nonlinear_fold_results),
+    base_reference=family_summary if "family_summary" in globals() else None,
+)
+
+NONLINEAR_FOLD_RESULTS_PATH = RESULTS_DIR / "nonlinear_benchmark_fold_results.csv"
+NONLINEAR_SUMMARY_PATH = RESULTS_DIR / "nonlinear_benchmark_summary.csv"
+NONLINEAR_SKIPPED_PATH = RESULTS_DIR / "nonlinear_benchmark_skipped.csv"
+
+if not nonlinear_fold_results.empty:
+    nonlinear_fold_results.to_csv(NONLINEAR_FOLD_RESULTS_PATH, index=False)
+if not nonlinear_summary.empty:
+    nonlinear_summary.to_csv(NONLINEAR_SUMMARY_PATH, index=False)
+if nonlinear_skipped:
+    pd.DataFrame(nonlinear_skipped).to_csv(NONLINEAR_SKIPPED_PATH, index=False)
+
+nonlinear_display_cols = [
+    "geography",
+    "model_id",
+    "label",
+    "validation",
+    "weighting",
+    "n_zones",
+    "n_folds",
+    "r2_mean",
+    "delta_r2_vs_base",
+    "rmse_pp",
+    "delta_rmse_pp_vs_base",
+    "mae_pp",
+    "features_dropped_for_validation",
+]
+
+if nonlinear_summary.empty:
+    display(nonlinear_summary)
+else:
+    nonlinear_display = nonlinear_summary[nonlinear_display_cols].copy()
+    for col in ["r2_mean", "delta_r2_vs_base", "rmse_pp", "delta_rmse_pp_vs_base", "mae_pp"]:
+        nonlinear_display[col] = nonlinear_display[col].round(3)
+    display(
+        nonlinear_display.sort_values(
+            ["geography", "validation", "model_id"],
+            ascending=[True, True, True],
+        )
+    )
+    print(f"saved: {NONLINEAR_SUMMARY_PATH}")
+
+if nonlinear_skipped:
+    print("Modelos omitidos:")
+    display(pd.DataFrame(nonlinear_skipped))
+```
+
+# 12) Audit de outcomes
+
+Antes de seguir mejorando algoritmos o features, este bloque revisa si el
+problema esta en la definicion del outcome. La pregunta es si el crecimiento QR
+zonal se predice mejor como:
+
+- cambio relativo en puntos porcentuales;
+- cambio bruto en puntos porcentuales;
+- cambio relativo suavizado para reducir ruido en zonas chicas;
+- aporte volumetrico por cambio de share;
+- clasificacion de zonas top 20% en crecimiento relativo.
+
+La lectura principal de este bloque no es seleccionar automaticamente el mayor
+`R2`, sino distinguir si la tesis debe modelar una tasa, un aporte agregado o un
+ranking de zonas de alto crecimiento.
+
+```{python}
+#| label: block9a-outcome-audit-targets
+print("label: block9a-outcome-audit-targets")
+
+OUTCOME_SHRINKAGE_K = BASE_MIN_SUPPORT
+
+
+def add_outcome_audit_targets(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    support = pd.to_numeric(out["support_min"], errors="coerce").clip(lower=0)
+    shrink_weight = support / (support + OUTCOME_SHRINKAGE_K)
+    out["outcome_shrink_weight"] = shrink_weight
+
+    if "delta_relative_pp" in out.columns:
+        out["delta_relative_pp_shrunk_support"] = (
+            shrink_weight * pd.to_numeric(out["delta_relative_pp"], errors="coerce")
+        )
+
+    if {"delta_pp", "global_delta_pp"}.issubset(out.columns):
+        delta_pp = pd.to_numeric(out["delta_pp"], errors="coerce")
+        global_delta = pd.to_numeric(out["global_delta_pp"], errors="coerce")
+        out["delta_pp_shrunk_support"] = global_delta + shrink_weight * (delta_pp - global_delta)
+
+    out["top20_delta_relative_pp"] = np.nan
+    for geography_key, part in out.groupby("geography_key", dropna=False):
+        mask = (
+            out["geography_key"].eq(geography_key)
+            & out["support_min"].ge(BASE_MIN_SUPPORT)
+            & out["delta_relative_pp"].notna()
+        )
+        if mask.sum() == 0:
+            continue
+        threshold = out.loc[mask, "delta_relative_pp"].quantile(0.80)
+        out.loc[mask, "top20_delta_relative_pp"] = (
+            out.loc[mask, "delta_relative_pp"].ge(threshold).astype(int)
+        )
+    return out
+
+
+model_df = add_outcome_audit_targets(model_df)
+
+OUTCOME_AUDIT_CONTINUOUS = [
+    {
+        "outcome": "delta_relative_pp",
+        "label": "Delta relativo pp",
+        "family": "tasa",
+        "unit": "pp",
+        "lectura": "Cambio zonal sobre/bajo la tendencia global.",
+    },
+    {
+        "outcome": "delta_relative_pp_shrunk_support",
+        "label": "Delta relativo pp suavizado",
+        "family": "tasa_suavizada",
+        "unit": "pp",
+        "lectura": "Delta relativo contraido hacia cero en zonas de menor soporte.",
+    },
+    {
+        "outcome": "delta_pp",
+        "label": "Delta bruto pp",
+        "family": "tasa",
+        "unit": "pp",
+        "lectura": "Cambio bruto del share QR entre 2024 y 2025.",
+    },
+    {
+        "outcome": "delta_pp_shrunk_support",
+        "label": "Delta bruto pp suavizado",
+        "family": "tasa_suavizada",
+        "unit": "pp",
+        "lectura": "Delta bruto contraido hacia el cambio global de la geografia.",
+    },
+    {
+        "outcome": "delta_logit_qr_share_smooth",
+        "label": "Delta logit suavizado",
+        "family": "tasa_tecnica",
+        "unit": "logit",
+        "lectura": "Cambio en escala logit suavizada.",
+    },
+    {
+        "outcome": "share_shift_qr_delta",
+        "label": "Aporte por cambio de share",
+        "family": "volumen",
+        "unit": "QR equivalentes",
+        "lectura": "QR equivalentes asociados al cambio de share, fijando volumen 2025.",
+    },
+]
+
+OUTCOME_AUDIT_BINARY = [
+    {
+        "outcome": "top20_delta_relative_pp",
+        "label": "Top 20% crecimiento relativo",
+        "family": "ranking",
+        "unit": "binario",
+        "lectura": "Zona en el quintil superior de crecimiento relativo.",
+    }
+]
+
+display(pd.DataFrame(OUTCOME_AUDIT_CONTINUOUS + OUTCOME_AUDIT_BINARY))
+```
+
+## 12.1) Resumen de targets candidatos
+
+```{python}
+#| label: block9b-outcome-audit-target-summary
+print("label: block9b-outcome-audit-target-summary")
+
+
+def summarize_outcome_candidate(
+    df: pd.DataFrame,
+    *,
+    geography_key: str,
+    outcome: str,
+) -> dict:
+    base = df.loc[
+        df["geography_key"].eq(geography_key)
+        & df["support_min"].ge(BASE_MIN_SUPPORT)
+        & df[outcome].notna()
+    ].copy()
+    values = pd.to_numeric(base[outcome], errors="coerce").dropna()
+    if values.empty:
+        return {
+            "geography_key": geography_key,
+            "geography": GEOGRAPHY_LABELS.get(geography_key, geography_key),
+            "outcome": outcome,
+            "n_zones": 0,
+        }
+
+    corr_with_main = np.nan
+    if outcome != "delta_relative_pp" and "delta_relative_pp" in base.columns:
+        corr_with_main = values.corr(
+            pd.to_numeric(base.loc[values.index, "delta_relative_pp"], errors="coerce"),
+            method="spearman",
+        )
+
+    return {
+        "geography_key": geography_key,
+        "geography": GEOGRAPHY_LABELS.get(geography_key, geography_key),
+        "outcome": outcome,
+        "n_zones": int(values.shape[0]),
+        "mean": float(values.mean()),
+        "std": float(values.std()),
+        "p10": float(values.quantile(0.10)),
+        "median": float(values.median()),
+        "p90": float(values.quantile(0.90)),
+        "share_positive": float(values.gt(0).mean()),
+        "spearman_with_delta_relative_pp": corr_with_main,
+    }
+
+
+outcome_audit_target_summary = pd.DataFrame(
+    [
+        summarize_outcome_candidate(
+            model_df,
+            geography_key=geography_key,
+            outcome=spec["outcome"],
+        )
+        for geography_key in GEOGRAPHIES
+        for spec in OUTCOME_AUDIT_CONTINUOUS + OUTCOME_AUDIT_BINARY
+    ]
+)
+
+OUTCOME_AUDIT_TARGET_SUMMARY_PATH = RESULTS_DIR / "outcome_audit_target_summary.csv"
+outcome_audit_target_summary.to_csv(OUTCOME_AUDIT_TARGET_SUMMARY_PATH, index=False)
+
+display(
+    outcome_audit_target_summary.assign(
+        mean=lambda df: df["mean"].round(3),
+        std=lambda df: df["std"].round(3),
+        p10=lambda df: df["p10"].round(3),
+        median=lambda df: df["median"].round(3),
+        p90=lambda df: df["p90"].round(3),
+        share_positive=lambda df: (100 * df["share_positive"]).round(1),
+        spearman_with_delta_relative_pp=lambda df: df["spearman_with_delta_relative_pp"].round(3),
+    )
+)
+print(f"saved: {OUTCOME_AUDIT_TARGET_SUMMARY_PATH}")
+```
+
+## 12.2) Comparacion predictiva de outcomes continuos
+
+Esta corrida mantiene pocas especificaciones para que el audit sea legible:
+base territorial, familia interpretable principal, modelo lineal completo y
+benchmark XGBoost completo cuando este disponible.
+
+```{python}
+#| label: block9c-run-continuous-outcome-audit
+print("label: block9c-run-continuous-outcome-audit")
+
+OUTCOME_AUDIT_VALIDATION_PLAN = [
+    plan
+    for plan in BASELINE_VALIDATION_PLAN
+    if plan["validation_id"] in ["kfold_zones", "kfold_support_weighted"]
+]
+
+
+def build_outcome_audit_regression_specs() -> list[dict]:
+    specs = []
+    for geography_key in GEOGRAPHIES:
+        if geography_key == "residence":
+            interpretable_features = features_for_family_expression("base + residence_socio")
+            full_features = features_for_family_expression(
+                "base + residence_socio + urban_osm + bip_access"
+            )
+            interpretable_label = "Base + socioeconomico"
+            full_label = "Base + socioeconomico + OSM + BIP"
+        else:
+            interpretable_features = features_for_family_expression("base + origin_operations")
+            full_features = features_for_family_expression(
+                "base + origin_operations + urban_osm + bip_access"
+            )
+            interpretable_label = "Base + operacional"
+            full_label = "Base + operacional + OSM + BIP"
+
+        base_features = FAMILY_BASE_FEATURES_DESCRIPTIVE
+        for model_id, label, features, estimator in [
+            ("A1_base_linear", "Base territorial", base_features, "LinearRegression"),
+            ("A2_interpretable_linear", interpretable_label, interpretable_features, "LinearRegression"),
+            ("A3_full_linear", full_label, full_features, "LinearRegression"),
+            ("A4_full_xgboost", f"{full_label} | XGBoost", full_features, "XGBoostRegressor"),
+        ]:
+            specs.append(
+                {
+                    "geography_key": geography_key,
+                    "model_id": model_id,
+                    "label": label,
+                    "features": dedupe_preserve_order(features),
+                    "categorical": [col for col in ["macrozone_group"] if col in features],
+                    "estimator": estimator,
+                }
+            )
+    return specs
+
+
+OUTCOME_AUDIT_REGRESSION_SPECS = build_outcome_audit_regression_specs()
+
+continuous_outcome_fold_results = []
+continuous_outcome_skipped = []
+
+for outcome_spec in OUTCOME_AUDIT_CONTINUOUS:
+    outcome = outcome_spec["outcome"]
+    for spec in OUTCOME_AUDIT_REGRESSION_SPECS:
+        geography_key = spec["geography_key"]
+        data = model_df.loc[
+            model_df["geography_key"].eq(geography_key)
+            & model_df["support_min"].ge(BASE_MIN_SUPPORT)
+        ].copy()
+        if data.empty or outcome not in data.columns:
+            continue
+        for validation_plan in OUTCOME_AUDIT_VALIDATION_PLAN:
+            try:
+                result = evaluate_model_cv(
+                    data,
+                    spec,
+                    validation_plan,
+                    geography_key=geography_key,
+                    outcome=outcome,
+                )
+            except ImportError as exc:
+                continuous_outcome_skipped.append(
+                    {
+                        "outcome": outcome,
+                        "model_id": spec["model_id"],
+                        "validation": validation_plan["validation_id"],
+                        "reason": str(exc),
+                    }
+                )
+                continue
+            if not result.empty:
+                continuous_outcome_fold_results.append(result)
+
+continuous_outcome_fold_results = (
+    pd.concat(continuous_outcome_fold_results, ignore_index=True)
+    if continuous_outcome_fold_results
+    else pd.DataFrame()
+)
+continuous_outcome_summary = summarize_cv_results(continuous_outcome_fold_results)
+
+if not continuous_outcome_summary.empty:
+    continuous_outcome_summary = continuous_outcome_summary.rename(
+        columns={"label": "model_label"}
+    )
+    base = continuous_outcome_summary.loc[
+        continuous_outcome_summary["model_id"].eq("A1_base_linear"),
+        [
+            "geography_key",
+            "validation_id",
+            "weighting",
+            "outcome",
+            "r2_mean",
+            "rmse_pp",
+            "mae_pp",
+        ],
+    ].rename(
+        columns={
+            "r2_mean": "base_r2_mean",
+            "rmse_pp": "base_rmse",
+            "mae_pp": "base_mae",
+        }
+    )
+    continuous_outcome_summary = continuous_outcome_summary.merge(
+        base,
+        on=["geography_key", "validation_id", "weighting", "outcome"],
+        how="left",
+    )
+    continuous_outcome_summary["delta_r2_vs_a1_base"] = (
+        continuous_outcome_summary["r2_mean"] - continuous_outcome_summary["base_r2_mean"]
+    )
+    continuous_outcome_summary["delta_rmse_vs_a1_base"] = (
+        continuous_outcome_summary["base_rmse"] - continuous_outcome_summary["rmse_pp"]
+    )
+    continuous_outcome_summary["delta_mae_vs_a1_base"] = (
+        continuous_outcome_summary["base_mae"] - continuous_outcome_summary["mae_pp"]
+    )
+    continuous_outcome_summary = continuous_outcome_summary.merge(
+        pd.DataFrame(OUTCOME_AUDIT_CONTINUOUS)[["outcome", "label", "family", "unit"]].rename(
+            columns={"label": "outcome_label"}
+        ),
+        on="outcome",
+        how="left",
+    )
+
+CONTINUOUS_OUTCOME_FOLD_RESULTS_PATH = RESULTS_DIR / "outcome_audit_continuous_fold_results.csv"
+CONTINUOUS_OUTCOME_SUMMARY_PATH = RESULTS_DIR / "outcome_audit_continuous_summary.csv"
+CONTINUOUS_OUTCOME_SKIPPED_PATH = RESULTS_DIR / "outcome_audit_continuous_skipped.csv"
+
+if not continuous_outcome_fold_results.empty:
+    continuous_outcome_fold_results.to_csv(CONTINUOUS_OUTCOME_FOLD_RESULTS_PATH, index=False)
+if not continuous_outcome_summary.empty:
+    continuous_outcome_summary.to_csv(CONTINUOUS_OUTCOME_SUMMARY_PATH, index=False)
+if continuous_outcome_skipped:
+    pd.DataFrame(continuous_outcome_skipped).to_csv(CONTINUOUS_OUTCOME_SKIPPED_PATH, index=False)
+
+continuous_display_cols = [
+    "geography",
+    "outcome_label",
+    "family",
+    "unit",
+    "model_id",
+    "model_label",
+    "validation",
+    "weighting",
+    "n_zones",
+    "r2_mean",
+    "delta_r2_vs_a1_base",
+    "rmse_pp",
+    "delta_rmse_vs_a1_base",
+    "mae_pp",
+]
+
+if continuous_outcome_summary.empty:
+    display(continuous_outcome_summary)
+else:
+    continuous_display = continuous_outcome_summary[continuous_display_cols].copy()
+    for col in ["r2_mean", "delta_r2_vs_a1_base", "rmse_pp", "delta_rmse_vs_a1_base", "mae_pp"]:
+        continuous_display[col] = continuous_display[col].round(3)
+    display(
+        continuous_display.sort_values(
+            ["geography", "outcome_label", "validation", "model_id"],
+            ascending=[True, True, True, True],
+        )
+    )
+    print(f"saved: {CONTINUOUS_OUTCOME_SUMMARY_PATH}")
+
+if continuous_outcome_skipped:
+    print("Modelos omitidos:")
+    display(pd.DataFrame(continuous_outcome_skipped))
+```
+
+## 12.2.1) Resumen compacto del audit continuo
+
+La tabla anterior guarda todo el detalle. Esta vista resume el mejor desempeno
+por geografia, outcome y validacion, y luego muestra solo los outcomes mas
+informativos para decidir si conviene modelar tasa, tasa suavizada o volumen.
+
+```{python}
+#| label: block9c2-continuous-outcome-audit-compact-summary
+print("label: block9c2-continuous-outcome-audit-compact-summary")
+
+if "continuous_outcome_summary" not in globals() or continuous_outcome_summary.empty:
+    compact_continuous_summary = pd.DataFrame()
+    display(compact_continuous_summary)
+else:
+    outcome_priority = {
+        "delta_relative_pp": 1,
+        "delta_relative_pp_shrunk_support": 2,
+        "share_shift_qr_delta": 3,
+        "delta_pp": 4,
+        "delta_pp_shrunk_support": 5,
+        "delta_logit_qr_share_smooth": 6,
+    }
+    compact_source = continuous_outcome_summary.copy()
+    compact_source["outcome_priority"] = compact_source["outcome"].map(outcome_priority).fillna(99)
+
+    best_by_outcome = (
+        compact_source
+        .sort_values(
+            ["geography", "validation", "outcome_priority", "r2_mean", "delta_r2_vs_a1_base"],
+            ascending=[True, True, True, False, False],
+        )
+        .groupby(["geography", "validation", "weighting", "outcome", "outcome_label", "family", "unit"], dropna=False)
+        .head(1)
+        .copy()
+    )
+
+    best_display_cols = [
+        "geography",
+        "validation",
+        "weighting",
+        "outcome_label",
+        "family",
+        "unit",
+        "model_id",
+        "model_label",
+        "r2_mean",
+        "delta_r2_vs_a1_base",
+        "rmse_pp",
+        "mae_pp",
+    ]
+
+    compact_continuous_summary = best_by_outcome[best_display_cols].copy()
+    for col in ["r2_mean", "delta_r2_vs_a1_base", "rmse_pp", "mae_pp"]:
+        compact_continuous_summary[col] = compact_continuous_summary[col].round(3)
+
+    print("Mejor modelo por geografia, validacion y outcome:")
+    display(
+        compact_continuous_summary.sort_values(
+            ["geography", "validation", "family", "outcome_label"],
+            ascending=[True, True, True, True],
+        )
+    )
+
+    key_outcomes = [
+        "delta_relative_pp",
+        "delta_relative_pp_shrunk_support",
+        "share_shift_qr_delta",
+    ]
+    key_comparison = (
+        best_by_outcome.loc[best_by_outcome["outcome"].isin(key_outcomes), best_display_cols]
+        .copy()
+    )
+    for col in ["r2_mean", "delta_r2_vs_a1_base", "rmse_pp", "mae_pp"]:
+        key_comparison[col] = key_comparison[col].round(3)
+
+    print("Comparacion corta: tasa, tasa suavizada y volumen:")
+    display(
+        key_comparison.sort_values(
+            ["geography", "validation", "outcome_label"],
+            ascending=[True, True, True],
+        )
+    )
+```
+
+## 12.3) Clasificacion de zonas top 20% de crecimiento relativo
+
+Si el outcome continuo es ruidoso, una pregunta alternativa es si el modelo
+sirve para identificar zonas de mayor crecimiento relativo. Este bloque usa
+`top20_delta_relative_pp` como target binario.
+
+```{python}
+#| label: block9d-run-top-growth-classification-audit
+print("label: block9d-run-top-growth-classification-audit")
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score, balanced_accuracy_score, roc_auc_score
+
+
+def make_classifier_estimator(estimator_name: str):
+    if estimator_name == "LogisticRegression":
+        return LogisticRegression(max_iter=5000, solver="lbfgs")
+    if estimator_name == "RandomForestClassifier":
+        return RandomForestClassifier(
+            n_estimators=500,
+            max_depth=4,
+            min_samples_leaf=20,
+            max_features="sqrt",
+            random_state=SEED,
+            n_jobs=-1,
+        )
+    raise ValueError(f"Clasificador no soportado: {estimator_name}")
+
+
+def make_classifier_pipeline(
+    *,
+    numeric_features: list[str],
+    categorical_features: list[str],
+    estimator_name: str,
+) -> Pipeline:
+    estimator = make_classifier_estimator(estimator_name)
+    tree_estimators = {"RandomForestClassifier"}
+    transformers = []
+    if numeric_features:
+        numeric_steps = [("imputer", SimpleImputer(strategy="median"))]
+        if estimator_name not in tree_estimators:
+            numeric_steps.append(("scaler", StandardScaler()))
+        transformers.append(("num", Pipeline(numeric_steps), numeric_features))
+    if categorical_features:
+        transformers.append(
+            (
+                "cat",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("onehot", make_one_hot_encoder()),
+                    ]
+                ),
+                categorical_features,
+            )
+        )
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+    return Pipeline([("preprocessor", preprocessor), ("estimator", estimator)])
+
+
+def precision_at_observed_positive_count(y_true: np.ndarray, score: np.ndarray) -> float:
+    k = int(np.sum(y_true == 1))
+    if k <= 0:
+        return np.nan
+    order = np.argsort(-score)
+    top_idx = order[:k]
+    return float(np.mean(y_true[top_idx] == 1))
+
+
+def evaluate_classifier_cv(
+    data: pd.DataFrame,
+    spec: dict,
+    validation_plan: dict,
+    *,
+    geography_key: str,
+    outcome: str,
+) -> pd.DataFrame:
+    model_data = data.loc[data[outcome].notna()].reset_index(drop=True).copy()
+    feature_info = prepare_spec_features(model_data, spec, validation_plan)
+    if feature_info["missing_features"]:
+        return pd.DataFrame()
+
+    y = model_data[outcome].astype(int).to_numpy()
+    if np.unique(y).shape[0] < 2:
+        return pd.DataFrame()
+
+    X = model_data[feature_info["features"]].copy()
+    sample_weight = normalized_sample_weight(model_data, validation_plan["weight_col"])
+    pipeline = make_classifier_pipeline(
+        numeric_features=feature_info["numeric_features"],
+        categorical_features=feature_info["categorical_features"],
+        estimator_name=spec["estimator"],
+    )
+
+    rows = []
+    for fold_id, (train_idx, test_idx) in enumerate(
+        iter_validation_splits(model_data, validation_plan),
+        start=1,
+    ):
+        y_train = y[train_idx]
+        y_test = y[test_idx]
+        if np.unique(y_train).shape[0] < 2 or np.unique(y_test).shape[0] < 2:
+            continue
+
+        fitted = clone(pipeline)
+        fit_kwargs = {}
+        if sample_weight is not None:
+            fit_kwargs["estimator__sample_weight"] = sample_weight[train_idx]
+        fitted.fit(X.iloc[train_idx], y_train, **fit_kwargs)
+
+        score = fitted.predict_proba(X.iloc[test_idx])[:, 1]
+        y_pred = score >= 0.50
+        test_weight = sample_weight[test_idx] if sample_weight is not None else None
+        rows.append(
+            {
+                "geography_key": geography_key,
+                "geography": GEOGRAPHY_LABELS.get(geography_key, geography_key),
+                "model_id": spec["model_id"],
+                "label": spec["label"],
+                "validation_id": validation_plan["validation_id"],
+                "validation": validation_plan["validation"],
+                "weighting": validation_plan["weighting"],
+                "outcome": outcome,
+                "fold": fold_id,
+                "fold_n": len(test_idx),
+                "fold_weight_sum": (
+                    float(np.sum(test_weight)) if test_weight is not None else float(len(test_idx))
+                ),
+                "event_rate": float(np.average(y_test, weights=test_weight)),
+                "roc_auc": roc_auc_score(y_test, score, sample_weight=test_weight),
+                "average_precision": average_precision_score(
+                    y_test,
+                    score,
+                    sample_weight=test_weight,
+                ),
+                "balanced_accuracy": balanced_accuracy_score(y_test, y_pred),
+                "precision_at_observed_positive_count": precision_at_observed_positive_count(
+                    y_test,
+                    score,
+                ),
+                "features_used": ", ".join(feature_info["features"]),
+                "features_dropped_for_validation": ", ".join(feature_info["dropped_for_validation"]),
+                "status": "ok",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def summarize_classifier_results(fold_results: pd.DataFrame) -> pd.DataFrame:
+    if fold_results.empty:
+        return fold_results.copy()
+
+    group_cols = [
+        "geography_key",
+        "geography",
+        "model_id",
+        "label",
+        "validation_id",
+        "validation",
+        "weighting",
+        "outcome",
+        "features_used",
+        "features_dropped_for_validation",
+    ]
+    summaries = []
+    for keys, part in fold_results.groupby(group_cols, dropna=False):
+        weights = part["fold_weight_sum"].to_numpy()
+        summaries.append(
+            {
+                **dict(zip(group_cols, keys)),
+                "n_folds": int(part["fold"].nunique()),
+                "n_zones": int(part["fold_n"].sum()),
+                "event_rate": float(np.average(part["event_rate"], weights=weights)),
+                "roc_auc": float(np.average(part["roc_auc"], weights=weights)),
+                "average_precision": float(np.average(part["average_precision"], weights=weights)),
+                "balanced_accuracy": float(np.average(part["balanced_accuracy"], weights=weights)),
+                "precision_at_observed_positive_count": float(
+                    np.average(part["precision_at_observed_positive_count"], weights=weights)
+                ),
+            }
+        )
+    return pd.DataFrame(summaries)
+
+
+def build_top_growth_classifier_specs() -> list[dict]:
+    regression_specs = build_outcome_audit_regression_specs()
+    selected = [
+        spec
+        for spec in regression_specs
+        if spec["model_id"] in ["A1_base_linear", "A2_interpretable_linear", "A3_full_linear"]
+    ]
+    classifier_specs = []
+    for spec in selected:
+        for estimator_name in ["LogisticRegression", "RandomForestClassifier"]:
+            out = spec.copy()
+            out["model_id"] = spec["model_id"].replace("_linear", f"_{estimator_name}")
+            out["label"] = f"{spec['label']} | {estimator_name}"
+            out["estimator"] = estimator_name
+            classifier_specs.append(out)
+    return classifier_specs
+
+
+TOP_GROWTH_CLASSIFIER_SPECS = build_top_growth_classifier_specs()
+
+top_growth_fold_results = []
+for spec in TOP_GROWTH_CLASSIFIER_SPECS:
+    geography_key = spec["geography_key"]
+    data = model_df.loc[
+        model_df["geography_key"].eq(geography_key)
+        & model_df["support_min"].ge(BASE_MIN_SUPPORT)
+    ].copy()
+    for validation_plan in OUTCOME_AUDIT_VALIDATION_PLAN:
+        result = evaluate_classifier_cv(
+            data,
+            spec,
+            validation_plan,
+            geography_key=geography_key,
+            outcome="top20_delta_relative_pp",
+        )
+        if not result.empty:
+            top_growth_fold_results.append(result)
+
+top_growth_fold_results = (
+    pd.concat(top_growth_fold_results, ignore_index=True)
+    if top_growth_fold_results
+    else pd.DataFrame()
+)
+top_growth_summary = summarize_classifier_results(top_growth_fold_results)
+
+if not top_growth_summary.empty:
+    base = top_growth_summary.loc[
+        top_growth_summary["model_id"].str.contains("A1_base_"),
+        [
+            "geography_key",
+            "validation_id",
+            "weighting",
+            "outcome",
+            "model_id",
+            "roc_auc",
+            "average_precision",
+            "precision_at_observed_positive_count",
+        ],
+    ].copy()
+    base["base_estimator"] = base["model_id"].str.replace("A1_base_", "", regex=False)
+    base = base.rename(
+        columns={
+            "roc_auc": "base_roc_auc",
+            "average_precision": "base_average_precision",
+            "precision_at_observed_positive_count": "base_precision_at_k",
+        }
+    ).drop(columns=["model_id"])
+    top_growth_summary["base_estimator"] = (
+        top_growth_summary["model_id"]
+        .str.extract(r"_(LogisticRegression|RandomForestClassifier)$", expand=False)
+    )
+    top_growth_summary = top_growth_summary.merge(
+        base,
+        on=["geography_key", "validation_id", "weighting", "outcome", "base_estimator"],
+        how="left",
+    )
+    top_growth_summary["delta_roc_auc_vs_base"] = (
+        top_growth_summary["roc_auc"] - top_growth_summary["base_roc_auc"]
+    )
+    top_growth_summary["delta_ap_vs_base"] = (
+        top_growth_summary["average_precision"] - top_growth_summary["base_average_precision"]
+    )
+    top_growth_summary["delta_precision_at_k_vs_base"] = (
+        top_growth_summary["precision_at_observed_positive_count"]
+        - top_growth_summary["base_precision_at_k"]
+    )
+
+TOP_GROWTH_FOLD_RESULTS_PATH = RESULTS_DIR / "outcome_audit_top20_fold_results.csv"
+TOP_GROWTH_SUMMARY_PATH = RESULTS_DIR / "outcome_audit_top20_summary.csv"
+
+if not top_growth_fold_results.empty:
+    top_growth_fold_results.to_csv(TOP_GROWTH_FOLD_RESULTS_PATH, index=False)
+if not top_growth_summary.empty:
+    top_growth_summary.to_csv(TOP_GROWTH_SUMMARY_PATH, index=False)
+
+top_growth_display_cols = [
+    "geography",
+    "model_id",
+    "label",
+    "validation",
+    "weighting",
+    "n_zones",
+    "event_rate",
+    "roc_auc",
+    "delta_roc_auc_vs_base",
+    "average_precision",
+    "delta_ap_vs_base",
+    "precision_at_observed_positive_count",
+    "delta_precision_at_k_vs_base",
+]
+
+if top_growth_summary.empty:
+    display(top_growth_summary)
+else:
+    top_growth_display = top_growth_summary[top_growth_display_cols].copy()
+    for col in [
+        "event_rate",
+        "roc_auc",
+        "delta_roc_auc_vs_base",
+        "average_precision",
+        "delta_ap_vs_base",
+        "precision_at_observed_positive_count",
+        "delta_precision_at_k_vs_base",
+    ]:
+        top_growth_display[col] = top_growth_display[col].round(3)
+    display(
+        top_growth_display.sort_values(
+            ["geography", "validation", "model_id"],
+            ascending=[True, True, True],
+        )
+    )
+    print(f"saved: {TOP_GROWTH_SUMMARY_PATH}")
+```
+
+## 12.4) Plantilla de lectura del audit
+
+Completar despues de ejecutar los bloques anteriores.
+
+```{python}
+#| label: block9e-outcome-audit-reading-template
+print("label: block9e-outcome-audit-reading-template")
+
+outcome_audit_reading_template = pd.DataFrame(
+    [
+        {
+            "pregunta": "Outcome continuo mas estable",
+            "lectura": "",
+            "evidencia": "Comparar R2 y RMSE dentro de cada outcome y validacion.",
+        },
+        {
+            "pregunta": "Efecto del suavizado",
+            "lectura": "",
+            "evidencia": "Comparar delta_relative_pp vs delta_relative_pp_shrunk_support.",
+        },
+        {
+            "pregunta": "Tasa versus volumen",
+            "lectura": "",
+            "evidencia": "Comparar delta_relative_pp vs share_shift_qr_delta.",
+        },
+        {
+            "pregunta": "Prediccion de top 20%",
+            "lectura": "",
+            "evidencia": "Comparar ROC-AUC, average precision y precision@k.",
+        },
+        {
+            "pregunta": "Decision metodologica",
+            "lectura": "",
+            "evidencia": "Definir si seguir como regresion, ranking/clasificacion o complemento descriptivo.",
+        },
+    ]
+)
+
+display(outcome_audit_reading_template)
+```
+
+# 13) Audit de señal fina: residuos del baseline territorial
+
+Este bloque cambia la pregunta. En vez de evaluar si un modelo explica todo el
+crecimiento QR zonal, primero remueve la parte explicada por el baseline
+territorial:
+
+```text
+QR inicial + soporte/volumen + macrozona
+```
+
+Luego analiza si las variables candidatas se asocian con el residuo. Esto ayuda
+a distinguir senales finas de simples diferencias territoriales gruesas.
+
+No se agregan interacciones manuales en esta etapa. Los modelos de arboles ya
+capturan interacciones de forma flexible; si aqui no aparece senal residual
+basica, complejizar con interacciones no seria una prioridad.
+
+```{python}
+#| label: block10a-residualized-outcome-contract
+print("label: block10a-residualized-outcome-contract")
+
+if "delta_relative_pp_shrunk_support" not in model_df.columns and "add_outcome_audit_targets" in globals():
+    model_df = add_outcome_audit_targets(model_df)
+
+FINE_SIGNAL_OUTCOMES = [
+    outcome
+    for outcome in ["delta_relative_pp", "delta_relative_pp_shrunk_support"]
+    if outcome in model_df.columns
+]
+
+FINE_SIGNAL_VALIDATION_PLAN = [
+    plan
+    for plan in BASELINE_VALIDATION_PLAN
+    if plan["validation_id"] in ["kfold_zones", "kfold_support_weighted"]
+]
+
+FINE_SIGNAL_BASELINE_SPEC = {
+    "model_id": "fine_signal_base_territorial",
+    "label": "Baseline territorial",
+    "features": FAMILY_BASE_FEATURES_DESCRIPTIVE,
+    "categorical": ["macrozone_group"],
+    "estimator": "LinearRegression",
+}
+
+fine_signal_contract = pd.DataFrame(
+    [
+        {
+            "elemento": "Outcome residualizado",
+            "definicion": ", ".join(FINE_SIGNAL_OUTCOMES),
+            "lectura": "Cambio QR no explicado por QR inicial, soporte/volumen y macrozona.",
+        },
+        {
+            "elemento": "Baseline removido",
+            "definicion": "qr_share_2024 + support_min_log + n_2025_log + macrozone_group",
+            "lectura": "Estructura territorial y operacional gruesa.",
+        },
+        {
+            "elemento": "Validacion",
+            "definicion": ", ".join(plan["validation"] for plan in FINE_SIGNAL_VALIDATION_PLAN),
+            "lectura": "Residuos out-of-fold para evitar leer ajuste in-sample como senal fina.",
+        },
+    ]
+)
+
+display(fine_signal_contract)
+```
+
+## 13.1) Construir residuos out-of-fold del baseline territorial
+
+```{python}
+#| label: block10b-build-territorial-baseline-residuals
+print("label: block10b-build-territorial-baseline-residuals")
+
+
+def predict_baseline_oof_residuals(
+    data: pd.DataFrame,
+    *,
+    spec: dict,
+    validation_plan: dict,
+    geography_key: str,
+    outcome: str,
+) -> pd.DataFrame:
+    model_data = data.loc[data[outcome].notna()].reset_index(drop=True).copy()
+    feature_info = prepare_spec_features(model_data, spec, validation_plan)
+    if feature_info["missing_features"]:
+        return pd.DataFrame()
+
+    y = pd.to_numeric(model_data[outcome], errors="coerce").to_numpy()
+    X = model_data[feature_info["features"]].copy()
+    sample_weight = normalized_sample_weight(model_data, validation_plan["weight_col"])
+    pipeline = make_regression_pipeline(
+        numeric_features=feature_info["numeric_features"],
+        categorical_features=feature_info["categorical_features"],
+        estimator_name=spec["estimator"],
+    )
+
+    rows = []
+    for fold_id, (train_idx, test_idx) in enumerate(
+        iter_validation_splits(model_data, validation_plan),
+        start=1,
+    ):
+        fitted = clone(pipeline)
+        fit_kwargs = {}
+        if sample_weight is not None:
+            fit_kwargs["estimator__sample_weight"] = sample_weight[train_idx]
+        fitted.fit(X.iloc[train_idx], y[train_idx], **fit_kwargs)
+
+        y_pred = fitted.predict(X.iloc[test_idx])
+        part = model_data.iloc[test_idx].copy()
+        part["geography_key"] = geography_key
+        part["geography"] = GEOGRAPHY_LABELS.get(geography_key, geography_key)
+        part["outcome"] = outcome
+        part["validation_id"] = validation_plan["validation_id"]
+        part["validation"] = validation_plan["validation"]
+        part["weighting"] = validation_plan["weighting"]
+        part["fold"] = fold_id
+        part["baseline_prediction"] = y_pred
+        part["baseline_residual"] = y[test_idx] - y_pred
+        part["baseline_weight"] = sample_weight[test_idx] if sample_weight is not None else 1.0
+        rows.append(part)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+
+fine_signal_residual_rows = []
+for geography_key in GEOGRAPHIES:
+    data = model_df.loc[
+        model_df["geography_key"].eq(geography_key)
+        & model_df["support_min"].ge(BASE_MIN_SUPPORT)
+    ].copy()
+    if data.empty:
+        continue
+    for outcome in FINE_SIGNAL_OUTCOMES:
+        for validation_plan in FINE_SIGNAL_VALIDATION_PLAN:
+            residuals = predict_baseline_oof_residuals(
+                data,
+                spec=FINE_SIGNAL_BASELINE_SPEC,
+                validation_plan=validation_plan,
+                geography_key=geography_key,
+                outcome=outcome,
+            )
+            if not residuals.empty:
+                fine_signal_residual_rows.append(residuals)
+
+fine_signal_residuals = (
+    pd.concat(fine_signal_residual_rows, ignore_index=True)
+    if fine_signal_residual_rows
+    else pd.DataFrame()
+)
+
+
+def summarize_baseline_residuals(residuals: pd.DataFrame) -> pd.DataFrame:
+    if residuals.empty:
+        return residuals.copy()
+    rows = []
+    for keys, part in residuals.groupby(
+        ["geography", "outcome", "validation", "weighting"],
+        dropna=False,
+    ):
+        weights = pd.to_numeric(part["baseline_weight"], errors="coerce").fillna(1.0).to_numpy()
+        y_true = pd.to_numeric(part["delta_relative_pp" if keys[1] == "delta_relative_pp" else keys[1]], errors="coerce").to_numpy()
+        y_pred = pd.to_numeric(part["baseline_prediction"], errors="coerce").to_numpy()
+        residual = pd.to_numeric(part["baseline_residual"], errors="coerce").to_numpy()
+        rows.append(
+            {
+                "geography": keys[0],
+                "outcome": keys[1],
+                "validation": keys[2],
+                "weighting": keys[3],
+                "n_zones": int(part.shape[0]),
+                "baseline_r2_oof": r2_score(y_true, y_pred, sample_weight=weights),
+                "baseline_rmse_oof": float(np.sqrt(mean_squared_error(y_true, y_pred, sample_weight=weights))),
+                "baseline_mae_oof": mean_absolute_error(y_true, y_pred, sample_weight=weights),
+                "residual_mean": float(np.average(residual, weights=weights)),
+                "residual_std": float(np.sqrt(np.average((residual - np.average(residual, weights=weights)) ** 2, weights=weights))),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+fine_signal_residual_summary = summarize_baseline_residuals(fine_signal_residuals)
+
+FINE_SIGNAL_RESIDUALS_PATH = RESULTS_DIR / "fine_signal_baseline_residuals.csv"
+FINE_SIGNAL_RESIDUAL_SUMMARY_PATH = RESULTS_DIR / "fine_signal_baseline_residual_summary.csv"
+
+if not fine_signal_residuals.empty:
+    fine_signal_residuals.to_csv(FINE_SIGNAL_RESIDUALS_PATH, index=False)
+if not fine_signal_residual_summary.empty:
+    fine_signal_residual_summary.to_csv(FINE_SIGNAL_RESIDUAL_SUMMARY_PATH, index=False)
+
+display(
+    fine_signal_residual_summary.assign(
+        baseline_r2_oof=lambda df: df["baseline_r2_oof"].round(3),
+        baseline_rmse_oof=lambda df: df["baseline_rmse_oof"].round(3),
+        baseline_mae_oof=lambda df: df["baseline_mae_oof"].round(3),
+        residual_mean=lambda df: df["residual_mean"].round(3),
+        residual_std=lambda df: df["residual_std"].round(3),
+    )
+)
+print(f"saved: {FINE_SIGNAL_RESIDUAL_SUMMARY_PATH}")
+```
+
+## 13.2) Screening de variables contra el residuo
+
+Esta tabla no reestima un modelo final. Solo pregunta que variables mantienen
+asociacion con el residuo out-of-fold del baseline territorial.
+
+```{python}
+#| label: block10c-residual-feature-screening
+print("label: block10c-residual-feature-screening")
+
+
+def weighted_corr(x: pd.Series, y: pd.Series, weight: pd.Series) -> float:
+    valid = pd.DataFrame({"x": x, "y": y, "w": weight}).replace([np.inf, -np.inf], np.nan).dropna()
+    valid = valid.loc[valid["w"].gt(0)]
+    if valid.shape[0] < 5:
+        return np.nan
+    w = valid["w"].to_numpy(dtype=float)
+    x_arr = valid["x"].to_numpy(dtype=float)
+    y_arr = valid["y"].to_numpy(dtype=float)
+    w = w / w.sum()
+    x_centered = x_arr - np.sum(w * x_arr)
+    y_centered = y_arr - np.sum(w * y_arr)
+    denom = np.sqrt(np.sum(w * x_centered**2) * np.sum(w * y_centered**2))
+    if denom == 0 or not np.isfinite(denom):
+        return np.nan
+    return float(np.sum(w * x_centered * y_centered) / denom)
+
+
+def feature_family_lookup() -> dict:
+    lookup = {}
+    for family, features in FEATURE_FAMILIES.items():
+        for feature in features:
+            lookup[feature] = family
+    return lookup
+
+
+FEATURE_TO_FAMILY = feature_family_lookup()
+
+
+def residual_candidate_features(geography_key: str) -> list[str]:
+    if geography_key == "residence":
+        families = ["residence_socio", "urban_osm", "bip_access"]
+    elif geography_key == "origin_trip":
+        families = ["origin_operations", "urban_osm", "bip_access"]
+    else:
+        return []
+    return [
+        feature
+        for family in families
+        for feature in FEATURE_FAMILIES[family]
+        if feature in model_df.columns
+    ]
+
+
+def q5_q1_residual_gap(values: pd.Series, residual: pd.Series) -> float:
+    valid = pd.DataFrame({"x": values, "residual": residual}).replace([np.inf, -np.inf], np.nan).dropna()
+    if valid["x"].nunique() < 5 or valid.shape[0] < 20:
+        return np.nan
+    rank = valid["x"].rank(method="first")
+    quintile = pd.qcut(rank, 5, labels=False, duplicates="drop") + 1
+    if quintile.nunique() < 5:
+        return np.nan
+    valid = valid.assign(quintile=quintile)
+    return float(
+        valid.loc[valid["quintile"].eq(5), "residual"].mean()
+        - valid.loc[valid["quintile"].eq(1), "residual"].mean()
+    )
+
+
+def screen_residual_features(residuals: pd.DataFrame) -> pd.DataFrame:
+    if residuals.empty:
+        return residuals.copy()
+
+    rows = []
+    group_cols = ["geography_key", "geography", "outcome", "validation_id", "validation", "weighting"]
+    for keys, part in residuals.groupby(group_cols, dropna=False):
+        geography_key = keys[0]
+        candidates = residual_candidate_features(geography_key)
+        for feature in candidates:
+            values = pd.to_numeric(part[feature], errors="coerce") if feature in part.columns else pd.Series(dtype=float)
+            residual = pd.to_numeric(part["baseline_residual"], errors="coerce")
+            weight = pd.to_numeric(part["baseline_weight"], errors="coerce").fillna(1.0)
+            valid = pd.DataFrame({"x": values, "residual": residual, "weight": weight}).dropna()
+            if valid.shape[0] < 20:
+                continue
+            spearman = valid["x"].corr(valid["residual"], method="spearman")
+            pearson_weighted = weighted_corr(valid["x"], valid["residual"], valid["weight"])
+            q_gap = q5_q1_residual_gap(valid["x"], valid["residual"])
+            rows.append(
+                {
+                    "geography_key": geography_key,
+                    "geography": keys[1],
+                    "outcome": keys[2],
+                    "validation_id": keys[3],
+                    "validation": keys[4],
+                    "weighting": keys[5],
+                    "feature": feature,
+                    "family": FEATURE_TO_FAMILY.get(feature, "unknown"),
+                    "n_zones_with_feature": int(valid.shape[0]),
+                    "spearman_residual": spearman,
+                    "weighted_pearson_residual": pearson_weighted,
+                    "q5_q1_residual_gap": q_gap,
+                    "abs_spearman_residual": abs(spearman) if pd.notna(spearman) else np.nan,
+                    "abs_weighted_pearson_residual": abs(pearson_weighted) if pd.notna(pearson_weighted) else np.nan,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+fine_signal_residual_screening = screen_residual_features(fine_signal_residuals)
+
+FINE_SIGNAL_RESIDUAL_SCREENING_PATH = RESULTS_DIR / "fine_signal_residual_feature_screening.csv"
+if not fine_signal_residual_screening.empty:
+    fine_signal_residual_screening.to_csv(FINE_SIGNAL_RESIDUAL_SCREENING_PATH, index=False)
+
+screening_display_cols = [
+    "geography",
+    "outcome",
+    "validation",
+    "weighting",
+    "feature",
+    "family",
+    "n_zones_with_feature",
+    "spearman_residual",
+    "weighted_pearson_residual",
+    "q5_q1_residual_gap",
+]
+
+if fine_signal_residual_screening.empty:
+    display(fine_signal_residual_screening)
+else:
+    residual_screening_display = (
+        fine_signal_residual_screening
+        .sort_values(
+            ["geography", "outcome", "validation", "abs_weighted_pearson_residual", "abs_spearman_residual"],
+            ascending=[True, True, True, False, False],
+        )
+        .groupby(["geography", "outcome", "validation"], dropna=False)
+        .head(8)
+        [screening_display_cols]
+        .copy()
+    )
+    for col in ["spearman_residual", "weighted_pearson_residual", "q5_q1_residual_gap"]:
+        residual_screening_display[col] = residual_screening_display[col].round(3)
+    display(residual_screening_display)
+    print(f"saved: {FINE_SIGNAL_RESIDUAL_SCREENING_PATH}")
+```
+
+## 13.3) Lectura preliminar esperada
+
+Completar despues de ejecutar el screening residual.
+
+```{python}
+#| label: block10d-residual-fine-signal-reading-template
+print("label: block10d-residual-fine-signal-reading-template")
+
+residual_fine_signal_reading_template = pd.DataFrame(
+    [
+        {
+            "pregunta": "Queda senal fina despues del baseline territorial?",
+            "lectura": "",
+            "evidencia": "Mirar correlaciones residuales y brecha Q5-Q1.",
+        },
+        {
+            "pregunta": "Que familia sobrevive mejor?",
+            "lectura": "",
+            "evidencia": "Comparar socio/operacional, OSM y BIP contra residuos.",
+        },
+        {
+            "pregunta": "La senal depende de ponderar por soporte?",
+            "lectura": "",
+            "evidencia": "Comparar KFold zonas y KFold ponderado por soporte.",
+        },
+        {
+            "pregunta": "Vale la pena probar interacciones manuales?",
+            "lectura": "",
+            "evidencia": "Solo si aparecen variables residuales consistentes.",
+        },
+        {
+            "pregunta": "Vale la pena mejorar features?",
+            "lectura": "",
+            "evidencia": "Priorizar familias con senal residual; evitar agregar features donde no queda senal.",
+        },
+    ]
+)
+
+display(residual_fine_signal_reading_template)
+```
+
+# 14) Audit within/between macrozona
+
+Este bloque separa cada variable candidata en dos componentes:
+
+```text
+variable_between_macrozone = promedio de la variable dentro de la macrozona
+variable_within_macrozone  = variable - promedio de la variable dentro de la macrozona
+```
+
+La parte `between` captura diferencias gruesas entre macrozonas. La parte
+`within` pregunta si, dentro de una misma macrozona, las zonas relativamente mas
+altas en una variable tambien muestran mayor crecimiento QR residual.
+
+```{python}
+#| label: block11a-build-within-between-macrozone-features
+print("label: block11a-build-within-between-macrozone-features")
+
+
+def add_within_between_macrozone_features(
+    df: pd.DataFrame,
+    features: list[str],
+    *,
+    group_col: str = "macrozone_group",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if df.empty:
+        return df.copy(), pd.DataFrame()
+    if group_col not in df.columns:
+        raise KeyError(f"No existe columna de macrozona: {group_col}")
+
+    out = df.copy()
+    metadata_rows = []
+    for feature in features:
+        if feature not in out.columns:
+            continue
+        values = pd.to_numeric(out[feature], errors="coerce")
+        group_mean = values.groupby(out[group_col]).transform("mean")
+        between_col = f"{feature}__between_macrozone"
+        within_col = f"{feature}__within_macrozone"
+        out[between_col] = group_mean
+        out[within_col] = values - group_mean
+        metadata_rows.append(
+            {
+                "feature": feature,
+                "within_feature": within_col,
+                "between_feature": between_col,
+                "family": FEATURE_TO_FAMILY.get(feature, "unknown") if "FEATURE_TO_FAMILY" in globals() else "unknown",
+                "n_notna": int(values.notna().sum()),
+                "n_macrozone_groups": int(out.loc[values.notna(), group_col].nunique()),
+            }
+        )
+    return out, pd.DataFrame(metadata_rows)
+
+
+WITHIN_BETWEEN_FEATURES = sorted(
+    {
+        feature
+        for geography_key in GEOGRAPHIES
+        for feature in residual_candidate_features(geography_key)
+    }
+)
+
+model_df, within_between_feature_metadata = add_within_between_macrozone_features(
+    model_df,
+    WITHIN_BETWEEN_FEATURES,
+)
+
+WITHIN_BETWEEN_METADATA_PATH = RESULTS_DIR / "within_between_macrozone_feature_metadata.csv"
+if not within_between_feature_metadata.empty:
+    within_between_feature_metadata.to_csv(WITHIN_BETWEEN_METADATA_PATH, index=False)
+
+display(within_between_feature_metadata)
+print(f"saved: {WITHIN_BETWEEN_METADATA_PATH}")
+```
+
+## 14.1) Screening residual raw vs within-macrozone
+
+```{python}
+#| label: block11b-within-macrozone-residual-screening
+print("label: block11b-within-macrozone-residual-screening")
+
+
+def attach_within_between_to_residuals(
+    residuals: pd.DataFrame,
+    source_df: pd.DataFrame,
+    metadata: pd.DataFrame,
+) -> pd.DataFrame:
+    if residuals.empty or metadata.empty:
+        return residuals.copy()
+
+    join_cols = ["zone_id", "geography_key"]
+    feature_cols = []
+    for _, row in metadata.iterrows():
+        feature_cols.extend([row["feature"], row["within_feature"], row["between_feature"]])
+    feature_cols = [col for col in dedupe_preserve_order(feature_cols) if col in source_df.columns]
+    source = source_df[join_cols + feature_cols].drop_duplicates(join_cols)
+    out = residuals.drop(columns=[col for col in feature_cols if col in residuals.columns], errors="ignore")
+    return out.merge(source, on=join_cols, how="left")
+
+
+def screen_within_between_residual_features(
+    residuals: pd.DataFrame,
+    metadata: pd.DataFrame,
+) -> pd.DataFrame:
+    if residuals.empty or metadata.empty:
+        return pd.DataFrame()
+
+    rows = []
+    group_cols = ["geography_key", "geography", "outcome", "validation_id", "validation", "weighting"]
+    for keys, part in residuals.groupby(group_cols, dropna=False):
+        geography_key = keys[0]
+        allowed_features = set(residual_candidate_features(geography_key))
+        meta_part = metadata.loc[metadata["feature"].isin(allowed_features)].copy()
+        for _, row in meta_part.iterrows():
+            residual = pd.to_numeric(part["baseline_residual"], errors="coerce")
+            weight = pd.to_numeric(part["baseline_weight"], errors="coerce").fillna(1.0)
+            for component, feature_col in [
+                ("raw", row["feature"]),
+                ("within_macrozone", row["within_feature"]),
+                ("between_macrozone", row["between_feature"]),
+            ]:
+                if feature_col not in part.columns:
+                    continue
+                values = pd.to_numeric(part[feature_col], errors="coerce")
+                valid = pd.DataFrame({"x": values, "residual": residual, "weight": weight}).dropna()
+                if valid.shape[0] < 20 or valid["x"].nunique() < 2:
+                    continue
+                spearman = valid["x"].corr(valid["residual"], method="spearman")
+                pearson_weighted = weighted_corr(valid["x"], valid["residual"], valid["weight"])
+                q_gap = q5_q1_residual_gap(valid["x"], valid["residual"]) if component != "between_macrozone" else np.nan
+                rows.append(
+                    {
+                        "geography_key": geography_key,
+                        "geography": keys[1],
+                        "outcome": keys[2],
+                        "validation_id": keys[3],
+                        "validation": keys[4],
+                        "weighting": keys[5],
+                        "feature": row["feature"],
+                        "component": component,
+                        "feature_col": feature_col,
+                        "family": row["family"],
+                        "n_zones_with_feature": int(valid.shape[0]),
+                        "spearman_residual": spearman,
+                        "weighted_pearson_residual": pearson_weighted,
+                        "q5_q1_residual_gap": q_gap,
+                        "abs_spearman_residual": abs(spearman) if pd.notna(spearman) else np.nan,
+                        "abs_weighted_pearson_residual": abs(pearson_weighted) if pd.notna(pearson_weighted) else np.nan,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+if "fine_signal_residuals" not in globals() or fine_signal_residuals.empty:
+    print("Primero ejecutar block10b-build-territorial-baseline-residuals.")
+    within_between_residual_screening = pd.DataFrame()
+else:
+    fine_signal_residuals_within_between = attach_within_between_to_residuals(
+        fine_signal_residuals,
+        model_df,
+        within_between_feature_metadata,
+    )
+    within_between_residual_screening = screen_within_between_residual_features(
+        fine_signal_residuals_within_between,
+        within_between_feature_metadata,
+    )
+
+WITHIN_BETWEEN_RESIDUAL_SCREENING_PATH = RESULTS_DIR / "within_between_macrozone_residual_screening.csv"
+if not within_between_residual_screening.empty:
+    within_between_residual_screening.to_csv(WITHIN_BETWEEN_RESIDUAL_SCREENING_PATH, index=False)
+
+if within_between_residual_screening.empty:
+    display(within_between_residual_screening)
+else:
+    raw_within_comparison = (
+        within_between_residual_screening
+        .loc[within_between_residual_screening["component"].isin(["raw", "within_macrozone"])]
+        .pivot_table(
+            index=["geography", "outcome", "validation", "weighting", "feature", "family"],
+            columns="component",
+            values=["spearman_residual", "weighted_pearson_residual", "q5_q1_residual_gap"],
+            aggfunc="first",
+        )
+        .reset_index()
+    )
+    raw_within_comparison.columns = [
+        "_".join([str(part) for part in col if str(part)])
+        if isinstance(col, tuple)
+        else col
+        for col in raw_within_comparison.columns
+    ]
+    raw_within_comparison["abs_within_weighted"] = raw_within_comparison[
+        "weighted_pearson_residual_within_macrozone"
+    ].abs()
+    raw_within_comparison["abs_raw_weighted"] = raw_within_comparison[
+        "weighted_pearson_residual_raw"
+    ].abs()
+    raw_within_comparison["within_minus_raw_abs_weighted"] = (
+        raw_within_comparison["abs_within_weighted"]
+        - raw_within_comparison["abs_raw_weighted"]
+    )
+
+    display_cols = [
+        "geography",
+        "outcome",
+        "validation",
+        "weighting",
+        "feature",
+        "family",
+        "spearman_residual_raw",
+        "spearman_residual_within_macrozone",
+        "weighted_pearson_residual_raw",
+        "weighted_pearson_residual_within_macrozone",
+        "q5_q1_residual_gap_raw",
+        "q5_q1_residual_gap_within_macrozone",
+        "within_minus_raw_abs_weighted",
+    ]
+
+    within_display = (
+        raw_within_comparison
+        .sort_values(
+            ["geography", "outcome", "validation", "abs_within_weighted", "abs_raw_weighted"],
+            ascending=[True, True, True, False, False],
+        )
+        .groupby(["geography", "outcome", "validation"], dropna=False)
+        .head(8)
+        [display_cols]
+        .copy()
+    )
+    for col in display_cols:
+        if col not in ["geography", "outcome", "validation", "weighting", "feature", "family"]:
+            within_display[col] = within_display[col].round(3)
+    display(within_display)
+    print(f"saved: {WITHIN_BETWEEN_RESIDUAL_SCREENING_PATH}")
+```
+
+## 14.2) Plantilla de lectura within/between
+
+```{python}
+#| label: block11c-within-between-reading-template
+print("label: block11c-within-between-reading-template")
+
+within_between_reading_template = pd.DataFrame(
+    [
+        {
+            "pregunta": "La senal fina sobrevive dentro de macrozona?",
+            "lectura": "Sobrevive solo como senal debil. Centrar por macrozona no revela un predictor local fuerte.",
+            "evidencia": "Los maximos within quedan aprox. en |corr| 0.09-0.13 ponderado y 0.12-0.16 Spearman.",
+        },
+        {
+            "pregunta": "La senal era principalmente between macrozona?",
+            "lectura": "Parte importante de la lectura previa parece territorial/base. El componente within no cambia la conclusion general.",
+            "evidencia": "Las diferencias within-minus-raw son pequenas; el mayor aumento absoluto ponderado observado es bajo.",
+        },
+        {
+            "pregunta": "Que variables se vuelven mas claras dentro de macrozona?",
+            "lectura": "En origen, oferta bus es la senal residual mas consistente. En residencia aparece mas composicion etaria que educacion.",
+            "evidencia": "bus_stop_hour_supply alcanza Spearman within +0.155 y brecha Q5-Q1 +0.455 pp; population_60_plus y age_mean_z son negativas en residencia.",
+        },
+        {
+            "pregunta": "Decision",
+            "lectura": "No conviene abrir una rama compleja de modelos centrados como camino principal. Usar el audit como evidencia de techo bajo y priorizar mejores features o otra estructura temporal.",
+            "evidencia": "Las asociaciones residuales siguen siendo pequenas luego de controlar baseline territorial y macrozona.",
+        },
+    ]
+)
+
+display(within_between_reading_template)
+```
+
+**Lectura del bloque.** Al separar las variables candidatas entre diferencias
+gruesas de macrozona y diferencias dentro de macrozona, no aparece una senal
+fina fuerte que explique los residuos del baseline territorial. En origen de
+viaje, la oferta bus mantiene la senal residual mas consistente, aunque de
+magnitud moderada. En residencia, las senales residuales apuntan mas a
+composicion etaria que a educacion o centralidad urbana. El acceso fisico a
+carga BIP sigue funcionando como control de baja senal. En conjunto, este audit
+sugiere que el modelo zonal actual captura mejor estructura territorial,
+soporte y volumen que mecanismos locales finos con las variables disponibles.
+
+# 15) Diagnosticos
+
+Diagnosticos minimos antes de interpretar:
+
+- predicho vs observado;
+- residuos por macrozona;
+- residuos vs soporte;
+- sensibilidad a zonas influyentes;
+- comparacion tasa vs aporte volumetrico.
+
+```{python}
+#| label: block9-diagnostics-contract
+print("label: block9-diagnostics-contract")
+
+diagnostics_contract = pd.DataFrame(
+    [
+        {"diagnostico": "predicho vs observado", "pregunta": "El modelo ordena zonas razonablemente?"},
+        {"diagnostico": "residuos por macrozona", "pregunta": "Quedan patrones territoriales no capturados?"},
+        {"diagnostico": "residuos vs soporte", "pregunta": "El error se concentra en zonas chicas?"},
+        {"diagnostico": "zonas influyentes", "pregunta": "El resultado depende de pocas zonas de alto volumen?"},
+        {"diagnostico": "tasa vs volumen", "pregunta": "Crecimiento relativo y aporte agregado cuentan la misma historia?"},
+    ]
+)
+
+display(diagnostics_contract)
+```
+
+# 16) Robustez
+
+Robustez minima del modelo:
+
+- soporte 100/250/500;
+- delta bruto vs delta relativo;
+- zonas pesan igual vs ponderadas;
+- excluir macrozonas externas;
+- reemplazar variables redundantes: educacion vs D+E, oferta bus vs abordajes.
+
+```{python}
+#| label: block10-robustness-contract
+print("label: block10-robustness-contract")
+
+robustness_contract = pd.DataFrame(
+    [
+        {"sensibilidad": "soporte minimo", "valores": "100, 250, 500"},
+        {"sensibilidad": "outcome", "valores": "delta_pp, delta_relative_pp, share_shift_qr_delta"},
+        {"sensibilidad": "ponderacion", "valores": "zona igual, support_min, n_2025"},
+        {"sensibilidad": "macrozonas externas", "valores": "incluye, excluye"},
+        {"sensibilidad": "variables redundantes", "valores": "educacion vs D+E; oferta bus vs abordajes"},
+    ]
+)
+
+display(robustness_contract)
+```
+
+# 17) Criterios de seleccion del modelo
+
+El modelo recomendado no necesariamente sera el que maximice R2. Debe cumplir:
+
+1. mejora sobre baseline;
+2. estabilidad bajo sensibilidad;
+3. interpretabilidad;
+4. baja dependencia de variables redundantes;
+5. lectura compatible con el EDA.
+
+```{python}
+#| label: block11-model-selection-criteria
+print("label: block11-model-selection-criteria")
+
+selection_criteria = pd.DataFrame(
+    [
+        {"criterio": "Performance", "detalle": "Mejora out-of-sample sobre M0/M1."},
+        {"criterio": "Estabilidad", "detalle": "Signo y magnitud razonables bajo sensibilidad."},
+        {"criterio": "Interpretabilidad", "detalle": "Variables y controles defendibles en el manuscrito."},
+        {"criterio": "Parsimonia", "detalle": "Evitar muchos predictores altamente redundantes."},
+        {"criterio": "Consistencia EDA", "detalle": "No contradecir sin razon los patrones descriptivos ya revisados."},
+    ]
+)
+
+display(selection_criteria)
+```
+
+# 18) Cierre esperado del notebook
+
+El notebook deberia terminar con una tabla corta:
+
+- outcome recomendado;
+- modelo base recomendado;
+- modelo interpretable recomendado;
+- benchmark predictivo;
+- variables prioritarias;
+- riesgos residuales;
+- decision sobre si seguir con modelo zonal como modelo principal o como
+  complemento del modelo a nivel tarjeta.
+
+```{python}
+#| label: block12-final-handoff-template
+print("label: block12-final-handoff-template")
+
+handoff_template = pd.DataFrame(
+    [
+        {"item": "Outcome recomendado", "decision": ""},
+        {"item": "Unidad principal", "decision": ""},
+        {"item": "Modelo interpretable recomendado", "decision": ""},
+        {"item": "Benchmark predictivo", "decision": ""},
+        {"item": "Variables prioritarias", "decision": ""},
+        {"item": "Controles minimos", "decision": ""},
+        {"item": "Riesgos residuales", "decision": ""},
+        {"item": "Uso en manuscrito", "decision": ""},
+    ]
+)
+
+display(handoff_template)
+```
+
+# 19) Factibilidad panel zona-semana
+
+Antes de reformular el modelo zonal, este bloque verifica si los datos ya
+permiten pasar de una unica diferencia interanual por zona a un panel semanal
+comparable. La unidad tentativa es:
+
+```text
+zona ZONA777 x semana comparable
+```
+
+con pares `W14`, `W15`, `W16` y `W17`, comparando 2025 contra 2024 dentro de la
+misma semana ISO. Esto no reemplaza el modelo actual; evalua si hay suficiente
+soporte, cobertura y estabilidad temporal para justificar una segunda
+especificacion.
+
+## 19.1) Contrato e insumos
+
+```{python}
+#| label: block19a-zone-week-panel-contract
+print("label: block19a-zone-week-panel-contract")
+
+import polars as pl
+
+ZONE_WEEK_PANEL_DIR = RESULTS_DIR / "zone_week_panel_feasibility"
+ZONE_WEEK_PANEL_DIR.mkdir(parents=True, exist_ok=True)
+
+PANEL_WEEK_PAIRS = ["W14", "W15", "W16", "W17"]
+PANEL_YEARS = [2024, 2025]
+PANEL_WEEKS = [f"{year}-{week_pair}" for year in PANEL_YEARS for week_pair in PANEL_WEEK_PAIRS]
+
+TRIP_WEEK_PATHS = {
+    week: PROJECT_ROOT / "tmp" / f"viajes_con_te_calculado_{week}.parquet"
+    for week in PANEL_WEEKS
+}
+CARD_MATRIX_PATH = (
+    PROJECT_ROOT
+    / "tmp"
+    / "audits"
+    / "user_level_redesign"
+    / "user_model_matrix_interannual_ml_clean_alta_n3.parquet"
+)
+
+zone_week_panel_contract = pd.DataFrame(
+    [
+        {
+            "geografia": "Origen de viaje",
+            "unidad_panel": "zona_inicio_viaje x semana comparable",
+            "observacion": "viajes iniciados en la zona-semana",
+            "outcome_principal": "delta_relative_pp_week",
+            "soporte": "min(n_2024_week, n_2025_week)",
+        },
+        {
+            "geografia": "Residencia",
+            "unidad_panel": "zona_hogar x semana comparable",
+            "observacion": "tarjetas activas en la zona de residencia-semana",
+            "outcome_principal": "delta_relative_pp_week",
+            "soporte": "min(n_2024_week, n_2025_week)",
+        },
+    ]
+)
+
+path_status = pd.DataFrame(
+    [
+        {
+            "input": "trip_week",
+            "week": week,
+            "path": str(path),
+            "exists": path.exists(),
+        }
+        for week, path in TRIP_WEEK_PATHS.items()
+    ]
+    + [
+        {
+            "input": "card_matrix",
+            "week": "",
+            "path": str(CARD_MATRIX_PATH),
+            "exists": CARD_MATRIX_PATH.exists(),
+        }
+    ]
+)
+
+display(zone_week_panel_contract)
+display(path_status)
+```
+
+## 19.2) Construccion del panel zona-semana
+
+Esta celda agrega primero por semana para evitar materializar todos los viajes
+como una sola tabla. Puede tardar, porque procesa ocho parquets grandes.
+
+```{python}
+#| label: block19b-build-zone-week-panel
+print("label: block19b-build-zone-week-panel")
+
+
+def collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
+    try:
+        return lf.collect(engine="streaming")
+    except TypeError:
+        try:
+            return lf.collect(streaming=True)
+        except TypeError:
+            return lf.collect()
+
+
+def parse_week_label(week: str) -> tuple[int, str]:
+    year_text, week_pair = week.split("-")
+    return int(year_text), week_pair
+
+
+def validate_zone_week_inputs() -> None:
+    missing_trip_weeks = [
+        f"{week}: {path}"
+        for week, path in TRIP_WEEK_PATHS.items()
+        if not path.exists()
+    ]
+    if missing_trip_weeks:
+        raise FileNotFoundError("Faltan parquets semanales: " + "; ".join(missing_trip_weeks))
+    if not CARD_MATRIX_PATH.exists():
+        raise FileNotFoundError(CARD_MATRIX_PATH)
+
+
+def trip_week_lf(week: str) -> pl.LazyFrame:
+    path = TRIP_WEEK_PATHS[week]
+    year, week_pair = parse_week_label(week)
+    schema_names = set(pl.scan_parquet(path).collect_schema().names())
+    required = {"id_tarjeta", "zona_inicio_viaje", "is_qr"}
+    missing = sorted(required - schema_names)
+    if missing:
+        raise KeyError(f"{week} no contiene columnas requeridas: {missing}")
+    return (
+        pl.scan_parquet(path)
+        .select(
+            [
+                pl.col("id_tarjeta").cast(pl.Utf8).alias("id_tarjeta"),
+                pl.col("zona_inicio_viaje").cast(pl.Int64, strict=False).alias("origin_zone_id"),
+                pl.col("is_qr").cast(pl.Int8, strict=False).alias("is_qr_trip"),
+                pl.lit(year).cast(pl.Int16).alias("year"),
+                pl.lit(week_pair).alias("week_pair"),
+                pl.lit(week).alias("partition"),
+            ]
+        )
+    )
+
+
+def origin_week_rates(week: str) -> pd.DataFrame:
+    rates = (
+        trip_week_lf(week)
+        .filter(pl.col("origin_zone_id").is_not_null() & (pl.col("origin_zone_id") > 0))
+        .group_by(["origin_zone_id", "year", "week_pair", "partition"])
+        .agg(
+            [
+                pl.len().alias("n_obs"),
+                pl.col("is_qr_trip").sum().alias("n_qr"),
+            ]
+        )
+        .with_columns((pl.col("n_qr") / pl.col("n_obs")).alias("qr_share"))
+        .rename({"origin_zone_id": "zone_id"})
+    )
+    out = collect_streaming(rates).to_pandas()
+    out["geography_key"] = "origin_trip"
+    out["geography"] = "Origen de viaje"
+    out["unit"] = "viajes iniciados en la zona-semana"
+    return out
+
+
+def residence_universe_lf() -> pl.LazyFrame:
+    return (
+        pl.scan_parquet(CARD_MATRIX_PATH)
+        .select(
+            [
+                pl.col("id_tarjeta").cast(pl.Utf8).alias("id_tarjeta"),
+                pl.col("zona_hogar").cast(pl.Int64, strict=False).alias("zone_id"),
+            ]
+        )
+        .filter(pl.col("zone_id").is_not_null() & (pl.col("zone_id") > 0))
+        .unique(subset=["id_tarjeta"], keep="first")
+    )
+
+
+def residence_week_rates(week: str, residence_lf: pl.LazyFrame) -> pd.DataFrame:
+    card_week = (
+        trip_week_lf(week)
+        .join(residence_lf, on="id_tarjeta", how="inner")
+        .group_by(["id_tarjeta", "zone_id", "year", "week_pair", "partition"])
+        .agg(
+            [
+                pl.len().alias("n_trips_week"),
+                pl.col("is_qr_trip").first().alias("is_qr_week"),
+                pl.col("is_qr_trip").n_unique().alias("n_payment_values"),
+            ]
+        )
+        .filter(pl.col("n_payment_values") == 1)
+    )
+    rates = (
+        card_week
+        .group_by(["zone_id", "year", "week_pair", "partition"])
+        .agg(
+            [
+                pl.len().alias("n_obs"),
+                pl.col("is_qr_week").sum().alias("n_qr"),
+            ]
+        )
+        .with_columns((pl.col("n_qr") / pl.col("n_obs")).alias("qr_share"))
+    )
+    out = collect_streaming(rates).to_pandas()
+    out["geography_key"] = "residence"
+    out["geography"] = "Residencia"
+    out["unit"] = "tarjetas activas en zona hogar-semana"
+    return out
+
+
+def safe_logit_from_counts_np(n_success: pd.Series, n_total: pd.Series, alpha: float = 0.5) -> pd.Series:
+    p = (n_success.astype(float) + alpha) / (n_total.astype(float) + 2 * alpha)
+    p = p.clip(1e-9, 1 - 1e-9)
+    return np.log(p / (1 - p))
+
+
+def build_week_pair_growth_panel(long_df: pd.DataFrame) -> pd.DataFrame:
+    index_cols = ["geography_key", "geography", "unit", "zone_id", "week_pair"]
+    wide = (
+        long_df
+        .pivot_table(
+            index=index_cols,
+            columns="year",
+            values=["n_obs", "n_qr", "qr_share"],
+            aggfunc="first",
+        )
+        .reset_index()
+    )
+    wide.columns = [
+        f"{metric}_{year}" if str(year) else str(metric)
+        for metric, year in wide.columns.to_flat_index()
+    ]
+    wide = wide.rename(
+        columns={
+            "geography_key_": "geography_key",
+            "geography_": "geography",
+            "unit_": "unit",
+            "zone_id_": "zone_id",
+            "week_pair_": "week_pair",
+        }
+    )
+    for year in PANEL_YEARS:
+        for col in [f"n_obs_{year}", f"n_qr_{year}"]:
+            wide[col] = wide[col].fillna(0).astype("int64")
+        share_col = f"qr_share_{year}"
+        wide[share_col] = wide[share_col].where(wide[f"n_obs_{year}"] > 0)
+
+    wide["support_min"] = wide[[f"n_obs_{year}" for year in PANEL_YEARS]].min(axis=1)
+    wide["delta_pp"] = (wide["qr_share_2025"] - wide["qr_share_2024"]) * 100
+    wide["qr_count_delta"] = wide["n_qr_2025"] - wide["n_qr_2024"]
+    wide["total_count_delta"] = wide["n_obs_2025"] - wide["n_obs_2024"]
+    wide["share_shift_qr_delta"] = (wide["qr_share_2025"] - wide["qr_share_2024"]) * wide["n_obs_2025"]
+    wide["volume_qr_delta"] = wide["qr_share_2024"] * (wide["n_obs_2025"] - wide["n_obs_2024"])
+    wide["logit_qr_share_2024_smooth"] = safe_logit_from_counts_np(wide["n_qr_2024"], wide["n_obs_2024"])
+    wide["logit_qr_share_2025_smooth"] = safe_logit_from_counts_np(wide["n_qr_2025"], wide["n_obs_2025"])
+    wide["delta_logit_qr_share_smooth"] = (
+        wide["logit_qr_share_2025_smooth"] - wide["logit_qr_share_2024_smooth"]
+    )
+
+    group_cols = ["geography_key", "week_pair"]
+    totals = (
+        wide
+        .groupby(group_cols, dropna=False)
+        .agg(
+            total_obs_2024=("n_obs_2024", "sum"),
+            total_qr_2024=("n_qr_2024", "sum"),
+            total_obs_2025=("n_obs_2025", "sum"),
+            total_qr_2025=("n_qr_2025", "sum"),
+        )
+        .reset_index()
+    )
+    totals["global_qr_share_2024"] = totals["total_qr_2024"] / totals["total_obs_2024"]
+    totals["global_qr_share_2025"] = totals["total_qr_2025"] / totals["total_obs_2025"]
+    totals["global_delta_pp"] = (
+        totals["global_qr_share_2025"] - totals["global_qr_share_2024"]
+    ) * 100
+
+    wide = wide.merge(
+        totals[
+            [
+                "geography_key",
+                "week_pair",
+                "global_qr_share_2024",
+                "global_qr_share_2025",
+                "global_delta_pp",
+            ]
+        ],
+        on=["geography_key", "week_pair"],
+        how="left",
+        validate="many_to_one",
+    )
+    wide["delta_relative_pp"] = wide["delta_pp"] - wide["global_delta_pp"]
+    wide["model_base_support"] = wide["support_min"].ge(BASE_MIN_SUPPORT)
+    return wide.sort_values(["geography_key", "week_pair", "zone_id"]).reset_index(drop=True)
+
+
+validate_zone_week_inputs()
+residence_lf = residence_universe_lf()
+
+long_parts = []
+for week in PANEL_WEEKS:
+    print(f"agregando origen {week}...")
+    long_parts.append(origin_week_rates(week))
+for week in PANEL_WEEKS:
+    print(f"agregando residencia {week}...")
+    long_parts.append(residence_week_rates(week, residence_lf))
+
+zone_week_panel_long = pd.concat(long_parts, ignore_index=True)
+zone_week_pair_growth_panel = build_week_pair_growth_panel(zone_week_panel_long)
+
+ZONE_WEEK_PANEL_LONG_PATH = ZONE_WEEK_PANEL_DIR / "zone_week_panel_long.parquet"
+ZONE_WEEK_PAIR_GROWTH_PANEL_PATH = ZONE_WEEK_PANEL_DIR / "zone_week_pair_growth_panel.parquet"
+pl.from_pandas(zone_week_panel_long).write_parquet(ZONE_WEEK_PANEL_LONG_PATH)
+pl.from_pandas(zone_week_pair_growth_panel).write_parquet(ZONE_WEEK_PAIR_GROWTH_PANEL_PATH)
+
+print(f"long rows={zone_week_panel_long.shape[0]:,}")
+print(f"paired rows={zone_week_pair_growth_panel.shape[0]:,}")
+print(f"saved: {ZONE_WEEK_PANEL_LONG_PATH}")
+print(f"saved: {ZONE_WEEK_PAIR_GROWTH_PANEL_PATH}")
+display(zone_week_pair_growth_panel.head(10))
+```
+
+## 19.3) Soporte, cobertura y consistencia del panel
+
+```{python}
+#| label: block19c-zone-week-panel-support-audit
+print("label: block19c-zone-week-panel-support-audit")
+
+if "zone_week_pair_growth_panel" not in globals():
+    zone_week_pair_growth_panel = pl.read_parquet(ZONE_WEEK_PAIR_GROWTH_PANEL_PATH).to_pandas()
+
+panel = zone_week_pair_growth_panel.copy()
+
+support_summary_rows = []
+for (geography, week_pair), part in panel.groupby(["geography", "week_pair"], dropna=False):
+    supported_100 = part["support_min"].ge(100)
+    supported_250 = part["support_min"].ge(250)
+    supported_500 = part["support_min"].ge(500)
+    support_summary_rows.append(
+        {
+            "geography": geography,
+            "week_pair": week_pair,
+            "n_zones": int(part.shape[0]),
+            "zones_support_100": int(supported_100.sum()),
+            "zones_support_250": int(supported_250.sum()),
+            "zones_support_500": int(supported_500.sum()),
+            "share_support_250": supported_250.mean(),
+            "median_support_min": part["support_min"].median(),
+            "p10_support_min": part["support_min"].quantile(0.10),
+            "p90_support_min": part["support_min"].quantile(0.90),
+            "global_qr_share_2024": part["global_qr_share_2024"].iloc[0],
+            "global_qr_share_2025": part["global_qr_share_2025"].iloc[0],
+            "global_delta_pp": part["global_delta_pp"].iloc[0],
+        }
+    )
+
+zone_week_support_summary = pd.DataFrame(support_summary_rows)
+
+zone_week_completeness = (
+    panel.assign(supported_250=panel["support_min"].ge(BASE_MIN_SUPPORT))
+    .groupby(["geography", "zone_id"], dropna=False)
+    .agg(
+        n_week_pairs=("week_pair", "nunique"),
+        n_supported_pairs=("supported_250", "sum"),
+        min_support_observed=("support_min", "min"),
+        median_support_observed=("support_min", "median"),
+    )
+    .reset_index()
+)
+zone_week_completeness_summary = (
+    zone_week_completeness
+    .groupby("geography", dropna=False)
+    .agg(
+        n_zones=("zone_id", "nunique"),
+        zones_all_4_pairs=("n_week_pairs", lambda s: int((s == len(PANEL_WEEK_PAIRS)).sum())),
+        zones_all_4_supported_250=("n_supported_pairs", lambda s: int((s == len(PANEL_WEEK_PAIRS)).sum())),
+        median_supported_pairs=("n_supported_pairs", "median"),
+        p10_min_support=("min_support_observed", lambda s: s.quantile(0.10)),
+        median_min_support=("min_support_observed", "median"),
+    )
+    .reset_index()
+)
+
+ZONE_WEEK_SUPPORT_SUMMARY_PATH = ZONE_WEEK_PANEL_DIR / "zone_week_support_summary.csv"
+ZONE_WEEK_COMPLETENESS_PATH = ZONE_WEEK_PANEL_DIR / "zone_week_completeness.csv"
+zone_week_support_summary.to_csv(ZONE_WEEK_SUPPORT_SUMMARY_PATH, index=False)
+zone_week_completeness.to_csv(ZONE_WEEK_COMPLETENESS_PATH, index=False)
+
+display(zone_week_support_summary.round(4))
+display(zone_week_completeness_summary.round(2))
+print(f"saved: {ZONE_WEEK_SUPPORT_SUMMARY_PATH}")
+print(f"saved: {ZONE_WEEK_COMPLETENESS_PATH}")
+```
+
+## 19.4) Estabilidad temporal de la señal semanal
+
+Este bloque mira si el cambio relativo por zona se parece entre semanas
+comparables. Si la correlacion entre semanas es muy baja, el panel puede servir
+para diagnostico, pero no necesariamente como modelo principal estable.
+
+```{python}
+#| label: block19d-zone-week-temporal-stability
+print("label: block19d-zone-week-temporal-stability")
+
+if "zone_week_pair_growth_panel" not in globals():
+    zone_week_pair_growth_panel = pl.read_parquet(ZONE_WEEK_PAIR_GROWTH_PANEL_PATH).to_pandas()
+
+panel_supported = zone_week_pair_growth_panel.loc[
+    zone_week_pair_growth_panel["support_min"].ge(BASE_MIN_SUPPORT)
+].copy()
+
+stability_rows = []
+top_persistence_rows = []
+correlation_tables = {}
+
+for geography, part in panel_supported.groupby("geography", dropna=False):
+    pivot = part.pivot_table(
+        index="zone_id",
+        columns="week_pair",
+        values="delta_relative_pp",
+        aggfunc="first",
+    )
+    corr = pivot.corr(method="spearman")
+    correlation_tables[geography] = corr
+    off_diag = corr.where(~np.eye(corr.shape[0], dtype=bool)).stack().dropna()
+    stability_rows.append(
+        {
+            "geography": geography,
+            "n_zones_any_supported": int(pivot.shape[0]),
+            "n_zones_all_pairs_supported": int(pivot.dropna().shape[0]),
+            "mean_pairwise_spearman": off_diag.mean() if not off_diag.empty else np.nan,
+            "median_pairwise_spearman": off_diag.median() if not off_diag.empty else np.nan,
+            "min_pairwise_spearman": off_diag.min() if not off_diag.empty else np.nan,
+            "max_pairwise_spearman": off_diag.max() if not off_diag.empty else np.nan,
+        }
+    )
+
+    top_flags = []
+    for week_pair, week_part in part.groupby("week_pair", dropna=False):
+        threshold = week_part["delta_relative_pp"].quantile(0.80)
+        top_flags.append(
+            week_part.loc[:, ["zone_id", "week_pair", "delta_relative_pp"]]
+            .assign(top20_week=week_part["delta_relative_pp"].ge(threshold))
+        )
+    top_df = pd.concat(top_flags, ignore_index=True)
+    top_counts = (
+        top_df
+        .groupby("zone_id", dropna=False)
+        .agg(
+            n_supported_pairs=("week_pair", "nunique"),
+            n_top20_pairs=("top20_week", "sum"),
+        )
+        .reset_index()
+    )
+    top_persistence_rows.append(
+        {
+            "geography": geography,
+            "zones_top_any_week": int(top_counts["n_top20_pairs"].ge(1).sum()),
+            "zones_top_2plus_weeks": int(top_counts["n_top20_pairs"].ge(2).sum()),
+            "zones_top_3plus_weeks": int(top_counts["n_top20_pairs"].ge(3).sum()),
+            "zones_top_all_supported_weeks": int(
+                (top_counts["n_top20_pairs"] == top_counts["n_supported_pairs"]).sum()
+            ),
+            "median_top20_pairs_among_top_any": top_counts.loc[
+                top_counts["n_top20_pairs"].ge(1), "n_top20_pairs"
+            ].median(),
+        }
+    )
+
+zone_week_stability_summary = pd.DataFrame(stability_rows)
+zone_week_top_persistence = pd.DataFrame(top_persistence_rows)
+
+ZONE_WEEK_STABILITY_PATH = ZONE_WEEK_PANEL_DIR / "zone_week_temporal_stability_summary.csv"
+ZONE_WEEK_TOP_PERSISTENCE_PATH = ZONE_WEEK_PANEL_DIR / "zone_week_top_persistence_summary.csv"
+zone_week_stability_summary.to_csv(ZONE_WEEK_STABILITY_PATH, index=False)
+zone_week_top_persistence.to_csv(ZONE_WEEK_TOP_PERSISTENCE_PATH, index=False)
+
+for geography, corr in correlation_tables.items():
+    print(f"Correlacion Spearman entre semanas - {geography}")
+    display(corr.round(3))
+
+display(zone_week_stability_summary.round(3))
+display(zone_week_top_persistence)
+print(f"saved: {ZONE_WEEK_STABILITY_PATH}")
+print(f"saved: {ZONE_WEEK_TOP_PERSISTENCE_PATH}")
+```
+
+## 19.5) Plantilla de decision
+
+```{python}
+#| label: block19e-zone-week-panel-decision-template
+print("label: block19e-zone-week-panel-decision-template")
+
+zone_week_decision_template = pd.DataFrame(
+    [
+        {
+            "criterio": "Cobertura temporal",
+            "umbral_practico": "8 parquets: W14-W17 de 2024 y 2025",
+            "lectura": "",
+        },
+        {
+            "criterio": "Soporte por zona-semana",
+            "umbral_practico": "mayoria de zonas con support_min >= 250",
+            "lectura": "",
+        },
+        {
+            "criterio": "Zonas con panel completo",
+            "umbral_practico": "suficientes zonas con 4 pares semanales soportados",
+            "lectura": "",
+        },
+        {
+            "criterio": "Estabilidad del delta semanal",
+            "umbral_practico": "correlaciones entre semanas no cercanas a cero",
+            "lectura": "",
+        },
+        {
+            "criterio": "Persistencia top-growth",
+            "umbral_practico": "zonas top no cambian completamente cada semana",
+            "lectura": "",
+        },
+        {
+            "criterio": "Decision metodologica",
+            "umbral_practico": "si cobertura y estabilidad son razonables, redisenar modelo como panel zona-semana",
+            "lectura": "",
+        },
+    ]
+)
+
+display(zone_week_decision_template)
+```
