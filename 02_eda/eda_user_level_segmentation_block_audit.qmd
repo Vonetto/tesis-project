@@ -1,0 +1,3891 @@
+---
+title: "EDA User-Level Segmentation - Block Audit"
+format:
+  html:
+    toc: true
+    code-fold: true
+jupyter: python3
+freeze: false
+---
+
+# Objetivo
+
+Este notebook audita bloques de variables candidatas para segmentacion
+user-level. No estima modelos finales ni decide automaticamente que variables
+entran al clustering.
+
+La primera auditoria cubre el bloque de **intensidad / soporte de uso**. La
+decision buscada no es que variable predice mejor QR, sino que variables
+representan dimensiones no redundantes y metodologicamente defendibles para una
+matriz `behavioral_wide`.
+
+# 1) Setup
+
+```{python}
+#| label: setup
+print("label: setup")
+
+from pathlib import Path
+import math
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import polars as pl
+from IPython.display import display
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+pd.set_option("display.max_columns", 120)
+pd.set_option("display.width", 180)
+pl.Config.set_tbl_rows(-1)
+pl.Config.set_tbl_cols(-1)
+pl.Config.set_tbl_width_chars(180)
+
+PROJECT_ROOT = Path().resolve()
+while PROJECT_ROOT != PROJECT_ROOT.parent:
+    if (PROJECT_ROOT / "config").is_dir() and (PROJECT_ROOT / "lib").is_dir():
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
+else:
+    raise RuntimeError("No se encontro la raiz del proyecto.")
+
+USER_DIR = PROJECT_ROOT / "tmp" / "audits" / "user_level_redesign"
+SEED = 20260527
+PCA_SAMPLE_N = 300_000
+PRIMARY_UNIVERSE = "alta_n3"
+```
+
+# 2) Universos
+
+```{python}
+#| label: universes
+print("label: universes")
+
+UNIVERSES = [
+    {
+        "label": "alta_n3",
+        "path": USER_DIR / "user_model_matrix_interannual_ml_clean_alta_n3.parquet",
+        "note": "Universo principal actual.",
+    },
+    {
+        "label": "alta_n5",
+        "path": USER_DIR / "user_model_matrix_interannual_ml_clean_alta_n5.parquet",
+        "note": "Sensibilidad por mayor soporte minimo de viajes.",
+    },
+    {
+        "label": "alta_n10",
+        "path": USER_DIR / "user_model_matrix_interannual_ml_clean_alta_n10.parquet",
+        "note": "Sensibilidad por alta historia observada.",
+    },
+    {
+        "label": "alta_n3_home3",
+        "path": USER_DIR / "user_model_matrix_interannual_ml_clean_alta_n3_home3.parquet",
+        "note": "Sensibilidad con residencia mejor soportada.",
+    },
+]
+
+universe_status = []
+for u in UNIVERSES:
+    exists = u["path"].exists()
+    universe_status.append({**u, "exists": exists})
+    print(f"{u['label']}: exists={exists} | path={u['path']}")
+
+display(pd.DataFrame(universe_status))
+```
+
+# 3) Protocolo de auditoria
+
+No elegimos variables por "tincada". Para cada bloque usamos cinco criterios:
+
+1. **Validez conceptual**: que mide la variable en lenguaje humano.
+2. **Calidad estadistica**: missing, varianza, outliers, distribucion,
+   estabilidad entre universos.
+3. **No redundancia**: si dos variables miden casi lo mismo, se elige una
+   representante por subdimension.
+4. **Utilidad no supervisada**: PCA/loadings internos, potencial de separar
+   estructura de comportamiento, estabilidad al incluir/excluir.
+5. **QR/BIP solo post-hoc**: tasas o lifts QR se miran como contexto, no como
+   criterio principal de seleccion.
+
+# 4) Bloque intensidad / soporte de uso
+
+## 4.1 Variables candidatas y lectura conceptual
+
+```{python}
+#| label: intensity-concept-table
+print("label: intensity-concept-table")
+
+INTENSITY_CANDIDATES = [
+    {
+        "raw_variable": "n_viajes",
+        "audit_variable": "log1p_n_viajes",
+        "concept": "Exposicion/intensidad total observada.",
+        "subdimension": "intensidad_total",
+        "transform": "log1p",
+        "initial_status": "candidate_main",
+        "caveat": "Puede dominar el clustering si se combina con muchos proxies de intensidad.",
+    },
+    {
+        "raw_variable": "n_dias_activos",
+        "audit_variable": "log1p_n_dias_activos",
+        "concept": "Persistencia temporal medida como dias con al menos un viaje.",
+        "subdimension": "persistencia_temporal",
+        "transform": "log1p",
+        "initial_status": "needs_audit",
+        "caveat": "Probablemente muy correlacionada con n_viajes.",
+    },
+    {
+        "raw_variable": "n_semanas_activas",
+        "audit_variable": "log1p_n_semanas_activas",
+        "concept": "Cobertura semanal dentro del scope observado.",
+        "subdimension": "cobertura_semanal",
+        "transform": "log1p",
+        "initial_status": "needs_audit",
+        "caveat": "Puede redundar con n_viajes y n_dias_activos.",
+    },
+    {
+        "raw_variable": "rhythm_active_day_density_span",
+        "audit_variable": "rhythm_active_day_density_span",
+        "concept": "Densidad de dias activos dentro del span observado.",
+        "subdimension": "cotidianeidad_densidad",
+        "transform": "raw",
+        "initial_status": "candidate_main",
+        "caveat": "Debe evaluarse frente a n_dias_activos/n_viajes para evitar duplicacion.",
+    },
+    {
+        "raw_variable": "rhythm_trips_per_active_week",
+        "audit_variable": "rhythm_trips_per_active_week",
+        "concept": "Frecuencia semanal condicional a semanas activas.",
+        "subdimension": "frecuencia_semanal_condicional",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Puede captar intensidad normalizada, pero puede ser redundante.",
+    },
+    {
+        "raw_variable": "rhythm_trips_per_span_day",
+        "audit_variable": "rhythm_trips_per_span_day",
+        "concept": "Intensidad distribuida por dia del span observado.",
+        "subdimension": "intensidad_densificada",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Potencialmente redundante con densidad de dias activos y viajes totales.",
+    },
+]
+
+concept_df = pd.DataFrame(INTENSITY_CANDIDATES)
+display(concept_df)
+```
+
+## 4.2 Helpers
+
+```{python}
+#| label: intensity-helpers
+print("label: intensity-helpers")
+
+RAW_INTENSITY_COLS = [v["raw_variable"] for v in INTENSITY_CANDIDATES]
+AUDIT_INTENSITY_COLS = [v["audit_variable"] for v in INTENSITY_CANDIDATES]
+TARGET_CONTEXT_COLS = ["is_qr", "is_qr_red", "is_qr_other", "tipo_tarjeta"]
+
+
+def existing_columns(path: Path) -> list[str]:
+    return pl.scan_parquet(path).collect_schema().names()
+
+
+def load_intensity_frame(path: Path) -> pl.DataFrame:
+    cols = existing_columns(path)
+    missing = [c for c in RAW_INTENSITY_COLS + TARGET_CONTEXT_COLS if c not in cols]
+    if missing:
+        raise ValueError(f"Faltan columnas en {path.name}: {missing}")
+
+    lf = pl.scan_parquet(path).select(["id_tarjeta"] + RAW_INTENSITY_COLS + TARGET_CONTEXT_COLS)
+    return lf.with_columns(
+        [
+            pl.col("n_viajes").cast(pl.Float64).log1p().alias("log1p_n_viajes"),
+            pl.col("n_dias_activos").cast(pl.Float64).log1p().alias("log1p_n_dias_activos"),
+            pl.col("n_semanas_activas").cast(pl.Float64).log1p().alias("log1p_n_semanas_activas"),
+        ]
+    ).collect()
+
+
+def variable_stats(df: pl.DataFrame, universe: str) -> pd.DataFrame:
+    rows = []
+    n = df.height
+    for c in AUDIT_INTENSITY_COLS:
+        s = df[c].cast(pl.Float64)
+        desc = df.select(
+            [
+                pl.col(c).is_null().mean().alias("missing_rate"),
+                pl.col(c).mean().alias("mean"),
+                pl.col(c).std().alias("std"),
+                pl.col(c).min().alias("min"),
+                pl.col(c).quantile(0.01).alias("p01"),
+                pl.col(c).quantile(0.05).alias("p05"),
+                pl.col(c).quantile(0.25).alias("p25"),
+                pl.col(c).median().alias("median"),
+                pl.col(c).quantile(0.75).alias("p75"),
+                pl.col(c).quantile(0.95).alias("p95"),
+                pl.col(c).quantile(0.99).alias("p99"),
+                pl.col(c).max().alias("max"),
+                pl.col(c).n_unique().alias("n_unique"),
+            ]
+        ).row(0, named=True)
+        rows.append({"universe": universe, "variable": c, "n": n, **desc})
+    return pd.DataFrame(rows)
+
+
+def correlation_matrix(df: pl.DataFrame) -> pd.DataFrame:
+    pdf = df.select(AUDIT_INTENSITY_COLS).to_pandas()
+    return pdf.corr(method="spearman")
+
+
+def pca_diagnostic(df: pl.DataFrame, sample_n: int = PCA_SAMPLE_N) -> tuple[pd.DataFrame, pd.DataFrame]:
+    pdf = df.select(AUDIT_INTENSITY_COLS).to_pandas()
+    if sample_n and len(pdf) > sample_n:
+        pdf = pdf.sample(sample_n, random_state=SEED)
+
+    # Median imputation only for the diagnostic. Missing rates are reported
+    # separately and must be considered before any final modeling choice.
+    x = pdf.copy()
+    x = x.fillna(x.median(numeric_only=True))
+    x_scaled = StandardScaler().fit_transform(x)
+
+    pca = PCA(n_components=len(AUDIT_INTENSITY_COLS), random_state=SEED)
+    scores = pca.fit_transform(x_scaled)
+    explained = pd.DataFrame(
+        {
+            "pc": [f"PC{i+1}" for i in range(len(AUDIT_INTENSITY_COLS))],
+            "explained_variance_ratio": pca.explained_variance_ratio_,
+            "cumulative_variance_ratio": np.cumsum(pca.explained_variance_ratio_),
+        }
+    )
+    loadings = pd.DataFrame(
+        pca.components_.T,
+        index=AUDIT_INTENSITY_COLS,
+        columns=[f"PC{i+1}" for i in range(len(AUDIT_INTENSITY_COLS))],
+    ).reset_index(names="variable")
+    return explained, loadings
+
+
+def representative_reconstruction_diagnostic(
+    df: pl.DataFrame,
+    representative_cols: list[str],
+    target_cols: list[str] = AUDIT_INTENSITY_COLS,
+    sample_n: int = PCA_SAMPLE_N,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Measure how well representative variables approximate the full block.
+
+    This is a diagnostic, not a supervised model. It standardizes the full block,
+    computes PCA on all target columns, then fits linear projections from the
+    representative columns to each standardized target variable.
+    """
+    pdf = df.select(target_cols).to_pandas()
+    if sample_n and len(pdf) > sample_n:
+        pdf = pdf.sample(sample_n, random_state=SEED)
+
+    x = pdf.copy()
+    x = x.fillna(x.median(numeric_only=True))
+    x_scaled = pd.DataFrame(
+        StandardScaler().fit_transform(x),
+        columns=target_cols,
+        index=x.index,
+    )
+
+    reps = x_scaled[representative_cols].to_numpy()
+    design = np.column_stack([np.ones(reps.shape[0]), reps])
+    targets = x_scaled[target_cols].to_numpy()
+    beta, *_ = np.linalg.lstsq(design, targets, rcond=None)
+    pred = design @ beta
+
+    rows = []
+    for j, col in enumerate(target_cols):
+        y = targets[:, j]
+        yhat = pred[:, j]
+        ss_res = float(np.sum((y - yhat) ** 2))
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        rows.append(
+            {
+                "target_variable": col,
+                "r2_from_representatives": 1 - ss_res / ss_tot if ss_tot > 0 else np.nan,
+                "corr_with_prediction": float(np.corrcoef(y, yhat)[0, 1]),
+            }
+        )
+    reconstruction = pd.DataFrame(rows)
+
+    pca = PCA(n_components=len(target_cols), random_state=SEED)
+    scores = pca.fit_transform(x_scaled[target_cols])
+    pc_corr_rows = []
+    for pc_idx in range(2):
+        for rep in representative_cols:
+            pc_corr_rows.append(
+                {
+                    "pc": f"PC{pc_idx + 1}",
+                    "representative_variable": rep,
+                    "corr": float(np.corrcoef(scores[:, pc_idx], x_scaled[rep])[0, 1]),
+                    "abs_corr": abs(float(np.corrcoef(scores[:, pc_idx], x_scaled[rep])[0, 1])),
+                }
+            )
+    pc_correlations = pd.DataFrame(pc_corr_rows)
+
+    subset_pca = PCA(n_components=len(representative_cols), random_state=SEED)
+    subset_pca.fit(x_scaled[representative_cols])
+    subset_summary = pd.DataFrame(
+        {
+            "metric": [
+                "n_representatives",
+                "mean_r2_all_targets",
+                "median_r2_all_targets",
+                "min_r2_all_targets",
+                "pc1_best_abs_corr",
+                "pc2_best_abs_corr",
+            ],
+            "value": [
+                len(representative_cols),
+                reconstruction["r2_from_representatives"].mean(),
+                reconstruction["r2_from_representatives"].median(),
+                reconstruction["r2_from_representatives"].min(),
+                pc_correlations.query("pc == 'PC1'")["abs_corr"].max(),
+                pc_correlations.query("pc == 'PC2'")["abs_corr"].max(),
+            ],
+        }
+    )
+    return subset_summary, reconstruction, pc_correlations
+
+
+def posthoc_quantile_lift(df: pl.DataFrame, variable: str, n_bins: int = 5) -> pd.DataFrame:
+    pdf = df.select([variable, "is_qr", "is_qr_red", "is_qr_other"]).to_pandas()
+    pdf = pdf.dropna(subset=[variable])
+    if pdf[variable].nunique() < 2:
+        return pd.DataFrame()
+    try:
+        bin_codes = pd.qcut(pdf[variable], q=n_bins, labels=False, duplicates="drop")
+    except ValueError:
+        return pd.DataFrame()
+    if bin_codes.isna().all():
+        return pd.DataFrame()
+
+    pdf["bin_id"] = bin_codes
+    pdf = pdf.dropna(subset=["bin_id"])
+    pdf["bin"] = pdf["bin_id"].astype(int).map(lambda x: f"Q{x + 1}")
+
+    base = {
+        "qr": pdf["is_qr"].mean(),
+        "qr_red": pdf["is_qr_red"].mean(),
+        "qr_other": pdf["is_qr_other"].mean(),
+    }
+    out = (
+        pdf.groupby("bin", observed=True)
+        .agg(
+            n=(variable, "size"),
+            value_min=(variable, "min"),
+            value_max=(variable, "max"),
+            qr_rate=("is_qr", "mean"),
+            qr_red_rate=("is_qr_red", "mean"),
+            qr_other_rate=("is_qr_other", "mean"),
+        )
+        .reset_index()
+    )
+    out["variable"] = variable
+    out["share"] = out["n"] / len(pdf)
+    out["qr_lift"] = out["qr_rate"] / base["qr"]
+    out["qr_red_lift"] = out["qr_red_rate"] / base["qr_red"]
+    out["qr_other_lift"] = out["qr_other_rate"] / base["qr_other"]
+    return out[
+        [
+            "variable",
+            "bin",
+            "n",
+            "share",
+            "value_min",
+            "value_max",
+            "qr_rate",
+            "qr_lift",
+            "qr_red_rate",
+            "qr_red_lift",
+            "qr_other_rate",
+            "qr_other_lift",
+        ]
+    ]
+```
+
+## 4.3 Disponibilidad y calidad estadistica por universo
+
+```{python}
+#| label: intensity-quality-by-universe
+print("label: intensity-quality-by-universe")
+
+stats_frames = []
+loaded = {}
+for u in universe_status:
+    if not u["exists"]:
+        continue
+    df_u = load_intensity_frame(u["path"])
+    loaded[u["label"]] = df_u
+    stats_frames.append(variable_stats(df_u, u["label"]))
+
+intensity_stats = pd.concat(stats_frames, ignore_index=True)
+display(intensity_stats)
+```
+
+## 4.4 Correlacion interna en universo principal
+
+```{python}
+#| label: intensity-correlation-main
+print("label: intensity-correlation-main")
+
+df_primary = loaded[PRIMARY_UNIVERSE]
+corr = correlation_matrix(df_primary)
+display(corr)
+
+fig, ax = plt.subplots(figsize=(8, 6))
+im = ax.imshow(corr.values, vmin=-1, vmax=1, cmap="coolwarm")
+ax.set_xticks(range(len(corr.columns)))
+ax.set_yticks(range(len(corr.index)))
+ax.set_xticklabels(corr.columns, rotation=45, ha="right")
+ax.set_yticklabels(corr.index)
+ax.set_title(f"Spearman correlation - intensity block ({PRIMARY_UNIVERSE})")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+fig.tight_layout()
+plt.show()
+```
+
+## 4.5 PCA diagnostico del bloque intensidad
+
+```{python}
+#| label: intensity-pca-diagnostic
+print("label: intensity-pca-diagnostic")
+
+explained, loadings = pca_diagnostic(df_primary)
+display(explained)
+display(loadings)
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.bar(explained["pc"], explained["explained_variance_ratio"], alpha=0.6, label="individual")
+ax.plot(explained["pc"], explained["cumulative_variance_ratio"], marker="o", color="C3", label="cumulative")
+ax.axhline(0.80, color="grey", linestyle="--", linewidth=1)
+ax.set_ylim(0, 1.05)
+ax.set_ylabel("Variance ratio")
+ax.set_title("PCA diagnostic - intensity block")
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+## 4.6 Representatividad de variables candidatas
+
+Esta prueba cuantifica cuanto retienen dos representantes simples del bloque:
+
+- `log1p_n_viajes`: intensidad / soporte observado.
+- `rhythm_active_day_density_span`: densidad / cotidianeidad.
+
+La metrica principal es el `R2` de reconstruccion lineal de cada variable
+estandarizada del bloque usando solo esos representantes. Tambien se reporta
+la correlacion de los representantes con PC1 y PC2.
+
+```{python}
+#| label: intensity-representative-retention
+print("label: intensity-representative-retention")
+
+REPRESENTATIVE_INTENSITY_COLS = [
+    "log1p_n_viajes",
+    "rhythm_active_day_density_span",
+]
+
+rep_summary, rep_reconstruction, rep_pc_corr = representative_reconstruction_diagnostic(
+    df_primary,
+    representative_cols=REPRESENTATIVE_INTENSITY_COLS,
+)
+
+display(rep_summary)
+display(rep_reconstruction.sort_values("r2_from_representatives", ascending=False))
+display(rep_pc_corr.sort_values(["pc", "abs_corr"], ascending=[True, False]))
+```
+
+## 4.7 QR/BIP post-hoc descriptivo
+
+Esta tabla se mira como contexto externo. No debe decidir por si sola que
+variable entra al clustering.
+
+```{python}
+#| label: intensity-posthoc-qr
+print("label: intensity-posthoc-qr")
+
+lift_frames = []
+for c in AUDIT_INTENSITY_COLS:
+    out = posthoc_quantile_lift(df_primary, c)
+    if not out.empty:
+        lift_frames.append(out)
+
+if lift_frames:
+    intensity_qr_lifts = pd.concat(lift_frames, ignore_index=True)
+    display(intensity_qr_lifts)
+else:
+    print("No se pudieron construir bins de cuantiles para las variables de intensidad.")
+```
+
+## 4.8 Decision del bloque intensidad
+
+Decision provisional para el catalogo, sujeta a revision si una matriz
+posterior muestra inestabilidad o mala interpretabilidad.
+
+```{python}
+#| label: intensity-decision
+print("label: intensity-decision")
+display(pd.DataFrame([
+    {
+        "decision_item": "representante_intensidad_total",
+        "candidate_variables": "log1p_n_viajes, log1p_n_dias_activos, log1p_n_semanas_activas",
+        "decision": "usar log1p_n_viajes como main",
+        "evidence": "PC1 volumen/soporte; corr(PC1, log1p_n_viajes)=0.94; dias/semanas se reconstruyen con R2 0.95/0.88 desde representantes",
+    },
+    {
+        "decision_item": "representante_densidad_cotidianeidad",
+        "candidate_variables": "rhythm_active_day_density_span, rhythm_trips_per_span_day",
+        "decision": "usar rhythm_active_day_density_span como main",
+        "evidence": "PC2 densidad/cotidianeidad; corr(PC2, density)=0.86; trips_per_span_day es casi redundante con density",
+    },
+    {
+        "decision_item": "frecuencia_semanal_condicional",
+        "candidate_variables": "rhythm_trips_per_active_week",
+        "decision": "dejar como sensitivity",
+        "evidence": "mezcla intensidad y densidad; R2 0.81 desde los dos representantes",
+    },
+]))
+```
+
+# 5) Bloque horario / franja
+
+Este bloque pregunta si conviene incluir variables que describen **cuando** se
+usa el transporte: hora promedio, variabilidad horaria y distribucion entre
+franjas laborales/no laborales.
+
+No se decide por QR/BIP. QR/BIP se mira solo post-hoc para interpretar.
+
+## 5.1 Variables candidatas y lectura conceptual
+
+```{python}
+#| label: time-concept-table
+print("label: time-concept-table")
+
+TIME_CANDIDATES = [
+    {
+        "raw_variable": "hora_mean",
+        "audit_variable": "hora_mean",
+        "concept": "Hora promedio de inicio de viajes.",
+        "subdimension": "centralidad_horaria",
+        "transform": "raw",
+        "initial_status": "candidate_main",
+        "caveat": "Promedio circular imperfecto; puede mezclar manana/tarde si hay patrones bimodales.",
+    },
+    {
+        "raw_variable": "hora_std",
+        "audit_variable": "hora_std",
+        "concept": "Variabilidad horaria de los viajes de la tarjeta.",
+        "subdimension": "irregularidad_horaria",
+        "transform": "raw",
+        "initial_status": "candidate_main",
+        "caveat": "Puede estar condicionada por intensidad; revisar missing/imputacion y relacion con n_viajes.",
+    },
+    {
+        "raw_variable": "share_lab_pm",
+        "audit_variable": "share_lab_pm",
+        "concept": "Share de viajes en punta laboral manana.",
+        "subdimension": "punta_manana",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Composicional con otras franjas; no meter todas sin revisar redundancia.",
+    },
+    {
+        "raw_variable": "share_lab_pt",
+        "audit_variable": "share_lab_pt",
+        "concept": "Share de viajes en punta laboral tarde.",
+        "subdimension": "punta_tarde",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Composicional con otras franjas; puede capturar patron laboral.",
+    },
+    {
+        "raw_variable": "share_lab_valle",
+        "audit_variable": "share_lab_valle",
+        "concept": "Share de viajes laborales en valle.",
+        "subdimension": "valle_laboral",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Composicional; puede dominar porque muchos viajes caen en valle.",
+    },
+    {
+        "raw_variable": "share_no_lab",
+        "audit_variable": "share_no_lab",
+        "concept": "Share de viajes en dias/periodos no laborales.",
+        "subdimension": "no_laboral",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Composicional; relevante para distinguir uso no laboral/esporadico.",
+    },
+]
+
+time_concept_df = pd.DataFrame(TIME_CANDIDATES)
+display(time_concept_df)
+```
+
+## 5.2 Helpers
+
+```{python}
+#| label: time-helpers
+print("label: time-helpers")
+
+RAW_TIME_COLS = [v["raw_variable"] for v in TIME_CANDIDATES]
+AUDIT_TIME_COLS = [v["audit_variable"] for v in TIME_CANDIDATES]
+
+
+def load_time_frame(path: Path) -> pl.DataFrame:
+    cols = existing_columns(path)
+    missing = [c for c in RAW_TIME_COLS + TARGET_CONTEXT_COLS if c not in cols]
+    if missing:
+        raise ValueError(f"Faltan columnas en {path.name}: {missing}")
+    return pl.scan_parquet(path).select(["id_tarjeta"] + RAW_TIME_COLS + TARGET_CONTEXT_COLS).collect()
+
+
+def variable_stats_for_cols(df: pl.DataFrame, cols: list[str], universe: str) -> pd.DataFrame:
+    rows = []
+    n = df.height
+    for c in cols:
+        desc = df.select(
+            [
+                pl.col(c).is_null().mean().alias("missing_rate"),
+                pl.col(c).mean().alias("mean"),
+                pl.col(c).std().alias("std"),
+                pl.col(c).min().alias("min"),
+                pl.col(c).quantile(0.01).alias("p01"),
+                pl.col(c).quantile(0.05).alias("p05"),
+                pl.col(c).quantile(0.25).alias("p25"),
+                pl.col(c).median().alias("median"),
+                pl.col(c).quantile(0.75).alias("p75"),
+                pl.col(c).quantile(0.95).alias("p95"),
+                pl.col(c).quantile(0.99).alias("p99"),
+                pl.col(c).max().alias("max"),
+                pl.col(c).n_unique().alias("n_unique"),
+            ]
+        ).row(0, named=True)
+        rows.append({"universe": universe, "variable": c, "n": n, **desc})
+    return pd.DataFrame(rows)
+
+
+def correlation_matrix_for_cols(df: pl.DataFrame, cols: list[str]) -> pd.DataFrame:
+    return df.select(cols).to_pandas().corr(method="spearman")
+
+
+def pca_diagnostic_for_cols(
+    df: pl.DataFrame,
+    cols: list[str],
+    sample_n: int = PCA_SAMPLE_N,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    pdf = df.select(cols).to_pandas()
+    if sample_n and len(pdf) > sample_n:
+        pdf = pdf.sample(sample_n, random_state=SEED)
+
+    x = pdf.fillna(pdf.median(numeric_only=True))
+    x_scaled = StandardScaler().fit_transform(x)
+    pca = PCA(n_components=len(cols), random_state=SEED)
+    pca.fit(x_scaled)
+
+    explained = pd.DataFrame(
+        {
+            "pc": [f"PC{i+1}" for i in range(len(cols))],
+            "explained_variance_ratio": pca.explained_variance_ratio_,
+            "cumulative_variance_ratio": np.cumsum(pca.explained_variance_ratio_),
+        }
+    )
+    loadings = pd.DataFrame(
+        pca.components_.T,
+        index=cols,
+        columns=[f"PC{i+1}" for i in range(len(cols))],
+    ).reset_index(names="variable")
+    return explained, loadings
+```
+
+## 5.3 Disponibilidad y calidad estadistica por universo
+
+```{python}
+#| label: time-quality-by-universe
+print("label: time-quality-by-universe")
+
+time_stats_frames = []
+loaded_time = {}
+for u in universe_status:
+    if not u["exists"]:
+        continue
+    df_u = load_time_frame(u["path"])
+    loaded_time[u["label"]] = df_u
+    time_stats_frames.append(variable_stats_for_cols(df_u, AUDIT_TIME_COLS, u["label"]))
+
+time_stats = pd.concat(time_stats_frames, ignore_index=True)
+display(time_stats)
+```
+
+## 5.4 Correlacion interna en universo principal
+
+```{python}
+#| label: time-correlation-main
+print("label: time-correlation-main")
+
+df_time_primary = loaded_time[PRIMARY_UNIVERSE]
+time_corr = correlation_matrix_for_cols(df_time_primary, AUDIT_TIME_COLS)
+display(time_corr)
+
+fig, ax = plt.subplots(figsize=(8, 6))
+im = ax.imshow(time_corr.values, vmin=-1, vmax=1, cmap="coolwarm")
+ax.set_xticks(range(len(time_corr.columns)))
+ax.set_yticks(range(len(time_corr.index)))
+ax.set_xticklabels(time_corr.columns, rotation=45, ha="right")
+ax.set_yticklabels(time_corr.index)
+ax.set_title(f"Spearman correlation - time block ({PRIMARY_UNIVERSE})")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+fig.tight_layout()
+plt.show()
+```
+
+## 5.5 PCA diagnostico del bloque horario/franja
+
+```{python}
+#| label: time-pca-diagnostic
+print("label: time-pca-diagnostic")
+
+time_explained, time_loadings = pca_diagnostic_for_cols(df_time_primary, AUDIT_TIME_COLS)
+display(time_explained)
+display(time_loadings)
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.bar(time_explained["pc"], time_explained["explained_variance_ratio"], alpha=0.6, label="individual")
+ax.plot(time_explained["pc"], time_explained["cumulative_variance_ratio"], marker="o", color="C3", label="cumulative")
+ax.axhline(0.80, color="grey", linestyle="--", linewidth=1)
+ax.set_ylim(0, 1.05)
+ax.set_ylabel("Variance ratio")
+ax.set_title("PCA diagnostic - time block")
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+## 5.6 Representatividad de variables candidatas
+
+Esta prueba evalua un primer set parsimonioso:
+
+- `hora_mean`
+- `hora_std`
+- `share_lab_pm`
+- `share_no_lab`
+
+La pregunta es si estas cuatro variables aproximan razonablemente el bloque
+completo de seis variables (`hora_*` + shares de franja). Como el PCA mostro
+que PC3 es relevante, ademas de R2 miramos correlaciones con PC1-PC3.
+
+```{python}
+#| label: time-representative-retention
+print("label: time-representative-retention")
+
+TIME_REPRESENTATIVES_V1 = [
+    "hora_mean",
+    "hora_std",
+    "share_lab_pm",
+    "share_no_lab",
+]
+
+time_rep_summary, time_rep_reconstruction, time_rep_pc12 = representative_reconstruction_diagnostic(
+    df_time_primary,
+    representative_cols=TIME_REPRESENTATIVES_V1,
+    target_cols=AUDIT_TIME_COLS,
+)
+
+
+def representative_pc_correlations_for_cols(
+    df: pl.DataFrame,
+    representative_cols: list[str],
+    target_cols: list[str],
+    n_pcs: int = 3,
+    sample_n: int = PCA_SAMPLE_N,
+) -> pd.DataFrame:
+    pdf = df.select(target_cols).to_pandas()
+    if sample_n and len(pdf) > sample_n:
+        pdf = pdf.sample(sample_n, random_state=SEED)
+
+    x = pdf.fillna(pdf.median(numeric_only=True))
+    x_scaled = pd.DataFrame(
+        StandardScaler().fit_transform(x),
+        columns=target_cols,
+        index=x.index,
+    )
+    pca = PCA(n_components=len(target_cols), random_state=SEED)
+    scores = pca.fit_transform(x_scaled[target_cols])
+
+    rows = []
+    for pc_idx in range(min(n_pcs, len(target_cols))):
+        for rep in representative_cols:
+            corr = float(np.corrcoef(scores[:, pc_idx], x_scaled[rep])[0, 1])
+            rows.append(
+                {
+                    "pc": f"PC{pc_idx + 1}",
+                    "representative_variable": rep,
+                    "corr": corr,
+                    "abs_corr": abs(corr),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+time_rep_pc_correlations = representative_pc_correlations_for_cols(
+    df_time_primary,
+    representative_cols=TIME_REPRESENTATIVES_V1,
+    target_cols=AUDIT_TIME_COLS,
+    n_pcs=3,
+)
+
+time_rep_summary_ext = pd.concat(
+    [
+        time_rep_summary,
+        pd.DataFrame(
+            [
+                {
+                    "metric": "pc3_best_abs_corr",
+                    "value": time_rep_pc_correlations.query("pc == 'PC3'")["abs_corr"].max(),
+                }
+            ]
+        ),
+    ],
+    ignore_index=True,
+)
+
+display(time_rep_summary_ext)
+display(time_rep_reconstruction.sort_values("r2_from_representatives", ascending=False))
+display(time_rep_pc_correlations.sort_values(["pc", "abs_corr"], ascending=[True, False]))
+```
+
+Segundo set: se agrega `share_lab_pt` para evaluar si la punta tarde debe
+entrar como representante explicito, dejando `share_lab_valle` como referencia
+composicional implícita.
+
+```{python}
+#| label: time-representative-retention-v2
+print("label: time-representative-retention-v2")
+
+TIME_REPRESENTATIVES_V2 = [
+    "hora_mean",
+    "hora_std",
+    "share_lab_pm",
+    "share_lab_pt",
+    "share_no_lab",
+]
+
+time_rep2_summary, time_rep2_reconstruction, _ = representative_reconstruction_diagnostic(
+    df_time_primary,
+    representative_cols=TIME_REPRESENTATIVES_V2,
+    target_cols=AUDIT_TIME_COLS,
+)
+
+time_rep2_pc_correlations = representative_pc_correlations_for_cols(
+    df_time_primary,
+    representative_cols=TIME_REPRESENTATIVES_V2,
+    target_cols=AUDIT_TIME_COLS,
+    n_pcs=3,
+)
+
+time_rep2_summary_ext = pd.concat(
+    [
+        time_rep2_summary,
+        pd.DataFrame(
+            [
+                {
+                    "metric": "pc3_best_abs_corr",
+                    "value": time_rep2_pc_correlations.query("pc == 'PC3'")["abs_corr"].max(),
+                }
+            ]
+        ),
+    ],
+    ignore_index=True,
+)
+
+display(time_rep2_summary_ext)
+display(time_rep2_reconstruction.sort_values("r2_from_representatives", ascending=False))
+display(time_rep2_pc_correlations.sort_values(["pc", "abs_corr"], ascending=[True, False]))
+```
+
+## 5.7 QR/BIP post-hoc descriptivo
+
+Esta tabla es contexto externo. No decide el input del clustering.
+
+```{python}
+#| label: time-posthoc-qr
+print("label: time-posthoc-qr")
+
+time_lift_frames = []
+for c in AUDIT_TIME_COLS:
+    out = posthoc_quantile_lift(df_time_primary, c)
+    if not out.empty:
+        time_lift_frames.append(out)
+
+if time_lift_frames:
+    time_qr_lifts = pd.concat(time_lift_frames, ignore_index=True)
+    display(time_qr_lifts)
+else:
+    print("No se pudieron construir bins de cuantiles para las variables de horario/franja.")
+```
+
+## 5.8 Decision provisional
+
+```{python}
+#| label: time-decision-template
+print("label: time-decision-template")
+display(pd.DataFrame([
+    {
+        "decision_item": "centralidad_horaria",
+        "candidate_variables": "hora_mean",
+        "decision": "input_behavioral/main",
+        "evidence_to_review": "PC2 abs corr=0.823; mantener caveat de promedio horario ante patrones bimodales.",
+    },
+    {
+        "decision_item": "irregularidad_horaria",
+        "candidate_variables": "hora_std",
+        "decision": "input_behavioral/main",
+        "evidence_to_review": "No redundante con hora_mean; aporta eje de dispersion/puntas.",
+    },
+    {
+        "decision_item": "franjas_laborales",
+        "candidate_variables": "share_lab_pm, share_lab_pt, share_no_lab",
+        "decision": "input_behavioral/main",
+        "evidence_to_review": "Set v2 reconstruye bloque completo; conserva punta manana, punta tarde y no laboral.",
+    },
+    {
+        "decision_item": "franja_referencia",
+        "candidate_variables": "share_lab_valle",
+        "decision": "posthoc_only/sensitivity",
+        "evidence_to_review": "Redundante por composicionalidad; queda como categoria base implicita.",
+    },
+]))
+```
+
+# 6) Bloque regularidad / ritmo temporal
+
+Este bloque pregunta si conviene incluir variables que describen **como se
+distribuye la actividad en el tiempo**, mas alla de intensidad total y franjas
+horarias:
+
+- intermitencia entre dias activos;
+- concentracion diaria;
+- concentracion semanal.
+
+No repetimos aqui las variables ya auditadas como intensidad/densidad
+(`rhythm_active_day_density_span`, `rhythm_trips_per_span_day`,
+`rhythm_trips_per_active_week`). Pueden volver como sensibilidad, pero no deben
+mezclarse silenciosamente con regularidad.
+
+## 6.1 Variables candidatas y lectura conceptual
+
+```{python}
+#| label: rhythm-regularity-concept-table
+print("label: rhythm-regularity-concept-table")
+
+RHYTHM_REGULARITY_CANDIDATES = [
+    {
+        "raw_variable": "rhythm_has_gap",
+        "audit_variable": "rhythm_has_gap",
+        "concept": "Indicador de al menos un gap entre dias activos.",
+        "subdimension": "intermitencia_gap",
+        "transform": "raw binary",
+        "initial_status": "needs_audit",
+        "caveat": "Binaria; puede ser poco informativa con min_trips alto.",
+    },
+    {
+        "raw_variable": "rhythm_n_gap_days",
+        "audit_variable": "rhythm_n_gap_days",
+        "concept": "Numero total de dias sin actividad entre dias activos.",
+        "subdimension": "intermitencia_gap",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Puede correlacionar con span observado y soporte temporal.",
+    },
+    {
+        "raw_variable": "rhythm_median_gap_active_days",
+        "audit_variable": "rhythm_median_gap_active_days",
+        "concept": "Mediana de gaps entre dias activos.",
+        "subdimension": "intermitencia_gap",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Missing esperado en tarjetas con un solo dia activo.",
+    },
+    {
+        "raw_variable": "rhythm_mean_gap_active_days",
+        "audit_variable": "rhythm_mean_gap_active_days",
+        "concept": "Promedio de gaps entre dias activos.",
+        "subdimension": "intermitencia_gap",
+        "transform": "raw",
+        "initial_status": "candidate_main",
+        "caveat": "Fue señal univariada fuerte en ML, pero aqui no se selecciona por QR.",
+    },
+    {
+        "raw_variable": "rhythm_max_gap_active_days",
+        "audit_variable": "rhythm_max_gap_active_days",
+        "concept": "Maximo gap entre dias activos.",
+        "subdimension": "intermitencia_gap",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Sensible a extremos y al span observado.",
+    },
+    {
+        "raw_variable": "rhythm_activity_top1_day_share",
+        "audit_variable": "rhythm_activity_top1_day_share",
+        "concept": "Share de viajes concentrado en el dia mas activo.",
+        "subdimension": "concentracion_diaria",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Puede estar inflada en usuarios de pocos viajes.",
+    },
+    {
+        "raw_variable": "rhythm_activity_top2_day_share",
+        "audit_variable": "rhythm_activity_top2_day_share",
+        "concept": "Share de viajes concentrado en los dos dias mas activos.",
+        "subdimension": "concentracion_diaria",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Probablemente redundante con top1 y HHI.",
+    },
+    {
+        "raw_variable": "rhythm_daily_hhi",
+        "audit_variable": "rhythm_daily_hhi",
+        "concept": "Concentracion HHI de viajes por dia activo.",
+        "subdimension": "concentracion_diaria",
+        "transform": "raw",
+        "initial_status": "candidate_main",
+        "caveat": "Debe evaluarse contra entropia diaria; ambas suelen ser inversas.",
+    },
+    {
+        "raw_variable": "rhythm_daily_entropy_norm",
+        "audit_variable": "rhythm_daily_entropy_norm",
+        "concept": "Entropia normalizada de viajes por dia activo.",
+        "subdimension": "dispersion_diaria",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Probable inversa de HHI; elegir una representacion.",
+    },
+    {
+        "raw_variable": "rhythm_daily_burstiness",
+        "audit_variable": "rhythm_daily_burstiness",
+        "concept": "Burstiness diaria de la actividad.",
+        "subdimension": "irregularidad_diaria",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Interpretacion menos directa; validar distribucion y redundancia.",
+    },
+    {
+        "raw_variable": "rhythm_single_trip_day_share",
+        "audit_variable": "rhythm_single_trip_day_share",
+        "concept": "Share de dias activos con un solo viaje.",
+        "subdimension": "estructura_dia_activo",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Puede mezclarse con intensidad por dia activo.",
+    },
+    {
+        "raw_variable": "rhythm_weekly_top1_share",
+        "audit_variable": "rhythm_weekly_top1_share",
+        "concept": "Share de viajes concentrado en la semana mas activa.",
+        "subdimension": "concentracion_semanal",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Scope tiene pocas semanas; revisar discretizacion.",
+    },
+    {
+        "raw_variable": "rhythm_weekly_hhi",
+        "audit_variable": "rhythm_weekly_hhi",
+        "concept": "Concentracion HHI de viajes por semana activa.",
+        "subdimension": "concentracion_semanal",
+        "transform": "raw",
+        "initial_status": "candidate_main",
+        "caveat": "Puede redundar con top1 semanal y entropia semanal.",
+    },
+    {
+        "raw_variable": "rhythm_weekly_entropy_norm",
+        "audit_variable": "rhythm_weekly_entropy_norm",
+        "concept": "Entropia normalizada de viajes por semana activa.",
+        "subdimension": "dispersion_semanal",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Probable inversa de HHI semanal.",
+    },
+    {
+        "raw_variable": "rhythm_weekly_burstiness",
+        "audit_variable": "rhythm_weekly_burstiness",
+        "concept": "Burstiness semanal de la actividad.",
+        "subdimension": "irregularidad_semanal",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Interpretacion menos directa; validar si aporta eje propio.",
+    },
+]
+
+rhythm_regularity_concept_df = pd.DataFrame(RHYTHM_REGULARITY_CANDIDATES)
+display(rhythm_regularity_concept_df)
+```
+
+## 6.2 Helpers
+
+```{python}
+#| label: rhythm-regularity-helpers
+print("label: rhythm-regularity-helpers")
+
+RAW_RHYTHM_REGULARITY_COLS = [v["raw_variable"] for v in RHYTHM_REGULARITY_CANDIDATES]
+AUDIT_RHYTHM_REGULARITY_COLS = [v["audit_variable"] for v in RHYTHM_REGULARITY_CANDIDATES]
+
+
+def load_rhythm_regularity_frame(path: Path) -> pl.DataFrame:
+    cols = existing_columns(path)
+    missing = [c for c in RAW_RHYTHM_REGULARITY_COLS + TARGET_CONTEXT_COLS if c not in cols]
+    if missing:
+        raise ValueError(f"Faltan columnas en {path.name}: {missing}")
+    return pl.scan_parquet(path).select(
+        ["id_tarjeta"] + RAW_RHYTHM_REGULARITY_COLS + TARGET_CONTEXT_COLS
+    ).collect()
+```
+
+## 6.3 Disponibilidad y calidad estadistica por universo
+
+```{python}
+#| label: rhythm-regularity-quality-by-universe
+print("label: rhythm-regularity-quality-by-universe")
+
+rhythm_regularity_stats_frames = []
+loaded_rhythm_regularity = {}
+for u in universe_status:
+    if not u["exists"]:
+        continue
+    df_u = load_rhythm_regularity_frame(u["path"])
+    loaded_rhythm_regularity[u["label"]] = df_u
+    rhythm_regularity_stats_frames.append(
+        variable_stats_for_cols(df_u, AUDIT_RHYTHM_REGULARITY_COLS, u["label"])
+    )
+
+rhythm_regularity_stats = pd.concat(rhythm_regularity_stats_frames, ignore_index=True)
+display(rhythm_regularity_stats)
+```
+
+## 6.4 Correlacion interna en universo principal
+
+```{python}
+#| label: rhythm-regularity-correlation-main
+print("label: rhythm-regularity-correlation-main")
+
+df_rhythm_regularity_primary = loaded_rhythm_regularity[PRIMARY_UNIVERSE]
+rhythm_regularity_corr = correlation_matrix_for_cols(
+    df_rhythm_regularity_primary,
+    AUDIT_RHYTHM_REGULARITY_COLS,
+)
+display(rhythm_regularity_corr)
+
+fig, ax = plt.subplots(figsize=(11, 9))
+im = ax.imshow(rhythm_regularity_corr.values, vmin=-1, vmax=1, cmap="coolwarm")
+ax.set_xticks(range(len(rhythm_regularity_corr.columns)))
+ax.set_yticks(range(len(rhythm_regularity_corr.index)))
+ax.set_xticklabels(rhythm_regularity_corr.columns, rotation=45, ha="right")
+ax.set_yticklabels(rhythm_regularity_corr.index)
+ax.set_title(f"Spearman correlation - rhythm regularity block ({PRIMARY_UNIVERSE})")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+fig.tight_layout()
+plt.show()
+```
+
+## 6.5 PCA diagnostico del bloque regularidad/ritmo
+
+```{python}
+#| label: rhythm-regularity-pca-diagnostic
+print("label: rhythm-regularity-pca-diagnostic")
+
+rhythm_regularity_explained, rhythm_regularity_loadings = pca_diagnostic_for_cols(
+    df_rhythm_regularity_primary,
+    AUDIT_RHYTHM_REGULARITY_COLS,
+)
+display(rhythm_regularity_explained)
+display(rhythm_regularity_loadings)
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.bar(
+    rhythm_regularity_explained["pc"],
+    rhythm_regularity_explained["explained_variance_ratio"],
+    alpha=0.6,
+    label="individual",
+)
+ax.plot(
+    rhythm_regularity_explained["pc"],
+    rhythm_regularity_explained["cumulative_variance_ratio"],
+    marker="o",
+    color="C3",
+    label="cumulative",
+)
+ax.axhline(0.80, color="grey", linestyle="--", linewidth=1)
+ax.set_ylim(0, 1.05)
+ax.set_ylabel("Variance ratio")
+ax.set_title("PCA diagnostic - rhythm regularity block")
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+## 6.6 QR/BIP post-hoc descriptivo
+
+Esta tabla es contexto externo. No decide el input del clustering.
+
+```{python}
+#| label: rhythm-regularity-posthoc-qr
+print("label: rhythm-regularity-posthoc-qr")
+
+rhythm_regularity_lift_frames = []
+for c in AUDIT_RHYTHM_REGULARITY_COLS:
+    out = posthoc_quantile_lift(df_rhythm_regularity_primary, c)
+    if not out.empty:
+        rhythm_regularity_lift_frames.append(out)
+
+if rhythm_regularity_lift_frames:
+    rhythm_regularity_qr_lifts = pd.concat(rhythm_regularity_lift_frames, ignore_index=True)
+    display(rhythm_regularity_qr_lifts)
+else:
+    print("No se pudieron construir bins de cuantiles para regularidad/ritmo.")
+```
+
+## 6.7 Representatividad de variables candidatas
+
+Primer set parsimonioso:
+
+- `rhythm_mean_gap_active_days`
+- `rhythm_daily_hhi`
+- `rhythm_single_trip_day_share`
+- `rhythm_weekly_hhi`
+
+```{python}
+#| label: rhythm-regularity-representative-retention-v1
+print("label: rhythm-regularity-representative-retention-v1")
+
+if "representative_pc_correlations_for_cols" not in globals():
+
+    def representative_pc_correlations_for_cols(
+        df: pl.DataFrame,
+        representative_cols: list[str],
+        target_cols: list[str],
+        n_pcs: int = 3,
+        sample_n: int = PCA_SAMPLE_N,
+    ) -> pd.DataFrame:
+        pdf = df.select(target_cols).to_pandas()
+        if sample_n and len(pdf) > sample_n:
+            pdf = pdf.sample(sample_n, random_state=SEED)
+
+        x = pdf.fillna(pdf.median(numeric_only=True))
+        x_scaled = pd.DataFrame(
+            StandardScaler().fit_transform(x),
+            columns=target_cols,
+            index=x.index,
+        )
+        pca = PCA(n_components=len(target_cols), random_state=SEED)
+        scores = pca.fit_transform(x_scaled[target_cols])
+
+        rows = []
+        for pc_idx in range(min(n_pcs, len(target_cols))):
+            for rep in representative_cols:
+                corr = float(np.corrcoef(scores[:, pc_idx], x_scaled[rep])[0, 1])
+                rows.append(
+                    {
+                        "pc": f"PC{pc_idx + 1}",
+                        "representative_variable": rep,
+                        "corr": corr,
+                        "abs_corr": abs(corr),
+                    }
+                )
+        return pd.DataFrame(rows)
+
+RHYTHM_REGULARITY_REPRESENTATIVES_V1 = [
+    "rhythm_mean_gap_active_days",
+    "rhythm_daily_hhi",
+    "rhythm_single_trip_day_share",
+    "rhythm_weekly_hhi",
+]
+
+rhythm_rep_summary, rhythm_rep_reconstruction, _ = representative_reconstruction_diagnostic(
+    df_rhythm_regularity_primary,
+    representative_cols=RHYTHM_REGULARITY_REPRESENTATIVES_V1,
+    target_cols=AUDIT_RHYTHM_REGULARITY_COLS,
+)
+
+rhythm_rep_pc_correlations = representative_pc_correlations_for_cols(
+    df_rhythm_regularity_primary,
+    representative_cols=RHYTHM_REGULARITY_REPRESENTATIVES_V1,
+    target_cols=AUDIT_RHYTHM_REGULARITY_COLS,
+    n_pcs=5,
+)
+
+
+def representative_summary_with_pcs(
+    summary: pd.DataFrame,
+    pc_correlations: pd.DataFrame,
+    max_pc: int = 5,
+) -> pd.DataFrame:
+    extra_rows = []
+    for pc_idx in range(3, max_pc + 1):
+        pc_label = f"PC{pc_idx}"
+        extra_rows.append(
+            {
+                "metric": f"pc{pc_idx}_best_abs_corr",
+                "value": pc_correlations.query("pc == @pc_label")["abs_corr"].max(),
+            }
+        )
+    return pd.concat([summary, pd.DataFrame(extra_rows)], ignore_index=True)
+
+
+rhythm_rep_summary_ext = representative_summary_with_pcs(
+    rhythm_rep_summary,
+    rhythm_rep_pc_correlations,
+    max_pc=5,
+)
+
+display(rhythm_rep_summary_ext)
+display(rhythm_rep_reconstruction.sort_values("r2_from_representatives", ascending=False))
+display(rhythm_rep_pc_correlations.sort_values(["pc", "abs_corr"], ascending=[True, False]))
+```
+
+Segundo set: se agrega `rhythm_weekly_entropy_norm` para evaluar si la
+dispersion semanal aporta algo que `rhythm_weekly_hhi` no capture.
+
+```{python}
+#| label: rhythm-regularity-representative-retention-v2
+print("label: rhythm-regularity-representative-retention-v2")
+
+RHYTHM_REGULARITY_REPRESENTATIVES_V2 = [
+    "rhythm_mean_gap_active_days",
+    "rhythm_daily_hhi",
+    "rhythm_single_trip_day_share",
+    "rhythm_weekly_hhi",
+    "rhythm_weekly_entropy_norm",
+]
+
+rhythm_rep2_summary, rhythm_rep2_reconstruction, _ = representative_reconstruction_diagnostic(
+    df_rhythm_regularity_primary,
+    representative_cols=RHYTHM_REGULARITY_REPRESENTATIVES_V2,
+    target_cols=AUDIT_RHYTHM_REGULARITY_COLS,
+)
+
+rhythm_rep2_pc_correlations = representative_pc_correlations_for_cols(
+    df_rhythm_regularity_primary,
+    representative_cols=RHYTHM_REGULARITY_REPRESENTATIVES_V2,
+    target_cols=AUDIT_RHYTHM_REGULARITY_COLS,
+    n_pcs=5,
+)
+
+rhythm_rep2_summary_ext = representative_summary_with_pcs(
+    rhythm_rep2_summary,
+    rhythm_rep2_pc_correlations,
+    max_pc=5,
+)
+
+display(rhythm_rep2_summary_ext)
+display(rhythm_rep2_reconstruction.sort_values("r2_from_representatives", ascending=False))
+display(rhythm_rep2_pc_correlations.sort_values(["pc", "abs_corr"], ascending=[True, False]))
+```
+
+Tercer set A: se agrega `rhythm_max_gap_active_days` para evaluar si captura
+el PC3 asociado a gaps/extremos.
+
+```{python}
+#| label: rhythm-regularity-representative-retention-v3a
+print("label: rhythm-regularity-representative-retention-v3a")
+
+RHYTHM_REGULARITY_REPRESENTATIVES_V3A = [
+    *RHYTHM_REGULARITY_REPRESENTATIVES_V2,
+    "rhythm_max_gap_active_days",
+]
+
+rhythm_rep3a_summary, rhythm_rep3a_reconstruction, _ = representative_reconstruction_diagnostic(
+    df_rhythm_regularity_primary,
+    representative_cols=RHYTHM_REGULARITY_REPRESENTATIVES_V3A,
+    target_cols=AUDIT_RHYTHM_REGULARITY_COLS,
+)
+
+rhythm_rep3a_pc_correlations = representative_pc_correlations_for_cols(
+    df_rhythm_regularity_primary,
+    representative_cols=RHYTHM_REGULARITY_REPRESENTATIVES_V3A,
+    target_cols=AUDIT_RHYTHM_REGULARITY_COLS,
+    n_pcs=5,
+)
+
+rhythm_rep3a_summary_ext = representative_summary_with_pcs(
+    rhythm_rep3a_summary,
+    rhythm_rep3a_pc_correlations,
+    max_pc=5,
+)
+
+display(rhythm_rep3a_summary_ext)
+display(rhythm_rep3a_reconstruction.sort_values("r2_from_representatives", ascending=False))
+display(rhythm_rep3a_pc_correlations.sort_values(["pc", "abs_corr"], ascending=[True, False]))
+```
+
+Tercer set B: se agrega `rhythm_n_gap_days` para evaluar si captura el PC3
+asociado a gaps/distribucion de dias activos.
+
+```{python}
+#| label: rhythm-regularity-representative-retention-v3b
+print("label: rhythm-regularity-representative-retention-v3b")
+
+RHYTHM_REGULARITY_REPRESENTATIVES_V3B = [
+    *RHYTHM_REGULARITY_REPRESENTATIVES_V2,
+    "rhythm_n_gap_days",
+]
+
+rhythm_rep3b_summary, rhythm_rep3b_reconstruction, _ = representative_reconstruction_diagnostic(
+    df_rhythm_regularity_primary,
+    representative_cols=RHYTHM_REGULARITY_REPRESENTATIVES_V3B,
+    target_cols=AUDIT_RHYTHM_REGULARITY_COLS,
+)
+
+rhythm_rep3b_pc_correlations = representative_pc_correlations_for_cols(
+    df_rhythm_regularity_primary,
+    representative_cols=RHYTHM_REGULARITY_REPRESENTATIVES_V3B,
+    target_cols=AUDIT_RHYTHM_REGULARITY_COLS,
+    n_pcs=5,
+)
+
+rhythm_rep3b_summary_ext = representative_summary_with_pcs(
+    rhythm_rep3b_summary,
+    rhythm_rep3b_pc_correlations,
+    max_pc=5,
+)
+
+display(rhythm_rep3b_summary_ext)
+display(rhythm_rep3b_reconstruction.sort_values("r2_from_representatives", ascending=False))
+display(rhythm_rep3b_pc_correlations.sort_values(["pc", "abs_corr"], ascending=[True, False]))
+```
+
+## 6.8 Decision provisional
+
+```{python}
+#| label: rhythm-regularity-decision-template
+print("label: rhythm-regularity-decision-template")
+display(pd.DataFrame([
+    {
+        "decision_item": "intermitencia_gap",
+        "candidate_variables": "rhythm_mean_gap_active_days",
+        "decision": "input_behavioral/main",
+        "evidence_to_review": "Mejor representante de PC2; abs corr=0.958. Considerar log1p/imputacion explicita.",
+    },
+    {
+        "decision_item": "concentracion_diaria",
+        "candidate_variables": "rhythm_daily_hhi, rhythm_single_trip_day_share",
+        "decision": "input_behavioral/main",
+        "evidence_to_review": "daily_hhi representa PC1/concentracion; single_trip_day_share captura eje propio PC5.",
+    },
+    {
+        "decision_item": "concentracion_semanal",
+        "candidate_variables": "rhythm_weekly_hhi, rhythm_weekly_entropy_norm",
+        "decision": "input_behavioral/main",
+        "evidence_to_review": "v2 mejora R2 promedio 0.811->0.886; weekly_entropy agrega dispersion semanal.",
+    },
+    {
+        "decision_item": "episodicidad_extrema",
+        "candidate_variables": "rhythm_max_gap_active_days",
+        "decision": "input_behavioral/sensitivity",
+        "evidence_to_review": "v3a mejora PC3 0.279->0.515, pero puede capturar extremos/salto interanual.",
+    },
+    {
+        "decision_item": "descartes_principales",
+        "candidate_variables": "rhythm_has_gap, rhythm_n_gap_days, entropy/burstiness duplicadas, top shares",
+        "decision": "posthoc_only / exclude",
+        "evidence_to_review": "baja varianza, contaminacion por soporte o redundancia fuerte.",
+    },
+]))
+```
+
+# 7) Bloque modo / transbordo / complejidad modal
+
+Este bloque evalua si conviene agregar variables agregadas de composicion modal
+y transbordo al `behavioral_wide`.
+
+Separacion conceptual:
+
+- **Modo/composicion**: que proporcion de viajes son bus-only, metro-only o
+  metro+bus.
+- **Transbordo**: frecuencia e intensidad promedio de transbordos.
+- **Complejidad OD/ruta**: proporcion de viajes en OD con multiples rutas.
+
+Caveat de alcance: si luego usamos la matriz `macro_franja_modo` o scores NMF
+derivados de ella, estas variables pueden ser redundantes. Aqui se auditan como
+bloque agregado independiente para decidir si entran al set conductual principal
+o quedan como descriptivas/sensibilidad.
+
+## 7.1 Variables candidatas y lectura conceptual
+
+```{python}
+#| label: modal-complexity-concept-table
+print("label: modal-complexity-concept-table")
+
+MODAL_COMPLEXITY_CANDIDATES = [
+    {
+        "raw_variable": "share_trips_solo_bus",
+        "audit_variable": "share_trips_solo_bus",
+        "concept": "Share de viajes realizados solo en bus.",
+        "subdimension": "composicion_modal",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Composicional con otras categorias modales; no asumir independencia.",
+    },
+    {
+        "raw_variable": "share_trips_solo_metro",
+        "audit_variable": "share_trips_solo_metro",
+        "concept": "Share de viajes realizados solo en metro.",
+        "subdimension": "composicion_modal",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Composicional; puede reflejar oferta/acceso mas que conducta pura.",
+    },
+    {
+        "raw_variable": "share_trips_metro_bus",
+        "audit_variable": "share_trips_metro_bus",
+        "concept": "Share de viajes que combinan metro y bus.",
+        "subdimension": "intermodalidad",
+        "transform": "raw share",
+        "initial_status": "candidate_main",
+        "caveat": "Puede solaparse fuertemente con variables de transbordo.",
+    },
+    {
+        "raw_variable": "share_trips_with_transfer",
+        "audit_variable": "share_trips_with_transfer",
+        "concept": "Share de viajes con al menos un transbordo.",
+        "subdimension": "transbordo",
+        "transform": "raw share",
+        "initial_status": "candidate_main",
+        "caveat": "Puede medir complejidad de red/oferta ademas de decision de viaje.",
+    },
+    {
+        "raw_variable": "n_trasbordos_mean",
+        "audit_variable": "n_trasbordos_mean",
+        "concept": "Promedio de transbordos por viaje.",
+        "subdimension": "transbordo",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Probablemente redundante con share de viajes con transbordo.",
+    },
+    {
+        "raw_variable": "share_trips_in_multi_route_od",
+        "audit_variable": "share_trips_in_multi_route_od",
+        "concept": "Share de viajes en OD con multiples rutas observadas/disponibles.",
+        "subdimension": "complejidad_od_ruta",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Interpretacion depende de como se definio multi-route OD; revisar antes de usar como input final.",
+    },
+]
+
+modal_complexity_concept_df = pd.DataFrame(MODAL_COMPLEXITY_CANDIDATES)
+display(modal_complexity_concept_df)
+```
+
+## 7.2 Helpers
+
+```{python}
+#| label: modal-complexity-helpers
+print("label: modal-complexity-helpers")
+
+RAW_MODAL_COMPLEXITY_COLS = [v["raw_variable"] for v in MODAL_COMPLEXITY_CANDIDATES]
+AUDIT_MODAL_COMPLEXITY_COLS = [v["audit_variable"] for v in MODAL_COMPLEXITY_CANDIDATES]
+
+
+def load_modal_complexity_frame(path: Path) -> pl.DataFrame:
+    cols = existing_columns(path)
+    missing = [c for c in RAW_MODAL_COMPLEXITY_COLS + TARGET_CONTEXT_COLS if c not in cols]
+    if missing:
+        raise ValueError(f"Faltan columnas en {path.name}: {missing}")
+    return pl.scan_parquet(path).select(
+        ["id_tarjeta"] + RAW_MODAL_COMPLEXITY_COLS + TARGET_CONTEXT_COLS
+    ).collect()
+```
+
+## 7.3 Disponibilidad y calidad estadistica por universo
+
+```{python}
+#| label: modal-complexity-quality-by-universe
+print("label: modal-complexity-quality-by-universe")
+
+modal_complexity_stats_frames = []
+loaded_modal_complexity = {}
+for u in universe_status:
+    if not u["exists"]:
+        continue
+    df_u = load_modal_complexity_frame(u["path"])
+    loaded_modal_complexity[u["label"]] = df_u
+    modal_complexity_stats_frames.append(
+        variable_stats_for_cols(df_u, AUDIT_MODAL_COMPLEXITY_COLS, u["label"])
+    )
+
+modal_complexity_stats = pd.concat(modal_complexity_stats_frames, ignore_index=True)
+display(modal_complexity_stats)
+```
+
+## 7.4 Chequeo de composicion modal
+
+Este chequeo mira si las tres shares modales auditadas se comportan como una
+composicion casi cerrada o si dejan masa fuera. Esto afecta directamente la
+decision de cuantas columnas incluir.
+
+```{python}
+#| label: modal-complexity-composition-check
+print("label: modal-complexity-composition-check")
+
+df_modal_complexity_primary = loaded_modal_complexity[PRIMARY_UNIVERSE]
+
+mode_share_sum = (
+    df_modal_complexity_primary
+    .with_columns(
+        (
+            pl.col("share_trips_solo_bus")
+            + pl.col("share_trips_solo_metro")
+            + pl.col("share_trips_metro_bus")
+        ).alias("mode_share_sum")
+    )
+    .select(
+        [
+            pl.len().alias("n"),
+            pl.col("mode_share_sum").mean().alias("mean"),
+            pl.col("mode_share_sum").std().alias("std"),
+            pl.col("mode_share_sum").min().alias("min"),
+            pl.col("mode_share_sum").quantile(0.01).alias("p01"),
+            pl.col("mode_share_sum").quantile(0.05).alias("p05"),
+            pl.col("mode_share_sum").quantile(0.25).alias("p25"),
+            pl.col("mode_share_sum").median().alias("median"),
+            pl.col("mode_share_sum").quantile(0.75).alias("p75"),
+            pl.col("mode_share_sum").quantile(0.95).alias("p95"),
+            pl.col("mode_share_sum").quantile(0.99).alias("p99"),
+            pl.col("mode_share_sum").max().alias("max"),
+            ((pl.col("mode_share_sum") - 1).abs() < 1e-9).mean().alias("share_exactly_one"),
+        ]
+    )
+)
+
+display(mode_share_sum)
+```
+
+## 7.5 Correlacion interna en universo principal
+
+```{python}
+#| label: modal-complexity-correlation-main
+print("label: modal-complexity-correlation-main")
+
+modal_complexity_corr = correlation_matrix_for_cols(
+    df_modal_complexity_primary,
+    AUDIT_MODAL_COMPLEXITY_COLS,
+)
+display(modal_complexity_corr)
+
+fig, ax = plt.subplots(figsize=(8, 6))
+im = ax.imshow(modal_complexity_corr.values, vmin=-1, vmax=1, cmap="coolwarm")
+ax.set_xticks(range(len(modal_complexity_corr.columns)))
+ax.set_yticks(range(len(modal_complexity_corr.index)))
+ax.set_xticklabels(modal_complexity_corr.columns, rotation=45, ha="right")
+ax.set_yticklabels(modal_complexity_corr.index)
+ax.set_title(f"Spearman correlation - modal complexity block ({PRIMARY_UNIVERSE})")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+fig.tight_layout()
+plt.show()
+```
+
+## 7.6 PCA diagnostico del bloque modo/transbordo
+
+```{python}
+#| label: modal-complexity-pca-diagnostic
+print("label: modal-complexity-pca-diagnostic")
+
+modal_complexity_explained, modal_complexity_loadings = pca_diagnostic_for_cols(
+    df_modal_complexity_primary,
+    AUDIT_MODAL_COMPLEXITY_COLS,
+)
+display(modal_complexity_explained)
+display(modal_complexity_loadings)
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.bar(
+    modal_complexity_explained["pc"],
+    modal_complexity_explained["explained_variance_ratio"],
+    alpha=0.6,
+    label="individual",
+)
+ax.plot(
+    modal_complexity_explained["pc"],
+    modal_complexity_explained["cumulative_variance_ratio"],
+    marker="o",
+    color="C3",
+    label="cumulative",
+)
+ax.axhline(0.80, color="grey", linestyle="--", linewidth=1)
+ax.set_ylim(0, 1.05)
+ax.set_ylabel("Variance ratio")
+ax.set_title("PCA diagnostic - modal complexity block")
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+## 7.7 QR/BIP post-hoc descriptivo
+
+```{python}
+#| label: modal-complexity-posthoc-qr
+print("label: modal-complexity-posthoc-qr")
+
+modal_complexity_posthoc_frames = []
+for c in AUDIT_MODAL_COMPLEXITY_COLS:
+    out = posthoc_quantile_lift(df_modal_complexity_primary, c)
+    modal_complexity_posthoc_frames.append(out)
+
+modal_complexity_posthoc = pd.concat(modal_complexity_posthoc_frames, ignore_index=True)
+display(modal_complexity_posthoc)
+```
+
+## 7.8 Representatividad de variables candidatas
+
+Primer set: representantes parsimoniosos para composicion modal, transbordo y
+complejidad OD/ruta.
+
+```{python}
+#| label: modal-complexity-representative-retention-v1
+print("label: modal-complexity-representative-retention-v1")
+
+if "representative_summary_with_pcs" not in globals():
+
+    def representative_summary_with_pcs(
+        summary: pd.DataFrame,
+        pc_correlations: pd.DataFrame,
+        max_pc: int = 5,
+    ) -> pd.DataFrame:
+        extra_rows = []
+        for pc_idx in range(3, max_pc + 1):
+            pc_label = f"PC{pc_idx}"
+            extra_rows.append(
+                {
+                    "metric": f"pc{pc_idx}_best_abs_corr",
+                    "value": pc_correlations.query("pc == @pc_label")["abs_corr"].max(),
+                }
+            )
+        return pd.concat([summary, pd.DataFrame(extra_rows)], ignore_index=True)
+
+
+MODAL_COMPLEXITY_REPRESENTATIVES_V1 = [
+    "share_trips_solo_bus",
+    "share_trips_with_transfer",
+    "share_trips_in_multi_route_od",
+]
+
+modal_rep_summary, modal_rep_reconstruction, _ = representative_reconstruction_diagnostic(
+    df_modal_complexity_primary,
+    representative_cols=MODAL_COMPLEXITY_REPRESENTATIVES_V1,
+    target_cols=AUDIT_MODAL_COMPLEXITY_COLS,
+)
+
+modal_rep_pc_correlations = representative_pc_correlations_for_cols(
+    df_modal_complexity_primary,
+    representative_cols=MODAL_COMPLEXITY_REPRESENTATIVES_V1,
+    target_cols=AUDIT_MODAL_COMPLEXITY_COLS,
+    n_pcs=5,
+)
+
+modal_rep_summary_ext = representative_summary_with_pcs(
+    modal_rep_summary,
+    modal_rep_pc_correlations,
+    max_pc=5,
+)
+
+display(modal_rep_summary_ext)
+display(modal_rep_reconstruction.sort_values("r2_from_representatives", ascending=False))
+display(modal_rep_pc_correlations.sort_values(["pc", "abs_corr"], ascending=[True, False]))
+```
+
+Segundo set: agrega `share_trips_metro_bus` para evaluar si la intermodalidad
+metro-bus aporta algo mas alla del transbordo general.
+
+```{python}
+#| label: modal-complexity-representative-retention-v2
+print("label: modal-complexity-representative-retention-v2")
+
+MODAL_COMPLEXITY_REPRESENTATIVES_V2 = [
+    *MODAL_COMPLEXITY_REPRESENTATIVES_V1,
+    "share_trips_metro_bus",
+]
+
+modal_rep2_summary, modal_rep2_reconstruction, _ = representative_reconstruction_diagnostic(
+    df_modal_complexity_primary,
+    representative_cols=MODAL_COMPLEXITY_REPRESENTATIVES_V2,
+    target_cols=AUDIT_MODAL_COMPLEXITY_COLS,
+)
+
+modal_rep2_pc_correlations = representative_pc_correlations_for_cols(
+    df_modal_complexity_primary,
+    representative_cols=MODAL_COMPLEXITY_REPRESENTATIVES_V2,
+    target_cols=AUDIT_MODAL_COMPLEXITY_COLS,
+    n_pcs=5,
+)
+
+modal_rep2_summary_ext = representative_summary_with_pcs(
+    modal_rep2_summary,
+    modal_rep2_pc_correlations,
+    max_pc=5,
+)
+
+display(modal_rep2_summary_ext)
+display(modal_rep2_reconstruction.sort_values("r2_from_representatives", ascending=False))
+display(modal_rep2_pc_correlations.sort_values(["pc", "abs_corr"], ascending=[True, False]))
+```
+
+## 7.9 Decision provisional
+
+```{python}
+#| label: modal-complexity-decision-template
+print("label: modal-complexity-decision-template")
+display(pd.DataFrame([
+    {
+        "decision_item": "composicion_modal",
+        "candidate_variables": "share_trips_solo_bus, share_trips_solo_metro, share_trips_metro_bus",
+        "decision": "share_trips_solo_bus + share_trips_metro_bus como input_behavioral/main; share_trips_solo_metro como referencia implicita/posthoc",
+        "evidence_to_review": "Las tres shares suman 1 para 100% de tarjetas; v2 reconstruye composicion modal completa con R2=1.",
+    },
+    {
+        "decision_item": "transbordo",
+        "candidate_variables": "share_trips_with_transfer, n_trasbordos_mean",
+        "decision": "share_trips_with_transfer como input_behavioral/main; n_trasbordos_mean como posthoc/sensitivity",
+        "evidence_to_review": "Spearman=0.960 entre ambas; n_trasbordos_mean se reconstruye con R2=0.846 desde v2.",
+    },
+    {
+        "decision_item": "complejidad_od_ruta",
+        "candidate_variables": "share_trips_in_multi_route_od",
+        "decision": "input_behavioral/main con caveat fuerte",
+        "evidence_to_review": "Aporta eje propio: PC3 abs corr=0.610 en v1/v2; conceptualmente puede mezclar conducta con red/oferta.",
+    },
+    {
+        "decision_item": "redundancia_con_nmf_modo",
+        "candidate_variables": "bloque modal agregado vs macro_franja_modo/NMF scores",
+        "decision": "mantener como caveat de sensibilidad posterior",
+        "evidence_to_review": "Si usamos scores NMF con modo incluido, este bloque podria quedar redundante o requerir ponderacion por bloque.",
+    },
+]))
+```
+
+# 8) Bloque espacial / OD / zonas
+
+Este bloque evalua concentracion y diversidad espacial del comportamiento
+observado. La idea es separar **donde se mueve** la tarjeta de variables
+estructurales como residencia, macrozona, coordenadas u oferta.
+
+Separacion conceptual:
+
+- **Origen/actividad zonal**: concentracion de origenes y de zonas visitadas
+  como origen o destino.
+- **Diversidad OD**: cantidad y dispersion de pares OD utilizados.
+- **Anclaje OD principal**: peso del OD principal y balance ida/vuelta.
+
+Exclusiones deliberadas en esta primera pasada:
+
+- `home_macro_*`, `origin_top1_macro_*`, `origin_top1_lon/lat`: geografia
+  residencial/contextual, mejor como sensibilidad estructural.
+- `offer_*`, `osm_*`, `bip_load_*`: oferta/acceso.
+- `service_route_*`, `top_od_service_*`: diversidad de servicio/ruta, bloque
+  posterior.
+
+## 8.1 Variables candidatas y lectura conceptual
+
+```{python}
+#| label: spatial-od-zone-concept-table
+print("label: spatial-od-zone-concept-table")
+
+SPATIAL_OD_ZONE_CANDIDATES = [
+    {
+        "raw_variable": "origin_zone_top1_share",
+        "audit_variable": "origin_zone_top1_share",
+        "concept": "Share de viajes que parten desde la zona de origen mas frecuente.",
+        "subdimension": "concentracion_origen",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Puede estar condicionado por residencia/top origin y por soporte de viajes.",
+    },
+    {
+        "raw_variable": "origin_zone_entropy",
+        "audit_variable": "origin_zone_entropy",
+        "concept": "Entropia de la distribucion de zonas de origen.",
+        "subdimension": "dispersion_origen",
+        "transform": "raw",
+        "initial_status": "candidate_main",
+        "caveat": "Podria redundar con top1_share; revisar correlacion.",
+    },
+    {
+        "raw_variable": "activity_zone_top1_share",
+        "audit_variable": "activity_zone_top1_share",
+        "concept": "Share de eventos origen/destino en la zona de actividad mas frecuente.",
+        "subdimension": "concentracion_zonas_actividad",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Combina origenes y destinos; puede aproximar anclaje espacial general.",
+    },
+    {
+        "raw_variable": "activity_zone_entropy",
+        "audit_variable": "activity_zone_entropy",
+        "concept": "Entropia de zonas observadas como origen o destino.",
+        "subdimension": "dispersion_zonas_actividad",
+        "transform": "raw",
+        "initial_status": "candidate_main",
+        "caveat": "Puede ser una version mas completa de dispersion que solo origen.",
+    },
+    {
+        "raw_variable": "routine_zone_n_unique",
+        "audit_variable": "routine_zone_n_unique",
+        "concept": "Numero de zonas unicas usadas como origen o destino.",
+        "subdimension": "diversidad_zonal",
+        "transform": "raw count; revisar log1p",
+        "initial_status": "needs_audit",
+        "caveat": "Cuenta discreta y ligada a intensidad/soporte.",
+    },
+    {
+        "raw_variable": "routine_zone_top1_usage_share",
+        "audit_variable": "routine_zone_top1_usage_share",
+        "concept": "Share de eventos zonales en la zona mas usada.",
+        "subdimension": "concentracion_zonal",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Probable redundancia con activity_zone_top1_share.",
+    },
+    {
+        "raw_variable": "routine_zone_exploration_share",
+        "audit_variable": "routine_zone_exploration_share",
+        "concept": "Share de eventos zonales fuera de las dos zonas principales.",
+        "subdimension": "exploracion_zonal",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Derivada de top2; puede tener muchos ceros.",
+    },
+    {
+        "raw_variable": "routine_od_top1_share",
+        "audit_variable": "routine_od_top1_share",
+        "concept": "Share de viajes en el OD dirigido mas frecuente.",
+        "subdimension": "concentracion_od",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Puede redundar con HHI OD y main_od_share.",
+    },
+    {
+        "raw_variable": "routine_od_hhi",
+        "audit_variable": "routine_od_hhi",
+        "concept": "Concentracion HHI de pares OD dirigidos.",
+        "subdimension": "concentracion_od",
+        "transform": "raw",
+        "initial_status": "candidate_main",
+        "caveat": "Elegir entre HHI, top1 y main_od_share segun redundancia.",
+    },
+    {
+        "raw_variable": "routine_main_od_share",
+        "audit_variable": "routine_main_od_share",
+        "concept": "Share de viajes en el OD no dirigido principal.",
+        "subdimension": "anclaje_od_principal",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "OD no dirigido; puede capturar commute-like sin usar horario.",
+    },
+    {
+        "raw_variable": "routine_main_od_roundtrip_balance",
+        "audit_variable": "routine_main_od_roundtrip_balance",
+        "concept": "Balance ida/vuelta dentro del OD principal no dirigido.",
+        "subdimension": "reciprocidad_od_principal",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Puede solaparse con daily-tour/commute-like; mantener caveat.",
+    },
+]
+
+spatial_od_zone_concept_df = pd.DataFrame(SPATIAL_OD_ZONE_CANDIDATES)
+display(spatial_od_zone_concept_df)
+```
+
+## 8.2 Helpers
+
+```{python}
+#| label: spatial-od-zone-helpers
+print("label: spatial-od-zone-helpers")
+
+RAW_SPATIAL_OD_ZONE_COLS = [v["raw_variable"] for v in SPATIAL_OD_ZONE_CANDIDATES]
+AUDIT_SPATIAL_OD_ZONE_COLS = [v["audit_variable"] for v in SPATIAL_OD_ZONE_CANDIDATES]
+
+
+def load_spatial_od_zone_frame(path: Path) -> pl.DataFrame:
+    cols = existing_columns(path)
+    missing = [c for c in RAW_SPATIAL_OD_ZONE_COLS + TARGET_CONTEXT_COLS if c not in cols]
+    if missing:
+        raise ValueError(f"Faltan columnas en {path.name}: {missing}")
+    return pl.scan_parquet(path).select(
+        ["id_tarjeta"] + RAW_SPATIAL_OD_ZONE_COLS + TARGET_CONTEXT_COLS
+    ).collect()
+```
+
+## 8.3 Disponibilidad y calidad estadistica por universo
+
+```{python}
+#| label: spatial-od-zone-quality-by-universe
+print("label: spatial-od-zone-quality-by-universe")
+
+spatial_od_zone_stats_frames = []
+loaded_spatial_od_zone = {}
+for u in universe_status:
+    if not u["exists"]:
+        continue
+    df_u = load_spatial_od_zone_frame(u["path"])
+    loaded_spatial_od_zone[u["label"]] = df_u
+    spatial_od_zone_stats_frames.append(
+        variable_stats_for_cols(df_u, AUDIT_SPATIAL_OD_ZONE_COLS, u["label"])
+    )
+
+spatial_od_zone_stats = pd.concat(spatial_od_zone_stats_frames, ignore_index=True)
+display(spatial_od_zone_stats)
+```
+
+## 8.4 Correlacion interna en universo principal
+
+```{python}
+#| label: spatial-od-zone-correlation-main
+print("label: spatial-od-zone-correlation-main")
+
+df_spatial_od_zone_primary = loaded_spatial_od_zone[PRIMARY_UNIVERSE]
+spatial_od_zone_corr = correlation_matrix_for_cols(
+    df_spatial_od_zone_primary,
+    AUDIT_SPATIAL_OD_ZONE_COLS,
+)
+display(spatial_od_zone_corr)
+
+fig, ax = plt.subplots(figsize=(10, 8))
+im = ax.imshow(spatial_od_zone_corr.values, vmin=-1, vmax=1, cmap="coolwarm")
+ax.set_xticks(range(len(spatial_od_zone_corr.columns)))
+ax.set_yticks(range(len(spatial_od_zone_corr.index)))
+ax.set_xticklabels(spatial_od_zone_corr.columns, rotation=45, ha="right")
+ax.set_yticklabels(spatial_od_zone_corr.index)
+ax.set_title(f"Spearman correlation - spatial/OD/zone block ({PRIMARY_UNIVERSE})")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+fig.tight_layout()
+plt.show()
+```
+
+## 8.5 PCA diagnostico del bloque espacial/OD/zona
+
+```{python}
+#| label: spatial-od-zone-pca-diagnostic
+print("label: spatial-od-zone-pca-diagnostic")
+
+spatial_od_zone_explained, spatial_od_zone_loadings = pca_diagnostic_for_cols(
+    df_spatial_od_zone_primary,
+    AUDIT_SPATIAL_OD_ZONE_COLS,
+)
+display(spatial_od_zone_explained)
+display(spatial_od_zone_loadings)
+
+fig, ax = plt.subplots(figsize=(9, 4))
+ax.bar(
+    spatial_od_zone_explained["pc"],
+    spatial_od_zone_explained["explained_variance_ratio"],
+    alpha=0.6,
+    label="individual",
+)
+ax.plot(
+    spatial_od_zone_explained["pc"],
+    spatial_od_zone_explained["cumulative_variance_ratio"],
+    marker="o",
+    color="C3",
+    label="cumulative",
+)
+ax.axhline(0.80, color="grey", linestyle="--", linewidth=1)
+ax.set_ylim(0, 1.05)
+ax.set_ylabel("Variance ratio")
+ax.set_title("PCA diagnostic - spatial/OD/zone block")
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+## 8.6 QR/BIP post-hoc descriptivo
+
+```{python}
+#| label: spatial-od-zone-posthoc-qr
+print("label: spatial-od-zone-posthoc-qr")
+
+spatial_od_zone_posthoc_frames = []
+for c in AUDIT_SPATIAL_OD_ZONE_COLS:
+    out = posthoc_quantile_lift(df_spatial_od_zone_primary, c)
+    spatial_od_zone_posthoc_frames.append(out)
+
+spatial_od_zone_posthoc = pd.concat(spatial_od_zone_posthoc_frames, ignore_index=True)
+display(spatial_od_zone_posthoc)
+```
+
+## 8.7 Representatividad de variables candidatas
+
+Primer set: representantes parsimoniosos para diversidad espacial general,
+concentracion OD, reciprocidad y anclaje de origen.
+
+```{python}
+#| label: spatial-od-zone-representative-retention-v1
+print("label: spatial-od-zone-representative-retention-v1")
+
+if "representative_summary_with_pcs" not in globals():
+
+    def representative_summary_with_pcs(
+        summary: pd.DataFrame,
+        pc_correlations: pd.DataFrame,
+        max_pc: int = 5,
+    ) -> pd.DataFrame:
+        extra_rows = []
+        for pc_idx in range(3, max_pc + 1):
+            pc_label = f"PC{pc_idx}"
+            extra_rows.append(
+                {
+                    "metric": f"pc{pc_idx}_best_abs_corr",
+                    "value": pc_correlations.query("pc == @pc_label")["abs_corr"].max(),
+                }
+            )
+        return pd.concat([summary, pd.DataFrame(extra_rows)], ignore_index=True)
+
+
+SPATIAL_OD_ZONE_REPRESENTATIVES_V1 = [
+    "activity_zone_entropy",
+    "routine_od_hhi",
+    "routine_main_od_roundtrip_balance",
+    "origin_zone_top1_share",
+]
+
+spatial_rep_summary, spatial_rep_reconstruction, _ = representative_reconstruction_diagnostic(
+    df_spatial_od_zone_primary,
+    representative_cols=SPATIAL_OD_ZONE_REPRESENTATIVES_V1,
+    target_cols=AUDIT_SPATIAL_OD_ZONE_COLS,
+)
+
+spatial_rep_pc_correlations = representative_pc_correlations_for_cols(
+    df_spatial_od_zone_primary,
+    representative_cols=SPATIAL_OD_ZONE_REPRESENTATIVES_V1,
+    target_cols=AUDIT_SPATIAL_OD_ZONE_COLS,
+    n_pcs=5,
+)
+
+spatial_rep_summary_ext = representative_summary_with_pcs(
+    spatial_rep_summary,
+    spatial_rep_pc_correlations,
+    max_pc=5,
+)
+
+display(spatial_rep_summary_ext)
+display(spatial_rep_reconstruction.sort_values("r2_from_representatives", ascending=False))
+display(spatial_rep_pc_correlations.sort_values(["pc", "abs_corr"], ascending=[True, False]))
+```
+
+Segundo set: agrega `routine_main_od_share` para evaluar si el peso del OD
+principal aporta algo mas alla del HHI OD y la reciprocidad.
+
+```{python}
+#| label: spatial-od-zone-representative-retention-v2
+print("label: spatial-od-zone-representative-retention-v2")
+
+SPATIAL_OD_ZONE_REPRESENTATIVES_V2 = [
+    *SPATIAL_OD_ZONE_REPRESENTATIVES_V1,
+    "routine_main_od_share",
+]
+
+spatial_rep2_summary, spatial_rep2_reconstruction, _ = representative_reconstruction_diagnostic(
+    df_spatial_od_zone_primary,
+    representative_cols=SPATIAL_OD_ZONE_REPRESENTATIVES_V2,
+    target_cols=AUDIT_SPATIAL_OD_ZONE_COLS,
+)
+
+spatial_rep2_pc_correlations = representative_pc_correlations_for_cols(
+    df_spatial_od_zone_primary,
+    representative_cols=SPATIAL_OD_ZONE_REPRESENTATIVES_V2,
+    target_cols=AUDIT_SPATIAL_OD_ZONE_COLS,
+    n_pcs=5,
+)
+
+spatial_rep2_summary_ext = representative_summary_with_pcs(
+    spatial_rep2_summary,
+    spatial_rep2_pc_correlations,
+    max_pc=5,
+)
+
+display(spatial_rep2_summary_ext)
+display(spatial_rep2_reconstruction.sort_values("r2_from_representatives", ascending=False))
+display(spatial_rep2_pc_correlations.sort_values(["pc", "abs_corr"], ascending=[True, False]))
+```
+
+## 8.8 Decision provisional
+
+```{python}
+#| label: spatial-od-zone-decision-template
+print("label: spatial-od-zone-decision-template")
+display(pd.DataFrame([
+    {
+        "decision_item": "origen_y_actividad_zonal",
+        "candidate_variables": "origin_zone_top1_share, origin_zone_entropy, activity_zone_top1_share, activity_zone_entropy",
+        "decision": "activity_zone_entropy + origin_zone_top1_share como input_behavioral/main; origin_zone_entropy como posthoc/sensitivity",
+        "evidence_to_review": "activity_zone_entropy representa PC1 (abs corr=0.948); origin_zone_top1_share captura PC3/PC5 residual.",
+    },
+    {
+        "decision_item": "diversidad_zonal",
+        "candidate_variables": "routine_zone_n_unique, routine_zone_top1_usage_share, routine_zone_exploration_share",
+        "decision": "posthoc/sensitivity; routine_zone_top1_usage_share excluida por duplicacion exacta",
+        "evidence_to_review": "routine_zone_top1_usage_share = activity_zone_top1_share; zone_n_unique depende de soporte; exploration_share se reconstruye con R2=0.928 en v2.",
+    },
+    {
+        "decision_item": "concentracion_diversidad_od",
+        "candidate_variables": "routine_od_top1_share, routine_od_hhi, routine_main_od_share",
+        "decision": "routine_od_hhi + routine_main_od_share como input_behavioral/main; routine_od_top1_share como posthoc",
+        "evidence_to_review": "v2 mejora R2 promedio 0.873->0.904 y PC4 0.167->0.402; routine_od_top1_share se reconstruye con R2=0.931.",
+    },
+    {
+        "decision_item": "od_principal_y_reciprocidad",
+        "candidate_variables": "routine_main_od_share, routine_main_od_roundtrip_balance",
+        "decision": "ambas input_behavioral/main",
+        "evidence_to_review": "roundtrip_balance representa PC2 (abs corr=0.806); main_od_share captura anclaje OD no dirigido y mejora reconstruccion.",
+    },
+]))
+```
+
+# 9) Bloque rutina / repeticion de patrones
+
+Este bloque evalua repeticion de patrones combinados. A diferencia del bloque
+espacial/OD, aqui no buscamos solo concentracion de zonas u OD, sino si el
+usuario repite **la misma combinacion de OD, franja temporal y modo**.
+
+Separacion conceptual:
+
+- **Patron OD-tiempo-modo**: rutina fuerte cuando se repite el mismo OD, en la
+  misma franja, con el mismo modo grueso.
+- **Patron OD-tiempo**: rutina espacio-temporal, sin condicionar por modo.
+- **Componente laboral/commute-like**: variables auxiliares que resumen punta
+  laboral o un score compuesto de rutina.
+
+Exclusiones deliberadas:
+
+- `routine_od_hhi`, `routine_main_od_share`,
+  `routine_main_od_roundtrip_balance`, `routine_zone_*`: ya fueron auditadas en
+  el bloque espacial/OD/zonas.
+- `routine_combo_entropy_norm`, `routine_combo_n_unique`,
+  `routine_od_entropy_norm`, `routine_od_n_unique`: no estan disponibles en la
+  matriz actual `user_model_matrix_*`.
+
+## 9.1 Variables candidatas y lectura conceptual
+
+```{python}
+#| label: routine-pattern-concept-table
+print("label: routine-pattern-concept-table")
+
+ROUTINE_PATTERN_CANDIDATES = [
+    {
+        "raw_variable": "routine_combo_top1_share",
+        "audit_variable": "routine_combo_top1_share",
+        "concept": "Share del patron OD + franja + modo mas frecuente.",
+        "subdimension": "rutina_combo_od_tiempo_modo",
+        "transform": "raw share",
+        "initial_status": "candidate_main",
+        "caveat": "Puede duplicar OD, tiempo y modo si esos bloques entran por separado.",
+    },
+    {
+        "raw_variable": "routine_combo_hhi",
+        "audit_variable": "routine_combo_hhi",
+        "concept": "Concentracion HHI de patrones OD + franja + modo.",
+        "subdimension": "rutina_combo_od_tiempo_modo",
+        "transform": "raw",
+        "initial_status": "candidate_main",
+        "caveat": "Probable redundancia con top1_share; elegir representante si correlacionan fuerte.",
+    },
+    {
+        "raw_variable": "routine_od_time_top1_share",
+        "audit_variable": "routine_od_time_top1_share",
+        "concept": "Share del patron OD + franja mas frecuente.",
+        "subdimension": "rutina_od_tiempo",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Puede ser version sin modo de routine_combo_top1_share.",
+    },
+    {
+        "raw_variable": "routine_od_time_hhi",
+        "audit_variable": "routine_od_time_hhi",
+        "concept": "Concentracion HHI de patrones OD + franja.",
+        "subdimension": "rutina_od_tiempo",
+        "transform": "raw",
+        "initial_status": "candidate_main",
+        "caveat": "Puede capturar rutina espacio-temporal sin duplicar modo.",
+    },
+    {
+        "raw_variable": "routine_od_time_entropy_norm",
+        "audit_variable": "routine_od_time_entropy_norm",
+        "concept": "Entropia normalizada de patrones OD + franja.",
+        "subdimension": "dispersion_od_tiempo",
+        "transform": "raw",
+        "initial_status": "needs_audit",
+        "caveat": "Probable complemento de HHI; revisar si aporta eje propio.",
+    },
+    {
+        "raw_variable": "routine_od_time_n_unique",
+        "audit_variable": "routine_od_time_n_unique",
+        "concept": "Numero de patrones OD + franja unicos.",
+        "subdimension": "diversidad_od_tiempo",
+        "transform": "raw count; revisar log1p",
+        "initial_status": "needs_audit",
+        "caveat": "Muy dependiente de soporte/intensidad.",
+    },
+    {
+        "raw_variable": "routine_lab_peak_share",
+        "audit_variable": "routine_lab_peak_share",
+        "concept": "Share de viajes en punta laboral AM/PM dentro del routine pack.",
+        "subdimension": "anclaje_laboral",
+        "transform": "raw share",
+        "initial_status": "needs_audit",
+        "caveat": "Redundante con bloque horario/franja; no usar si no aporta eje propio.",
+    },
+    {
+        "raw_variable": "routine_commute_like_score",
+        "audit_variable": "routine_commute_like_score",
+        "concept": "Score compuesto de rutina tipo commute: combo_top1 * top2 zonas * peak * balance ida/vuelta.",
+        "subdimension": "commute_like_compuesto",
+        "transform": "raw score",
+        "initial_status": "posthoc_candidate",
+        "caveat": "Indice construido manualmente; puede ser mejor como descriptor/posthoc que input de clustering.",
+    },
+]
+
+routine_pattern_concept_df = pd.DataFrame(ROUTINE_PATTERN_CANDIDATES)
+display(routine_pattern_concept_df)
+```
+
+## 9.2 Helpers
+
+```{python}
+#| label: routine-pattern-helpers
+print("label: routine-pattern-helpers")
+
+RAW_ROUTINE_PATTERN_COLS = [v["raw_variable"] for v in ROUTINE_PATTERN_CANDIDATES]
+AUDIT_ROUTINE_PATTERN_COLS = [v["audit_variable"] for v in ROUTINE_PATTERN_CANDIDATES]
+
+
+def load_routine_pattern_frame(path: Path) -> pl.DataFrame:
+    cols = existing_columns(path)
+    missing = [c for c in RAW_ROUTINE_PATTERN_COLS + TARGET_CONTEXT_COLS if c not in cols]
+    if missing:
+        raise ValueError(f"Faltan columnas en {path.name}: {missing}")
+    return pl.scan_parquet(path).select(
+        ["id_tarjeta"] + RAW_ROUTINE_PATTERN_COLS + TARGET_CONTEXT_COLS
+    ).collect()
+```
+
+## 9.3 Disponibilidad y calidad estadistica por universo
+
+```{python}
+#| label: routine-pattern-quality-by-universe
+print("label: routine-pattern-quality-by-universe")
+
+routine_pattern_stats_frames = []
+loaded_routine_pattern = {}
+for u in universe_status:
+    if not u["exists"]:
+        continue
+    df_u = load_routine_pattern_frame(u["path"])
+    loaded_routine_pattern[u["label"]] = df_u
+    routine_pattern_stats_frames.append(
+        variable_stats_for_cols(df_u, AUDIT_ROUTINE_PATTERN_COLS, u["label"])
+    )
+
+routine_pattern_stats = pd.concat(routine_pattern_stats_frames, ignore_index=True)
+display(routine_pattern_stats)
+```
+
+## 9.4 Correlacion interna en universo principal
+
+```{python}
+#| label: routine-pattern-correlation-main
+print("label: routine-pattern-correlation-main")
+
+df_routine_pattern_primary = loaded_routine_pattern[PRIMARY_UNIVERSE]
+routine_pattern_corr = correlation_matrix_for_cols(
+    df_routine_pattern_primary,
+    AUDIT_ROUTINE_PATTERN_COLS,
+)
+display(routine_pattern_corr)
+
+fig, ax = plt.subplots(figsize=(9, 7))
+im = ax.imshow(routine_pattern_corr.values, vmin=-1, vmax=1, cmap="coolwarm")
+ax.set_xticks(range(len(routine_pattern_corr.columns)))
+ax.set_yticks(range(len(routine_pattern_corr.index)))
+ax.set_xticklabels(routine_pattern_corr.columns, rotation=45, ha="right")
+ax.set_yticklabels(routine_pattern_corr.index)
+ax.set_title(f"Spearman correlation - routine pattern block ({PRIMARY_UNIVERSE})")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+fig.tight_layout()
+plt.show()
+```
+
+## 9.5 PCA diagnostico del bloque rutina/patron
+
+```{python}
+#| label: routine-pattern-pca-diagnostic
+print("label: routine-pattern-pca-diagnostic")
+
+routine_pattern_explained, routine_pattern_loadings = pca_diagnostic_for_cols(
+    df_routine_pattern_primary,
+    AUDIT_ROUTINE_PATTERN_COLS,
+)
+display(routine_pattern_explained)
+display(routine_pattern_loadings)
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.bar(
+    routine_pattern_explained["pc"],
+    routine_pattern_explained["explained_variance_ratio"],
+    alpha=0.6,
+    label="individual",
+)
+ax.plot(
+    routine_pattern_explained["pc"],
+    routine_pattern_explained["cumulative_variance_ratio"],
+    marker="o",
+    color="C3",
+    label="cumulative",
+)
+ax.axhline(0.80, color="grey", linestyle="--", linewidth=1)
+ax.set_ylim(0, 1.05)
+ax.set_ylabel("Variance ratio")
+ax.set_title("PCA diagnostic - routine pattern block")
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+## 9.6 QR/BIP post-hoc descriptivo
+
+```{python}
+#| label: routine-pattern-posthoc-qr
+print("label: routine-pattern-posthoc-qr")
+
+routine_pattern_posthoc_frames = []
+for c in AUDIT_ROUTINE_PATTERN_COLS:
+    out = posthoc_quantile_lift(df_routine_pattern_primary, c)
+    routine_pattern_posthoc_frames.append(out)
+
+routine_pattern_posthoc = pd.concat(routine_pattern_posthoc_frames, ignore_index=True)
+display(routine_pattern_posthoc)
+```
+
+## 9.7 Representatividad de variables candidatas v1
+
+Primer set parsimonioso y no prescriptivo:
+
+- `routine_od_time_hhi`: concentracion de patrones OD + franja.
+- `routine_lab_peak_share`: anclaje laboral/punta.
+- `routine_od_time_entropy_norm`: dispersion normalizada de patrones OD + franja.
+
+```{python}
+#| label: routine-pattern-representative-retention-v1
+print("label: routine-pattern-representative-retention-v1")
+
+ROUTINE_PATTERN_REPRESENTATIVES_V1 = [
+    "routine_od_time_hhi",
+    "routine_lab_peak_share",
+    "routine_od_time_entropy_norm",
+]
+
+routine_pattern_rep_summary, routine_pattern_rep_reconstruction, _ = (
+    representative_reconstruction_diagnostic(
+        df_routine_pattern_primary,
+        representative_cols=ROUTINE_PATTERN_REPRESENTATIVES_V1,
+        target_cols=AUDIT_ROUTINE_PATTERN_COLS,
+    )
+)
+
+routine_pattern_rep_pc_correlations = representative_pc_correlations_for_cols(
+    df_routine_pattern_primary,
+    representative_cols=ROUTINE_PATTERN_REPRESENTATIVES_V1,
+    target_cols=AUDIT_ROUTINE_PATTERN_COLS,
+    n_pcs=5,
+)
+
+routine_pattern_rep_summary_ext = representative_summary_with_pcs(
+    routine_pattern_rep_summary,
+    routine_pattern_rep_pc_correlations,
+    max_pc=5,
+)
+
+display(routine_pattern_rep_summary_ext)
+display(
+    routine_pattern_rep_reconstruction.sort_values(
+        "r2_from_representatives",
+        ascending=False,
+    )
+)
+display(
+    routine_pattern_rep_pc_correlations.sort_values(
+        ["pc", "abs_corr"],
+        ascending=[True, False],
+    )
+)
+```
+
+## 9.8 Representatividad de variables candidatas v2
+
+Segundo set de sensibilidad: agrega el score compuesto `routine_commute_like_score`
+para medir si aporta una dimension interpretable adicional o si solo funciona
+mejor como descriptor post-hoc.
+
+```{python}
+#| label: routine-pattern-representative-retention-v2
+print("label: routine-pattern-representative-retention-v2")
+
+ROUTINE_PATTERN_REPRESENTATIVES_V2 = [
+    "routine_od_time_hhi",
+    "routine_lab_peak_share",
+    "routine_od_time_entropy_norm",
+    "routine_commute_like_score",
+]
+
+routine_pattern_rep2_summary, routine_pattern_rep2_reconstruction, _ = (
+    representative_reconstruction_diagnostic(
+        df_routine_pattern_primary,
+        representative_cols=ROUTINE_PATTERN_REPRESENTATIVES_V2,
+        target_cols=AUDIT_ROUTINE_PATTERN_COLS,
+    )
+)
+
+routine_pattern_rep2_pc_correlations = representative_pc_correlations_for_cols(
+    df_routine_pattern_primary,
+    representative_cols=ROUTINE_PATTERN_REPRESENTATIVES_V2,
+    target_cols=AUDIT_ROUTINE_PATTERN_COLS,
+    n_pcs=5,
+)
+
+routine_pattern_rep2_summary_ext = representative_summary_with_pcs(
+    routine_pattern_rep2_summary,
+    routine_pattern_rep2_pc_correlations,
+    max_pc=5,
+)
+
+display(routine_pattern_rep2_summary_ext)
+display(
+    routine_pattern_rep2_reconstruction.sort_values(
+        "r2_from_representatives",
+        ascending=False,
+    )
+)
+display(
+    routine_pattern_rep2_pc_correlations.sort_values(
+        ["pc", "abs_corr"],
+        ascending=[True, False],
+    )
+)
+```
+
+## 9.9 Decision provisional
+
+```{python}
+#| label: routine-pattern-decision-template
+print("label: routine-pattern-decision-template")
+display(pd.DataFrame([
+    {
+        "decision_item": "combo_od_tiempo_modo",
+        "candidate_variables": "routine_combo_top1_share, routine_combo_hhi",
+        "decision": "pending",
+        "evidence_to_review": "Elegir representante si top1 y HHI son redundantes; revisar si aporta mas que OD-tiempo.",
+    },
+    {
+        "decision_item": "od_tiempo",
+        "candidate_variables": "routine_od_time_top1_share, routine_od_time_hhi, routine_od_time_entropy_norm, routine_od_time_n_unique",
+        "decision": "pending",
+        "evidence_to_review": "Evaluar si OD+franja captura rutina sin duplicar modo ni bloque horario.",
+    },
+    {
+        "decision_item": "anclaje_laboral",
+        "candidate_variables": "routine_lab_peak_share",
+        "decision": "pending",
+        "evidence_to_review": "Comparar contra bloque horario; probablemente posthoc/sensitivity si es redundante.",
+    },
+    {
+        "decision_item": "commute_like_compuesto",
+        "candidate_variables": "routine_commute_like_score",
+        "decision": "pending",
+        "evidence_to_review": "Validar si usar como input es demasiado prescriptivo; candidato fuerte a posthoc.",
+    },
+]))
+```
+
+# 10) Bloque daily tour / estructura diaria
+
+Este bloque evalua la organizacion de viajes **dentro del dia activo**. A
+diferencia del bloque de rutina, no pregunta si el usuario repite el mismo
+patron OD-franja, sino si sus dias observados se ven simples, pendulares,
+complejos, multimodales o extendidos temporalmente.
+
+Separacion conceptual:
+
+- **Complejidad diaria**: cantidad de viajes y estructura simple vs compleja.
+- **Cierre/pendularidad diaria**: si el dia vuelve al origen o mantiene un OD
+  reciproco.
+- **Anclaje horario diario**: primer/ultimo viaje en punta y span del dia.
+- **Diversidad diaria**: zonas, OD y modos distintos dentro del dia.
+
+Caveat:
+
+- Varias variables de este bloque pueden duplicar bloques ya auditados:
+  horario/franja, modo/transbordo, espacial/OD y rutina/repeticion.
+- El artefacto `daily_tour_pack` contiene mas variables que las actualmente
+  seleccionadas en `user_model_matrix_*`. Para el catalogo auditamos el
+  artefacto completo y filtramos por los mismos universos.
+
+## 10.1 Variables candidatas y lectura conceptual
+
+```{python}
+#| label: daily-tour-concept-table
+print("label: daily-tour-concept-table")
+
+DAILY_TOUR_ARTIFACT_PATH = USER_DIR / "user_behavior_daily_tour_features_interannual_ml.parquet"
+
+DAILY_TOUR_CANDIDATES = [
+    {
+        "raw_variable": "tour_two_trip_day_share",
+        "audit_variable": "tour_two_trip_day_share",
+        "concept": "Share de dias activos con exactamente dos viajes.",
+        "subdimension": "estructura_simple",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "needs_audit",
+        "caveat": "Complementa tres+ viajes; puede duplicar complejidad diaria.",
+    },
+    {
+        "raw_variable": "tour_three_plus_trip_day_share",
+        "audit_variable": "tour_three_plus_trip_day_share",
+        "concept": "Share de dias activos con tres o mas viajes.",
+        "subdimension": "multi_viaje",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "candidate_main",
+        "caveat": "Puede solaparse con intensidad por dia activo.",
+    },
+    {
+        "raw_variable": "tour_complex_day_share",
+        "audit_variable": "tour_complex_day_share",
+        "concept": "Share de dias con tres+ viajes y tres+ zonas.",
+        "subdimension": "dia_complejo",
+        "source": "user_model_matrix",
+        "initial_status": "candidate_main",
+        "caveat": "Mezcla complejidad diaria con diversidad espacial.",
+    },
+    {
+        "raw_variable": "tour_closed_loop_day_share",
+        "audit_variable": "tour_closed_loop_day_share",
+        "concept": "Share de dias donde el ultimo destino coincide con el primer origen.",
+        "subdimension": "cierre_diario",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "candidate_main",
+        "caveat": "Puede solaparse con reciprocidad OD y commute-like.",
+    },
+    {
+        "raw_variable": "tour_reciprocal_od_day_share",
+        "audit_variable": "tour_reciprocal_od_day_share",
+        "concept": "Share de dias donde primer y ultimo viaje forman OD reciproco.",
+        "subdimension": "reciprocidad_diaria",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "candidate_main",
+        "caveat": "Puede solaparse con main OD roundtrip balance.",
+    },
+    {
+        "raw_variable": "tour_same_unordered_od_day_share",
+        "audit_variable": "tour_same_unordered_od_day_share",
+        "concept": "Share de dias con un unico OD no dirigido.",
+        "subdimension": "pendularidad_simple",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "needs_audit",
+        "caveat": "Puede duplicar reciprocidad y concentracion OD.",
+    },
+    {
+        "raw_variable": "tour_mode_consistent_day_share",
+        "audit_variable": "tour_mode_consistent_day_share",
+        "concept": "Share de dias con un solo modo grueso observado.",
+        "subdimension": "consistencia_modal_diaria",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "needs_audit",
+        "caveat": "Puede duplicar bloque modal.",
+    },
+    {
+        "raw_variable": "tour_mixed_mode_day_share",
+        "audit_variable": "tour_mixed_mode_day_share",
+        "concept": "Share de dias con mas de un modo grueso observado.",
+        "subdimension": "mezcla_modal_diaria",
+        "source": "user_model_matrix",
+        "initial_status": "needs_audit",
+        "caveat": "Complementaria de mode_consistent; no usar ambas sin referencia.",
+    },
+    {
+        "raw_variable": "tour_first_trip_lab_am_peak_share",
+        "audit_variable": "tour_first_trip_lab_am_peak_share",
+        "concept": "Share de dias cuyo primer viaje ocurre en punta AM laboral.",
+        "subdimension": "anclaje_inicio_laboral",
+        "source": "user_model_matrix",
+        "initial_status": "needs_audit",
+        "caveat": "Puede duplicar bloque horario/franja.",
+    },
+    {
+        "raw_variable": "tour_last_trip_lab_pm_peak_share",
+        "audit_variable": "tour_last_trip_lab_pm_peak_share",
+        "concept": "Share de dias cuyo ultimo viaje ocurre en punta PM laboral.",
+        "subdimension": "anclaje_cierre_laboral",
+        "source": "user_model_matrix",
+        "initial_status": "needs_audit",
+        "caveat": "Puede duplicar bloque horario/franja.",
+    },
+    {
+        "raw_variable": "tour_peak_anchor_day_share",
+        "audit_variable": "tour_peak_anchor_day_share",
+        "concept": "Share de dias con primer viaje AM peak o ultimo viaje PM peak.",
+        "subdimension": "anclaje_peak",
+        "source": "user_model_matrix",
+        "initial_status": "needs_audit",
+        "caveat": "Variable compuesta de first/last peak; revisar redundancia.",
+    },
+    {
+        "raw_variable": "tour_workday_commute_like_day_share",
+        "audit_variable": "tour_workday_commute_like_day_share",
+        "concept": "Share de dias cerrados con primer viaje AM peak y ultimo PM peak.",
+        "subdimension": "commute_like_diario",
+        "source": "user_model_matrix",
+        "initial_status": "candidate_main",
+        "caveat": "Indice prescriptivo; podria quedar como post-hoc si duplica otros ejes.",
+    },
+    {
+        "raw_variable": "tour_distinct_zones_per_day_mean",
+        "audit_variable": "tour_distinct_zones_per_day_mean",
+        "concept": "Promedio de zonas distintas por dia activo.",
+        "subdimension": "diversidad_zonal_diaria",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "needs_audit",
+        "caveat": "Puede duplicar bloque espacial y soporte diario.",
+    },
+    {
+        "raw_variable": "tour_distinct_zones_per_day_median",
+        "audit_variable": "tour_distinct_zones_per_day_median",
+        "concept": "Mediana de zonas distintas por dia activo.",
+        "subdimension": "diversidad_zonal_diaria",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "needs_audit",
+        "caveat": "Alternativa robusta al promedio; probablemente redundante.",
+    },
+    {
+        "raw_variable": "tour_distinct_od_per_day_mean",
+        "audit_variable": "tour_distinct_od_per_day_mean",
+        "concept": "Promedio de OD dirigidos distintos por dia activo.",
+        "subdimension": "diversidad_od_diaria",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "needs_audit",
+        "caveat": "Puede duplicar espacial/OD y complejidad diaria.",
+    },
+    {
+        "raw_variable": "tour_distinct_unordered_od_per_day_mean",
+        "audit_variable": "tour_distinct_unordered_od_per_day_mean",
+        "concept": "Promedio de OD no dirigidos distintos por dia activo.",
+        "subdimension": "diversidad_od_diaria",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "needs_audit",
+        "caveat": "Alternativa no dirigida; revisar contra OD dirigido.",
+    },
+    {
+        "raw_variable": "tour_distinct_modes_per_day_mean",
+        "audit_variable": "tour_distinct_modes_per_day_mean",
+        "concept": "Promedio de modos gruesos distintos por dia activo.",
+        "subdimension": "diversidad_modal_diaria",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "needs_audit",
+        "caveat": "Puede duplicar bloque modal.",
+    },
+    {
+        "raw_variable": "tour_day_span_hours_mean",
+        "audit_variable": "tour_day_span_hours_mean",
+        "concept": "Promedio del span horario diario entre primer y ultimo viaje.",
+        "subdimension": "amplitud_diaria",
+        "source": "user_model_matrix",
+        "initial_status": "candidate_main",
+        "caveat": "Puede duplicar first/last hour; sensible a dias de un viaje.",
+    },
+    {
+        "raw_variable": "tour_day_span_hours_median",
+        "audit_variable": "tour_day_span_hours_median",
+        "concept": "Mediana del span horario diario.",
+        "subdimension": "amplitud_diaria",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "needs_audit",
+        "caveat": "Alternativa robusta al promedio; revisar redundancia.",
+    },
+    {
+        "raw_variable": "tour_first_trip_hour_mean",
+        "audit_variable": "tour_first_trip_hour_mean",
+        "concept": "Hora promedio del primer viaje diario.",
+        "subdimension": "inicio_diario",
+        "source": "daily_tour_artifact_only",
+        "initial_status": "needs_audit",
+        "caveat": "Puede duplicar hora_mean y first_trip_lab_am_peak_share.",
+    },
+    {
+        "raw_variable": "tour_last_trip_hour_mean",
+        "audit_variable": "tour_last_trip_hour_mean",
+        "concept": "Hora promedio del ultimo viaje diario.",
+        "subdimension": "cierre_diario_horario",
+        "source": "user_model_matrix",
+        "initial_status": "candidate_main",
+        "caveat": "Puede duplicar day_span y bloque horario.",
+    },
+]
+
+daily_tour_concept_df = pd.DataFrame(DAILY_TOUR_CANDIDATES)
+display(daily_tour_concept_df)
+```
+
+## 10.2 Helpers
+
+```{python}
+#| label: daily-tour-helpers
+print("label: daily-tour-helpers")
+
+RAW_DAILY_TOUR_COLS = [v["raw_variable"] for v in DAILY_TOUR_CANDIDATES]
+AUDIT_DAILY_TOUR_COLS = [v["audit_variable"] for v in DAILY_TOUR_CANDIDATES]
+
+
+def load_daily_tour_frame(path: Path) -> pl.DataFrame:
+    universe_cols = existing_columns(path)
+    missing_universe = [c for c in ["id_tarjeta"] + TARGET_CONTEXT_COLS if c not in universe_cols]
+    if missing_universe:
+        raise ValueError(f"Faltan columnas en {path.name}: {missing_universe}")
+
+    if not DAILY_TOUR_ARTIFACT_PATH.exists():
+        raise FileNotFoundError(f"No existe daily_tour artifact: {DAILY_TOUR_ARTIFACT_PATH}")
+
+    artifact_cols = existing_columns(DAILY_TOUR_ARTIFACT_PATH)
+    missing_artifact = [c for c in ["id_tarjeta"] + RAW_DAILY_TOUR_COLS if c not in artifact_cols]
+    if missing_artifact:
+        raise ValueError(f"Faltan columnas en {DAILY_TOUR_ARTIFACT_PATH.name}: {missing_artifact}")
+
+    universe_lf = pl.scan_parquet(path).select(["id_tarjeta"] + TARGET_CONTEXT_COLS)
+    daily_tour_lf = pl.scan_parquet(DAILY_TOUR_ARTIFACT_PATH).select(["id_tarjeta"] + RAW_DAILY_TOUR_COLS)
+    return universe_lf.join(daily_tour_lf, on="id_tarjeta", how="left").collect()
+```
+
+## 10.3 Disponibilidad y calidad estadistica por universo
+
+```{python}
+#| label: daily-tour-quality-by-universe
+print("label: daily-tour-quality-by-universe")
+
+daily_tour_stats_frames = []
+loaded_daily_tour = {}
+for u in universe_status:
+    if not u["exists"]:
+        continue
+    df_u = load_daily_tour_frame(u["path"])
+    loaded_daily_tour[u["label"]] = df_u
+    daily_tour_stats_frames.append(
+        variable_stats_for_cols(df_u, AUDIT_DAILY_TOUR_COLS, u["label"])
+    )
+
+daily_tour_stats = pd.concat(daily_tour_stats_frames, ignore_index=True)
+display(daily_tour_stats)
+```
+
+## 10.4 Correlacion interna en universo principal
+
+```{python}
+#| label: daily-tour-correlation-main
+print("label: daily-tour-correlation-main")
+
+df_daily_tour_primary = loaded_daily_tour[PRIMARY_UNIVERSE]
+daily_tour_corr = correlation_matrix_for_cols(
+    df_daily_tour_primary,
+    AUDIT_DAILY_TOUR_COLS,
+)
+display(daily_tour_corr)
+
+fig, ax = plt.subplots(figsize=(12, 10))
+im = ax.imshow(daily_tour_corr.values, vmin=-1, vmax=1, cmap="coolwarm")
+ax.set_xticks(range(len(daily_tour_corr.columns)))
+ax.set_yticks(range(len(daily_tour_corr.index)))
+ax.set_xticklabels(daily_tour_corr.columns, rotation=45, ha="right")
+ax.set_yticklabels(daily_tour_corr.index)
+ax.set_title(f"Spearman correlation - daily tour block ({PRIMARY_UNIVERSE})")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+fig.tight_layout()
+plt.show()
+```
+
+## 10.5 PCA diagnostico del bloque daily tour
+
+```{python}
+#| label: daily-tour-pca-diagnostic
+print("label: daily-tour-pca-diagnostic")
+
+daily_tour_explained, daily_tour_loadings = pca_diagnostic_for_cols(
+    df_daily_tour_primary,
+    AUDIT_DAILY_TOUR_COLS,
+)
+display(daily_tour_explained)
+display(daily_tour_loadings)
+
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.bar(
+    daily_tour_explained["pc"],
+    daily_tour_explained["explained_variance_ratio"],
+    alpha=0.6,
+    label="individual",
+)
+ax.plot(
+    daily_tour_explained["pc"],
+    daily_tour_explained["cumulative_variance_ratio"],
+    marker="o",
+    color="C3",
+    label="cumulative",
+)
+ax.axhline(0.80, color="grey", linestyle="--", linewidth=1)
+ax.set_ylim(0, 1.05)
+ax.set_ylabel("Variance ratio")
+ax.set_title("PCA diagnostic - daily tour block")
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+## 10.6 Representatividad de variables candidatas v1
+
+Primer set parsimonioso:
+
+- `tour_three_plus_trip_day_share`: complejidad diaria por cantidad de viajes.
+- `tour_reciprocal_od_day_share`: pendularidad/ida-vuelta OD.
+- `tour_closed_loop_day_share`: cierre del dia en el origen inicial.
+- `tour_mixed_mode_day_share`: mezcla modal diaria.
+- `tour_day_span_hours_mean`: amplitud temporal diaria.
+
+```{python}
+#| label: daily-tour-representative-retention-v1
+print("label: daily-tour-representative-retention-v1")
+
+DAILY_TOUR_REPRESENTATIVES_V1 = [
+    "tour_three_plus_trip_day_share",
+    "tour_reciprocal_od_day_share",
+    "tour_closed_loop_day_share",
+    "tour_mixed_mode_day_share",
+    "tour_day_span_hours_mean",
+]
+
+daily_tour_rep_summary, daily_tour_rep_reconstruction, _ = (
+    representative_reconstruction_diagnostic(
+        df_daily_tour_primary,
+        representative_cols=DAILY_TOUR_REPRESENTATIVES_V1,
+        target_cols=AUDIT_DAILY_TOUR_COLS,
+    )
+)
+
+daily_tour_rep_pc_correlations = representative_pc_correlations_for_cols(
+    df_daily_tour_primary,
+    representative_cols=DAILY_TOUR_REPRESENTATIVES_V1,
+    target_cols=AUDIT_DAILY_TOUR_COLS,
+    n_pcs=6,
+)
+
+daily_tour_rep_summary_ext = representative_summary_with_pcs(
+    daily_tour_rep_summary,
+    daily_tour_rep_pc_correlations,
+    max_pc=6,
+)
+
+display(daily_tour_rep_summary_ext)
+display(
+    daily_tour_rep_reconstruction.sort_values(
+        "r2_from_representatives",
+        ascending=False,
+    )
+)
+display(
+    daily_tour_rep_pc_correlations.sort_values(
+        ["pc", "abs_corr"],
+        ascending=[True, False],
+    )
+)
+```
+
+## 10.7 Representatividad de variables candidatas v2
+
+Segundo set de sensibilidad: agrega anclaje laboral explicito de primer y
+ultimo viaje. Sirve para evaluar si first/last peak aportan mas que el span
+horario diario.
+
+```{python}
+#| label: daily-tour-representative-retention-v2
+print("label: daily-tour-representative-retention-v2")
+
+DAILY_TOUR_REPRESENTATIVES_V2 = [
+    "tour_three_plus_trip_day_share",
+    "tour_reciprocal_od_day_share",
+    "tour_closed_loop_day_share",
+    "tour_mixed_mode_day_share",
+    "tour_day_span_hours_mean",
+    "tour_first_trip_lab_am_peak_share",
+    "tour_last_trip_lab_pm_peak_share",
+]
+
+daily_tour_rep2_summary, daily_tour_rep2_reconstruction, _ = (
+    representative_reconstruction_diagnostic(
+        df_daily_tour_primary,
+        representative_cols=DAILY_TOUR_REPRESENTATIVES_V2,
+        target_cols=AUDIT_DAILY_TOUR_COLS,
+    )
+)
+
+daily_tour_rep2_pc_correlations = representative_pc_correlations_for_cols(
+    df_daily_tour_primary,
+    representative_cols=DAILY_TOUR_REPRESENTATIVES_V2,
+    target_cols=AUDIT_DAILY_TOUR_COLS,
+    n_pcs=6,
+)
+
+daily_tour_rep2_summary_ext = representative_summary_with_pcs(
+    daily_tour_rep2_summary,
+    daily_tour_rep2_pc_correlations,
+    max_pc=6,
+)
+
+display(daily_tour_rep2_summary_ext)
+display(
+    daily_tour_rep2_reconstruction.sort_values(
+        "r2_from_representatives",
+        ascending=False,
+    )
+)
+display(
+    daily_tour_rep2_pc_correlations.sort_values(
+        ["pc", "abs_corr"],
+        ascending=[True, False],
+    )
+)
+```
+
+## 10.8 QR/BIP post-hoc descriptivo
+
+```{python}
+#| label: daily-tour-posthoc-qr
+print("label: daily-tour-posthoc-qr")
+
+daily_tour_posthoc_frames = []
+for c in AUDIT_DAILY_TOUR_COLS:
+    out = posthoc_quantile_lift(df_daily_tour_primary, c)
+    if not out.empty:
+        daily_tour_posthoc_frames.append(out)
+
+if daily_tour_posthoc_frames:
+    daily_tour_posthoc = pd.concat(daily_tour_posthoc_frames, ignore_index=True)
+else:
+    daily_tour_posthoc = pd.DataFrame()
+display(daily_tour_posthoc)
+```
+
+## 10.9 Decision provisional
+
+```{python}
+#| label: daily-tour-decision-template
+print("label: daily-tour-decision-template")
+display(pd.DataFrame([
+    {
+        "decision_item": "complejidad_diaria",
+        "candidate_variables": "tour_two_trip_day_share, tour_three_plus_trip_day_share, tour_complex_day_share",
+        "decision": "pending",
+        "evidence_to_review": "Elegir representantes de simpleza vs complejidad sin duplicar intensidad.",
+    },
+    {
+        "decision_item": "cierre_pendularidad",
+        "candidate_variables": "tour_closed_loop_day_share, tour_reciprocal_od_day_share, tour_same_unordered_od_day_share, tour_workday_commute_like_day_share",
+        "decision": "pending",
+        "evidence_to_review": "Separar cierre geometrico, reciprocidad OD y commute-like prescriptivo.",
+    },
+    {
+        "decision_item": "anclaje_horario_diario",
+        "candidate_variables": "tour_first_trip_lab_am_peak_share, tour_last_trip_lab_pm_peak_share, tour_peak_anchor_day_share, tour_day_span_hours_mean, tour_day_span_hours_median, tour_first_trip_hour_mean, tour_last_trip_hour_mean",
+        "decision": "pending",
+        "evidence_to_review": "Revisar redundancia con bloque horario/franja antes de seleccionar main.",
+    },
+    {
+        "decision_item": "diversidad_diaria",
+        "candidate_variables": "tour_distinct_zones_per_day_mean, tour_distinct_od_per_day_mean, tour_distinct_unordered_od_per_day_mean, tour_distinct_modes_per_day_mean, tour_mixed_mode_day_share",
+        "decision": "pending",
+        "evidence_to_review": "Revisar redundancia con bloques espacial/OD y modal.",
+    },
+]))
+```
+
+# 11) Ensamble behavioral_wide v0
+
+Este bloque junta las variables `main` ya cerradas provisionalmente en el
+catalogo. La idea no es fijar la especificacion final, sino mirar el set
+conductual completo antes de construir una matriz persistente:
+
+- calidad y disponibilidad conjunta;
+- correlaciones altas entre bloques;
+- PCA global;
+- variables con caveat que podrian bajar a sensibilidad.
+
+## 11.1 Inventario de variables main
+
+```{python}
+#| label: behavioral-wide-main-inventory
+print("label: behavioral-wide-main-inventory")
+
+BEHAVIORAL_WIDE_MAIN_METADATA = [
+    {"block": "intensidad", "variable": "log1p_n_viajes", "source": "model_matrix:derived", "caveat": "soporte puede dominar"},
+    {"block": "intensidad", "variable": "rhythm_active_day_density_span", "source": "model_matrix", "caveat": "densidad/cotidianeidad"},
+    {"block": "horario", "variable": "hora_mean", "source": "model_matrix", "caveat": "promedio horario"},
+    {"block": "horario", "variable": "hora_std", "source": "model_matrix", "caveat": "dispersion vs soporte"},
+    {"block": "horario", "variable": "share_lab_pm", "source": "model_matrix", "caveat": "composicional"},
+    {"block": "horario", "variable": "share_lab_pt", "source": "model_matrix", "caveat": "composicional"},
+    {"block": "horario", "variable": "share_no_lab", "source": "model_matrix", "caveat": "composicional"},
+    {"block": "regularidad", "variable": "log1p_rhythm_mean_gap_active_days", "source": "model_matrix:derived", "caveat": "cola larga / missing gap"},
+    {"block": "regularidad", "variable": "rhythm_daily_hhi", "source": "model_matrix", "caveat": "soporte diario"},
+    {"block": "regularidad", "variable": "rhythm_single_trip_day_share", "source": "model_matrix", "caveat": "solapa daily-tour"},
+    {"block": "regularidad", "variable": "rhythm_weekly_hhi", "source": "model_matrix", "caveat": "scope semanal corto"},
+    {"block": "regularidad", "variable": "rhythm_weekly_entropy_norm", "source": "model_matrix", "caveat": "no incluir burstiness"},
+    {"block": "modal", "variable": "share_trips_solo_bus", "source": "model_matrix", "caveat": "oferta/acceso"},
+    {"block": "modal", "variable": "share_trips_metro_bus", "source": "model_matrix", "caveat": "intermodalidad"},
+    {"block": "modal", "variable": "share_trips_with_transfer", "source": "model_matrix", "caveat": "red/oferta"},
+    {"block": "modal", "variable": "share_trips_in_multi_route_od", "source": "model_matrix", "caveat": "red/oferta fuerte"},
+    {"block": "espacial_od", "variable": "activity_zone_entropy", "source": "model_matrix", "caveat": "soporte/intensidad"},
+    {"block": "espacial_od", "variable": "routine_od_hhi", "source": "model_matrix", "caveat": "concentracion OD"},
+    {"block": "espacial_od", "variable": "routine_main_od_share", "source": "model_matrix", "caveat": "solapa commute/daily-tour"},
+    {"block": "espacial_od", "variable": "routine_main_od_roundtrip_balance", "source": "model_matrix", "caveat": "discreta/bimodal"},
+    {"block": "espacial_od", "variable": "origin_zone_top1_share", "source": "model_matrix", "caveat": "residencia/actividad"},
+    {"block": "rutina", "variable": "routine_od_time_hhi", "source": "model_matrix", "caveat": "solapa OD/horario"},
+    {"block": "rutina", "variable": "routine_lab_peak_share", "source": "model_matrix", "caveat": "solapa horario"},
+    {"block": "rutina", "variable": "routine_od_time_entropy_norm", "source": "model_matrix", "caveat": "techo frecuente"},
+    {"block": "daily_tour", "variable": "tour_three_plus_trip_day_share", "source": "daily_tour_artifact", "caveat": "solapa intensidad"},
+    {"block": "daily_tour", "variable": "tour_reciprocal_od_day_share", "source": "daily_tour_artifact", "caveat": "solapa OD"},
+    {"block": "daily_tour", "variable": "tour_closed_loop_day_share", "source": "daily_tour_artifact", "caveat": "solapa reciprocidad"},
+    {"block": "daily_tour", "variable": "tour_mixed_mode_day_share", "source": "daily_tour_artifact", "caveat": "solapa modal"},
+    {"block": "daily_tour", "variable": "tour_day_span_hours_mean", "source": "daily_tour_artifact", "caveat": "solapa horario"},
+    {"block": "daily_tour", "variable": "tour_first_trip_lab_am_peak_share", "source": "daily_tour_artifact", "caveat": "solapa horario"},
+    {"block": "daily_tour", "variable": "tour_last_trip_lab_pm_peak_share", "source": "daily_tour_artifact", "caveat": "solapa horario"},
+]
+
+behavioral_wide_inventory = pd.DataFrame(BEHAVIORAL_WIDE_MAIN_METADATA)
+BEHAVIORAL_WIDE_MAIN_COLS = behavioral_wide_inventory["variable"].tolist()
+BEHAVIORAL_WIDE_BLOCK_BY_VAR = dict(zip(behavioral_wide_inventory["variable"], behavioral_wide_inventory["block"]))
+
+display(behavioral_wide_inventory)
+display(
+    behavioral_wide_inventory
+    .groupby(["block", "source"], observed=True)
+    .size()
+    .reset_index(name="n_variables")
+)
+```
+
+## 11.2 Carga del ensamble por universo
+
+Las variables `tour_*` se toman del artefacto completo de daily-tour, incluso
+cuando algunas ya existen en `user_model_matrix_*`, para mantener una fuente
+consistente dentro del bloque.
+
+```{python}
+#| label: behavioral-wide-helpers
+print("label: behavioral-wide-helpers")
+
+DAILY_TOUR_MAIN_COLS = [
+    "tour_three_plus_trip_day_share",
+    "tour_reciprocal_od_day_share",
+    "tour_closed_loop_day_share",
+    "tour_mixed_mode_day_share",
+    "tour_day_span_hours_mean",
+    "tour_first_trip_lab_am_peak_share",
+    "tour_last_trip_lab_pm_peak_share",
+]
+
+BEHAVIORAL_WIDE_BASE_RAW_COLS = [
+    "n_viajes",
+    "rhythm_active_day_density_span",
+    "hora_mean",
+    "hora_std",
+    "share_lab_pm",
+    "share_lab_pt",
+    "share_no_lab",
+    "rhythm_mean_gap_active_days",
+    "rhythm_daily_hhi",
+    "rhythm_single_trip_day_share",
+    "rhythm_weekly_hhi",
+    "rhythm_weekly_entropy_norm",
+    "share_trips_solo_bus",
+    "share_trips_metro_bus",
+    "share_trips_with_transfer",
+    "share_trips_in_multi_route_od",
+    "activity_zone_entropy",
+    "routine_od_hhi",
+    "routine_main_od_share",
+    "routine_main_od_roundtrip_balance",
+    "origin_zone_top1_share",
+    "routine_od_time_hhi",
+    "routine_lab_peak_share",
+    "routine_od_time_entropy_norm",
+]
+
+
+def load_behavioral_wide_frame(path: Path) -> pl.DataFrame:
+    cols = existing_columns(path)
+    required_base = ["id_tarjeta"] + BEHAVIORAL_WIDE_BASE_RAW_COLS + TARGET_CONTEXT_COLS
+    missing_base = [c for c in required_base if c not in cols]
+    if missing_base:
+        raise ValueError(f"Faltan columnas base en {path.name}: {missing_base}")
+
+    daily_cols = existing_columns(DAILY_TOUR_ARTIFACT_PATH)
+    required_daily = ["id_tarjeta"] + DAILY_TOUR_MAIN_COLS
+    missing_daily = [c for c in required_daily if c not in daily_cols]
+    if missing_daily:
+        raise ValueError(f"Faltan columnas daily-tour: {missing_daily}")
+
+    base_lf = (
+        pl.scan_parquet(path)
+        .select(required_base)
+        .with_columns(
+            [
+                pl.col("n_viajes").cast(pl.Float64).log1p().alias("log1p_n_viajes"),
+                pl.col("rhythm_mean_gap_active_days")
+                .cast(pl.Float64)
+                .log1p()
+                .alias("log1p_rhythm_mean_gap_active_days"),
+            ]
+        )
+    )
+    daily_lf = pl.scan_parquet(DAILY_TOUR_ARTIFACT_PATH).select(required_daily)
+    return base_lf.join(daily_lf, on="id_tarjeta", how="left").collect()
+
+
+def attach_behavioral_metadata(df: pd.DataFrame, variable_col: str = "variable") -> pd.DataFrame:
+    out = df.copy()
+    out["block"] = out[variable_col].map(BEHAVIORAL_WIDE_BLOCK_BY_VAR)
+    return out
+```
+
+## 11.3 Calidad conjunta por universo
+
+```{python}
+#| label: behavioral-wide-quality-by-universe
+print("label: behavioral-wide-quality-by-universe")
+
+behavioral_wide_stats_frames = []
+df_behavioral_wide_primary = None
+
+for u in universe_status:
+    if not u["exists"]:
+        continue
+    df_u = load_behavioral_wide_frame(u["path"])
+    if u["label"] == PRIMARY_UNIVERSE:
+        df_behavioral_wide_primary = df_u
+    behavioral_wide_stats_frames.append(
+        variable_stats_for_cols(df_u, BEHAVIORAL_WIDE_MAIN_COLS, u["label"])
+    )
+
+if df_behavioral_wide_primary is None:
+    raise RuntimeError(f"No se cargo el universo primario: {PRIMARY_UNIVERSE}")
+
+behavioral_wide_stats = pd.concat(behavioral_wide_stats_frames, ignore_index=True)
+behavioral_wide_stats = attach_behavioral_metadata(behavioral_wide_stats)
+
+behavioral_wide_stats_view = behavioral_wide_stats[
+    [
+        "universe",
+        "block",
+        "variable",
+        "n",
+        "missing_rate",
+        "mean",
+        "std",
+        "min",
+        "p01",
+        "p05",
+        "p25",
+        "median",
+        "p75",
+        "p95",
+        "p99",
+        "max",
+        "n_unique",
+    ]
+].sort_values(["universe", "block", "variable"])
+
+behavioral_wide_stats_csv = USER_DIR / "behavioral_wide_v0_quality_by_universe.csv"
+behavioral_wide_stats_html = USER_DIR / "behavioral_wide_v0_quality_by_universe.html"
+behavioral_wide_stats_view.to_csv(str(behavioral_wide_stats_csv), index=False)
+behavioral_wide_stats_view.to_html(str(behavioral_wide_stats_html), index=False)
+
+print(f"saved_csv={behavioral_wide_stats_csv}")
+print(f"saved_html={behavioral_wide_stats_html}")
+
+with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 240):
+    display(behavioral_wide_stats_view)
+
+behavioral_wide_quality_summary = (
+    behavioral_wide_stats_view.groupby(["universe", "block"], observed=True)
+    .agg(
+        n_variables=("variable", "size"),
+        max_missing_rate=("missing_rate", "max"),
+        min_std=("std", "min"),
+        median_n_unique=("n_unique", "median"),
+    )
+    .reset_index()
+    .sort_values(["universe", "block"])
+)
+display(behavioral_wide_quality_summary)
+
+behavioral_wide_quality_flags = behavioral_wide_stats_view.loc[
+    (behavioral_wide_stats_view["missing_rate"] > 0)
+    | (behavioral_wide_stats_view["std"].fillna(0) == 0)
+    | (behavioral_wide_stats_view["n_unique"] <= 2)
+].copy()
+display(behavioral_wide_quality_flags)
+```
+
+## 11.4 Correlacion cross-block
+
+```{python}
+#| label: behavioral-wide-correlation-main
+print("label: behavioral-wide-correlation-main")
+
+behavioral_wide_corr = correlation_matrix_for_cols(
+    df_behavioral_wide_primary,
+    BEHAVIORAL_WIDE_MAIN_COLS,
+)
+display(behavioral_wide_corr)
+
+fig, ax = plt.subplots(figsize=(14, 12))
+im = ax.imshow(behavioral_wide_corr.values, vmin=-1, vmax=1, cmap="coolwarm")
+ax.set_xticks(range(len(behavioral_wide_corr.columns)))
+ax.set_yticks(range(len(behavioral_wide_corr.index)))
+ax.set_xticklabels(behavioral_wide_corr.columns, rotation=60, ha="right", fontsize=8)
+ax.set_yticklabels(behavioral_wide_corr.index, fontsize=8)
+ax.set_title(f"Spearman correlation - behavioral_wide v0 ({PRIMARY_UNIVERSE})")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+fig.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: behavioral-wide-high-correlation-pairs
+print("label: behavioral-wide-high-correlation-pairs")
+
+
+def high_correlation_pairs(
+    corr: pd.DataFrame,
+    min_abs_corr: float = 0.75,
+) -> pd.DataFrame:
+    rows = []
+    cols = list(corr.columns)
+    for i, a in enumerate(cols):
+        for b in cols[i + 1:]:
+            value = float(corr.loc[a, b])
+            rows.append(
+                {
+                    "variable_a": a,
+                    "block_a": BEHAVIORAL_WIDE_BLOCK_BY_VAR.get(a),
+                    "variable_b": b,
+                    "block_b": BEHAVIORAL_WIDE_BLOCK_BY_VAR.get(b),
+                    "same_block": BEHAVIORAL_WIDE_BLOCK_BY_VAR.get(a) == BEHAVIORAL_WIDE_BLOCK_BY_VAR.get(b),
+                    "corr": value,
+                    "abs_corr": abs(value),
+                }
+            )
+    out = pd.DataFrame(rows)
+    return (
+        out.loc[out["abs_corr"] >= min_abs_corr]
+        .sort_values("abs_corr", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+behavioral_wide_high_corr_pairs = high_correlation_pairs(behavioral_wide_corr)
+display(behavioral_wide_high_corr_pairs)
+display(
+    behavioral_wide_high_corr_pairs
+    .loc[~behavioral_wide_high_corr_pairs["same_block"]]
+    .reset_index(drop=True)
+)
+```
+
+## 11.5 PCA diagnostico global
+
+```{python}
+#| label: behavioral-wide-pca-diagnostic
+print("label: behavioral-wide-pca-diagnostic")
+
+behavioral_wide_explained, behavioral_wide_loadings = pca_diagnostic_for_cols(
+    df_behavioral_wide_primary,
+    BEHAVIORAL_WIDE_MAIN_COLS,
+)
+
+display(behavioral_wide_explained)
+display(behavioral_wide_loadings)
+
+fig, ax = plt.subplots(figsize=(12, 4))
+ax.bar(
+    behavioral_wide_explained["pc"],
+    behavioral_wide_explained["explained_variance_ratio"],
+    alpha=0.6,
+    label="individual",
+)
+ax.plot(
+    behavioral_wide_explained["pc"],
+    behavioral_wide_explained["cumulative_variance_ratio"],
+    marker="o",
+    color="C3",
+    label="cumulative",
+)
+ax.axhline(0.80, color="grey", linestyle="--", linewidth=1)
+ax.set_ylim(0, 1.05)
+ax.set_ylabel("Variance ratio")
+ax.set_title("PCA diagnostic - behavioral_wide v0")
+ax.tick_params(axis="x", rotation=45)
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: behavioral-wide-pca-loading-summary
+print("label: behavioral-wide-pca-loading-summary")
+
+
+def top_pca_loadings(
+    loadings: pd.DataFrame,
+    max_pc: int = 8,
+    top_n: int = 8,
+) -> pd.DataFrame:
+    rows = []
+    for pc_idx in range(1, max_pc + 1):
+        pc = f"PC{pc_idx}"
+        if pc not in loadings.columns:
+            continue
+        tmp = loadings[["variable", pc]].copy()
+        tmp["pc"] = pc
+        tmp["loading"] = tmp[pc]
+        tmp["abs_loading"] = tmp["loading"].abs()
+        tmp["block"] = tmp["variable"].map(BEHAVIORAL_WIDE_BLOCK_BY_VAR)
+        rows.append(
+            tmp.sort_values("abs_loading", ascending=False)
+            .head(top_n)[["pc", "block", "variable", "loading", "abs_loading"]]
+        )
+    return pd.concat(rows, ignore_index=True)
+
+
+def pca_block_loading_summary(
+    loadings: pd.DataFrame,
+    max_pc: int = 8,
+) -> pd.DataFrame:
+    long = loadings.melt(id_vars="variable", var_name="pc", value_name="loading")
+    long["pc_num"] = long["pc"].str.replace("PC", "", regex=False).astype(int)
+    long = long.loc[long["pc_num"] <= max_pc].copy()
+    long["block"] = long["variable"].map(BEHAVIORAL_WIDE_BLOCK_BY_VAR)
+    long["abs_loading"] = long["loading"].abs()
+    return (
+        long.groupby(["pc", "block"], observed=True)
+        .agg(
+            n_variables=("variable", "size"),
+            mean_abs_loading=("abs_loading", "mean"),
+            sum_abs_loading=("abs_loading", "sum"),
+        )
+        .reset_index()
+        .sort_values(["pc", "sum_abs_loading"], ascending=[True, False])
+    )
+
+
+behavioral_wide_top_loadings = top_pca_loadings(behavioral_wide_loadings)
+behavioral_wide_block_loading_summary = pca_block_loading_summary(behavioral_wide_loadings)
+
+display(behavioral_wide_top_loadings)
+display(behavioral_wide_block_loading_summary)
+```
+
+## 11.6 Chequeos focalizados de caveats
+
+```{python}
+#| label: behavioral-wide-caveat-pair-check
+print("label: behavioral-wide-caveat-pair-check")
+
+BEHAVIORAL_WIDE_CAVEAT_PAIRS = [
+    ("tour_mixed_mode_day_share", "share_trips_metro_bus", "daily_tour_vs_modal"),
+    ("tour_mixed_mode_day_share", "share_trips_with_transfer", "daily_tour_vs_modal"),
+    ("tour_mixed_mode_day_share", "share_trips_solo_bus", "daily_tour_vs_modal"),
+    ("tour_first_trip_lab_am_peak_share", "share_lab_pm", "daily_tour_vs_horario"),
+    ("tour_last_trip_lab_pm_peak_share", "share_lab_pt", "daily_tour_vs_horario"),
+    ("tour_first_trip_lab_am_peak_share", "routine_lab_peak_share", "daily_tour_vs_rutina"),
+    ("tour_last_trip_lab_pm_peak_share", "routine_lab_peak_share", "daily_tour_vs_rutina"),
+    ("tour_day_span_hours_mean", "hora_std", "daily_tour_vs_horario"),
+    ("tour_day_span_hours_mean", "hora_mean", "daily_tour_vs_horario"),
+    ("routine_lab_peak_share", "share_lab_pm", "rutina_vs_horario"),
+    ("routine_lab_peak_share", "share_lab_pt", "rutina_vs_horario"),
+    ("routine_od_time_hhi", "routine_od_hhi", "rutina_vs_espacial_od"),
+    ("routine_main_od_share", "tour_reciprocal_od_day_share", "espacial_od_vs_daily_tour"),
+    ("routine_main_od_roundtrip_balance", "tour_reciprocal_od_day_share", "espacial_od_vs_daily_tour"),
+    ("routine_main_od_roundtrip_balance", "tour_closed_loop_day_share", "espacial_od_vs_daily_tour"),
+    ("rhythm_single_trip_day_share", "tour_three_plus_trip_day_share", "regularidad_vs_daily_tour"),
+    ("share_trips_in_multi_route_od", "share_trips_with_transfer", "modal_vs_red_oferta"),
+]
+
+caveat_rows = []
+for a, b, family in BEHAVIORAL_WIDE_CAVEAT_PAIRS:
+    caveat_rows.append(
+        {
+            "family": family,
+            "variable_a": a,
+            "block_a": BEHAVIORAL_WIDE_BLOCK_BY_VAR.get(a),
+            "variable_b": b,
+            "block_b": BEHAVIORAL_WIDE_BLOCK_BY_VAR.get(b),
+            "corr": float(behavioral_wide_corr.loc[a, b]),
+            "abs_corr": abs(float(behavioral_wide_corr.loc[a, b])),
+        }
+    )
+
+behavioral_wide_caveat_pair_check = (
+    pd.DataFrame(caveat_rows)
+    .sort_values("abs_corr", ascending=False)
+    .reset_index(drop=True)
+)
+display(behavioral_wide_caveat_pair_check)
+```
+
+## 11.7 Template de lectura
+
+```{python}
+#| label: behavioral-wide-decision-template
+print("label: behavioral-wide-decision-template")
+display(pd.DataFrame([
+    {
+        "decision_item": "variables_con_caveat_cross_block",
+        "evidence_to_review": "high-correlation-pairs y caveat-pair-check",
+        "possible_action": "bajar a sensibilidad si abs_corr es alta y no aporta PC propio",
+    },
+    {
+        "decision_item": "balance_por_bloque",
+        "evidence_to_review": "pca-loading-summary",
+        "possible_action": "ponderar por bloque o reducir variables si un bloque domina PC1/PC2",
+    },
+    {
+        "decision_item": "behavioral_wide_v0",
+        "evidence_to_review": "quality, PCA global y redundancia cross-block",
+        "possible_action": "cerrar lista v0 o definir v0b sin variables redundantes",
+    },
+]))
+```
+
+# 12) Ensamble behavioral_wide v0b
+
+`v0b` es una prueba de reduccion, no un reemplazo automatico de `v0`. La idea
+es bajar a sensibilidad las variables que quedaron mas claramente redundantes
+en la lectura cross-block de `v0`, y volver a correr los mismos diagnosticos
+para revisar si la estructura conductual se mantiene.
+
+## 12.1 Inventario v0b
+
+```{python}
+#| label: behavioral-wide-v0b-main-inventory
+print("label: behavioral-wide-v0b-main-inventory")
+
+BEHAVIORAL_WIDE_V0B_DROP_REASONS = {
+    "log1p_rhythm_mean_gap_active_days": "redundante con densidad de dias activos",
+    "tour_first_trip_lab_am_peak_share": "redundante con share_lab_pm / rutina peak",
+    "rhythm_daily_hhi": "redundante con soporte/intensidad",
+    "routine_od_hhi": "redundante con routine_od_time_hhi",
+    "tour_reciprocal_od_day_share": "redundante con balance roundtrip OD principal",
+}
+BEHAVIORAL_WIDE_V0B_DROP_COLS = list(BEHAVIORAL_WIDE_V0B_DROP_REASONS)
+BEHAVIORAL_WIDE_V0B_COLS = [
+    c for c in BEHAVIORAL_WIDE_MAIN_COLS
+    if c not in BEHAVIORAL_WIDE_V0B_DROP_COLS
+]
+
+behavioral_wide_v0b_inventory = behavioral_wide_inventory.copy()
+behavioral_wide_v0b_inventory["spec_role"] = behavioral_wide_v0b_inventory["variable"].map(
+    lambda c: "sensitivity_drop" if c in BEHAVIORAL_WIDE_V0B_DROP_COLS else "v0b_main"
+)
+behavioral_wide_v0b_inventory["v0b_drop_reason"] = behavioral_wide_v0b_inventory["variable"].map(
+    BEHAVIORAL_WIDE_V0B_DROP_REASONS
+)
+
+display(behavioral_wide_v0b_inventory)
+display(
+    behavioral_wide_v0b_inventory
+    .groupby(["block", "spec_role"], observed=True)
+    .size()
+    .reset_index(name="n_variables")
+    .sort_values(["block", "spec_role"])
+)
+display(
+    pd.DataFrame([
+        {"metric": "n_variables_v0", "value": len(BEHAVIORAL_WIDE_MAIN_COLS)},
+        {"metric": "n_variables_v0b", "value": len(BEHAVIORAL_WIDE_V0B_COLS)},
+        {"metric": "n_sensitivity_drops", "value": len(BEHAVIORAL_WIDE_V0B_DROP_COLS)},
+    ])
+)
+```
+
+## 12.2 Calidad conjunta v0b por universo
+
+```{python}
+#| label: behavioral-wide-v0b-quality-by-universe
+print("label: behavioral-wide-v0b-quality-by-universe")
+
+behavioral_wide_v0b_stats_frames = []
+df_behavioral_wide_v0b_primary = None
+
+for u in universe_status:
+    if not u["exists"]:
+        continue
+    df_u = load_behavioral_wide_frame(u["path"])
+    if u["label"] == PRIMARY_UNIVERSE:
+        df_behavioral_wide_v0b_primary = df_u
+    behavioral_wide_v0b_stats_frames.append(
+        variable_stats_for_cols(df_u, BEHAVIORAL_WIDE_V0B_COLS, u["label"])
+    )
+
+if df_behavioral_wide_v0b_primary is None:
+    raise RuntimeError(f"No se cargo el universo primario: {PRIMARY_UNIVERSE}")
+
+behavioral_wide_v0b_stats = pd.concat(behavioral_wide_v0b_stats_frames, ignore_index=True)
+behavioral_wide_v0b_stats = attach_behavioral_metadata(behavioral_wide_v0b_stats)
+
+behavioral_wide_v0b_stats_view = behavioral_wide_v0b_stats[
+    [
+        "universe",
+        "block",
+        "variable",
+        "n",
+        "missing_rate",
+        "mean",
+        "std",
+        "min",
+        "p01",
+        "p05",
+        "p25",
+        "median",
+        "p75",
+        "p95",
+        "p99",
+        "max",
+        "n_unique",
+    ]
+].sort_values(["universe", "block", "variable"])
+
+behavioral_wide_v0b_stats_csv = USER_DIR / "behavioral_wide_v0b_quality_by_universe.csv"
+behavioral_wide_v0b_stats_html = USER_DIR / "behavioral_wide_v0b_quality_by_universe.html"
+behavioral_wide_v0b_stats_view.to_csv(str(behavioral_wide_v0b_stats_csv), index=False)
+behavioral_wide_v0b_stats_view.to_html(str(behavioral_wide_v0b_stats_html), index=False)
+
+print(f"saved_csv={behavioral_wide_v0b_stats_csv}")
+print(f"saved_html={behavioral_wide_v0b_stats_html}")
+
+with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 240):
+    display(behavioral_wide_v0b_stats_view)
+
+behavioral_wide_v0b_quality_summary = (
+    behavioral_wide_v0b_stats_view.groupby(["universe", "block"], observed=True)
+    .agg(
+        n_variables=("variable", "size"),
+        max_missing_rate=("missing_rate", "max"),
+        min_std=("std", "min"),
+        median_n_unique=("n_unique", "median"),
+    )
+    .reset_index()
+    .sort_values(["universe", "block"])
+)
+display(behavioral_wide_v0b_quality_summary)
+
+behavioral_wide_v0b_quality_flags = behavioral_wide_v0b_stats_view.loc[
+    (behavioral_wide_v0b_stats_view["missing_rate"] > 0)
+    | (behavioral_wide_v0b_stats_view["std"].fillna(0) == 0)
+    | (behavioral_wide_v0b_stats_view["n_unique"] <= 2)
+].copy()
+display(behavioral_wide_v0b_quality_flags)
+```
+
+## 12.3 Correlacion cross-block v0b
+
+```{python}
+#| label: behavioral-wide-v0b-correlation-main
+print("label: behavioral-wide-v0b-correlation-main")
+
+behavioral_wide_v0b_corr = correlation_matrix_for_cols(
+    df_behavioral_wide_v0b_primary,
+    BEHAVIORAL_WIDE_V0B_COLS,
+)
+display(behavioral_wide_v0b_corr)
+
+fig, ax = plt.subplots(figsize=(13, 11))
+im = ax.imshow(behavioral_wide_v0b_corr.values, vmin=-1, vmax=1, cmap="coolwarm")
+ax.set_xticks(range(len(behavioral_wide_v0b_corr.columns)))
+ax.set_yticks(range(len(behavioral_wide_v0b_corr.index)))
+ax.set_xticklabels(behavioral_wide_v0b_corr.columns, rotation=60, ha="right", fontsize=8)
+ax.set_yticklabels(behavioral_wide_v0b_corr.index, fontsize=8)
+ax.set_title(f"Spearman correlation - behavioral_wide v0b ({PRIMARY_UNIVERSE})")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+fig.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: behavioral-wide-v0b-high-correlation-pairs
+print("label: behavioral-wide-v0b-high-correlation-pairs")
+
+behavioral_wide_v0b_high_corr_pairs = high_correlation_pairs(behavioral_wide_v0b_corr)
+display(behavioral_wide_v0b_high_corr_pairs)
+display(
+    behavioral_wide_v0b_high_corr_pairs
+    .loc[~behavioral_wide_v0b_high_corr_pairs["same_block"]]
+    .reset_index(drop=True)
+)
+```
+
+## 12.4 PCA diagnostico v0b
+
+```{python}
+#| label: behavioral-wide-v0b-pca-diagnostic
+print("label: behavioral-wide-v0b-pca-diagnostic")
+
+behavioral_wide_v0b_explained, behavioral_wide_v0b_loadings = pca_diagnostic_for_cols(
+    df_behavioral_wide_v0b_primary,
+    BEHAVIORAL_WIDE_V0B_COLS,
+)
+
+display(behavioral_wide_v0b_explained)
+display(behavioral_wide_v0b_loadings)
+
+fig, ax = plt.subplots(figsize=(12, 4))
+ax.bar(
+    behavioral_wide_v0b_explained["pc"],
+    behavioral_wide_v0b_explained["explained_variance_ratio"],
+    alpha=0.6,
+    label="individual",
+)
+ax.plot(
+    behavioral_wide_v0b_explained["pc"],
+    behavioral_wide_v0b_explained["cumulative_variance_ratio"],
+    marker="o",
+    color="C3",
+    label="cumulative",
+)
+ax.axhline(0.80, color="grey", linestyle="--", linewidth=1)
+ax.set_ylim(0, 1.05)
+ax.set_ylabel("Variance ratio")
+ax.set_title("PCA diagnostic - behavioral_wide v0b")
+ax.tick_params(axis="x", rotation=45)
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: behavioral-wide-v0b-pca-loading-summary
+print("label: behavioral-wide-v0b-pca-loading-summary")
+
+behavioral_wide_v0b_top_loadings = top_pca_loadings(behavioral_wide_v0b_loadings)
+behavioral_wide_v0b_block_loading_summary = pca_block_loading_summary(behavioral_wide_v0b_loadings)
+
+display(behavioral_wide_v0b_top_loadings)
+display(behavioral_wide_v0b_block_loading_summary)
+```
+
+## 12.5 Chequeos focalizados v0b
+
+```{python}
+#| label: behavioral-wide-v0b-caveat-pair-check
+print("label: behavioral-wide-v0b-caveat-pair-check")
+
+v0b_caveat_rows = []
+for a, b, family in BEHAVIORAL_WIDE_CAVEAT_PAIRS:
+    if a not in BEHAVIORAL_WIDE_V0B_COLS or b not in BEHAVIORAL_WIDE_V0B_COLS:
+        continue
+    v0b_caveat_rows.append(
+        {
+            "family": family,
+            "variable_a": a,
+            "block_a": BEHAVIORAL_WIDE_BLOCK_BY_VAR.get(a),
+            "variable_b": b,
+            "block_b": BEHAVIORAL_WIDE_BLOCK_BY_VAR.get(b),
+            "corr": float(behavioral_wide_v0b_corr.loc[a, b]),
+            "abs_corr": abs(float(behavioral_wide_v0b_corr.loc[a, b])),
+        }
+    )
+
+behavioral_wide_v0b_caveat_pair_check = (
+    pd.DataFrame(v0b_caveat_rows)
+    .sort_values("abs_corr", ascending=False)
+    .reset_index(drop=True)
+)
+display(behavioral_wide_v0b_caveat_pair_check)
+```
+
+## 12.6 Comparacion v0 vs v0b
+
+```{python}
+#| label: behavioral-wide-v0-v0b-comparison
+print("label: behavioral-wide-v0-v0b-comparison")
+
+
+def pc_count_at_threshold(explained: pd.DataFrame, threshold: float = 0.80) -> int | None:
+    reached = explained.loc[explained["cumulative_variance_ratio"] >= threshold]
+    if reached.empty:
+        return None
+    return int(str(reached.iloc[0]["pc"]).replace("PC", ""))
+
+
+def cross_block_high_pair_count(high_pairs: pd.DataFrame) -> int:
+    return int((~high_pairs["same_block"]).sum())
+
+
+behavioral_wide_v0_v0b_comparison = pd.DataFrame([
+    {
+        "metric": "n_variables",
+        "v0": len(BEHAVIORAL_WIDE_MAIN_COLS),
+        "v0b": len(BEHAVIORAL_WIDE_V0B_COLS),
+    },
+    {
+        "metric": "pc_count_to_80pct",
+        "v0": pc_count_at_threshold(behavioral_wide_explained),
+        "v0b": pc_count_at_threshold(behavioral_wide_v0b_explained),
+    },
+    {
+        "metric": "pc1_explained_variance",
+        "v0": float(behavioral_wide_explained.loc[0, "explained_variance_ratio"]),
+        "v0b": float(behavioral_wide_v0b_explained.loc[0, "explained_variance_ratio"]),
+    },
+    {
+        "metric": "pc1_to_pc4_cumulative",
+        "v0": float(behavioral_wide_explained.loc[3, "cumulative_variance_ratio"]),
+        "v0b": float(behavioral_wide_v0b_explained.loc[3, "cumulative_variance_ratio"]),
+    },
+    {
+        "metric": "n_high_pairs_abs_ge_075",
+        "v0": len(behavioral_wide_high_corr_pairs),
+        "v0b": len(behavioral_wide_v0b_high_corr_pairs),
+    },
+    {
+        "metric": "n_cross_block_high_pairs_abs_ge_075",
+        "v0": cross_block_high_pair_count(behavioral_wide_high_corr_pairs),
+        "v0b": cross_block_high_pair_count(behavioral_wide_v0b_high_corr_pairs),
+    },
+])
+display(behavioral_wide_v0_v0b_comparison)
+
+behavioral_wide_v0b_decision_template = pd.DataFrame([
+    {
+        "decision_item": "se_mantiene_multidimensionalidad",
+        "evidence_to_review": "pc_count_to_80pct y PC1/PC4 cumulative",
+        "possible_action": "si v0b sigue requiriendo varios PCs, usarlo como candidato principal",
+    },
+    {
+        "decision_item": "baja_redundancia_cross_block",
+        "evidence_to_review": "n_cross_block_high_pairs_abs_ge_075 y caveat-pair-check",
+        "possible_action": "si baja materialmente sin perder ejes, preferir v0b para clustering",
+    },
+    {
+        "decision_item": "perdida_de_interpretabilidad",
+        "evidence_to_review": "pca-loading-summary v0b por bloque",
+        "possible_action": "si desaparece un eje sustantivo, volver a v0 o reincorporar variable puntual",
+    },
+])
+display(behavioral_wide_v0b_decision_template)
+```

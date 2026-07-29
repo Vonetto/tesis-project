@@ -1,0 +1,180 @@
+---
+title: "EDA User-Level Segmentation / NMF"
+format: html
+jupyter: python3
+---
+
+```{python}
+#| label: setup
+from pathlib import Path
+import json
+
+import pandas as pd
+import polars as pl
+
+PROJECT_ROOT = Path("/Users/vicenteonetto/Desktop/FCFM/MDS/Tesis_Local/tesis-project")
+SEG_DIR = PROJECT_ROOT / "tmp" / "audits" / "user_level_redesign" / "segmentation"
+
+SCOPE = "interannual_ml"
+VARIANT = "clean"
+HOME_FILTER = "alta"
+MIN_TRIPS = 3
+MIN_HOME_TRIPS = 0
+MATRIX_SPEC = "macro_franja_modo"
+NORMALIZATION = "share"
+
+def universe_suffix(scope, variant, home_filter, min_trips, min_home_trips=0):
+    suffix = f"{scope}_{variant}_{home_filter}_n{min_trips}"
+    if min_home_trips > 0:
+        suffix += f"_home{min_home_trips}"
+    return suffix
+
+MATRIX_STEM = (
+    f"user_mobility_matrix_"
+    f"{universe_suffix(SCOPE, VARIANT, HOME_FILTER, MIN_TRIPS, MIN_HOME_TRIPS)}_"
+    f"{MATRIX_SPEC}_{NORMALIZATION}"
+)
+MATRIX_PATH = SEG_DIR / f"{MATRIX_STEM}.parquet"
+INVENTORY_PATH = SEG_DIR / f"{MATRIX_STEM}_feature_inventory.json"
+NMF_DIR = SEG_DIR / "nmf" / MATRIX_STEM
+POSTHOC_DIR = NMF_DIR / "posthoc"
+
+print("label: setup")
+print(f"matrix_path: {MATRIX_PATH} exists={MATRIX_PATH.exists()}")
+print(f"inventory_path: {INVENTORY_PATH} exists={INVENTORY_PATH.exists()}")
+print(f"nmf_dir: {NMF_DIR} exists={NMF_DIR.exists()}")
+```
+
+## Commands
+
+```{python}
+#| label: commands
+PY = "/Users/vicenteonetto/.local/share/mamba/envs/larch-env/bin/python"
+
+build_cmd = f"""{PY} \\
+  scripts/audits/build_user_mobility_segmentation_matrix.py \\
+  --scope {SCOPE} --variant {VARIANT} --home-filter {HOME_FILTER} --min-trips {MIN_TRIPS} \\
+  --matrix-spec {MATRIX_SPEC} --normalization {NORMALIZATION} --force"""
+
+nmf_cmd = f"""{PY} \\
+  scripts/audits/run_user_nmf_segmentation.py \\
+  --scope {SCOPE} --variant {VARIANT} --home-filter {HOME_FILTER} --min-trips {MIN_TRIPS} \\
+  --matrix-spec {MATRIX_SPEC} --normalization {NORMALIZATION} \\
+  --k-range 2-8 --n-runs 10 --seed 20260527"""
+
+posthoc_cmd = f"""{PY} \\
+  scripts/audits/summarize_user_nmf_segments.py \\
+  --scope {SCOPE} --variant {VARIANT} --home-filter {HOME_FILTER} --min-trips {MIN_TRIPS} \\
+  --matrix-spec {MATRIX_SPEC} --normalization {NORMALIZATION} --k all"""
+
+print("label: commands")
+print("\n# 1) Build matrix\n" + build_cmd)
+print("\n# 2) Run NMF\n" + nmf_cmd)
+print("\n# 3) Post-hoc summary\n" + posthoc_cmd)
+```
+
+## Matrix Audit
+
+```{python}
+#| label: matrix-audit
+print("label: matrix-audit")
+summary_path = SEG_DIR / f"{MATRIX_STEM}_summary.csv"
+feature_dist_path = SEG_DIR / f"{MATRIX_STEM}_feature_distribution.csv"
+
+if INVENTORY_PATH.exists():
+    inventory = json.loads(INVENTORY_PATH.read_text())
+    print({
+        "n_features": len(inventory.get("feature_cols", [])),
+        "matrix_spec": inventory.get("matrix_spec"),
+        "normalization": inventory.get("normalization"),
+        "target_metadata_cols": inventory.get("target_metadata_cols"),
+    })
+else:
+    print(f"Missing inventory: {INVENTORY_PATH}")
+
+if summary_path.exists():
+    display(pl.read_csv(summary_path).to_pandas())
+else:
+    print(f"Missing summary: {summary_path}")
+
+if feature_dist_path.exists():
+    feature_dist = pl.read_csv(feature_dist_path).sort("sum", descending=True)
+    display(feature_dist.head(25).to_pandas())
+else:
+    print(f"Missing feature distribution: {feature_dist_path}")
+```
+
+## NMF Diagnostics
+
+```{python}
+#| label: nmf-diagnostics
+print("label: nmf-diagnostics")
+metrics_path = NMF_DIR / "nmf_metrics.csv"
+top_features_path = NMF_DIR / "nmf_top_features.csv"
+meta_path = NMF_DIR / "run_meta.json"
+
+if meta_path.exists():
+    meta = json.loads(meta_path.read_text())
+    print({
+        "k_range": meta.get("k_range"),
+        "fit_sample_n": meta.get("fit_sample_n"),
+        "elbow": meta.get("elbow"),
+        "save_scores": meta.get("save_scores"),
+    })
+else:
+    print(f"Missing NMF meta: {meta_path}")
+
+if metrics_path.exists():
+    metrics = pl.read_csv(metrics_path)
+    display(metrics.to_pandas())
+else:
+    print(f"Missing NMF metrics: {metrics_path}")
+
+if top_features_path.exists():
+    top_features = pl.read_csv(top_features_path)
+    display(top_features.filter(pl.col("rank") <= 8).to_pandas())
+else:
+    print(f"Missing NMF top features: {top_features_path}")
+```
+
+## Post-Hoc QR/BIP Profile
+
+```{python}
+#| label: posthoc-qr-profile
+print("label: posthoc-qr-profile")
+segment_summary_path = POSTHOC_DIR / "segment_qr_summary.csv"
+association_path = POSTHOC_DIR / "segment_target_association.csv"
+categorical_path = POSTHOC_DIR / "segment_categorical_profile.csv"
+
+if segment_summary_path.exists():
+    segment_summary = pl.read_csv(segment_summary_path)
+    display(segment_summary.to_pandas())
+else:
+    print(f"Missing segment QR summary: {segment_summary_path}")
+
+if association_path.exists():
+    association = pl.read_csv(association_path)
+    display(association.to_pandas())
+else:
+    print(f"Missing target association: {association_path}")
+
+if categorical_path.exists():
+    categorical = pl.read_csv(categorical_path)
+    display(categorical.head(80).to_pandas())
+else:
+    print(f"Missing categorical profile: {categorical_path}")
+```
+
+## Reading Notes
+
+```{python}
+#| label: reading-notes
+print("label: reading-notes")
+print("""
+Lectura esperada:
+- Elegir k por reconstruccion, estabilidad, tamanos e interpretabilidad; no por QR/BIP.
+- Usar QR/BIP solo como validacion externa post-hoc.
+- Si macro_franja_modo es estable pero demasiado gruesa, la siguiente matriz candidata es OD macro.
+- Si los perfiles son estables e interpretables, exportar scores como prototype_pack solo en fase posterior.
+""")
+```
