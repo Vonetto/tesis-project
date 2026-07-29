@@ -64,6 +64,8 @@ COUNT_VARS = [
     "n_hombres",
     "n_mujeres",
     "n_edad_0_5",
+    *AGE_18_PLUS_BUCKETS,
+    "n_18_mas",
     "n_asistencia_parv",
     "n_inmigrantes",
     "n_pueblos_orig",

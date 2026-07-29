@@ -126,6 +126,10 @@ gcloud auth application-default login
 
 ### 3. Pipeline de Datos (ejecutar en orden)
 
+> 📄 **Referencia completa del flujo** (etapas 00→06, inputs/artefactos
+> intermedios/outputs exactos, fuentes crudas, parametrización por semana y
+> gotchas): [`docs/pipeline_procesamiento.md`](docs/pipeline_procesamiento.md).
+
 #### a) Ingesta RAW → Bronze (primera vez o al agregar datos nuevos)
 
 ```bash

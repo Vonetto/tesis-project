@@ -14,10 +14,24 @@ OUT_DIR = PROJECT_ROOT / "tmp" / "audits" / "proposito_residence" / "pk_bridge"
 
 ACTIVE_MODEL_WEEKS = {"2024-W17", "2025-W17"}
 ML_REFERENCE_WEEKS = {"2025-W14", "2025-W15", "2025-W17"}
+INTERANNUAL_ML_WEEKS = {
+    "2024-W14",
+    "2024-W15",
+    "2024-W16",
+    "2024-W17",
+    "2025-W14",
+    "2025-W15",
+    "2025-W16",
+    "2025-W17",
+}
 PROCESSED_TRIPS_BY_WEEK = {
+    "2024-W14": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2024-W14.parquet",
+    "2024-W15": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2024-W15.parquet",
+    "2024-W16": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2024-W16.parquet",
     "2024-W17": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2024-W17.parquet",
     "2025-W14": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W14.parquet",
     "2025-W15": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W15.parquet",
+    "2025-W16": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W16.parquet",
     "2025-W17": PROJECT_ROOT / "tmp" / "viajes_con_te_calculado_2025-W17.parquet",
 }
 
@@ -53,6 +67,8 @@ def weeks_for_scope(scope: str) -> set[str]:
         return ML_REFERENCE_WEEKS
     if scope == "active_ml":
         return ACTIVE_MODEL_WEEKS | ML_REFERENCE_WEEKS
+    if scope == "interannual_ml":
+        return INTERANNUAL_ML_WEEKS
     raise ValueError(f"Scope no soportado: {scope}")
 
 
@@ -88,10 +104,10 @@ def date_from_filename(path: Path) -> str:
     return match.group(1)
 
 
-def list_raw_files(scope: str) -> pl.DataFrame:
-    files = sorted(RAW_VIAJES_DIR.glob("*.viajes.csv"))
+def list_raw_files(scope: str, raw_viajes_dir: Path = RAW_VIAJES_DIR) -> pl.DataFrame:
+    files = sorted(p for p in raw_viajes_dir.glob("*.viajes.csv") if not p.name.startswith("._"))
     if not files:
-        raise FileNotFoundError(f"No se encontraron CSV raw de viajes en {RAW_VIAJES_DIR}")
+        raise FileNotFoundError(f"No se encontraron CSV raw de viajes en {raw_viajes_dir}")
     weeks = weeks_for_scope(scope)
 
     df = pl.DataFrame(
@@ -220,14 +236,27 @@ def build_raw_pk_artifact(file_index: pl.DataFrame, *, scope: str, force: bool) 
         print(f"ℹ️ Reusando raw PK existente: {out_path}")
         return out_path
 
-    frames = []
-    for row in file_index.iter_rows(named=True):
+    parts_dir = OUT_DIR / f"raw_viajes_proposito_pk_parts_{scope_suffix(scope)}"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    part_paths = []
+    for idx, row in enumerate(file_index.iter_rows(named=True), start=1):
         print(f"ℹ️ Leyendo raw y reconstruyendo pk_viaje: {row['filename']}")
-        frames.append(read_raw_csv_minimal(row["path"], row["semana_iso"], row["raw_date"]))
+        part_path = parts_dir / f"{idx:03d}_{row['raw_date']}.parquet"
+        if part_path.exists():
+            part_path.unlink()
+        read_raw_csv_minimal(row["path"], row["semana_iso"], row["raw_date"]).write_parquet(
+            part_path,
+            compression="zstd",
+        )
+        part_paths.append(part_path)
 
-    df_raw = pl.concat(frames, how="diagonal_relaxed")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    df_raw.write_parquet(out_path, compression="zstd")
+    if out_path.exists():
+        out_path.unlink()
+    pl.concat([pl.scan_parquet(p) for p in part_paths], how="diagonal_relaxed").sink_parquet(
+        out_path,
+        compression="zstd",
+    )
     print(f"✅ Raw con pk_viaje escrito en: {out_path}")
     return out_path
 
@@ -587,7 +616,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Reconstruye pk_viaje desde raw CSV y crea bridge auditable con proposito/residencia."
     )
-    parser.add_argument("--scope", choices=["active", "ml_2025", "active_ml"], default="active")
+    parser.add_argument("--scope", choices=["active", "ml_2025", "active_ml", "interannual_ml"], default="active")
+    parser.add_argument(
+        "--raw-viajes-dir",
+        type=Path,
+        default=RAW_VIAJES_DIR,
+        help="Directorio con CSV raw *.viajes.csv que contiene proposito.",
+    )
     parser.add_argument("--force", action="store_true", help="Recrear artefactos aunque ya existan.")
     parser.add_argument(
         "--min-match-rate",
@@ -598,7 +633,7 @@ def main() -> None:
     args = parser.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    file_index = list_raw_files(args.scope)
+    file_index = list_raw_files(args.scope, args.raw_viajes_dir)
     write_csv(file_index, f"raw_file_inventory_{scope_suffix(args.scope)}.csv")
     if args.scope == "active":
         write_csv(file_index, "raw_file_inventory_active.csv")
