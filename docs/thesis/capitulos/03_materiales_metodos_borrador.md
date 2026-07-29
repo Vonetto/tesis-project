@@ -2,196 +2,147 @@
 
 ## 3.1 Diseño general del estudio
 
-Esta tesis desarrolla un estudio empírico observacional sobre la elección de medio de pago en el sistema de transporte público de Santiago. La unidad básica de análisis corresponde al viaje individual observado en los registros del sistema. Para cada viaje se identifica el medio de pago utilizado y se construyen atributos asociados al viaje, al contexto temporal, a la oferta operacional y al entorno territorial de origen.
+Esta tesis desarrolla un estudio empírico observacional sobre la adopción de pagos QR en el transporte público de Santiago. El análisis utiliza registros pasivos de uso del sistema y los combina con información operacional y territorial para caracterizar diferencias entre `BIP` y pagos QR, estudiar perfiles de adopción a nivel tarjeta y describir el crecimiento territorial del uso QR entre 2024 y 2025.
 
-El objetivo metodológico del capítulo es describir cómo se construye la base analítica utilizada para estimar modelos de elección discreta. En particular, se documentan las fuentes de datos, el preprocesamiento aplicado a los registros de viaje, la construcción de variables, el enriquecimiento territorial mediante la zonificación `ZONA777` y la especificación econométrica utilizada para modelar la elección entre medios de pago.
+La estrategia metodológica se organiza en dos niveles complementarios. El primer nivel corresponde a la tarjeta, donde `id_tarjeta` se utiliza como proxy operacional de usuario. Este nivel permite comparar tarjetas asociadas a `BIP`, `QR_RED` y `QR_OTHER`, construir indicadores de intensidad y temporalidad de uso, e implementar modelos preliminares de adopción. El segundo nivel corresponde a la zona `ZONA777`, donde los registros se agregan por residencia u origen de viaje para estudiar patrones territoriales y cambios interanuales en la participación QR.
 
-El análisis se basa en tres alternativas mutuamente excluyentes: `BIP`, `QR_RED` y `QR_OTHER`. La primera corresponde al medio de pago tradicional del sistema, mientras que las dos últimas corresponden a pagos mediante código QR. En el modelo, `BIP` cumple el rol de alternativa base para interpretar la adopción relativa de alternativas digitales. `QR_RED` se analiza con particular atención porque está asociado al canal digital oficial del sistema, aunque esta interpretación se mantiene como una lectura observacional del medio de pago y no como evidencia directa de uso de aplicación, consulta de información en tiempo real u otro mecanismo individual no observado.
+El enfoque es descriptivo, predictivo e interpretativo, no causal. Los modelos y segmentaciones se usan para ordenar evidencia empírica, evaluar asociaciones y preparar hipótesis de modelamiento. No se interpreta el medio de pago como evidencia directa de motivaciones individuales, uso efectivo de aplicaciones, consulta de información en tiempo real ni preferencias subjetivas no observadas.
 
-La estrategia metodológica combina datos pasivos de viajes con información externa de transporte, territorio y entorno construido. Esta combinación permite estimar asociaciones entre la elección de medio de pago y tres grupos de factores: atributos del viaje, contexto operacional y características territoriales de la zona de origen. El enfoque es inferencial e interpretativo, no causal. Por lo tanto, los resultados deben leerse como patrones de asociación condicionados por las variables incluidas en el modelo.
+## 3.2 Fuentes de datos y caso de estudio
 
-## 3.2 Fuentes de datos
+El caso de estudio corresponde al sistema de transporte público de Santiago. La base principal contiene registros observados de uso del sistema durante 2024 y 2025, con información de medio de pago, viajes asociados, fechas, franjas temporales y localización territorial. A partir de esta base se distinguen tres categorías de medio de pago: `BIP`, `QR_RED` y `QR_OTHER`.
 
-El análisis utiliza una base principal de viajes observados del sistema de transporte público de Santiago, complementada con fuentes operacionales y territoriales. La base de viajes contiene información sobre validaciones, medio de pago, origen, destino, tiempos y etapas asociadas al desplazamiento. A partir de esta fuente se identifican las alternativas observadas y se construyen atributos de viaje tales como tiempo en vehículo, tiempo de espera inicial, tiempo de espera en transbordos y número de transbordos.
+`BIP` corresponde al medio de pago tradicional del sistema. `QR_RED` identifica pagos QR asociados al canal oficial de Red Metropolitana de Movilidad. `QR_OTHER` agrupa pagos QR realizados mediante otros canales o aplicaciones. En algunos análisis, `QR_RED` y `QR_OTHER` se agregan como QR frente a `BIP`; en otros, se mantienen separados para evaluar si los canales digitales presentan perfiles distintos.
 
-La información operacional se utiliza para mejorar la caracterización de los viajes y del entorno de transporte. Para Metro, se emplean datos GTFS que permiten representar la estructura de líneas, estaciones, horarios y frecuencias del servicio. Esta información se usa tanto para reconstruir rutas internas en la red de Metro como para estimar tiempos esperados de espera y viaje en etapas de Metro. Para buses, se utiliza información operacional proveniente de registros de oferta y perfiles de carga, a partir de los cuales se construyen frecuencias observadas por servicio, paradero y hora.
+La base de viajes se complementa con fuentes externas. Las variables sociodemográficas provienen de información censal agregada a nivel territorial. Las variables de entorno construido se construyen a partir de OpenStreetMap (OSM), usando objetos urbanos asignados a zonas. Las variables de carga `BIP` describen distancia, densidad y cantidad de puntos de carga física. Las variables operacionales resumen oferta y demanda de transporte, incluyendo señales asociadas a bus, Metro, paraderos, estaciones y relaciones demanda-oferta.
 
-Además, se incorporan fuentes territoriales externas. Las variables sociodemográficas provienen del Censo 2024 y se agregan a nivel de zona de origen. Algunas variables se obtienen directamente desde agregados espaciales de manzana-entidad, mientras que otras se derivan desde microdatos censales espacializados operacionalmente. Las variables de entorno construido se construyen a partir de OpenStreetMap (OSM), usando densidades de objetos urbanos e infraestructura de transporte dentro de cada zona.
+La unidad espacial común es `ZONA777`. En esta tesis, `ZONA777` corresponde a una zonificación de análisis de viajes más desagregada que la comuna, utilizada para representar orígenes y destinos dentro del área de estudio. Esta zonificación permite unir registros de uso con variables de Censo, OSM, carga `BIP` y contexto operacional.
 
-Finalmente, se utilizan geometrías de la zonificación `ZONA777` para vincular los viajes individuales con atributos agregados de origen. Esta zonificación funciona como unidad espacial común entre viajes, variables operacionales, Censo y OSM.
+## 3.3 Descripción de los datos analíticos
 
-## 3.3 Preprocesamiento, depuración y construcción de atributos de viaje
+La base analítica se construye a partir de registros observados de uso del sistema. Cada registro permite identificar el medio de pago y vincularlo con información temporal y espacial. A partir de estos registros se generan dos vistas principales de los datos: una vista a nivel tarjeta y una vista agregada a nivel zona.
 
-Antes de la estimación, los registros de viaje fueron sometidos a una etapa de depuración y reconstrucción de atributos. Esta etapa es necesaria porque los datos pasivos del sistema no constituyen directamente una base lista para modelar elección discreta. Los registros originales pueden contener tiempos inválidos, distancias inconsistentes, paraderos faltantes, etapas mal caracterizadas o viajes que no representan experiencias plausibles de desplazamiento. Además, algunos atributos centrales para el modelo, como las esperas y los transbordos, requieren procesamiento adicional antes de ser utilizados como variables explicativas.
+La vista a nivel tarjeta resume el historial observado de cada `id_tarjeta`. Para cada tarjeta se registra su tipo de pago observado (`BIP`, `QR_RED` o `QR_OTHER`) y se agregan medidas de uso, tales como número de viajes, días activos, semanas activas y distribución temporal de actividad. Esta vista permite estudiar adopción y perfil de uso sin tratar cada viaje como una decisión independiente. También permite distinguir tarjetas con uso muy ocasional de tarjetas con actividad más frecuente, lo que es relevante para definir universos de análisis y sensibilidades.
 
-La depuración inicial se basó en criterios de consistencia y detección de viajes anómalos inspirados en Núñez Sepúlveda (2015), quien desarrolla una metodología para calcular indicadores de calidad de servicio del transporte público de Santiago a partir de datos pasivos. En esta tesis, dichos criterios se adaptan al objetivo de construir una muestra consistente para modelos de elección discreta. En términos generales, se filtran registros con tiempos no válidos, paraderos inconsistentes, distancias inválidas y patrones de viaje incompatibles con una experiencia razonable de desplazamiento. La motivación de este paso es evitar que errores de medición o viajes mal reconstruidos distorsionen la estimación de parámetros asociados a tiempos, esperas y transbordos.
+La vista zonal resume la adopción QR en unidades `ZONA777`. Para cada zona se calculan cantidades observadas, participación QR y soporte mínimo por año. Esta vista se construye separadamente para residencia u origen habitual y para origen de viaje. La primera aproxima el entorno territorial asociado a la tarjeta; la segunda describe dónde se inician los viajes observados. Ambas geografías responden preguntas distintas y no deben mezclarse sin explicitar la unidad de lectura.
 
-La lógica de filtrado distingue entre viajes desfavorables pero plausibles y viajes anómalos. Esta distinción es relevante porque los modelos deben preservar experiencias reales de baja calidad de servicio, como viajes largos o con múltiples transbordos, pero no deben interpretar como comportamiento de usuario registros que provienen de errores de estimación, inconsistencias espaciales o artefactos de la base. En este sentido, el preprocesamiento no busca eliminar viajes complejos, sino excluir observaciones que no entregan una representación confiable del fenómeno analizado.
+La descripción de datos en la tesis debe reportar, al menos, el tamaño de los universos usados, la proporción de observaciones `BIP` y QR, la desagregación entre `QR_RED` y `QR_OTHER`, el soporte disponible por año y la cobertura espacial de las zonas. También debe mostrar cómo cambia la lectura al pasar de conteo de zonas a volumen de tarjetas o viajes. Esta distinción es importante porque un patrón puede ser territorialmente extendido pero representar poco volumen, o concentrar gran parte del aumento agregado en pocas zonas de alta actividad.
 
-Un segundo componente del preprocesamiento corresponde a la reconstrucción de etapas y transbordos internos de Metro. En los datos originales, ciertos cambios de línea dentro de la red de Metro pueden no quedar representados correctamente como parte de un mismo viaje continuo. Estos casos son problemáticos porque pueden sesgar el número de etapas, el número de transbordos y los tiempos asociados a la experiencia de viaje. Para abordar este punto, se implementó una reconstrucción de rutas internas de Metro mediante un grafo de la red, construido a partir de información GTFS. Esta reconstrucción permite identificar trayectorias factibles entre estaciones, reconocer transbordos internos y mejorar la consistencia de las etapas utilizadas para calcular atributos del viaje.
+El EDA QR vs `BIP` cumple el rol de descripción inicial de los datos. Sus figuras y tablas permiten mostrar que QR es minoritario en el sistema, que presenta diferencias agregadas de intensidad y temporalidad, y que tiene una señal territorial observable. Estas lecturas se usarán como motivación y caracterización de la base, no como evidencia causal ni como resultado definitivo del modelo final.
 
-El tercer componente corresponde al recálculo e imputación de tiempos de espera. Los tiempos de espera originales no se utilizaron de manera acrítica, debido a problemas de trazabilidad y consistencia. En su lugar, se calcularon tiempos esperados usando información operacional. Para Metro, los tiempos de espera se estimaron a partir de headways programados en GTFS, utilizando la mitad del headway equivalente cuando el servicio opera bajo una lógica más regular. Para buses, se estimó la espera esperada a partir de frecuencias observadas por servicio, paradero y hora, siguiendo la formulación discutida por Arriagada et al. (2022) para redes con servicios de buses de headways irregulares. En particular, cuando se asume una llegada tipo Poisson, la espera esperada para una línea con frecuencia observada \(f\) se calcula como:
+## 3.4 Preprocesamiento y construcción de datos analíticos
 
-\[
-WT = \frac{60}{f}
-\]
+Los registros originales no se utilizan directamente como base final de modelamiento. Primero se construyen artefactos intermedios que agregan, depuran y resumen la información en unidades analíticas consistentes. Este paso es necesario porque una misma tarjeta puede tener múltiples viajes, las zonas pueden tener soporte desigual y las variables territoriales u operacionales provienen de fuentes con distinta granularidad.
 
-medida en minutos cuando \(f\) está expresada en buses por hora. En la implementación, esta relación se expresa en segundos como \(3600/f\). Esta decisión es coherente con tratar la operación de buses como un servicio de frecuencia irregular, distinto del tratamiento aplicado a Metro, donde se utiliza información programada de headways y una aproximación de media espera igual a la mitad del intervalo.
+A nivel tarjeta, los registros se agregan por `id_tarjeta`. Para cada tarjeta se identifica el tipo de medio de pago observado y se construyen medidas de intensidad de uso, tales como número de viajes, días activos y semanas activas. También se derivan indicadores temporales, modales y de contexto territorial asociados al uso observado. Cuando se requiere residencia u origen habitual, estos se interpretan como asignaciones operacionales basadas en los patrones observados, no como domicilio individual verificado.
 
-El resultado de esta etapa es una base de viajes con atributos reconstruidos y consistentes para modelación. En particular, se generan variables de tiempo en vehículo, espera inicial, espera en transbordos y número de transbordos. La caminata en transbordos no se incorpora en la especificación principal, debido a la mayor dificultad de estimarla de manera homogénea y confiable para todos los tipos de transbordo. Esta decisión reduce la complejidad del modelo y evita introducir una variable con calidad desigual entre modos.
+A nivel zona, se construyen paneles por año y geografía. Las dos geografías principales son residencia y origen de viaje. En residencia, el universo corresponde a tarjetas asociadas a una zona de hogar u origen habitual. En origen de viaje, el universo corresponde a viajes iniciados en la zona. Para cada zona y año se calcula el soporte observado, el número de observaciones QR, el total de observaciones y la participación QR.
 
-## 3.4 Unidad de análisis, alternativas y muestra de estimación
+Para evitar que zonas con muy bajo soporte dominen la lectura, los análisis interanuales utilizan umbrales mínimos de observación por año. El umbral base utilizado en los EDA recientes es de 250 observaciones por año, con sensibilidades a otros umbrales. Las zonas sin soporte comparable se mantienen identificadas en mapas y tablas, pero no se usan para inferir crecimiento relativo.
 
-La unidad de análisis es el viaje individual. Cada observación corresponde a un desplazamiento observado en el sistema y contiene la alternativa de pago utilizada. El conjunto de elección considerado es:
+## 3.5 Unidad de análisis a nivel tarjeta
 
-\[
-C_n = \{\texttt{BIP}, \texttt{QR\_RED}, \texttt{QR\_OTHER}\}.
-\]
+La unidad principal para estudiar adopción y perfiles de pago es `id_tarjeta`. Esta unidad permite comparar tarjetas observadas como `BIP`, `QR_RED` o `QR_OTHER`, y es más coherente que el viaje individual cuando la pregunta se refiere a adopción de medio de pago o perfil de uso.
 
-La alternativa `BIP` corresponde al pago mediante tarjeta tradicional. La alternativa `QR_RED` corresponde al pago mediante código QR asociado al canal digital oficial del sistema. La alternativa `QR_OTHER` agrupa pagos QR realizados mediante otros canales o aplicaciones. Estas tres alternativas se tratan como mutuamente excluyentes dentro de cada viaje.
+El uso de `id_tarjeta` tiene una interpretación acotada. Una tarjeta no necesariamente equivale a una persona, porque una persona puede usar más de una tarjeta o una tarjeta puede tener usos compartidos. Por esta razón, la tesis habla de tarjetas o proxies operacionales de usuario, no de individuos observados. Esta distinción es central para evitar una lectura individualista de resultados que son construidos a partir de identificadores operacionales.
 
-La base de estimación se construye a partir de una muestra conjunta de viajes observados en 2024 y 2025. La incorporación de ambos años permite analizar diferencias temporales en la adopción observada de medios de pago, controlando explícitamente por el año de observación mediante la variable `ANIO_2025`. En vez de estimar modelos separados por año, se utiliza una base pooled que permite incorporar la dimensión temporal dentro de una misma especificación.
+En este nivel, el outcome natural no es la elección de medio de pago en cada viaje, sino el tipo de tarjeta o canal de pago observado. Por ello, los modelos preliminares se formulan como modelos de adopción o clasificación de tipo de tarjeta. La comparación puede ser binaria, QR frente a `BIP`, o multinomial, distinguiendo `BIP`, `QR_RED` y `QR_OTHER`.
 
-Por razones computacionales, la estimación principal se realiza sobre una submuestra estratificada de la base enriquecida. El submuestreo preserva la composición por período de datos y alternativa de pago observada. Es decir, dentro de cada combinación de partición temporal y alternativa elegida se selecciona aleatoriamente una fracción fija de viajes, utilizando una semilla definida para asegurar reproducibilidad. Esta estrategia evita que el muestreo altere de manera importante la representación relativa de `BIP`, `QR_RED` y `QR_OTHER`, especialmente considerando que las alternativas digitales tienen frecuencias distintas a la alternativa tradicional.
+## 3.6 Unidad de análisis a nivel zona
 
-En la versión actualmente documentada del modelo, la estimación principal utiliza una submuestra de 2% de la base interanual enriquecida, con aproximadamente 466 mil observaciones. Este número deberá actualizarse en la versión final si la muestra definitiva cambia por la incorporación de nuevas variables o sensibilidades adicionales. Además, se han estimado sensibilidades con muestras mayores en Larch, debido a que este framework permitió correr especificaciones similares con mayor volumen de datos y menor presión de memoria. Estas corridas se utilizan como validación de que los patrones principales no dependan exclusivamente del tamaño de muestra usado en Biogeme.
+El segundo nivel de análisis es zonal. Su propósito no es reemplazar el análisis a nivel tarjeta, sino describir cómo la adopción QR se distribuye territorialmente y cómo cambia entre 2024 y 2025. Este nivel permite responder preguntas que no se contestan bien con tarjetas individuales, como qué macrozonas explican mayor volumen agregado de nuevos pagos QR o qué zonas crecen más que la tendencia global.
 
-## 3.5 Enriquecimiento territorial mediante `ZONA777`
-
-Para incorporar información territorial, cada viaje se asocia a una zona de origen `ZONA777`. Esta corresponde a una zonificación utilizada por el sistema de transporte público de Santiago para representar espacialmente los viajes y organizar información de origen y destino. En esta tesis, dicha zonificación permite vincular cada observación individual con variables agregadas de demanda, oferta, Censo y OpenStreetMap.
-
-El enriquecimiento territorial se realiza usando la zona de inicio del viaje. Esta decisión responde a que el objetivo es caracterizar el entorno desde el cual se inicia la interacción con el sistema de transporte y con el medio de pago. Por lo tanto, las variables territoriales incluidas en el modelo describen el contexto de origen, no necesariamente el destino ni la trayectoria completa del viaje.
-
-El uso de `ZONA777` permite combinar fuentes con resoluciones espaciales distintas. Los viajes se observan a nivel individual, mientras que variables de demanda, oferta y territorio se construyen a nivel agregado. La zonificación funciona como una unidad espacial común que permite unir estos niveles de información. Sin embargo, esta operación implica una cautela interpretativa importante: las variables territoriales no deben leerse como características individuales del pasajero. Por ejemplo, una zona con mayor proporción de población con educación universitaria no implica que cada usuario que inicia viaje en esa zona tenga educación universitaria; indica que el entorno territorial de origen presenta esa composición agregada.
-
-## 3.6 Construcción de variables
-
-Las variables utilizadas en el modelo se organizan en cuatro grupos principales: atributos de viaje, variables temporales y operacionales, variables censales y variables de OpenStreetMap.
-
-### 3.6.1 Atributos de viaje
-
-Los atributos de viaje buscan capturar el costo temporal y operacional asociado a cada alternativa de pago. Estas variables se construyen como atributos alternativa-específicos, es decir, pueden tomar valores distintos para `BIP`, `QR_RED` y `QR_OTHER` dentro de una misma observación.
-
-Las variables incluidas son:
-
-- `T_VEH`: tiempo en vehículo de la alternativa, medido en segundos.
-- `T_ESPERA_INI`: tiempo de espera inicial de la alternativa, medido en segundos.
-- `T_ESPERA_TRASB`: tiempo de espera asociado a transbordos, medido en segundos.
-- `N_TRASB`: número de transbordos de la alternativa.
-
-Estas variables se construyen a partir de viajes comparables por origen, destino y tipo de pago. Para la alternativa efectivamente elegida se aplica una corrección tipo leave-one-out, de modo que el viaje observado no contribuya mecánicamente a construir sus propios atributos de contexto. Esta corrección reduce el riesgo de introducir endogeneidad mecánica en los atributos de la alternativa elegida.
-
-### 3.6.2 Variables temporales, demanda y oferta operacional
-
-El segundo grupo de variables describe el contexto temporal y operacional del viaje. A diferencia de los atributos de viaje, estas variables son comunes a las tres alternativas dentro de una observación.
-
-Las variables temporales incluyen `ANIO_2025`, `LAB_PM`, `LAB_PT` y `NO_LAB`. La variable `ANIO_2025` identifica viajes observados durante 2025. Las variables de franja horaria identifican viajes en día laboral durante punta mañana (`LAB_PM`), día laboral durante punta tarde (`LAB_PT`) y día no laboral (`NO_LAB`). La categoría base corresponde a viajes en día laboral fuera de las horas punta definidas (`LAB_VALLE`).
-
-La variable de demanda local se define como `LOG_DEMAND`. Esta variable mide la intensidad de viajes observados en la zona de origen y franja temporal del viaje. Para construirla, se cuenta el número de viajes por año, zona de inicio y franja horaria. Luego se aplica una corrección leave-one-out para evitar que el viaje observado contribuya a su propia medida de demanda, y finalmente se utiliza la transformación \(\log(1+x)\). Esta variable se interpreta como una proxy de intensidad local de demanda, no como demanda total del sistema.
-
-Las variables de oferta operacional resumen la disponibilidad de transporte en la zona de origen. `LOG_BUS_STOP_DENSITY` captura la densidad de paraderos de bus. `LOG_BUS_LINE_COUNT` aproxima la variedad de servicios de bus disponibles por zona y franja. `LOG_METRO_LINE_COUNT` representa el número promedio de líneas de Metro activas asociadas a estaciones de la zona. Todas estas variables se transforman mediante \(\log(1+x)\) para reducir asimetrías y permitir una lectura asociada a cambios proporcionales.
-
-### 3.6.3 Variables censales
-
-Las variables censales provienen del Censo 2024 y se incorporan a nivel de zona de origen. Algunas variables se derivan directamente desde la base agregada de manzana-entidad y se cruzan espacialmente con `ZONA777`. Cuando las unidades censales no coinciden exactamente con las zonas de transporte, se utiliza una agregación areal basada en intersecciones espaciales. Los conteos se agregan antes de calcular proporciones, evitando promediar porcentajes de unidades con distinto tamaño poblacional.
-
-Otras variables se construyen a partir de microdatos comunales del Censo 2024. Dado que estos microdatos no tienen localización fina observada, se utiliza una estrategia operacional de espacialización intra-comunal inspirada en la discusión metodológica de E. Graells-Garrido sobre asignación espacial de viviendas censales sin ubicación fina. Esta estrategia permite generar aproximaciones territoriales consistentes con agregados disponibles, pero no debe interpretarse como ubicación observada de hogares o personas.
-
-El bloque censal principal incluye variables como proporción de población de 18 años o más con educación universitaria o superior, proporción de viviendas con hacinamiento, proporción de personas con discapacidad y proporción de población inmigrante. Estas variables se estandarizan antes de entrar al modelo, por lo que sus coeficientes se interpretan como cambios asociados a un aumento de una desviación estándar en la característica territorial.
-
-### 3.6.4 Variables de OpenStreetMap
-
-Las variables OSM buscan capturar atributos del entorno construido y elementos de infraestructura próximos al origen del viaje. Para construirlas, se extraen objetos OSM dentro del área de estudio y se asignan espacialmente a `ZONA777`. Luego se calculan densidades por kilómetro cuadrado para combinaciones específicas de llave y valor, tales como `amenity=school`, `amenity=university` o `railway=subway_entrance`.
-
-El bloque OSM incluye variables de equipamiento urbano, como densidad de escuelas, universidades, juegos infantiles, centros deportivos y comercio de conveniencia. Además, el modelo incorpora variables de infraestructura de acceso al transporte, como densidad de objetos de transporte con `shelter=yes` y densidad de accesos físicos a Metro (`railway=subway_entrance`). Estas variables se estandarizan antes de la estimación.
-
-La interpretación de las variables OSM requiere cautela porque OpenStreetMap es una fuente colaborativa y su cobertura puede variar espacialmente. Por lo tanto, estas variables se usan como proxies observables del entorno construido y de la infraestructura mapeada, no como inventarios administrativos exhaustivos.
-
-## 3.7 Especificación del modelo de elección discreta
-
-La elección de medio de pago se modela mediante un modelo logit multinomial (MNL) basado en el marco de utilidad aleatoria. Se asume que cada viaje \(n\) tiene asociada una utilidad latente para cada alternativa \(i\) perteneciente al conjunto de elección \(C_n\). La alternativa observada corresponde a aquella que entrega la mayor utilidad.
-
-La utilidad total de la alternativa \(i\) para el viaje \(n\) se define como:
+Para cada zona se calculan medidas de participación QR por año:
 
 \[
-U_{ni} = V_{ni} + \varepsilon_{ni},
+share\_QR_{z,t} = \frac{QR_{z,t}}{N_{z,t}},
 \]
 
-donde \(V_{ni}\) corresponde a la utilidad sistemática observable y \(\varepsilon_{ni}\) captura factores no observados por el analista.
-
-La utilidad sistemática combina variables alternativa-específicas y variables comunes al viaje o a la zona de origen:
+donde \(QR_{z,t}\) es el número de observaciones QR en la zona \(z\) y año \(t\), y \(N_{z,t}\) es el total de observaciones comparables. El cambio bruto se define como:
 
 \[
-V_{ni}
-=
-ASC_i
-+
-\sum_{k \in K^{AS}} \beta^{AS}_{ki} X_{kni}
-+
-\sum_{m \in K^{C}} \beta^{C}_{mi} Z_{mn}.
+\Delta_z = share\_QR_{z,2025} - share\_QR_{z,2024}.
 \]
 
-En esta expresión, \(ASC_i\) es la constante específica de alternativa; \(X_{kni}\) representa atributos que pueden variar entre alternativas dentro de un mismo viaje, como tiempos de viaje, esperas y transbordos; y \(Z_{mn}\) representa variables comunes a las alternativas, como año, franja horaria, demanda, oferta, Censo y OSM.
-
-Bajo el supuesto de errores independientes e idénticamente distribuidos Gumbel tipo I, la probabilidad de que el viaje \(n\) utilice la alternativa \(i\) toma la forma:
+El crecimiento relativo descuenta la tendencia global de la geografía correspondiente:
 
 \[
-P_{ni}
-=
-\frac{\exp(V_{ni})}
-{\sum_{j \in C_n} \exp(V_{nj})}.
+\Delta^{rel}_z = \Delta_z - \Delta^{global}.
 \]
 
-Los coeficientes se interpretan en términos relativos entre alternativas. Un coeficiente positivo aumenta la utilidad sistemática de una alternativa respecto de las demás, mientras que un coeficiente negativo la reduce, manteniendo constantes el resto de las variables.
-
-## 3.8 Parametrización e interpretación
-
-El modelo combina variables alternativa-específicas y variables comunes. Para las variables alternativa-específicas, como `T_VEH`, `T_ESPERA_INI`, `T_ESPERA_TRASB` y `N_TRASB`, se estiman coeficientes para las tres alternativas. Esto es posible porque el valor de estas variables puede diferir entre `BIP`, `QR_RED` y `QR_OTHER` dentro de una misma observación.
-
-Para las variables comunes al viaje o a la zona, se utiliza `BIP` como alternativa de referencia. En este caso, el valor de la variable es el mismo para las tres alternativas de una observación, por lo que no se identifican tres efectos absolutos independientes. En consecuencia, se fija el coeficiente de `BIP` en cero y se estiman los coeficientes de `QR_RED` y `QR_OTHER` respecto de `BIP`.
-
-Esta parametrización implica que, para variables comunes, un coeficiente positivo de `QR_RED` indica que un aumento en la variable se asocia con mayor utilidad relativa de `QR_RED` frente a `BIP`. De forma análoga, un coeficiente negativo indica menor utilidad relativa de la alternativa digital considerada respecto de `BIP`. Esta lectura es relativa y no debe interpretarse como un efecto absoluto de la variable sobre una alternativa aislada.
-
-Además de reportar coeficientes, la tesis incorpora odds ratios como herramienta de interpretación. Para una variable \(x\) con coeficiente \(\beta\), el odds ratio asociado a un aumento de una unidad en \(x\) se calcula como:
+Esta medida permite distinguir zonas que crecen más o menos que el promedio global, incluso cuando casi todas las zonas aumentan su participación QR. Además, se calcula un aporte volumétrico por cambio de share:
 
 \[
-OR = \exp(\beta).
+aporte_z = N_{z,2025} \cdot (share\_QR_{z,2025} - share\_QR_{z,2024}).
 \]
 
-Cuando las variables están estandarizadas, el odds ratio se interpreta como el cambio multiplicativo en los odds asociado a un aumento de una desviación estándar. Para tiempos medidos en segundos, los odds ratios pueden escalarse a un minuto adicional multiplicando el coeficiente por 60 antes de aplicar la exponencial. Esta transformación facilita la lectura sustantiva de los resultados, especialmente para comparar efectos entre variables con distintas unidades.
+Esta descomposición separa la pregunta de tasa de crecimiento de la pregunta de contribución agregada. Una zona puede crecer mucho en términos relativos y aportar poco volumen si tiene pocas observaciones; también puede aportar mucho volumen con un crecimiento relativo moderado si concentra muchas tarjetas o viajes.
 
-## 3.9 Estrategia de estimación y evaluación
+## 3.7 Construcción de variables
 
-La estimación se realiza mediante máxima verosimilitud. La función objetivo corresponde a la log-verosimilitud de las elecciones observadas, dada la probabilidad asignada por el modelo a la alternativa efectivamente elegida. La estimación principal se implementa en Biogeme, una biblioteca especializada en la estimación de modelos de elección discreta y ampliamente utilizada en investigación aplicada en transporte. Larch, otra biblioteca orientada a modelos de elección discreta y análisis de demanda de transporte, se utiliza como herramienta complementaria para estimar sensibilidades con muestras mayores y verificar la estabilidad general de los resultados.
+Las variables se organizan en familias, de modo que la metodología sea estable aunque cambie el modelo final. La primera familia corresponde a intensidad y temporalidad de uso. Incluye número de viajes, días activos, semanas activas, concentración temporal, presencia en semanas específicas y patrones de uso en días laborales o no laborales. Estas variables describen cómo se usa el sistema, no por qué se elige un medio de pago.
 
-Las especificaciones se evalúan combinando criterios estadísticos, computacionales e interpretativos. En primer lugar, se revisa la convergencia numérica del modelo, incluyendo el estado de convergencia, el gradiente final y la presencia de errores de estimación. En segundo lugar, se reportan medidas de ajuste global como log-verosimilitud final, AIC y BIC. La log-verosimilitud permite comparar ajuste entre modelos, mientras que AIC y BIC penalizan la complejidad de la especificación. Dado el tamaño de muestra, BIC aplica una penalización especialmente exigente al número de parámetros, por lo que su interpretación se combina con criterios de interpretabilidad y valor sustantivo.
+La segunda familia corresponde a variables residenciales y sociodemográficas. Incluye proxies de educación, composición socioeconómica, edad y otras características agregadas de la zona de residencia u origen habitual. Estas variables se interpretan como atributos territoriales, no como características individuales de cada tarjeta.
 
-En tercer lugar, se revisan errores estándar robustos, estadísticos \(t\) y valores \(p\). La selección de variables no se basa únicamente en significancia estadística, sino también en estabilidad, signo, magnitud e interpretación. En particular, para variables territoriales se privilegian especificaciones parsimoniosas y defendibles, evitando sobrecargar el modelo con variables altamente redundantes o de lectura sustantiva débil.
+La tercera familia corresponde a contexto operacional. Incluye presencia de Metro, número de estaciones, oferta de bus, abordajes observados, demanda zonal y medidas de presión demanda-oferta. Estas variables buscan describir el entorno de transporte en el que se usa el sistema.
 
-El modelo principal se define como una especificación MNL territorial que incorpora atributos de viaje, controles temporales, demanda local, oferta operacional, variables censales y variables OSM. Sensibilidades adicionales se utilizan para evaluar robustez, pero no reemplazan el criterio central de construir un modelo interpretable y coherente con la pregunta de investigación.
+La cuarta familia corresponde a entorno urbano OSM. Incluye densidades o índices derivados de objetos urbanos, tales como comercio y servicios, educación superior, salud, equipamiento cívico, áreas verdes y otros componentes del entorno construido. Estas variables se usan como proxies de centralidad y equipamiento urbano. Dado que OSM es una fuente colaborativa, su lectura debe ser cuidadosa y no equivalente a un catastro administrativo completo.
 
-## 3.10 Consideraciones metodológicas y límites
+La quinta familia corresponde al acceso físico a carga `BIP`. Incluye distancia al punto de carga más cercano, densidad de puntos de carga y número de puntos de carga asociados a la zona. En la estrategia actual, estas variables cumplen un rol importante como controles negativos o controles de contraste: permiten evaluar si la adopción QR parece responder a falta de acceso físico a carga `BIP` o si se alinea más con otros perfiles territoriales y operacionales.
 
-La metodología presenta varias limitaciones que deben considerarse al interpretar los resultados. En primer lugar, el análisis es observacional. Por lo tanto, los coeficientes estimados representan asociaciones condicionadas por las variables incluidas, no efectos causales. No es posible afirmar, por ejemplo, que una característica territorial cause individualmente la adopción de `QR_RED`.
+Finalmente, se incorporan macrozonas y variables geográficas base. Estas variables ayudan a distinguir señales propias de una variable candidata de estructuras territoriales más amplias. Por ejemplo, una variable sociodemográfica puede capturar parte de la estructura Oriente/Poniente o Centro/Periferia si no se controla por macrozona.
 
-En segundo lugar, las variables territoriales corresponden al entorno de origen del viaje, no a atributos individuales de los pasajeros. Una asociación entre mayor educación universitaria en la zona y mayor utilidad relativa de una alternativa digital debe interpretarse como un patrón territorial, no como evidencia directa sobre el nivel educativo de cada usuario.
+## 3.8 Modelos preliminares a nivel tarjeta
 
-En tercer lugar, el medio de pago `QR_RED` se interpreta como una señal observable de inserción en un canal digital institucional, pero no permite observar directamente el uso de aplicaciones, información en tiempo real ni decisiones subjetivas durante el viaje. Esta distinción es central para evitar una sobreinterpretación de los resultados.
+El primer frente metodológico corresponde a modelos interpretables a nivel tarjeta. La especificación base se plantea como un modelo logit multinomial para el tipo de tarjeta observado:
 
-En cuarto lugar, la construcción de atributos de viaje depende de supuestos de preprocesamiento. Aunque se implementaron correcciones e imputaciones basadas en información operacional y literatura previa, todo cálculo de tiempos de espera o reconstrucción de etapas en datos pasivos contiene incertidumbre. Esta incertidumbre es menor que utilizar variables originales sin depuración, pero debe ser reconocida como parte de la metodología.
+\[
+C_i \in \{\texttt{BIP}, \texttt{QR\_OTHER}, \texttt{QR\_RED}\}.
+\]
 
-Finalmente, algunas líneas metodológicas originalmente consideradas, como inercia, hábito, clustering o segmentación de usuarios, no forman parte del objetivo principal de esta especificación. La tesis se concentra en la elección observada de medio de pago y en su relación con atributos de viaje, operación y territorio. Otras extensiones pueden ser abordadas en trabajos futuros o en análisis complementarios si los datos y resultados lo permiten.
+`BIP` se utiliza como categoría de referencia. Los coeficientes de `QR_OTHER` y `QR_RED` se interpretan en relación con `BIP`, condicionados por las variables incluidas. Esta estructura permite evaluar si los canales QR tienen perfiles similares o si `QR_RED` y `QR_OTHER` responden a patrones diferentes.
 
-## Referencias metodológicas a incorporar
+El modelo a nivel tarjeta no debe confundirse con un modelo de elección de ruta o modo a nivel viaje. En este caso, las covariables describen la tarjeta, su contexto de uso y su entorno territorial. Por lo tanto, el modelo se interpreta como una regresión de adopción o pertenencia a tipo de tarjeta, no como una elección instantánea de pago en cada viaje.
 
-- Arriagada, J., Munizaga, M. A., Guevara, C. A., & Prato, C. (2022). *Unveiling route choice strategy heterogeneity from smart card data in a large-scale public transport network*. Transportation Research Part C, 134, 103467.
-- Núñez Sepúlveda, C. L. (2015). *Cálculo de indicadores de calidad de servicio para el sistema de transporte público de Santiago a partir de datos pasivos*. Universidad de Chile.
-- E. Graells-Garrido (2026). *Cuando los datos no tienen ubicación: un método para asignar viviendas censales*. Datagramas.
+La tesis puede reportar también especificaciones binarias QR frente a `BIP`, pero estas se interpretan como versiones agregadas. Si `QR_RED` y `QR_OTHER` tienen perfiles distintos, la agregación puede diluir señales relevantes. Por esta razón, el modelo multinomial cumple un rol central como especificación interpretable preliminar.
+
+## 3.9 Benchmark predictivo
+
+El segundo frente metodológico corresponde a modelos predictivos, especialmente XGBoost. Su propósito no es reemplazar el modelo interpretable ni entregar evidencia causal, sino estimar un techo predictivo aproximado con las variables disponibles. Si un modelo flexible con muchas interacciones y no linealidades logra separar solo moderadamente `BIP` y QR, eso informa el límite descriptivo de las variables observadas.
+
+El benchmark predictivo se evalúa con métricas de clasificación, como AUC y PR-AUC en problemas binarios, y métricas one-vs-rest en problemas multiclase. Estas métricas se interpretan como capacidad de ordenamiento y separabilidad, no como prueba de mecanismo. También se utilizan para comparar familias de variables y evaluar si la señal está concentrada en uso, territorio, operación u otras dimensiones.
+
+En el manuscrito, XGBoost debe presentarse como complemento metodológico. Su aporte principal es responder cuánto se puede predecir con las variables disponibles y si los patrones encontrados por modelos interpretables son compatibles con un techo predictivo razonable.
+
+## 3.10 Segmentación descriptiva mediante NMF
+
+El tercer frente metodológico corresponde a segmentación descriptiva a nivel tarjeta. La estrategia principal utiliza factorización no negativa de matrices (NMF) sobre representaciones de movilidad y contexto construidas sin usar el medio de pago como input. Esta decisión evita que los segmentos se definan mecánicamente por ser QR o `BIP`.
+
+La segmentación busca identificar perfiles latentes de uso o contexto. Una vez construidos los segmentos, se cruza post-hoc su composición con `BIP`, QR, `QR_RED` y `QR_OTHER`. Por lo tanto, la pregunta no es si NMF predice causalmente adopción QR, sino si existen perfiles de uso o contexto donde los pagos QR aparecen sobrerrepresentados.
+
+Esta herramienta es especialmente útil para ordenar patrones complejos que no se reducen bien a una sola variable. Sin embargo, sus resultados deben leerse como tipologías descriptivas. No reemplazan el modelo interpretable ni prueban mecanismos individuales.
+
+## 3.11 Análisis zonal e interanual
+
+El análisis zonal complementa el frente a nivel tarjeta. Su objetivo es describir dónde se ubica la adopción QR, cómo cambió entre 2024 y 2025 y qué zonas o macrozonas explican mayor parte del aumento agregado.
+
+Este análisis utiliza mapas, tablas por macrozona, distribuciones de crecimiento, gradientes por variables candidatas y descomposición de volumen. La lectura distingue cuatro conceptos: nivel QR inicial, cambio bruto, crecimiento relativo frente a la tendencia global y contribución volumétrica al aumento total.
+
+El análisis zonal no se presenta como modelo final en esta etapa. Funciona como descripción territorial, validación de robustez y preparación de una posible segunda etapa de modelamiento. Si el modelo final incorpora una regresión zonal, esta sección entregará el puente metodológico necesario.
+
+## 3.12 Límites metodológicos
+
+La metodología presenta límites importantes. Primero, el análisis es observacional. Las asociaciones entre QR, uso, operación y territorio no deben leerse como efectos causales. Segundo, `id_tarjeta` es una unidad operacional, no una persona observada. Tercero, las variables territoriales describen zonas, no atributos individuales de quienes usan el sistema.
+
+Cuarto, el medio de pago observado no permite inferir directamente motivaciones, acceso a smartphone, bancarización, uso de aplicaciones, confianza tecnológica ni consulta de información en tiempo real. Estas dimensiones pueden ser relevantes para interpretar resultados, pero no se observan directamente en la base.
+
+Quinto, los análisis zonales dependen de soporte mínimo, asignación territorial y definición de geografía. Por eso se reportan sensibilidades a soporte, tratamiento de macrozonas externas y diferencias entre tasa y volumen. Finalmente, los modelos preliminares pueden estar limitados por el techo predictivo de las variables disponibles; una baja capacidad predictiva no invalida el análisis descriptivo, pero sí acota el tipo de afirmaciones que se pueden sostener.
 
 ## Pendientes para versión final
 
-- Confirmar la cita formal y fuente documental de `ZONA777`.
-- Actualizar tamaño final de muestra, período definitivo y porcentaje de submuestreo si cambia la especificación principal.
-- Confirmar si el modelo final incorpora nuevas variables censales como `share_mujeres_z` o `share_asistencia_parv_z`.
-- Convertir referencias metodológicas a formato BibTeX en la plantilla LaTeX.
-- Decidir si se agrega un anexo metodológico con detalle de filtros, reglas de anomalías y validaciones del pipeline de preprocesamiento.
+- Confirmar la fuente formal/documental de `ZONA777`.
+- Actualizar tamaños finales de muestra y universos de estimación.
+- Decidir qué resultados preliminares a nivel tarjeta pasan al capítulo de Resultados.
+- Definir si el modelo zonal queda como resultado principal, extensión o trabajo futuro.
+- Convertir referencias metodológicas a BibTeX en la plantilla LaTeX.
+- Decidir qué detalles técnicos pasan a anexos para no sobrecargar el cuerpo del manuscrito.
