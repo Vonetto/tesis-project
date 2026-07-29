@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2318 1282" width="2318" height="1282" role="img" aria-labelledby="title desc">
+  <title id="title">Hotspots OSM de objetos urbanos no comerciales</title>
+  <desc id="desc">Mapa de zonas con intensidad alta de escuelas, educacion superior, salud, centros comunitarios, parques, juegos infantiles y canchas o centros deportivos registrados en OpenStreetMap.</desc>
+  <image href="block12f-osm-activity-hotspots.png" x="0" y="0" width="2318" height="1282"/>
+  <rect x="0" y="0" width="2318" height="112" fill="#F7F2E8"/>
+  <text x="1159" y="43" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="36" font-weight="700" fill="#1F2933">Hotspots OSM de objetos urbanos no comerciales</text>
+  <text x="1159" y="78" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#6F6A61">Rojo: zonas sobre +1 desviacion estandar del indice transformado; rojo oscuro: sobre +2.</text>
+</svg>
