@@ -2,6 +2,95 @@
 
 Esta carpeta contiene scripts reproducibles para validar supuestos de datos antes de integrarlos al pipeline principal de modelación.
 
+## `build_operational_offer_demand_exposure.py`
+
+Reconstruye demanda observada y oferta bus para ocho semanas, y materializa
+exposiciones a nivel tarjeta sin depender de las variables operacionales históricas.
+
+### Comando
+
+```bash
+python scripts/audits/build_operational_offer_demand_exposure.py --force
+```
+
+### Variables normalizadas de oferta
+
+- `op_bus_stops_with_supply_zone_franja_density_km2`: paraderos activos por km2
+  para cada zona, semana y franja con geometría ZONA777.
+- `op_bus_stops_with_supply_zone_franja_density_percentile`: percentil de esa
+  densidad entre zonas de la misma semana-franja.
+- `op_bus_stops_with_supply_zone_franja_density_percentile_mean`: promedio del
+  percentil sobre los viajes con geometría de cada tarjeta.
+- `op_stop_bus_supply_buses_h_observed_percentile`: percentil de buses/h entre
+  observaciones únicas paradero-hora de la misma semana-franja.
+- `op_stop_bus_supply_buses_h_observed_percentile_mean`: promedio sobre los
+  viajes bus-like con match paradero-hora de cada tarjeta.
+
+Los percentiles están en `[0, 1]`. Las zonas sin geometría se mantienen en las
+variables que no requieren área, pero se excluyen de la densidad.
+
+## `build_operational_bus_demand_pressure.py`
+
+Construye la demanda bus específica desde todas las etapas de subida con modo
+bus o zona paga (`1` o `3`). Agrega subidas, viajes y tarjetas por
+`paradero-hora` y `zona-hora`, y las compara con buses/h programados en el mismo
+grano.
+
+```bash
+python scripts/audits/build_operational_bus_demand_pressure.py --force
+```
+
+Las exposiciones por tarjeta usan demanda leave-one-card-out. Se materializan
+dos ponderaciones: por subida observada y con igual peso por tarjeta-celda. Los
+cocientes se denominan presión observada y se leen como subidas o tarjetas por
+pasada bus programada equivalente. En zona, el denominador suma pasadas
+bus-paradero y no vehículos únicos.
+
+El script también escribe `operational_bus_unmapped_supply_stops.parquet`, que
+cuantifica y localiza cuando es posible los paraderos de frecuencia excluidos
+del denominador zonal. Ninguna presión mide ocupación, capacidad, congestión,
+espera real ni el servicio efectivamente abordado.
+
+## `audit_operational_bus_extremes_stability.py`
+
+Contiene las funciones usadas por el bloque 13J del notebook para auditar las
+variables bus antes de cruzarlas con QR/BIP:
+
+- agrega las celdas con subidas observadas a
+  `paradero x hora del día x semana x franja`;
+- identifica extremos recurrentes dentro de cada semana-franja;
+- compara rankings entre semanas adyacentes y la misma semana entre años;
+- cuantifica cambios de quintil y sensibilidad raw versus percentil.
+
+La escala paradero-hora está condicionada a celdas con demanda observada. No
+representa todos los paraderos programados de la red. El módulo no materializa
+nuevos datos: consume los artefactos construidos por los dos scripts
+operacionales anteriores y entrega tablas compactas al notebook.
+
+## Gradientes QR/BIP de las variables bus
+
+`build_operational_bus_qr_gradient_exposure.py` materializa exposiciones por
+`tarjeta x año x franja` para las familias de oferta, demanda bus específica y
+relación demanda-oferta. Mantiene los numeradores de soporte para que el
+resultado pooled pueda reconstruirse como promedio ponderado por viajes o
+subidas:
+
+```bash
+python scripts/audits/build_operational_bus_qr_gradient_exposure.py --force
+```
+
+La salida es
+`operational_bus_qr_gradient_exposure_year_franja.parquet`. El módulo
+`audit_operational_bus_qr_gradients.py` construye quintiles de igual número de
+tarjetas, calcula Q5-Q1 y monotonicidad, y estima intervalos agrupados por la
+zona modal de origen. El bloque 13K del notebook compara percentiles
+semana-franja como especificación principal, valores raw como sensibilidad y
+robustez por año y franja.
+
+La etiqueta `is_qr` es global a la tarjeta. Los cortes temporales caracterizan
+la estabilidad de sus exposiciones operacionales y no deben leerse como estado
+de adopción QR contemporáneo.
+
 ## `build_proposito_pk_bridge.py`
 
 Reconstruye un puente entre los CSV raw de viajes, que conservan `proposito`, y los viajes procesados usados en modelación. El objetivo es habilitar una inferencia auditable de residencia por `id_tarjeta` sin reingestar todo el pipeline Bronze/Silver.
@@ -108,6 +197,74 @@ Candidatos de residencia `ml_2025`:
 - confianza `alta`: `2.239.973` tarjetas.
 - confianza `media`: `445.005` tarjetas.
 - confianza `baja`: `590.652` tarjetas.
+
+## `audit_commute_home_vs_proposito.py`
+
+Audita una definición alternativa de zona residencial basada en patrón AM/PM de
+viajes y la compara contra `zona_hogar` inferida desde `proposito_norm == "HOGAR"`.
+Esto permite testear la observación metodológica de que `proposito` podría estar
+estimado indirectamente por permanencia y no ser una señal independiente perfecta de
+residencia.
+
+### Comando
+
+Para el frente ML intra-2025:
+
+```bash
+python scripts/audits/audit_commute_home_vs_proposito.py --scope ml_2025
+```
+
+Para el frente econométrico interanual:
+
+```bash
+python scripts/audits/audit_commute_home_vs_proposito.py --scope active
+```
+
+Parámetros horarios por defecto:
+
+- mañana: `05:00-12:00`, usando la moda de `zona_inicio_viaje`;
+- tarde: `15:00-22:00`, usando la moda de `zona_fin_viaje`.
+
+Opcionalmente se puede restringir a lunes-viernes:
+
+```bash
+python scripts/audits/audit_commute_home_vs_proposito.py --scope ml_2025 --weekday-only
+```
+
+### Regla alternativa
+
+Para cada `id_tarjeta`, el script calcula:
+
+- `am_origin_zone`: zona de origen más frecuente en viajes de la mañana;
+- `pm_dest_zone`: zona de destino más frecuente en viajes de la tarde;
+- `commute_zona_hogar_consensus`: zona residencial solo si `am_origin_zone == pm_dest_zone`;
+- `commute_zona_hogar_modal`: moda combinada de eventos tipo hogar
+  (`origen AM` + `destino PM`).
+
+La comparación principal contra `zona_hogar` actual se reporta tanto para la moda
+combinada como para el consenso estricto AM=PM.
+
+### Salidas
+
+Los artefactos se escriben en `tmp/audits/proposito_residence/commute_home/`:
+
+- `commute_home_candidates_<scope>.parquet`: candidatos AM/PM por tarjeta.
+- `commute_vs_proposito_home_<scope>.parquet`: comparación tarjeta a tarjeta contra
+  `user_home_candidates_<scope>.parquet`.
+- `commute_vs_proposito_summary_<scope>.csv`: cobertura y tasas globales de
+  coincidencia.
+- `commute_vs_proposito_by_home_confidence_<scope>.csv`: coincidencia por confianza
+  de la residencia basada en `proposito`.
+- `commute_vs_proposito_by_commute_confidence_<scope>.csv`: coincidencia por
+  confianza del candidato AM/PM.
+- `commute_vs_proposito_by_confidence_cross_<scope>.csv`: cruce de ambas
+  confianzas.
+- `commute_vs_proposito_mismatch_sample_<scope>.csv`: muestra de discrepancias.
+- `commute_vs_proposito_zone_pairs_top_<scope>.csv`: pares de zonas
+  `proposito` vs AM/PM más frecuentes.
+
+Si se usan ventanas horarias no estándar o `--weekday-only`, el sufijo del archivo
+incluye la configuración para no sobreescribir la corrida base.
 
 ## `build_residence_model_sample.py`
 
