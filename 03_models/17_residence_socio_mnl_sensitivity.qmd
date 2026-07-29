@@ -70,7 +70,7 @@ logger = blog.get_screen_logger(level=blog.INFO)
 print("label: config")
 MODEL_PARTITION = "pooled_2024_2025"
 ESTIMATION_SAMPLE_TAG = "sample2pct"
-RUN_ESTIMATION = True
+RUN_ESTIMATION = False
 ESTIMATE_ONLY_LABELS = {"mnl_origin_home_alta_parsimonious"}
 
 MODELS_DIR = PROJECT_ROOT / "03_models"
@@ -1011,4 +1011,108 @@ if base_parameter_rows:
         display(pl.from_pandas(df_base_wide))
 else:
     print("No hay parámetros base.")
+```
+
+## 9) Sensibilidad: indicadores de INERCIA (DSI/TSI/LSI) a nivel viaje
+
+Sección AUTOCONTENIDA y opcional. Replica las 6 especificaciones de inercia
+del frente TARJETA (ver `docs/planning/workstreams/user-level-econometric/
+notes.md`, sección 2026-06-07) sobre el sample de NIVEL VIAJE (home_alta).
+No toca `MODEL_SPECS` ni el flujo de arriba.
+
+Los índices son por tarjeta; se pegan a cada viaje vía `attach_inertia_trips`
+(INNER join -> subsetea viajes de tarjetas elegibles; z estandarizado a nivel
+TARJETA, no viaje). OJO de interpretación: el universo cae a ~18%-41% del
+sample (ver `scripts/user_level/measure_inertia_coverage_trips.py`) y queda
+SESGADO hacia usuarios frecuentes — reportar como sensibilidad, no como main.
+
+Entran como `extra_cols` del helper `estimate_mnl_with_extras` ya existente
+(betas específicos por alternativa, BIP referencia), idéntico patrón al socio.
+
+```{python}
+#| label: inertia-trip-models
+print("label: inertia-trip-models")
+from lib.user_level.inertia_trips import attach_inertia_trips, inertia_param_tags
+
+RUN_INERTIA_TRIPS = True  # poner False para saltar esta sección
+
+# 6 especificaciones, iguales a las del frente tarjeta.
+INERTIA_TRIP_WINDOW_SETS = {
+    "inter": ["inter_W15_W17"],
+    "intra2024": ["intra2024_W15_W17"],
+    "intra2025": ["intra2025_W15_W17"],
+    "inter+intra2024": ["inter_W15_W17", "intra2024_W15_W17"],
+    "inter+intra2025": ["inter_W15_W17", "intra2025_W15_W17"],
+    "inter+intra2024+intra2025":
+        ["inter_W15_W17", "intra2024_W15_W17", "intra2025_W15_W17"],
+}
+
+inertia_trip_summary = []
+inertia_trip_params = []
+
+if RUN_INERTIA_TRIPS:
+    # Sample base de viajes (home_alta), con id_tarjeta + columnas del modelo.
+    base_cols = unique_ordered(BASE_MODEL_COLUMNS + ["id_tarjeta"])
+    lf_base = pl.scan_parquet(HOME_ALTA_SAMPLE_PATH)
+    schema = lf_base.collect_schema().names()
+    miss = sorted(set(base_cols) - set(schema))
+    if miss:
+        raise ValueError(f"Faltan columnas en el sample home_alta: {miss}")
+    df_trips_base = lf_base.select(
+        [pl.col("id_tarjeta").cast(pl.Utf8)]
+        + [pl.col(c).cast(pl.Float64) for c in base_cols if c != "id_tarjeta"]
+    ).collect()
+    print(f"Sample base viajes (home_alta): {df_trips_base.height:,} viajes, "
+          f"{df_trips_base['id_tarjeta'].n_unique():,} tarjetas.")
+
+    for name, windows in INERTIA_TRIP_WINDOW_SETS.items():
+        label = f"mnl_inertia_trips_home_alta_{name.replace('+', '_')}"
+        print(f"\n--- {label}  (ventanas: {windows}) ---")
+        df_in, z_cols = attach_inertia_trips(df_trips_base, windows)
+        tags = inertia_param_tags(z_cols)
+        # a pandas: solo columnas numéricas que el helper usa (sin id_tarjeta).
+        model_cols = [c for c in BASE_MODEL_COLUMNS] + z_cols
+        pandas_df = df_in.select(model_cols).to_pandas()
+
+        out_dir = result_artifact_dir(label)
+        try:
+            results, stats, params_df = estimate_mnl_with_extras(
+                pandas_df, model_name=label, extra_cols=z_cols, param_tags=tags,
+            )
+            params_df.to_csv(out_dir / f"params_{label}.csv", index=False)
+            stats_to_frame(stats).to_csv(out_dir / f"stats_{label}.csv", index=False)
+            ll = metric_value(stats, "Final log likelihood")
+            nobs = metric_value(stats, "Sample size")
+            print(f"   ✅ {label}: LL={ll}, N={nobs}")
+            inertia_trip_summary.append(
+                {"spec": name, "label": label, "n_windows": len(windows),
+                 "sample_size": nobs, "ll_final": ll,
+                 "n_inertia_cols": len(z_cols)})
+            # extraer coefs de inercia (QR_RED / QR_OTHER) para la tabla
+            for c in z_cols:
+                tag = tags[c]
+                for alt, pref in [("QR_RED", "B_QR_RED"), ("QR_OTHER", "B_QR_OTHER")]:
+                    pname = f"{pref}_{tag}_{MODEL_PARTITION}"
+                    inertia_trip_params.append({
+                        "spec": name, "alternativa": alt, "indice": c,
+                        "beta": param_value(params_df, pname, ["Value"]),
+                        "robust_t": param_value(
+                            params_df, pname,
+                            ["Robust t-stat.", "Rob. t-test", "t-test"]),
+                    })
+        except Exception as exc:  # noqa: BLE001
+            print(f"   ⚠️ {label} falló: {exc}")
+            traceback.print_exc()
+
+    if inertia_trip_summary:
+        print("\n=== Resumen modelos de inercia (nivel viaje) ===")
+        display(pl.DataFrame(inertia_trip_summary))
+        df_itp = pl.DataFrame(inertia_trip_params)
+        df_itp.write_csv(
+            result_artifact_dir("mnl_inertia_trips_home_alta_inter")
+            / "SUMMARY_inertia_trips_coefs.csv")
+        with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=1800):
+            display(df_itp)
+else:
+    print("RUN_INERTIA_TRIPS = False o RUN_ESTIMATION = False; sección saltada.")
 ```
